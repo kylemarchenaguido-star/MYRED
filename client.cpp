@@ -40,7 +40,7 @@ static void buf_append(std::vector<uint8_t>  &buf, const uint8_t *data, size_t l
   buf.insert(buf.end(), data, data + len);
 }
 
-const size_t k_max_msg = 32 << 40;
+const size_t k_max_msg = 32 << 20;
 
 static int32_t send_req(int fd, const uint8_t *text, size_t len){
   if (len > k_max_msg) {return -1;}
@@ -99,9 +99,7 @@ int main(){
 	if (rv){die("connect");}
 
   std::vector<std::string> query_list = {
-    "hello1","hello2","hello3",
-    std::string(k_max_msg, 'z'),
-    "hello5",
+    "hello1","hello2","hello3","Te amo",
   };
 
   for(const std::string &s : query_list){

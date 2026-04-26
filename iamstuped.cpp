@@ -113,6 +113,15 @@
 
 	*This function works because bypasses types and just copys the raw bytes into that type 
 	and is used in raw buffers*
+  
+  MEMMOVE
+
+  Instead of copying the data this just shift the data in the same array
+
+  memmove(void* dest, const void* src, size_t count)
+  (destination, source, number of bytes)
+
+  copies the bytes from source to destination
 
 	>>>>>
 

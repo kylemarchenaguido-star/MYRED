@@ -9,9 +9,16 @@ const size_t k_max_msg = 32 << 20;
     bool want_write = false;
     bool want_close = false;
 
-    std::vector<uint8_t> incoming; // This two are for the buffers that we are gonna parse 
-    std::vector<uint8_t> outgoing; // 
+    Buffer incoming; // This two are for the buffers that we are gonna parse 
+    Buffer outgoing; // 
 
+};
+
+struct buf {
+  uint8_t *buffer_begin; // start of memory
+  uint8_t *buffer_end; // end of memory
+  uint8_t *data_begin; // start of data in memory 
+  uint8_t *data_end; // end of data in memory
 };
 
 static void msg(const char* message){
@@ -39,24 +46,79 @@ static void fd_set_nb(int fd){
     die("fcntl error");
   }
 }
+//Helper functions
+
+//bytes of the data available 
+size_t buf_size(Buffer *buf){
+  return buf->data_end - buf->data_begin;
+}
+
+//pointer to readble data 
+uint8_t* buf_data(Buffer *buf){
+  return buf->data_begin;
+}
+
+//free memory
+void buf_destroy(Buffer *buf){
+  delete[] bud->buffer_begin;
+}
+
 
 // append to the front 
-static void buf_append(std::vector<uint8_t>  &buf, const uint8_t *data, size_t len){
-  buf.insert(buf.end(), data, data + len);
+static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
+
+  size_t data_size = buf->data_end - buf->data_begin;
+
+  size_t space_at_back = buf->buffer_end - buf->data_end;
+
+  if (space_at_back < len){
+    //  Option A slide the data to the front 
+    memmove(buf->buffer_begin, buf->data_begin, data_size);
+    buf->data_begin = buf->buffer_begin;
+    buf->data_end = buf->buffer_end - buf->data_end;
+
+    space_at_back = buf->buffer_end - buf->data_end;
+
+    if (space_at_back < len){
+      // Option B still not enough
+      size_t old_cap = buf->buffer_end - buf->buffer_begin;
+      size_t new_cap = old_cap * 2;
+
+      while (new_cap < data_size + len) new_cap *= 2;
+
+      uint8_t *new_mem = new uint8_t[new_cap];
+      memcpy(new_mem, buf->data_begin, data_size);
+
+      delete[] buf->buffer_begin; // free old block 
+      
+      buf->buffer_begin = new_mem;
+      buf->buffer_end = new_mem + new_cap;
+      buf->data_begin = new_mem;
+      buf->data_end = new_mem + data_size;
+    }
+  }
+  memcpy(buf->data_end, data, len);
+  buf->data_end += len;
 }
 
 // remove form the front 
-static void buf_consume(std::vector<uint8_t> &buf, size_t n){
-  buf.erase(buf.begin(), buf.begin() + n);
+static void buf_consume(Buffer *buf, size_t n){
+  buf->data_begin += n; // we are just moving the pointer forward
+  
+  // This chunk is just only to reclaim espace 
+  if (buf->data_begin == buf->data_end){
+    buf->data_begin = bud->buffer_begin;
+    buf->data_end = bud->buffer_begin;
+  }
 }
 
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
   // try to parse the accumulated buffer 
-  if(conn->incoming.size() < 4){return false;}
+  if(buf_size(&conn->incoming) < 4){return false;}
 
   uint32_t len = 0;
-  memcpy(&len, conn->incoming.data(), 4);
+  memcpy(&len, buf_size(&conn->incoming, 4);
 
   //len is the message header
   if (len > k_max_msg) {
@@ -64,16 +126,16 @@ static bool try_one_request(Conn *conn){
     return false;
   }
   // this is the message body
-  if (4 + len > conn->incoming.size()){return false;}
+  if (4 + len > buf_size(&conn->incoming){return false;}
   
   const uint8_t *request = &conn->incoming[4];
   // here we are going to procces the parsed message
   // ...
   // generate the response
-  buf_append(conn->outgoing, (const uint8_t *)&len, 4); // appends header 
-  buf_append(conn->outgoing, request, len); // appends body
+  buf_append(&conn->outgoing, (const uint8_t *)&len, 4); // appends header 
+  buf_append(&conn->outgoing, request, len); // appends body
 
-  buf_consume(conn->incoming, 4 + len);
+  buf_consume(&conn->incoming, 4 + len);
   return true;
 
 }
@@ -103,30 +165,36 @@ static void handle_read(Conn *conn){
     return;
   }
   // add new data to the incoming buffer
-  buf_append(conn->incoming, buf, (size_t)rv);
+  buf_append(&conn->incoming, buf, (size_t)rv);
   // try to parse
   // procces the parsed message
   // remove the message from the buffer(incoming)
   while (try_one_request(conn)) {};
 
-  if(conn->outgoing.size() > 0){
+  if(buf_size(&conn->outgoing) > 0){
     conn->want_read = false;
     conn->want_write = true;
+    // this is a optimization 
+    return handle_write(conn);
   } // else wants to keep reading.
 }
 
 static void handle_write(Conn *conn){
-  assert(conn->outgoing.size() > 0);
-  ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+  assert(buf_size(&conn->outgoing) > 0);
+  ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_size(&conn->outgoing);
 
-  if(rv < 0){
+  if(rv < 0 && errno == EAGAIN){
+    return;
+  }
+
+  if (rv < 0) {
     conn->want_close = true;
     return;
   }
   // remove the data from outgoing
   buf_consume(conn->outgoing, (size_t)rv);
 
-  if(conn->outgoing.size() == 0){ // all data writen 
+  if(buf_size(&conn->outgoing) == 0){ // all data writen 
     conn->want_read = true;
     conn->want_write = false;
   }// want to keep writing 
@@ -155,6 +223,18 @@ static void handle_write(Conn *conn){
     // listen for connections on the socket
     rv = listen(fd, SOMAXCONN);
     if (rv) {die("listen()");}
+
+    Buffer buf_create(size_t capacity){
+      uint8_t *mem = new uint8_t(capacity);
+      return Buffer {
+        .buffer_begin = mem,
+        .buffer_end = mem + capacity,
+        .data_begin = mem,
+        .data_end = mem,
+    
+      };
+
+    }
 
     std::vector<Conn *> fd2conn; // this a pointer to all conecctions in the file descriptor [3,4,5], and is key by this aswell
     std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
