@@ -89,7 +89,7 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
     //  Option A slide the data to the front 
     memmove(buf->buffer_begin, buf->data_begin, data_size);
     buf->data_begin = buf->buffer_begin;
-    buf->data_end = buf->buffer_begin - data_size;
+    buf->data_end = buf->buffer_begin + data_size;
 
     space_at_back = buf->buffer_end - buf->data_end;
 
