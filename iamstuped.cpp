@@ -18,7 +18,7 @@
 
 	uint32_t = unsigned int 32 bytes
 	uint16_t = unsingned short 16 bytes
-  uint8_t = unsinged char 8 bytes
+  uint8_t = unsinged char 8 bytes:
 	this int32_t is just used for needing an exact size of bytes, this is always 32 bits
 
 	int32_t = int
@@ -36,7 +36,7 @@
 	static = limits the function to the current file kerks.
 
 	if (eer) =  if (err != 0) // if err is something other than 0 run this block.
-	if (err) = if (err == 0)
+	if (!err) = if (err == 0)
   basically if err equals something that is not 0 run this block 
 
 

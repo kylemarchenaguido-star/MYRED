@@ -2,6 +2,7 @@
 
 const size_t k_max_msg = 32 << 20;
 
+//Helper function for syscalls 
 static void msg(const char* message){
 	fprintf(stderr, "%s\n", message);
 }
@@ -28,13 +29,7 @@ static void fd_set_nb(int fd){
   }
 }
 
-struct Buffer {
-  uint8_t *buffer_begin; // start of memory
-  uint8_t *buffer_end; // end of memory
-  uint8_t *data_begin; // start of data in memory 
-  uint8_t *data_end; // end of data in memory
-};
-
+// Connections state and buffers 
 struct Conn {
     int fd = -1; // this is for the event loop
                 //
@@ -47,6 +42,16 @@ struct Conn {
 
 };
 
+
+// Buffer for the protocol
+struct Buffer {
+  uint8_t *buffer_begin; // start of memory
+  uint8_t *buffer_end; // end of memory
+  uint8_t *data_begin; // start of data in memory 
+  uint8_t *data_end; // end of data in memory
+};
+
+// Initialize the buffer protocol 
  Buffer buf_create(size_t capacity){
       uint8_t *mem = new uint8_t[capacity];
       return Buffer {
@@ -60,7 +65,7 @@ struct Conn {
     }
 
 
-//Helper functions
+//Helper functions // Buffer
 
 //bytes of the data available 
 size_t buf_size(Buffer *buf){
@@ -77,8 +82,32 @@ void buf_destroy(Buffer *buf){
   delete[] buf->buffer_begin;
 }
 
+//Helper functions // Arrays 
 
-// append to the front 
+// Reads data from string 
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
+  if (cur + 4 > end){
+    return false;
+  }
+  memcpy(&out, cur, 4);
+  cur += 4;
+
+  return true;
+}
+
+//Reads data length
+static bool read_str(onst uint8_t *&cur, const uint8_t *end, size_t n, string &out){
+  if  (cur + n > end){
+    return false;
+  }
+  out.assign(cur, cur + n);
+  cur += n;
+  return true;
+
+
+}
+
+// append to the front of the buffer
 static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
 
   size_t data_size = buf->data_end - buf->data_begin;
@@ -116,7 +145,7 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
   buf->data_end += len;
 }
 
-// remove form the front 
+// remove form the front of the buffer and resize 
 static void buf_consume(Buffer *buf, size_t n){
   buf->data_begin += n; // we are just moving the pointer forward
   
@@ -145,6 +174,79 @@ static Conn *handle_accept(int fd){
    return conn;
 }
 
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
+  const uint8_t *end = data + size;
+  uint32_t nstr = 0;
+
+  if(!read_u32(data, end, nstr)){return -1;}
+  if(nstr > k_max_msg){return -1;}
+  
+
+  while (out.size() < nstr) {
+    uint32_t len = 0;
+    if(!read_u32(data, end, len)){
+      return -1;
+    }
+    out.push_back(std::string());
+    if (!read_str(data, end, len, out.back())){return 1;}
+  }
+  if (data != end){return -1;}
+  return 0;
+
+}
+
+enum {
+  RES_OK = 0, // Ok response
+  RES_ERR = 1, // Error in response 
+  RES_NX = 2, // Response not found 
+};
+
+struct Response{
+  uint32_t status = 0;
+  std::vector<uint8_t> data;
+}
+
+static std::map<std::string, std::string> g_data;
+
+static void do_request(std::vector<std::string> &cmd, Response &out){
+
+  size_t header_pos = buf_size(out);
+
+  //placeholder for resp_len 
+  uint32_t placeholder = 0;
+  buf_append(out, (const uint8_t *)&placeholder, 4);
+
+  uint32_t status = RES_OK;
+
+  if(cmd.size() == 2 && cmd[0] == "get"){
+    auto it = g_data.find(cmd[1]);
+    if (it == g_data.end()){
+      status = RES_NX;
+      return;
+    }
+    const std::string &val = it->second;
+    buf_append(out, (const uint8_t *)val.data(), val.size());
+  } else if (cmd.size() == 3 && cmd[0] == "set"){
+    g_data[cmd[1]].swap(cmd[2]);
+  } else if (cmd.soze() == 2 && cmd[0] == "del"){
+    g_data.erase(cmd[1]);
+  } else {
+    status = RES_ERR;
+  }
+
+  buf_append(out, (const uint8_t *)&status, 4);
+
+  uint32_t resp_len = (uint32_t)(buf_size(out) - header_pos - 4);
+  memcpy(buf_data(out) + header_pos, &resp_len, 4);
+}
+
+static void make_response(const Response &resp, Buffer *out ){
+  uint32_t resp_len = 4 + (uint32_t) resp.data.size();
+  buf_append(out, (const uint8_t *)&resp_len, 4);
+  buf_append(out, (const uint8_t *)&resp.status, 4);
+  buf_append(out, resp.data.data(), resp.data.size());
+}
+
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
   // try to parse the accumulated buffer 
@@ -164,6 +266,15 @@ static bool try_one_request(Conn *conn){
   
   const uint8_t *request = buf_data(&conn->incoming) + 4;
   // here we are going to procces the parsed message
+  std::vector<std::string> cmd ;
+  if (parse_req(request, len, cmd) < 0){
+    conn->want_close = true;
+    return false;
+  }
+  Response resp;
+  do_request(cmd, resp);
+  make_response(resp, &conn->outgoing);
+
   // ...
   // generate the response
   buf_append(&conn->outgoing, (const uint8_t *)&len, 4); // appends header 
@@ -177,10 +288,7 @@ static bool try_one_request(Conn *conn){
 static void handle_write(Conn *conn){
   assert(buf_size(&conn->outgoing) > 0);
   ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_size(&conn->outgoing));
-
-  if(rv < 0 && errno == EAGAIN){
-    return;
-  }
+  if(rv < 0 && errno == EAGAIN){return;}
 
   if (rv < 0) {
     conn->want_close = true;
@@ -198,6 +306,7 @@ static void handle_write(Conn *conn){
 static void handle_read(Conn *conn){
   uint8_t buf [64 * 1024];
   ssize_t rv = read(conn->fd, buf, sizeof(buf));
+  if (rv < 0 && errno == EAGAIN){return;}
   if(rv <= 0) {
     conn->want_close = true;
     return;
@@ -254,7 +363,7 @@ static void handle_read(Conn *conn){
       for (Conn *conn : fd2conn){
         if(!conn){continue;}
 
-        struct pollfd pfd = {conn->fd, POLLERR, 0}; // This is for the flags of the aplication
+        struct pollfd pfd = {conn->fd, 0, 0}; // This is for the flags of the aplication
         if (conn->want_read){
           pfd.events |= POLLIN;
         }

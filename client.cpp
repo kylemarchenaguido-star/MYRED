@@ -46,7 +46,8 @@ static int32_t send_req(int fd, const uint8_t *text, size_t len){
   if (len > k_max_msg) {return -1;}
 
   std::vector<uint8_t> wbuf;
-  buf_append(wbuf, (const uint8_t *)&len, 4);// appends header 
+  uint32_t len32 = (uint32_t)len;
+  buf_append(wbuf, (const uint8_t *)&len32, 4);// appends header 
   buf_append(wbuf, text, len); // appends body
   
   return write_all(fd,wbuf.data(),wbuf.size());
@@ -99,7 +100,7 @@ int main(){
 	if (rv){die("connect");}
 
   std::vector<std::string> query_list = {
-    "hello1","hello2","hello3","Te amo",
+    "hola a todos kekers",
   };
 
   for(const std::string &s : query_list){
