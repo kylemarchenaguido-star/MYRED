@@ -43,7 +43,18 @@
 	(Int) 3.14 // This cast the float and convert it into a integer (3.14 = 3)
   
 
+	
+  For loops 
+
+  for ( something &s : something2)
+
+  the first something goes thorugh every element on something2
+  and if the element has a & symbol it grabs the memory location instead.
+
+
   Struct 
+
+	// yooo big bomboclat 
 
   // Remember Heap slower and stack much faster
 
@@ -58,16 +69,6 @@
    std::string name;
 
   };
-
-
-
-  For loops 
-
-  for ( something &s : something2)
-
-  the first something goes thorugh every element on something2
-  and if the element has a & symbol it grabs the memory location instead.
-
 
   // This is how you called it.
   StructName Sn;
@@ -246,5 +247,6 @@
 
   write(int fd, const void *buf, size_t count)
   // fd, buf with the bytes to send, how many bytes
+
 
 */

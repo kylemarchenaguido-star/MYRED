@@ -96,7 +96,7 @@ static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
 }
 
 //Reads data length
-static bool read_str(onst uint8_t *&cur, const uint8_t *end, size_t n, string &out){
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out){
   if  (cur + n > end){
     return false;
   }
@@ -204,16 +204,16 @@ enum {
 struct Response{
   uint32_t status = 0;
   std::vector<uint8_t> data;
-}
+};
 
 static std::map<std::string, std::string> g_data;
 
-static void do_request(std::vector<std::string> &cmd, Response &out){
+static void do_request(std::vector<std::string> &cmd, Buffer *out){
 
   size_t header_pos = buf_size(out);
 
   //placeholder for resp_len 
-  uint32_t placeholder = 0;
+  uint32_t placeholder = 0; //4 bytes
   buf_append(out, (const uint8_t *)&placeholder, 4);
 
   uint32_t status = RES_OK;
@@ -228,7 +228,7 @@ static void do_request(std::vector<std::string> &cmd, Response &out){
     buf_append(out, (const uint8_t *)val.data(), val.size());
   } else if (cmd.size() == 3 && cmd[0] == "set"){
     g_data[cmd[1]].swap(cmd[2]);
-  } else if (cmd.soze() == 2 && cmd[0] == "del"){
+  } else if (cmd.size() == 2 && cmd[0] == "del"){
     g_data.erase(cmd[1]);
   } else {
     status = RES_ERR;
@@ -271,14 +271,9 @@ static bool try_one_request(Conn *conn){
     conn->want_close = true;
     return false;
   }
-  Response resp;
-  do_request(cmd, resp);
-  make_response(resp, &conn->outgoing);
-
-  // ...
-  // generate the response
-  buf_append(&conn->outgoing, (const uint8_t *)&len, 4); // appends header 
-  buf_append(&conn->outgoing, request, len); // appends body
+  
+  // after (one copy, direct to buffer)
+  do_request(cmd, &conn->outgoing);
 
   buf_consume(&conn->incoming, 4 + len);
   return true;

@@ -4,22 +4,21 @@
 
 // Standard libraries 
 
-#include <cassert>
-#include <unistd.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
-
-// Unix libraries
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+// stdlib
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 #include <errno.h>
+// system
 #include <fcntl.h>
-#include <poll.h> 
-
-// c++ libraries
-#include <vector> 
+#include <poll.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
+// C++
 #include <string>
+#include <vector>
 #include <map>
