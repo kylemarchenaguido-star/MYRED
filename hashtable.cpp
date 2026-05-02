@@ -108,3 +108,13 @@ void hm_insert(HMap *hmap, HNode *node){
     }
     hm_help_rehashing(hmap); // this is the help function for rehashing
 }
+
+void hm_clear(HMap *hmap){
+    free(hmap->newer.tab);
+    free(hmap->older.tab);
+    *hmap = HMap{};
+}
+
+size_t hm_size(HMap *hmap){
+    return hmap->newer.size + hmap->older.size;
+}

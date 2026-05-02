@@ -19,7 +19,7 @@ struct  HTab
 };
 
 // the public hashtable struct
-// it uses 2 hashtables fro progressive rehashing
+// it uses 2 hashtables for progressive rehashing
 struct HMap 
 {
     HTab newer; // active table
