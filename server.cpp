@@ -1,5 +1,8 @@
 #include "libraries.h"
 
+#define container_of(ptr,T,member) \
+    ((T *)((char *)(ptr) - offsetof(T,member)))
+
 const size_t k_max_msg = 32 << 20;
 
 //Helper function for syscalls 
@@ -206,39 +209,30 @@ struct Response{
   std::vector<uint8_t> data;
 };
 
-static std::map<std::string, std::string> g_data;
+static struct 
+{
+  HMap db; // top level hashtable 
+} g_data;
 
-static void do_request(std::vector<std::string> &cmd, Buffer *out){
+// KV pair for the top level hashtable 
+struct Entry {
+  struct HNode node; // hashtable machinery
+  std::string key; // redis key
+  std::string val; // redis value 
+};
 
-  size_t header_pos = buf_size(out);
-
-  //placeholder for resp_len 
-  uint32_t placeholder = 0; //4 bytes
-  buf_append(out, (const uint8_t *)&placeholder, 4);
-
-  uint32_t status = RES_OK;
-
-  if(cmd.size() == 2 && cmd[0] == "get"){
-    auto it = g_data.find(cmd[1]);
-    if (it == g_data.end()){
-      status = RES_NX;
-      return;
-    }
-    const std::string &val = it->second;
-    buf_append(out, (const uint8_t *)val.data(), val.size());
-  } else if (cmd.size() == 3 && cmd[0] == "set"){
-    g_data[cmd[1]].swap(cmd[2]);
-  } else if (cmd.size() == 2 && cmd[0] == "del"){
-    g_data.erase(cmd[1]);
-  } else {
-    status = RES_ERR;
-  }
-
-  buf_append(out, (const uint8_t *)&status, 4);
-
-  uint32_t resp_len = (uint32_t)(buf_size(out) - header_pos - 4);
-  memcpy(buf_data(out) + header_pos, &resp_len, 4);
+static bool entry_eq(HNode *lhs, HNode *rhs){
+  struct Entry *le = container_of(lhs, struct Entry, node);
+  struct Entry *re = container_of(rhs, struct Entry, node);
+  return le->key == re->key;
 }
+
+static void do_get(std::vector<std::string> &cmd, Response &out){
+  // we create a dummy entry just for the lookup
+
+}
+
+
 
 static void make_response(const Response &resp, Buffer *out ){
   uint32_t resp_len = 4 + (uint32_t) resp.data.size();
@@ -273,7 +267,7 @@ static bool try_one_request(Conn *conn){
   }
   
   // after (one copy, direct to buffer)
-  do_request(cmd, &conn->outgoing);
+  // do_request(cmd, &conn->outgoing);
 
   buf_consume(&conn->incoming, 4 + len);
   return true;
