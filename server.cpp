@@ -257,7 +257,7 @@ static void out_err(Buffer *out, uint32_t code, const std::string &msg){
 
 // arr values 
 static void out_arr(Buffer *out, uint32_t n){
-  uint8_t tag = TAG_STR;
+  uint8_t tag = TAG_ARR;
   buf_append(out, &tag, 1);
   buf_append(out, (const uint8_t *)&n, 4); 
 };
@@ -353,7 +353,7 @@ static bool cb_keys(HNode *node, void *arg){
 
 static void do_keys(std::vector<std::string> &, Buffer *out){
   out_arr(out, (uint32_t)hm_size(&g_data.db));
-  hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+  hm_foreach(&g_data.db, &cb_keys, (void *)out);
 }
 
 static void do_request(std::vector<std::string> &cmd, Buffer *out){
@@ -364,7 +364,7 @@ static void do_request(std::vector<std::string> &cmd, Buffer *out){
   } else if (cmd.size() == 2 && cmd[0] == "del") {
     return do_del (cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys"){
-    // return do_keys(cmd, out);
+    return do_keys(cmd, out);
   } else {
     return out_err (out, ERR_UNKNOWN, "Unkwown command");
   } 
@@ -393,7 +393,7 @@ static void response_end(Buffer *out, size_t header){
   }
   // message header
   uint32_t len = (uint32_t)msg_size;
-  memcpy(&out[header], &len, 4);
+  memcpy(out->data_begin + header, &len, 4);
 }
 
 // we will try to proccess if theres enough data
@@ -423,9 +423,10 @@ static bool try_one_request(Conn *conn){
  
   size_t header_pos = 0;
   response_begin(&conn->outgoing, &header_pos);
-  
+  do_request(cmd, &conn->outgoing);
+  response_end(&conn->outgoing, header_pos);
 
- 
+  // application logic done
   buf_consume(&conn->incoming, 4 + len);
   return true;
 

@@ -1,5 +1,4 @@
 #pragma once
-
 // This is the libraries and public function so i don't rewrite everything
 
 // Standard libraries 
