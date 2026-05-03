@@ -36,55 +36,91 @@ static int32_t write_all (int fd, const uint8_t *buf, size_t n){
 	return 0;
 }
 
-static void buf_append(std::vector<uint8_t>  &buf, const uint8_t *data, size_t len){
-  buf.insert(buf.end(), data, data + len);
-}
+// static void buf_append(std::vector<uint8_t>  &buf, const uint8_t *data, size_t len){
+//   buf.insert(buf.end(), data, data + len);
+// }
 
-const size_t k_max_msg = 32 << 20;
+constexpr size_t k_max_msg = 4096;
 
-static int32_t send_req(int fd, const uint8_t *text, size_t len){
-  if (len > k_max_msg) {return -1;}
-
-  std::vector<uint8_t> wbuf;
-  uint32_t len32 = (uint32_t)len;
-  buf_append(wbuf, (const uint8_t *)&len32, 4);// appends header 
-  buf_append(wbuf, text, len); // appends body
-  
-  return write_all(fd,wbuf.data(),wbuf.size());
-}
-
-static int32_t read_res(int fd){
-  //we start with header body 
-  std::vector<uint8_t> rbuf;
-  rbuf.resize(4);
-  errno = 0;
-  int32_t err = read_full(fd, &rbuf[0], 4);
-  if (err) {
-    if (errno == 0){
-      msg("EOF - Client disconnected");
-    } else {
-      msg("read() error");
-    }
-    return err;
+static int32_t send_req(int fd, const std::vector<std::string> &cmd){
+  uint32_t len = 4;
+  for (const std::string &s : cmd){
+    len += 4 + s.size();
   }
-  uint32_t len = 0;
-  memcpy(&len, rbuf.data(), 4);
-  if(len > k_max_msg){
-    msg("too long");
-    return -1;
+  if (len > k_max_msg){
+	return -1;
   }
 
-  // now the reply body
-  rbuf.resize(4 + len); // (header + body)
-  err = read_full(fd, &rbuf[4], len); 
-  if (err){
-    msg("read() error");
-    return err;
+  char wbuf[4 + k_max_msg];
+
+  // writes len at the beggining of the buffer
+  memcpy(&wbuf[0], &len, 4); // assume little endian 
+  uint32_t n = (uint32_t)cmd.size();
+  //how many strings are after the len 
+  memcpy(&wbuf[4], &n, 4);
+
+  size_t cur = 8;// skips thw 8 bytes header from before 
+
+  for (const std::string &s : cmd){
+	uint32_t p = (uint32_t)s.size();
+	memcpy(&wbuf[cur], &p, 4);
+	memcpy(&wbuf[cur + 4], s.data(), s.size());
+	cur += 4 + s.size();
   }
-  // the do something part
-  printf("len:%u data:%.*s\n", len, len < 100 ? len : 100, &rbuf[4]);
-  return 0; 
+  return write_all(fd, (const uint8_t *)wbuf, size_t(4 + len));
 }
+
+// data types for tag types
+enum {
+  TAG_NIL = 0, // nil
+  TAG_ERR = 1, //err + msg
+  TAG_STR = 2, //string
+  TAG_INT = 3, //integer
+  TAG_DBL = 4, //double
+  TAG_ARR = 5, //array
+};
+
+static int32_t print_response(const uint8_t *data, size_t size){
+	if (size < 1){
+		msg("bad response");
+	}
+	switch (data[0])
+	{
+	case TAG_NIL:
+		printf("(nil)\n");
+		return 1;
+	case TAG_ERR:
+		if (size < 1 + 8){
+			msg("bad response");
+			return -1;
+		}
+		int32_t code = 0;
+		uint32_t len = 0;
+		memcpy(&code, &data[1], 4);
+		memcpy(&len, &data[1 + 4], 4);
+		if (size < 1 + 8 + len){
+			msg("bad response");
+			return -1;
+		}
+		printf("(err) %d %.*s\n", code, len, &data[1 + 8]);
+		return 1 + 8 + len;
+	case TAG_STR:
+		/* code */
+		break;
+	case TAG_INT:
+		/* code */
+		break;
+	case TAG_DBL:
+		/* code */
+		break;
+	case TAG_ARR:
+		/* code */
+		break;
+	default:
+		break;
+	}
+}
+
 // This the client side of the server
 
 int main(){

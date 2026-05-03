@@ -3,7 +3,7 @@
 #define container_of(ptr,T,member) \
     ((T *)((char *)(ptr) - offsetof(T,member)))
 
-const size_t k_max_msg = 32 << 20;
+constexpr size_t k_max_msg = 32 << 20;
 
 //Helper function for syscalls 
 static void msg(const char* message){
@@ -32,21 +32,7 @@ static void fd_set_nb(int fd){
   }
 }
 
-// Connections state and buffers 
-struct Conn {
-    int fd = -1; // this is for the event loop
-                //
-    bool want_read = false; // The the read and the write, is waiting for the fd api readiness
-    bool want_write = false;
-    bool want_close = false;
-
-    Buffer incoming; // This two are for the buffers that we are gonna parse 
-    Buffer outgoing; // 
-
-};
-
-
-// Buffer for the protocol
+// Buffer for the tcp protocol
 struct Buffer {
   uint8_t *buffer_begin; // start of memory
   uint8_t *buffer_end; // end of memory
@@ -67,50 +53,40 @@ struct Buffer {
 
     }
 
+// Connections state and buffers 
+struct Conn {
+    int fd = -1; // this is for the event loop
+                //
+    bool want_read = false; // The the read and the write, is waiting for the fd api readiness
+    bool want_write = false;
+    bool want_close = false;
 
-//Helper functions // Buffer
+    Buffer incoming; // This two are for the buffers that we are gonna parse 
+    Buffer outgoing; // 
 
-//bytes of the data available 
-size_t buf_size(Buffer *buf){
-  return buf->data_end - buf->data_begin;
+};
+
+// callback when the socket is ready
+static Conn *handle_accept(int fd){
+
+   struct sockaddr_in client_addr =  {};
+   socklen_t addrlen = sizeof(client_addr);
+
+   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+   if (connfd < 0) {return NULL;}
+
+   fd_set_nb(connfd);  // now we set the new connection to namb 
+   Conn *conn = new Conn(); // we create a new conn struct 
+    
+   conn->fd = connfd;
+   conn->want_read = true;
+   conn->incoming = buf_create(64 * 1024);
+   conn->outgoing = buf_create(64 * 1024);
+   return conn;
 }
 
-//pointer to readble data 
-uint8_t* buf_data(Buffer *buf){
-  return buf->data_begin;
-}
 
-//free memory
-void buf_destroy(Buffer *buf){
-  delete[] buf->buffer_begin;
-}
-
-//Helper functions // Arrays 
-
-// Reads data from string 
-static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
-  if (cur + 4 > end){
-    return false;
-  }
-  memcpy(&out, cur, 4);
-  cur += 4;
-
-  return true;
-}
-
-//Reads data length
-static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out){
-  if  (cur + n > end){
-    return false;
-  }
-  out.assign(cur, cur + n);
-  cur += n;
-  return true;
-
-
-}
-
-// append to the front of the buffer
+// append to the front of the buffer 
 static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
 
   size_t data_size = buf->data_end - buf->data_begin;
@@ -159,22 +135,46 @@ static void buf_consume(Buffer *buf, size_t n){
   }
 }
 
-static Conn *handle_accept(int fd){
+//Helper functions // Buffer
 
-   struct sockaddr_in client_addr =  {};
-   socklen_t addrlen = sizeof(client_addr);
+//bytes of the data available 
+size_t buf_size(Buffer *buf){
+  return buf->data_end - buf->data_begin;
+}
 
-   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-   if (connfd < 0) {return NULL;}
+//pointer to readble data 
+uint8_t* buf_data(Buffer *buf){
+  return buf->data_begin;
+}
 
-   fd_set_nb(connfd);  // now we set the new connection to namb 
-   Conn *conn = new Conn(); // we create a new conn struct 
-    
-   conn->fd = connfd;
-   conn->want_read = true;
-   conn->incoming = buf_create(64 * 1024);
-   conn->outgoing = buf_create(64 * 1024);
-   return conn;
+//free memory
+void buf_destroy(Buffer *buf){
+  delete[] buf->buffer_begin;
+}
+
+//Helper functions for parsing
+
+// Reads data from string 
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
+  if (cur + 4 > end){
+    return false;
+  }
+  memcpy(&out, cur, 4);
+  cur += 4;
+
+  return true;
+}
+
+//Reads data length
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out){
+  if  (cur + n > end){
+    return false;
+  }
+  out.assign(cur, cur + n);
+  cur += n;
+  return true;
+
+
 }
 
 static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
@@ -198,15 +198,68 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
 
 }
 
+//error codes for tag_err
 enum {
-  RES_OK = 0, // Ok response
-  RES_ERR = 1, // Error in response 
-  RES_NX = 2, // Response not found 
+  ERR_UNKNOWN = 1, // unknown command
+  ERR_TOO_BIG = 2, // response too big
 };
 
-struct Response{
-  uint32_t status = 0;
-  std::vector<uint8_t> data;
+// data types for tag types
+enum {
+  TAG_NIL = 0, // nil
+  TAG_ERR = 1, //err + msg
+  TAG_STR = 2, //string
+  TAG_INT = 3, //integer
+  TAG_DBL = 4, //double
+  TAG_ARR = 5, //array
+};
+
+//append for serializaed data 
+
+// NIL values
+static void out_nil(Buffer *out){
+  uint8_t tag = TAG_NIL;
+  buf_append(out, &tag, 1);
+}
+
+// STRING values
+static void out_str(Buffer *out, const std::string &s){
+  uint8_t tag = TAG_STR;
+  uint32_t len = (uint32_t)s.size();
+  buf_append(out, &tag, 1);
+  buf_append(out, (const uint8_t *)&len, 4);
+  buf_append(out, (const uint8_t*)s.data(), s.size());
+}
+
+// Integer values
+static void out_int(Buffer *out, int64_t val){
+  uint8_t tag = TAG_INT;
+  buf_append(out, &tag, 1);
+  buf_append(out, (const uint8_t *)&val, 8);
+}
+
+// Double values
+static void out_dbl(Buffer *out, double val){
+  uint8_t tag = TAG_DBL;
+  buf_append(out, &tag, 1);
+  buf_append(out, (const uint8_t *)&val, 8);
+}
+
+//err values
+static void out_err(Buffer *out, uint32_t code, const std::string &msg){
+  uint8_t tag = TAG_ERR;
+  uint32_t len = (uint32_t )msg.size();
+  buf_append(out, &tag, 1);
+  buf_append(out,(const uint8_t *)&code, 4);
+  buf_append(out,(const uint8_t *)&len, 4);
+  buf_append(out,(const uint8_t *)msg.data(), msg.size());
+}
+
+// arr values 
+static void out_arr(Buffer *out, uint32_t n){
+  uint8_t tag = TAG_STR;
+  buf_append(out, &tag, 1);
+  buf_append(out, (const uint8_t *)&n, 4); 
 };
 
 static struct 
@@ -236,7 +289,8 @@ static uint64_t str_hash(const uint8_t *data, size_t len){
   return h;
 }
 
-static void do_get(std::vector<std::string> &cmd, Response &out){
+//gets a value from key
+static void do_get(std::vector<std::string> &cmd, Buffer *out){
   // we create a dummy entry just for the lookup
   Entry key;
   key.key.swap(cmd[1]);
@@ -244,16 +298,16 @@ static void do_get(std::vector<std::string> &cmd, Response &out){
   //hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node){
-    out.status = RES_NX;
-    return;
+    return out_nil(out);
   }
   //copy 
+  // This points to the full entry of a node
   const std::string &val = container_of(node, Entry, node)->val;
-  assert(val.size() <= k_max_msg);
-  out.data.assign(val.begin(), val.end());
+  return out_str(out, val);
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &){
+// sets a key with value in the hashtab
+static void do_set(std::vector<std::string> &cmd, Buffer *out){
   // again with the dummy
   Entry key;
   key.key.swap(cmd[1]);
@@ -271,9 +325,11 @@ static void do_set(std::vector<std::string> &cmd, Response &){
     ent->val.swap(cmd[2]);
     hm_insert(&g_data.db, &ent->node);
   }
+  return out_nil(out);
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &){
+// deletes a key and value
+static void do_del(std::vector<std::string> &cmd, Buffer *out){
   // a dummy again
   Entry key;
   key.key.swap(cmd[1]);
@@ -284,13 +340,60 @@ static void do_del(std::vector<std::string> &cmd, Response &){
     //deallocate the memory
     delete container_of(node, Entry, node);
   }
+  return out_int(out, node ? 1 : 0); // number of deleted keys
 }
 
-static void make_response(const Response &resp, Buffer *out ){
-  uint32_t resp_len = 4 + (uint32_t) resp.data.size();
-  buf_append(out, (const uint8_t *)&resp_len, 4);
-  buf_append(out, (const uint8_t *)&resp.status, 4);
-  buf_append(out, resp.data.data(), resp.data.size());
+// Returns all the keys from the hashtable
+static bool cb_keys(HNode *node, void *arg){
+  Buffer *out = (Buffer *)arg;
+  const std::string &key = container_of(node, Entry, node)->key;
+  out_str(out, key);
+  return true;
+}
+
+static void do_keys(std::vector<std::string> &, Buffer *out){
+  out_arr(out, (uint32_t)hm_size(&g_data.db));
+  hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+}
+
+static void do_request(std::vector<std::string> &cmd, Buffer *out){
+  if (cmd.size() == 2 && cmd[0] == "get"){
+    return do_get(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "set"){
+    return do_set(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "del") {
+    return do_del (cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "keys"){
+    // return do_keys(cmd, out);
+  } else {
+    return out_err (out, ERR_UNKNOWN, "Unkwown command");
+  } 
+}
+
+// helper response functions
+
+static void response_begin(Buffer *out, size_t *header){
+  *header = buf_size(out); //message header position 
+  uint32_t placeholder = 0;
+  buf_append(out, (uint8_t *)&placeholder, 4);
+}
+
+static size_t response_size(Buffer *out, size_t header){
+  return buf_size(out) - header - 4;
+}
+
+static void response_end(Buffer *out, size_t header){
+  size_t msg_size = response_size(out, header);
+
+  if (msg_size > k_max_msg){
+    out->data_end =  out->data_begin + header + 4;
+    // reflects the error and not the original message
+    out_err(out, ERR_TOO_BIG, "message too big"); 
+    msg_size = response_size(out, header); 
+  }
+  // message header
+  uint32_t len = (uint32_t)msg_size;
+  memcpy(&out[header], &len, 4);
 }
 
 // we will try to proccess if theres enough data
@@ -317,10 +420,12 @@ static bool try_one_request(Conn *conn){
     conn->want_close = true;
     return false;
   }
+ 
+  size_t header_pos = 0;
+  response_begin(&conn->outgoing, &header_pos);
   
-  // after (one copy, direct to buffer)
-  // do_request(cmd, &conn->outgoing);
 
+ 
   buf_consume(&conn->incoming, 4 + len);
   return true;
 

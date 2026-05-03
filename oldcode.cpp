@@ -1,33 +1,75 @@
 // static std::map<std::string, std::string> g_data;
 
-// static void do_request(std::vector<std::string> &cmd, Buffer *out){
 
-//   size_t header_pos = buf_size(out);
 
-//   //placeholder for resp_len 
-//   uint32_t placeholder = 0; //4 bytes
-//   buf_append(out, (const uint8_t *)&placeholder, 4);
 
-//   uint32_t status = RES_OK;
+// enum {
+//   RES_OK = 0, // Ok response
+//   RES_ERR = 1, // Error in response 
+//   RES_NX = 2, // Response not found 
+// };
 
-//   if(cmd.size() == 2 && cmd[0] == "get"){
-//     auto it = g_data.find(cmd[1]);
-//     if (it == g_data.end()){
-//       status = RES_NX;
-//       return;
+// struct Response{
+//   uint32_t status = 0;
+//   std::vector<uint8_t> data;
+// };
+
+
+
+
+// static void make_response(const Response &resp, Buffer *out ){
+//   uint32_t resp_len = 4 + (uint32_t) resp.data.size();
+//   buf_append(out, (const uint8_t *)&resp_len, 4);
+//   buf_append(out, (const uint8_t *)&resp.status, 4);
+//   buf_append(out, resp.data.data(), resp.data.size());
+// }
+
+
+
+
+
+
+
+
+// static int32_t send_req(int fd, const uint8_t *text, size_t len){
+//   if (len > k_max_msg) {return -1;}
+
+//   std::vector<uint8_t> wbuf;
+//   uint32_t len32 = (uint32_t)len;
+//   buf_append(wbuf, (const uint8_t *)&len32, 4);// appends header 
+//   buf_append(wbuf, text, len); // appends body
+  
+//   return write_all(fd,wbuf.data(),wbuf.size());
+// }
+
+// static int32_t read_res(int fd){
+//   //we start with header body 
+//   std::vector<uint8_t> rbuf;
+//   rbuf.resize(4);
+//   errno = 0;
+//   int32_t err = read_full(fd, &rbuf[0], 4);
+//   if (err) {
+//     if (errno == 0){
+//       msg("EOF - Client disconnected");
+//     } else {
+//       msg("read() error");
 //     }
-//     const std::string &val = it->second;
-//     buf_append(out, (const uint8_t *)val.data(), val.size());
-//   } else if (cmd.size() == 3 && cmd[0] == "set"){
-//     g_data[cmd[1]].swap(cmd[2]);
-//   } else if (cmd.size() == 2 && cmd[0] == "del"){
-//     g_data.erase(cmd[1]);
-//   } else {
-//     status = RES_ERR;
+//     return err;
+//   }
+//   uint32_t len = 0;
+//   memcpy(&len, rbuf.data(), 4);
+//   if(len > k_max_msg){
+//     msg("too long");
+//     return -1;
 //   }
 
-//   buf_append(out, (const uint8_t *)&status, 4);
-
-//   uint32_t resp_len = (uint32_t)(buf_size(out) - header_pos - 4);
-//   memcpy(buf_data(out) + header_pos, &resp_len, 4);
-// }
+//   // now the reply body
+//   rbuf.resize(4 + len); // (header + body)
+//   err = read_full(fd, &rbuf[4], len); 
+//   if (err){
+//     msg("read() error");
+//     return err;
+//   }
+//   // the do something part
+//   printf("len:%u data:%.*s\n", len, len < 100 ? len : 100, &rbuf[4]);
+//   return 0; 
