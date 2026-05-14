@@ -56,7 +56,7 @@ struct Buffer {
 // Connections state and buffers 
 struct Conn {
     int fd = -1; // this is for the event loop
-                //
+
     bool want_read = false; // The the read and the write, is waiting for the fd api readiness
     bool want_write = false;
     bool want_close = false;
