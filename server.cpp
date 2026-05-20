@@ -48,7 +48,6 @@ struct Buffer {
         .buffer_end = mem + capacity,
         .data_begin = mem,
         .data_end = mem,
-    
       };
 
     }
