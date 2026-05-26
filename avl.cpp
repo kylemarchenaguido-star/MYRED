@@ -7,12 +7,13 @@ static uint32_t max(uint32_t lhs, uint32_t rhs){
 
 static void avl_update(AVLNode *node){
     node->height = 1 + max(avl_height(node->left), avl_height(node->right));
+    node->cnt =  1 + avl_cnt(node->left) + avl_cnt(node->right);
 }
 
 static AVLNode *rot_left(AVLNode *node) {
     AVLNode *parent = node->parent;
     AVLNode *new_node = node->right;
-    AVLNode *inner = node->left;
+    AVLNode *inner = new_node->left;
     // node -- inner
     node->right = inner;
     if (inner) {inner->parent = node;}
@@ -31,7 +32,7 @@ static AVLNode *rot_left(AVLNode *node) {
 static AVLNode *rot_right(AVLNode *node) {
     AVLNode *parent = node->parent;
     AVLNode *new_node = node->left;
-    AVLNode *inner = node->right;
+    AVLNode *inner = new_node->right;
     // node -- inner
     node->left = inner;
     if (inner) {inner->parent = node;}
@@ -57,7 +58,7 @@ static AVLNode *avl_fix_left(AVLNode *node){
 }
 // same logic as avl_fix_left
 static AVLNode *avl_fix_right(AVLNode *node){
-    if (avl_height(node->left->left) < avl_height(node->left->right)){ // checks if it is a straight line
+    if (avl_height(node->right->right) < avl_height(node->right->left)){ // checks if it is a straight line
         node->right = rot_right(node->right);
     }
     return rot_left(node);
@@ -89,3 +90,53 @@ AVLNode *avl_fix(AVLNode *node){
         node = parent;
     }
 }
+// detach a node when 1 children is empty
+static AVLNode *avl_del_easy(AVLNode *node){
+    assert(!node->left || !node->right); // this is making sure at least one child
+    AVLNode *child = node->left ? node->left : node->right; // if null
+    AVLNode *parent = node->parent;
+    if (child){ // update the child pointer if not null
+        child->parent = parent;
+    }
+    if (!parent){ // attach child to the grandparent
+        return child;
+    }
+    AVLNode **from = parent->left == node ? &parent->left : &parent->right;
+    *from = child;
+    // fix the inbalance tree
+    return avl_fix(parent);
+}
+
+//detach a node and returns the new root of the tree
+AVLNode *avl_del(AVLNode *node){
+    // easy case
+    if (!node->left || !node->right){
+        return avl_del_easy(node);
+    }
+    // find the successor
+    AVLNode *victim = node->right;
+    while (victim->left){
+        victim = victim->left;
+    }
+    //detach the successor
+    AVLNode *root = avl_del_easy(victim);
+    //swapt
+    *victim = *node;
+    if (victim->left){
+        victim->left->parent = victim;        
+    }
+    if(victim->right){
+        victim->right->parent = victim;        
+    }
+    // attach the successor to the parent, or update root ptr
+    AVLNode **from = &root;
+    AVLNode *parent = node->parent;
+    if (parent){
+        from = parent->left == node ? &parent->left : &parent->right;
+    }
+    *from = victim;
+    return root;
+}
+
+
+
