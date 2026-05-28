@@ -1,4 +1,24 @@
-#include "libraries.h"
+// stdlib
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+// system
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
+// C++
+#include <string>
+#include <vector>
+// project 
+#include "hashtable.h"
+#include "common.h"
+#include "zset.h"
 
 #define container_of(ptr,T,member) \
     ((T *)((char *)(ptr) - offsetof(T,member)))
@@ -266,12 +286,35 @@ static struct
   HMap db; // top level hashtable 
 } g_data;
 
-// KV pair for the top level hashtable 
-struct Entry {
-  struct HNode node; // hashtable machinery
-  std::string key; // redis key
-  std::string val; // redis value 
+//value types 
+enum {
+  T_INIT = 0,
+  T_STR = 1, // string
+  T_ZSET = 2, // sorted set
 };
+
+struct Entry {
+  struct HNode node; // hashtable node
+  std::string key;
+  // value
+  uint32_t type = 0;
+  std::string str;
+  ZSet zset;
+};
+
+static Entry *entry_new(uint32_t type) {
+  Entry *ent = new Entry();
+  ent->type = type;
+  return ent;
+}
+
+static void entry_del(Entry *ent) {
+  if (ent->type == T_ZSET) {
+    zset_clear(&ent->zset);
+  }
+  delete ent;
+}
+
 
 static bool entry_eq(HNode *lhs, HNode *rhs){
   struct Entry *le = container_of(lhs, struct Entry, node);
@@ -279,14 +322,7 @@ static bool entry_eq(HNode *lhs, HNode *rhs){
   return le->key == re->key;
 }
 
-// FNV hash
-static uint64_t str_hash(const uint8_t *data, size_t len){
-  uint32_t h = 0x811C9DC5;
-  for (size_t i = 0; i < len; i++){
-    h = (h ^ data[i]) * 0x01000193;
-  }
-  return h;
-}
+
 
 //gets a value from key
 static void do_get(std::vector<std::string> &cmd, Buffer *out){

@@ -138,5 +138,7 @@ AVLNode *avl_del(AVLNode *node){
     return root;
 }
 
+AVLNode *avl_offset(AVLNode *node, int64_t offset);
+
 
 
