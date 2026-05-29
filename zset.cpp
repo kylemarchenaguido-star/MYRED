@@ -68,6 +68,7 @@ static void zset_update(ZSet *zset, ZNode *node, double score) {
 }
 
 //add a new tuple (score, name) or update the score of an exsisting tuple
+// true if new node, false if an existing node is modify
 bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
     if (ZNode *node = zset_lookup(zset, name, len)) {
         zset_update(zset, node, score);
