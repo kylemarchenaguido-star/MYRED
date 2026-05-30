@@ -176,7 +176,7 @@ size_t buf_size(Buffer *buf){
 
 //pointer to readble data 
 uint8_t* buf_data(Buffer *buf){
-  return buf->data_begin;
+return buf->data_begin;
 }
 
 //free memory
@@ -262,7 +262,7 @@ static void out_str(Buffer *out, const std::string &s){
   uint32_t len = (uint32_t)s.size();
   buf_append(out, &tag, 1);
   buf_append(out, (const uint8_t *)&len, 4);
-  buf_append(out, (const uint8_t*)s.data(), s.size());
+  buf_append(out, (const uint8_t *)s.data(), s.size());
 }
 
 // Integer values
@@ -296,8 +296,29 @@ static void out_arr(Buffer *out, uint32_t n){
   buf_append(out, (const uint8_t *)&n, 4); 
 };
 
-static size_t out_begin_arr(Buffer *out);
-static size_t out_end_arr(Buffer *out, size_t ctx, uint32_t n);
+// reserve 4 bytes with the bookmark at the beggining
+static size_t out_begin_arr(Buffer *out){
+  uint8_t tag = TAG_ARR;
+  buf_append(out, &tag, 1);
+
+  // ctx is the bookmark
+  size_t ctx = buf_size(out);
+  uint32_t placeholder = 0;
+
+  buf_append(out, (const uint8_t *)&placeholder, 4); // reserves 4 bytes
+  return ctx;
+}
+
+static size_t out_end_arr(Buffer *out, size_t ctx, uint32_t n){
+  assert(buf_data(out)[ctx - 1] == TAG_ARR);
+  memcpy(buf_data(out) + ctx, &n, 4);
+}
+
+
+// cmd[0] = "zadd"      ← the command name
+// cmd[1] = "myzset"    ← the key (which ZSet to operate on)
+// cmd[2] = "3.14"      ← the score (a double as a string)
+// cmd[3] = "alice"     ← the name of the pair
 
 // global hashtable
 static struct {
@@ -480,6 +501,130 @@ static ZSet *expect_zset(std::string &s){
   }
   Entry *ent = container_of(hnode, Entry, node);
   return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+// zrem zset name (search and remove)
+static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  if (znode){
+    zset_delete(zset, znode);
+  }
+  return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name (search the score of a name)
+static void do_zscore(std::vector<std::string> &cmd, Buffer *out){
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){
+    return out_err(out, ERR_BAD_TYP, "expecte set");
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset score name offset limit (search by ascending order)
+static void do_zquery(std::vector<std::string> &cmd, Buffer *out){
+  // we parse the args
+  double score = 0;
+  if (!str2dbl(cmd[2], score)){
+    return out_err(out, ERR_BAD_ARG, "expected dbl ");
+  }
+  const std::string &name = cmd[3];
+  int64_t offset = 0, limit = 0;
+  if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
+    return out_err(out, ERR_BAD_ARG, "expected int");
+  }
+
+  // we get the zset 
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){
+    return out_err(out, ERR_BAD_TYP, "expected zset");
+  }
+
+  //seek the key
+  if (limit <= 0){
+    return out_arr(out, 0);
+  }
+
+  ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+  znode = znode_offset(znode, offset);
+
+  // out put
+  size_t ctx = out_begin_arr(out);
+  int64_t n = 0;
+  while (znode && n < limit){
+    out_str(out, znode->name);
+    out_dbl(out, znode->score);
+    znode = znode_offset(znode, +1);
+    n += 2;
+  }
+  out_end_arr(out, ctx, (uint32_t)n);
+}
+
+// reverse order from do_zquery (descending order)
+static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
+  // we parse the args
+  double score = 0;
+  if (!str2dbl(cmd[2], score)){
+    return out_err(out, ERR_BAD_ARG, "expected dbl ");
+  }
+  const std::string &name = cmd[3];
+  int64_t offset = 0, limit = 0;
+  if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
+    return out_err(out, ERR_BAD_ARG, "expected int");
+  }
+
+  // we get the zset 
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){
+    return out_err(out, ERR_BAD_TYP, "expected zset");
+  }
+
+  //seek the key
+  if (limit <= 0){
+    return out_arr(out, 0);
+  }
+
+  ZNode *znode = zset_seekle(zset, score, name.data(), name.size());
+  znode = znode_offset(znode, -offset);
+
+  // out put
+  size_t ctx = out_begin_arr(out);
+  int64_t n = 0;
+  while (znode && n < limit){
+    out_str(out, znode->name);
+    out_dbl(out, znode->score);
+    znode = znode_offset(znode, -1);
+    n += 2;
+  }
+  out_end_arr(out, ctx, (uint32_t)n);
+}
+
+//zrank key name (how many nodes comes before the actual one)
+static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
+  // cmd[1] = key
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){
+    return out_err(out, ERR_BAD_TYP, "expected zset");
+  }
+
+  // point query by name using the hashtable (cmd[2] = name)
+  ZNode *znode = zset_lookup(zset, cmd[2].data(), cmd[2].size());
+  if (!znode){
+    // name do not exist
+    return out_nil(out);
+  }
+
+  int64_t rank = avl_rank(&znode->tree);
+  return out_int(out, rank);
 }
 
 static void do_request(std::vector<std::string> &cmd, Buffer *out){

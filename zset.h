@@ -24,5 +24,7 @@ bool zset_insert(ZSet *zset, const char *name, size_t len, double score);
 ZNode *zset_lookup(ZSet *zset, const char *name, size_t len);
 void zset_delete(ZSet *zset, ZNode *node);
 ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len);
+ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len);
 void zset_clear(ZSet *zset);
 ZNode *znode_offset(ZNode *node, int64_t offset);
+int64_t avl_rank(AVLNode *node);

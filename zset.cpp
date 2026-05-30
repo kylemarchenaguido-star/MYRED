@@ -16,14 +16,14 @@ static ZNode *znode_new(const char *name, size_t len, double score){
     return node;
 }
 
-static void znode_del(ZNode *node){ free(node); }
+static void znode_del(ZNode *node){ free(node);}
 
-static size_t min(size_t lhs, size_t rhs) {
+static size_t min(size_t lhs, size_t rhs){
     return lhs < rhs ? lhs : rhs;
 }
 
 // (lhs.score, lhs.name) < (rhs.score, rhs.name)
-static bool zless(AVLNode *lhs, double score, const char *name, size_t len) {
+static bool zless(AVLNode *lhs, double score, const char *name, size_t len){
     ZNode *zl = container_of(lhs, ZNode, tree);
     if (zl->score != score){
         return zl->score < score;
@@ -35,11 +35,25 @@ static bool zless(AVLNode *lhs, double score, const char *name, size_t len) {
     return zl->len < len;
 }
 
+//overload of zless
 static bool zless(AVLNode *lhs, AVLNode *rhs){
     ZNode *zr = container_of(rhs, ZNode, tree);
-    //overload of zless
     return zless(lhs, zr->score, zr->name, zr->len);
 }
+
+// (rhs.score, rhs.name) > raw (score,name,len)
+static bool zless_raw(AVLNode *rhs, double score, const char* name, size_t len){
+    ZNode *zr = container_of(rhs, ZNode, tree);
+    if (zr->score != score){
+        return score < zr->score;
+    }
+    int rv = memcmp(name, zr->name, min(len, zr->len));
+    if (rv != 0){
+        return rv < 0;
+    }
+    return len < zr->len;
+}
+
 
 //insert into the avl tree
 static void tree_insert(ZSet *zset, ZNode *node){
@@ -142,8 +156,37 @@ ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len){
     return found ? container_of(found, ZNode, tree) : NULL;
 }
 
+ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len){
+    AVLNode *found = NULL;
+    for (AVLNode *node = zset->root; node; ){
+        if (zless_raw(node, score, name, len)){
+            // targer to big go left
+            node = node->left;
+        } else {
+            // node <= target (candidate)
+            found = node;
+            node = node->right;
+        }
+    }
+    return found ? container_of(found, ZNode, tree) : NULL;
+}
+
 //offsset into the succeding or preceding node
 ZNode *znode_offset(ZNode *node, int64_t offset) {
     AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
     return tnode ? container_of(tnode, ZNode, tree) : NULL;
+}
+
+//how many nodes come before it in sorted order
+static int64_t avl_rank(AVLNode *node){
+    // everything in the left get sum
+    int64_t rank = avl_cnt(node->left);
+    while (node->parent){
+        if (node->parent->right == node){
+            rank += avl_cnt(node->parent->left) + 1;
+        }
+        // we came from the left skip parent
+        node = node->parent;
+    }
+    return rank;
 }

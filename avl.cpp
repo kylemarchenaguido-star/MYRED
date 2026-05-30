@@ -138,7 +138,34 @@ AVLNode *avl_del(AVLNode *node){
     return root;
 }
 
-AVLNode *avl_offset(AVLNode *node, int64_t offset);
+AVLNode *avl_offset(AVLNode *node, int64_t offset){
+    // rank difference from starting node
+    int64_t pos = 0;
+    while (offset != pos){
+        if (pos < offset && pos + avl_cnt(node->right) >= offset){
+            // target is at the right
+            node = node->right;
+            pos += avl_cnt(node->left) + 1;
+        } else if (pos > offset && pos + avl_cnt(node->left) <= offset){
+            // target is at the left
+            node = node->left;
+            pos -= avl_cnt(node->right) + 1;
+        } else {
+            // to the parent
+            AVLNode *parent = node->parent;
+            if (!parent){
+                return NULL;
+            }
+            if (parent->right == node){
+                pos -= avl_cnt(node->left) + 1;
+            } else {
+                pos += avl_cnt(node->right) + 1;
+            }
+            node = parent;
+        }
+    }
+    return node;
+}
 
 
 
