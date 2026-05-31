@@ -21,18 +21,12 @@
 #include "common.h"
 #include "zset.h"
 
-#define container_of(ptr,T,member) \
-    ((T *)((char *)(ptr) - offsetof(T,member)))
-
 constexpr size_t k_max_msg = 32 << 20;
 
 //Helper function for syscalls 
-static void msg(const char* message){
-	fprintf(stderr, "%s\n", message);
-}
 
 static void msg_errno(const char *msg) {
-  fprintf(stderr, "[errno:%s\n], msg");
+  fprintf(stderr, "[errno:%s\n]", msg);
 }
 
 static void die(const char *msg){
@@ -309,16 +303,10 @@ static size_t out_begin_arr(Buffer *out){
   return ctx;
 }
 
-static size_t out_end_arr(Buffer *out, size_t ctx, uint32_t n){
+static void out_end_arr(Buffer *out, size_t ctx, uint32_t n){
   assert(buf_data(out)[ctx - 1] == TAG_ARR);
   memcpy(buf_data(out) + ctx, &n, 4);
 }
-
-
-// cmd[0] = "zadd"      ← the command name
-// cmd[1] = "myzset"    ← the key (which ZSet to operate on)
-// cmd[2] = "3.14"      ← the score (a double as a string)
-// cmd[3] = "alice"     ← the name of the pair
 
 // global hashtable
 static struct {
@@ -626,19 +614,85 @@ static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
   int64_t rank = avl_rank(&znode->tree);
   return out_int(out, rank);
 }
+// All the currents commands
+//
+// get key
+// cmd[0] = "get"       ← command name
+// cmd[1] = "mykey"     ← the key to retrieve
+//
+// set key value
+// cmd[0] = "set"       ← command name
+// cmd[1] = "mykey"     ← the key
+// cmd[2] = "hello"     ← the value to store
+//
+// del key
+// cmd[0] = "del"       ← command name
+// cmd[1] = "mykey"     ← the key to delete
+//
+// keys
+// cmd[0] = "keys"      ← command name (no other args)
+//
+// zadd zset score name
+// cmd[0] = "zadd"      ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "3.14"      ← the score (double as string)
+// cmd[3] = "alice"     ← the member name
+//
+// zrem zset name
+// cmd[0] = "zrem"      ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "alice"     ← the member to remove
+//
+// zscore zset name
+// cmd[0] = "zscore"    ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "alice"     ← the member to get the score of
+//
+// zquery zset score name offset limit
+// cmd[0] = "zquery"    ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "1.0"       ← starting score
+// cmd[3] = "alice"     ← starting name
+// cmd[4] = "0"         ← how many results to skip
+// cmd[5] = "10"        ← max results to return
+//
+// zrevquery zset score name offset limit
+// cmd[0] = "zrevquery" ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "9.0"       ← starting score (search downward)
+// cmd[3] = "alice"     ← starting name
+// cmd[4] = "0"         ← how many results to skip
+// cmd[5] = "10"        ← max results to return
+//
+// zrank zset name
+// cmd[0] = "zrank"     ← command name
+// cmd[1] = "myzset"    ← the zset key
+// cmd[2] = "alice"     ← the member to get the rank of
 
 static void do_request(std::vector<std::string> &cmd, Buffer *out){
   if (cmd.size() == 2 && cmd[0] == "get"){
     return do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set"){
     return do_set(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "del") {
+  } else if (cmd.size() == 2 && cmd[0] == "del"){
     return do_del (cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys"){
     return do_keys(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "zadd"){
+    return do_zadd(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrem"){
+    return do_zrem(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zscore"){
+    return do_zscore(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zquery"){
+    return do_zquery(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zrevquery"){
+    return do_zquery_reversed(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrank"){
+    return do_zrank(cmd, out);
   } else {
-    return out_err (out, ERR_UNKNOWN, "Unkwown command");
-  } 
+    return out_err(out, ERR_UNKNOWN, "unknown command");
+  }
 }
 
 // helper response functions

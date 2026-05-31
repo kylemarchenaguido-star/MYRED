@@ -24,6 +24,11 @@
 //   buf_append(out, resp.data.data(), resp.data.size());
 // }
 
+// static void msg(const char* message){
+// 	fprintf(stderr, "%s\n", message);
+// }
+
+
 
 
 

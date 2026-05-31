@@ -137,7 +137,7 @@ AVLNode *avl_del(AVLNode *node){
     *from = victim;
     return root;
 }
-
+// offset into the succeeding or preceding node.
 AVLNode *avl_offset(AVLNode *node, int64_t offset){
     // rank difference from starting node
     int64_t pos = 0;
@@ -146,7 +146,7 @@ AVLNode *avl_offset(AVLNode *node, int64_t offset){
             // target is at the right
             node = node->right;
             pos += avl_cnt(node->left) + 1;
-        } else if (pos > offset && pos + avl_cnt(node->left) <= offset){
+        } else if (pos > offset && pos - avl_cnt(node->left) <= offset){
             // target is at the left
             node = node->left;
             pos -= avl_cnt(node->right) + 1;

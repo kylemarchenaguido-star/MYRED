@@ -1,4 +1,15 @@
-#include "libraries.h"
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
+#include <string>
+#include <vector>
 
 static void msg(const char* message){
 	fprintf(stderr, "%s\n", message);
@@ -146,7 +157,7 @@ static int32_t print_response(const uint8_t *data, size_t size){
 		{
 			double val = 0;
 			memcpy(&val, &data[1], 8);
-			printf("(double) %g\n", val);
+			printf("(dbl) %g\n", val);
 			return 1 + 8;
 		}
 
@@ -158,7 +169,7 @@ static int32_t print_response(const uint8_t *data, size_t size){
 		{
 			uint32_t len = 0;
 			memcpy(&len, &data[1], 4);
-			printf("(array) len=%u\n", len);
+			printf("(arr) len=%u\n", len);
 			size_t arr_bytes = 1 + 4;
 			for (uint32_t i = 0; i < len; i++){
 				int32_t rv = print_response(&data[arr_bytes], size - arr_bytes);

@@ -177,8 +177,24 @@ ZNode *znode_offset(ZNode *node, int64_t offset) {
     return tnode ? container_of(tnode, ZNode, tree) : NULL;
 }
 
+static void tree_dispose(AVLNode *node){
+    if (!node){
+        return;
+    }
+    tree_dispose(node->left);
+    tree_dispose(node->right);
+    znode_del(container_of(node, ZNode, tree));
+}
+
+// destroy a zset
+void zset_clear(ZSet *zset){
+    hm_clear(&zset->hmap);
+    tree_dispose(zset->root);
+    zset->root = NULL;
+}
+
 //how many nodes come before it in sorted order
-static int64_t avl_rank(AVLNode *node){
+int64_t avl_rank(AVLNode *node){
     // everything in the left get sum
     int64_t rank = avl_cnt(node->left);
     while (node->parent){
