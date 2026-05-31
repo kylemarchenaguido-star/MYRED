@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <math.h> // for the isnan
 // system
+#include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #include "hashtable.h"
 #include "common.h"
 #include "zset.h"
+#include "list.h"
 
 constexpr size_t k_max_msg = 32 << 20;
 
@@ -33,6 +35,12 @@ static void die(const char *msg){
 	int err = errno;
 	fprintf(stderr, "[%d] %s\n", err, msg);
 	abort();
+}
+
+static uint64_t get_monotonic_msec(){
+  struct timespec tv = {0,0};
+  clock_gettime(CLOCK_MONOTONIC, &tv);
+  return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
 }
 
 static void fd_set_nb(int fd){
@@ -78,11 +86,22 @@ struct Conn {
     bool want_read = false; // The the read and the write, is waiting for the fd api readiness
     bool want_write = false;
     bool want_close = false;
-
+    // buffered input, output
     Buffer incoming; // This two are for the buffers that we are gonna parse // data
     Buffer outgoing; // the response 
-
+    //time
+    uint64_t last_active_ms = 0;
+    DList idle_node;
 };
+
+// global hashtable
+static struct {
+  HMap db; // top level hashtable 
+  std::vector<Conn *> fd2conn; // this a pointer to all conecctions in the file descriptor [3,4,5], and is key by this aswell
+  //timers and connection
+  DList idle_list; // list of active connections 
+} g_data;
+
 
 // callback when the socket is ready
 static Conn *handle_accept(int fd){
@@ -102,15 +121,17 @@ static Conn *handle_accept(int fd){
   );
 
    fd_set_nb(connfd);  // now we set the new connection to namb 
-   Conn *conn = new Conn(); // we create a new conn struct 
-    
+   // we create a new conn struct 
+   Conn *conn = new Conn();
    conn->fd = connfd;
    conn->want_read = true;
    conn->incoming = buf_create(64 * 1024);
    conn->outgoing = buf_create(64 * 1024);
+   conn->last_active_ms = get_monotonic_time();
+   dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
    return conn;
 }
-
 
 // append to the front of the buffer 
 static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
@@ -307,11 +328,6 @@ static void out_end_arr(Buffer *out, size_t ctx, uint32_t n){
   assert(buf_data(out)[ctx - 1] == TAG_ARR);
   memcpy(buf_data(out) + ctx, &n, 4);
 }
-
-// global hashtable
-static struct {
-  HMap db; // top level hashtable 
-} g_data;
 
 //value types 
 enum {
@@ -798,86 +814,99 @@ static void handle_read(Conn *conn){
   } // else wants to keep reading.
 }
 
-  // This is the server cpp
+// secondes * miliseconds (5s -> 5000ms)
+const uint64_t k_idle_timeout_ms = 5 * 1000;
 
-  int main(){
-
-    int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
-    if (fd < 0) {die("socket()");}
-
-    int val = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)); // set the socket option like the time wait for the socket
-
-    // the is the parameter bind to 0.0.0.0: 1234
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = ntohs(1234);
-    addr.sin_addr.s_addr = ntohl(0);
-
-    int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if (rv) {die("bind()");}
-
-    // listen for connections on the socket
-    rv = listen(fd, SOMAXCONN);
-    if (rv) {die("listen()");}
-
-   
-    std::vector<Conn *> fd2conn; // this a pointer to all conecctions in the file descriptor [3,4,5], and is key by this aswell
-    std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
-
-    while(true){
-      
-      poll_args.clear(); //This just clean the arguments for poll.
-      struct pollfd pfd = {fd, POLLIN, 0};
-      poll_args.push_back(pfd);
-      //So everething else are just connected sockets 
-
-      for (Conn *conn : fd2conn){
-        if(!conn){continue;}
-
-        struct pollfd pfd = {conn->fd, 0, 0}; // This is for the flags of the aplication
-        if (conn->want_read){
-          pfd.events |= POLLIN;
-        }
-        if (conn->want_write){
-          pfd.events |= POLLOUT;
-        }
-        poll_args.push_back(pfd);
-      }
-      int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
-
-      if(rv < 0 && errno == EINTR){continue;}
-
-      if(rv < 0){die("poll");}
-
-      // This code for a socket that is listening 
-      if(poll_args[0].revents){
-        if(Conn *conn = handle_accept(fd)){
-            if(fd2conn.size() <= (size_t)conn->fd){
-              fd2conn.resize(conn->fd + 1);
-            }
-            fd2conn[conn->fd] = conn;
-        }
-      }
-
-      //This is for to handle the connections of sockets
-      for(size_t i = 1;i < poll_args.size(); i++){
-
-        uint32_t ready = poll_args[i].revents;
-        Conn *conn = fd2conn[poll_args[i].fd];// So the [] inside the fd2conn is just the way to retrieve the object of the original conn 
-        // fd2conn it just the pointer of all connections   
-        // See if the connections are ready to write or read
-        if(ready & POLLIN){handle_read(conn);}
-        if(ready & POLLOUT){handle_write(conn);}
-        
-        //Close the socket from erros 
-        if((ready & POLLERR) || conn->want_close){
-          (void)close(conn->fd);
-          fd2conn[conn->fd] = NULL;
-          delete conn;
-
-        }
-      }
+static int32_t next_timer_ms() {
+  if (dlist_empty(&g_data.idle_list)){
+    return -1; // no timers, no timeouts (poll sleeps)
   }
-  return 0;
+
+  uint64_t now_ms = get_monotonic_msec();
+  Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+  uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+  if (next_ms <= now_ms){
+    return 0; 
+  }
+  return (int32_t)(next_ms - now_ms);
+
+}
+
+int main(){
+
+  // initialiaze 
+  dlist_init(&g_data.idle_list);
+
+  int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
+  if (fd < 0) {die("socket()");}
+
+  int val = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)); // set the socket option like the time wait for the socket
+
+  // the is the parameter bind to 0.0.0.0: 1234
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = ntohs(1234);
+  addr.sin_addr.s_addr = ntohl(0);
+
+  int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+  if (rv) {die("bind()");}
+
+  fd_set_nb(fd);
+
+  // listen for connections on the socket
+  rv = listen(fd, SOMAXCONN);
+  if (rv) {die("listen()");}
+
+  std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
+
+  while(true){
+    
+    poll_args.clear(); //This just clean the arguments for poll.
+    struct pollfd pfd = {fd, POLLIN, 0};
+    poll_args.push_back(pfd);
+    //So everething else are just connected sockets 
+
+    for (Conn *conn : g_data.fd2conn){
+      if(!conn){continue;}
+
+      struct pollfd pfd = {conn->fd,POLLERR, 0}; // This is for the flags of the aplication
+      if (conn->want_read){
+        pfd.events |= POLLIN;
+      }
+      if (conn->want_write){
+        pfd.events |= POLLOUT;
+      }
+      poll_args.push_back(pfd);
+    }
+    int32_t timeout_ms = next_timer_ms();
+    int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
+
+    if(rv < 0 && errno == EINTR){continue;}
+    if(rv < 0){die("poll");}
+
+    //This is for to handle the connections of sockets
+    for(size_t i = 1;i < poll_args.size(); i++){
+
+      uint32_t ready = poll_args[i].revents;
+      Conn *conn = fd2conn[poll_args[i].fd];// So the [] inside the fd2conn is just the way to retrieve the object of the original conn 
+      // fd2conn it just the pointer of all connections   
+      // See if the connections are ready to write or read
+      if(ready & POLLIN){
+        handle_read(conn);
+      }
+      if(ready & POLLOUT){
+        handle_write(conn);
+      }
+      
+      //Close the socket from erros 
+      if((ready & POLLERR) || conn->want_close){
+        (void)close(conn->fd);
+        fd2conn[conn->fd] = NULL;
+        delete conn;
+
+      }
+    }
+}
+return 0;
 }
