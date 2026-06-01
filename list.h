@@ -12,7 +12,7 @@ inline void dlist_init(DList *node){
     node->prev = node->next = node;
 }
 
-// checks if the pointer is pointing to itself
+// checks if the pointer is pointing to itself (empty)
 inline bool dlist_empty(DList *node){
     return node->next == node;
 }

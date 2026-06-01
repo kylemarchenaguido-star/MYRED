@@ -104,7 +104,7 @@ static struct {
 
 
 // callback when the socket is ready
-static Conn *handle_accept(int fd){
+static int32_t handle_accept(int fd){
   // accept logic
    struct sockaddr_in client_addr =  {};
    socklen_t addrlen = sizeof(client_addr);
@@ -112,7 +112,7 @@ static Conn *handle_accept(int fd){
    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
    if (connfd < 0) {
     msg_errno("accept() error");
-    return NULL;
+    return -1;
   }
   uint32_t ip = client_addr.sin_addr.s_addr;
   fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
@@ -127,10 +127,26 @@ static Conn *handle_accept(int fd){
    conn->want_read = true;
    conn->incoming = buf_create(64 * 1024);
    conn->outgoing = buf_create(64 * 1024);
-   conn->last_active_ms = get_monotonic_time();
+   conn->last_active_ms = get_monotonic_msec();
    dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
-   return conn;
+  //put it into the map
+  if (g_data.fd2conn.size() <= (size_t)conn->fd){
+    // resize if neccesary
+    g_data.fd2conn.resize(conn->fd + 1);
+  }
+  assert(!g_data.fd2conn[conn->fd]);
+  // return the conn 
+  g_data.fd2conn[conn->fd] = conn;
+
+  return 0;
+}
+
+static void conn_destroy(Conn *conn){
+  (void)close(conn->fd);
+  g_data.fd2conn[conn->fd] = NULL;
+  dlist_detach(&conn->idle_node);
+  delete conn;
 }
 
 // append to the front of the buffer 
@@ -829,7 +845,20 @@ static int32_t next_timer_ms() {
     return 0; 
   }
   return (int32_t)(next_ms - now_ms);
+}
 
+static void process_timers(){
+  uint64_t now_ms = get_monotonic_msec();
+  while (!dlist_empty(&g_data.idle_list)){
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    if (next_ms >= now_ms){
+      //expired
+      break;
+    }
+    fprintf(stderr, "removing idle connection: %d\n", conn->fd);
+    conn_destroy(conn);
+  }
 }
 
 int main(){
@@ -885,28 +914,42 @@ int main(){
     if(rv < 0 && errno == EINTR){continue;}
     if(rv < 0){die("poll");}
 
-    //This is for to handle the connections of sockets
-    for(size_t i = 1;i < poll_args.size(); i++){
+    // handle the listening socket
+    if (poll_args[0].revents) {
+      handle_accept(fd);
+    }
 
+    //This is for to handle the connections of sockets
+    for(size_t i = 1;i < poll_args.size(); i++){ // we skip the 1st
       uint32_t ready = poll_args[i].revents;
-      Conn *conn = fd2conn[poll_args[i].fd];// So the [] inside the fd2conn is just the way to retrieve the object of the original conn 
-      // fd2conn it just the pointer of all connections   
-      // See if the connections are ready to write or read
+      if (ready == 0){ // no events fired up
+        continue;
+      }
+      // retrieve the object of every fd (in this case only i)
+      Conn *conn = g_data.fd2conn[poll_args[i].fd];
+
+      // update the idle timer and putting the conn at the end of the list
+      conn->last_active_ms = get_monotonic_msec();
+      dlist_detach(&conn->idle_node);
+      dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
+      // Connection are ready to write and read
       if(ready & POLLIN){
+        assert(conn->want_read);
         handle_read(conn);
       }
       if(ready & POLLOUT){
+        assert(conn->want_write);
         handle_write(conn);
       }
-      
       //Close the socket from erros 
       if((ready & POLLERR) || conn->want_close){
-        (void)close(conn->fd);
-        fd2conn[conn->fd] = NULL;
-        delete conn;
+        conn_destroy(conn);
 
       }
-    }
-}
-return 0;
+    } // this if for each connection socket (fd)
+    // handle timers
+    process_timers();
+  }
+  return 0;
 }
