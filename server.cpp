@@ -22,6 +22,7 @@
 #include "common.h"
 #include "zset.h"
 #include "list.h"
+#include "heap.h"
 
 constexpr size_t k_max_msg = 32 << 20;
 
@@ -68,30 +69,37 @@ struct Buffer {
 };
 
 // Initialize the buffer protocol 
- Buffer buf_create(size_t capacity){
-      uint8_t *mem = new uint8_t[capacity];
-      return Buffer {
-        .buffer_begin = mem,
-        .buffer_end = mem + capacity,
-        .data_begin = mem,
-        .data_end = mem,
-      };
+Buffer buf_create(size_t capacity){
+  uint8_t *mem = new uint8_t[capacity];
+  return Buffer {
+    .buffer_begin = mem,
+    .buffer_end = mem + capacity,
+    .data_begin = mem,
+    .data_end = mem,
+  };
 
-    }
+}
+
+// Timer for both linked lists
+enum class ConnTimer {
+  IDLE,
+  IO,
+};
 
 // Connections state and buffers 
 struct Conn {
-    int fd = -1; // this is for the event loop
+  int fd = -1; // this is for the event loop
 
-    bool want_read = false; // The the read and the write, is waiting for the fd api readiness
-    bool want_write = false;
-    bool want_close = false;
-    // buffered input, output
-    Buffer incoming; // This two are for the buffers that we are gonna parse // data
-    Buffer outgoing; // the response 
-    //time
-    uint64_t last_active_ms = 0;
-    DList idle_node;
+  bool want_read = false; // The the read and the write, is waiting for the fd api readiness
+  bool want_write = false;
+  bool want_close = false;
+  // buffered input, output
+  Buffer incoming; // This two are for the buffers that we are gonna parse // data
+  Buffer outgoing; // the response 
+  //time
+  uint64_t last_active_ms = 0;
+  ConnTimer timer_type = ConnTimer::IO;
+  DList idle_node;
 };
 
 // global hashtable
@@ -99,47 +107,50 @@ static struct {
   HMap db; // top level hashtable 
   std::vector<Conn *> fd2conn; // this a pointer to all conecctions in the file descriptor [3,4,5], and is key by this aswell
   //timers and connection
-  DList idle_list; // list of active connections 
+  DList idle_list; // list of waiting connections 
+  DList io_list;  // list of waiting io (read and write)
+  // timers for ttls
+  std::vector<HeapItem> heap;
 } g_data;
-
 
 // callback when the socket is ready
 static int32_t handle_accept(int fd){
   // accept logic
-   struct sockaddr_in client_addr =  {};
-   socklen_t addrlen = sizeof(client_addr);
+  struct sockaddr_in client_addr =  {};
+  socklen_t addrlen = sizeof(client_addr);
 
-   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-   if (connfd < 0) {
-    msg_errno("accept() error");
-    return -1;
-  }
-  uint32_t ip = client_addr.sin_addr.s_addr;
-  fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
-    ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
-    ntohs(client_addr.sin_port)
-  );
+  int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+  if (connfd < 0) {
+  msg_errno("accept() error");
+  return -1;
+}
+uint32_t ip = client_addr.sin_addr.s_addr;
+fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+  ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+  ntohs(client_addr.sin_port)
+);
 
-   fd_set_nb(connfd);  // now we set the new connection to namb 
-   // we create a new conn struct 
-   Conn *conn = new Conn();
-   conn->fd = connfd;
-   conn->want_read = true;
-   conn->incoming = buf_create(64 * 1024);
-   conn->outgoing = buf_create(64 * 1024);
-   conn->last_active_ms = get_monotonic_msec();
-   dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+  fd_set_nb(connfd);  // now we set the new connection to namb 
+  // we create a new conn struct 
+  Conn *conn = new Conn();
+  conn->fd = connfd;
+  conn->want_read = true;
+  conn->incoming = buf_create(64 * 1024);
+  conn->outgoing = buf_create(64 * 1024);
+  conn->timer_type = ConnTimer::IO;
+  conn->last_active_ms = get_monotonic_msec();
+  dlist_insert_before(&g_data.io_list, &conn->idle_node);
 
-  //put it into the map
-  if (g_data.fd2conn.size() <= (size_t)conn->fd){
-    // resize if neccesary
-    g_data.fd2conn.resize(conn->fd + 1);
-  }
-  assert(!g_data.fd2conn[conn->fd]);
-  // return the conn 
-  g_data.fd2conn[conn->fd] = conn;
+//put it into the map
+if (g_data.fd2conn.size() <= (size_t)conn->fd){
+  // resize if neccesary
+  g_data.fd2conn.resize(conn->fd + 1);
+}
+assert(!g_data.fd2conn[conn->fd]);
+// return the conn 
+g_data.fd2conn[conn->fd] = conn;
 
-  return 0;
+return 0;
 }
 
 static void conn_destroy(Conn *conn){
@@ -356,8 +367,11 @@ enum {
 struct Entry {
   struct HNode node; // hashtable node
   std::string key;
+  // for ttl
+  size_t heap_idx = -1;
   // value
   uint32_t type = 0;
+  // one of the following 
   std::string str;
   ZSet zset;
 };
@@ -368,10 +382,14 @@ static Entry *entry_new(uint32_t type) {
   return ent;
 }
 
+// Definition later....
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
+
 static void entry_del(Entry *ent) {
   if (ent->type == T_ZSET) {
     zset_clear(&ent->zset);
   }
+  entry_set_ttl(ent, -1);
   delete ent;
 }
 
@@ -459,6 +477,46 @@ static bool cb_keys(HNode *node, void *arg){
 static void do_keys(std::vector<std::string> &, Buffer *out){
   out_arr(out, (uint32_t)hm_size(&g_data.db));
   hm_foreach(&g_data.db, &cb_keys, (void *)out);
+}
+
+// we use the duplicate trick
+// Before:  [1, 3, 2, 7, 5]   delete pos=1 (value 3)
+// Step 1:  [1, 5, 2, 7, 5]   overwrite pos=1 with last (5)
+// Step 2:  [1, 5, 2, 7]      pop_back removes duplicate
+// Step 3:  [1, 5, 2, 7]      heap_update fixes 5 into correct position
+static void heap_delete(std::vector<HeapItem> &a, size_t pos){
+  // swap the erased item with the last item
+  a[pos] = a.back();
+  a.pop_back();
+  // we update the swapped item
+  if (pos < a.size()){
+    heap_update(a.data(), pos, a.size());
+  } 
+}
+
+// update or append at the front
+static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t){
+  if (pos < a.size()){
+    a[pos] = t; // update 
+  } else {
+    pos = a.size();
+    a.push_back(t); // add a new item
+  }
+  heap_update(a.data(), pos, a.size());
+}
+
+// set or remove the TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
+  if (ttl_ms < 0 && ent->heap_idx != (size_t)-1){
+    // negative ttl -> remove ttl
+    heap_delete(g_data.heap, ent->heap_idx);
+    ent->heap_idx = -1;
+  } else if (ttl_ms >= 0){
+    // we add or update the data structure
+    uint64_t expire_at = get_monotonic_msec() - (uint64_t)ttl_ms;
+    HeapItem item = {expire_at, &ent->heap_idx};
+    heap_upsert(g_data.heap, ent->heap_idx, item);
+  }
 }
 
 static bool str2dbl(const std::string &s, double &out){
@@ -753,6 +811,101 @@ static void response_end(Buffer *out, size_t header){
   memcpy(out->data_begin + header, &len, 4);
 }
 
+// Timers logic 
+// secondes * miliseconds (5s -> 5000ms)
+constexpr uint64_t k_idle_timeout_ms = 5 * 5000;
+
+constexpr uint64_t k_io_timeout_ms = 5 * 1000;
+
+static int32_t next_timer_ms() {
+  uint64_t now_ms = get_monotonic_msec();
+  uint64_t next_ms = (uint64_t)-1; // maximun value
+
+  // check the front of the idle_list 
+  if (!dlist_empty(&g_data.idle_list)){
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    next_ms = conn->last_active_ms + k_idle_timeout_ms;
+  }
+  // check the front of the io_list 
+  if (!dlist_empty(&g_data.io_list)){
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    next_ms = conn->last_active_ms + k_io_timeout_ms;
+  }
+  // no timers 
+  if (next_ms == (uint64_t)-1){
+    return -1;
+  }
+  // already expired
+  if (next_ms == now_ms){
+    return 0;
+  }
+  return (int32_t)(next_ms - now_ms);
+
+}
+
+// 
+static bool hnode_same(HNode *node, HNode *key){
+  return node == key;
+}
+
+static void process_timers(){
+  uint64_t now_ms = get_monotonic_msec();
+  // This handles expired idle timers
+  while (!dlist_empty(&g_data.idle_list)){
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    uint64_t expired = conn->last_active_ms + k_idle_timeout_ms;
+    if (expired > now_ms){
+      //expired
+      break;
+    }
+    fprintf(stderr, "Idle timeout: closing fd %d\n", conn->fd);
+    conn->want_close = true;
+    conn_destroy(conn);
+  }
+  // This handles expired io timers
+  while (!dlist_empty(&g_data.io_list)){
+    Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
+    uint64_t expired = conn->last_active_ms + k_idle_timeout_ms;
+    if (expired > now_ms){
+      //expired
+      break;
+    }
+    fprintf(stderr, "IO timeout: closing fd %d\n", conn->fd);
+    conn->want_close = true;
+    conn_destroy(conn);
+  }
+  // TTL timers using a heap
+  const size_t k_max_works = 2000;
+  size_t nworks = 0;
+  const std::vector<HeapItem> &heap = g_data.heap;
+  // This handles TTL timers
+  while(!heap.empty() && heap[0].val < now_ms){
+    Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
+    HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
+    assert(node == &ent->node);
+    fprintf(stderr, "key expired: %s\n", ent->key.c_str());
+    entry_del(ent);
+    if (nworks++ >= k_max_works){
+      break;
+    }
+  }
+}
+
+static void conn_set_timer(Conn *conn, ConnTimer type){
+  dlist_detach(&conn->idle_node);
+
+  // record when it joined the new list
+  conn->timer_type = type;
+  conn->last_active_ms = get_monotonic_msec();
+
+  // insert at the back
+  if (type == ConnTimer::IDLE){
+    dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+  } else {
+    dlist_insert_before(&g_data.io_list, &conn->idle_node);
+  }
+}
+
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
   // try to parse the accumulated buffer 
@@ -785,6 +938,7 @@ static bool try_one_request(Conn *conn){
 
   // application logic done
   buf_consume(&conn->incoming, 4 + len);
+  conn_set_timer(conn, ConnTimer::IDLE);
   return true;
 
 }
@@ -817,9 +971,12 @@ static void handle_read(Conn *conn){
   }
   // add new data to the incoming buffer
   buf_append(&conn->incoming, buf, (size_t)rv);
-  // try to parse
-  // procces the parsed message
-  // remove the message from the buffer(incoming)
+
+  // We set the conn to IO (stop the idle)
+  if (conn->timer_type == ConnTimer::IDLE){
+    conn_set_timer(conn, ConnTimer::IO);
+  }
+  
   while (try_one_request(conn)) {};
 
   if(buf_size(&conn->outgoing) > 0){
@@ -830,41 +987,14 @@ static void handle_read(Conn *conn){
   } // else wants to keep reading.
 }
 
-// secondes * miliseconds (5s -> 5000ms)
-const uint64_t k_idle_timeout_ms = 5 * 1000;
-
-static int32_t next_timer_ms() {
-  if (dlist_empty(&g_data.idle_list)){
-    return -1; // no timers, no timeouts (poll sleeps)
-  }
-
-  uint64_t now_ms = get_monotonic_msec();
-  Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
-  uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
-  if (next_ms <= now_ms){
-    return 0; 
-  }
-  return (int32_t)(next_ms - now_ms);
-}
-
-static void process_timers(){
-  uint64_t now_ms = get_monotonic_msec();
-  while (!dlist_empty(&g_data.idle_list)){
-    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
-    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
-    if (next_ms >= now_ms){
-      //expired
-      break;
-    }
-    fprintf(stderr, "removing idle connection: %d\n", conn->fd);
-    conn_destroy(conn);
-  }
-}
-
 int main(){
 
-  // initialiaze 
+  // initialiaze idle connection list
   dlist_init(&g_data.idle_list);
+
+  // initializa io waiting list
+  dlist_init(&g_data.io_list);
+
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}

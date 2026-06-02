@@ -18,10 +18,6 @@ static ZNode *znode_new(const char *name, size_t len, double score){
 
 static void znode_del(ZNode *node){ free(node);}
 
-static size_t min(size_t lhs, size_t rhs){
-    return lhs < rhs ? lhs : rhs;
-}
-
 // (lhs.score, lhs.name) < (rhs.score, rhs.name)
 static bool zless(AVLNode *lhs, double score, const char *name, size_t len){
     ZNode *zl = container_of(lhs, ZNode, tree);

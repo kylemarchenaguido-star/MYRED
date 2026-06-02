@@ -10,6 +10,10 @@
     (type *)( (char *)__mptr - offsetof(type, member) );})
 
 
+static size_t min(size_t lhs, size_t rhs){
+    return lhs < rhs ? lhs : rhs;
+}
+
 // FNV hash
 static uint64_t str_hash(const uint8_t *data, size_t len){
   uint32_t h = 0x811C9DC5;
