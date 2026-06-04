@@ -50,6 +50,7 @@ const size_t k_rehashing_work = 128;
 static void hm_help_rehashing(HMap *hmap){
     size_t nwork = 0;
     while (nwork < k_rehashing_work && hmap->older.size > 0){
+        if (hmap->migrate_pos > hmap->older.mask){break;} // dont walt past the end of the table
         //find a non empty list
         HNode **from = &hmap->older.tab[hmap->migrate_pos];
         if (!*from){

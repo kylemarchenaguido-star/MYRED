@@ -23,6 +23,7 @@
 #include "zset.h"
 #include "list.h"
 #include "heap.h"
+#include "thread_pool.h"
 
 constexpr size_t k_max_msg = 32 << 20;
 
@@ -60,6 +61,10 @@ static void fd_set_nb(int fd){
   }
 }
 
+static bool hnode_same(HNode *node, HNode *key){
+  return node == key;
+}
+
 // Buffer for the tcp protocol
 struct Buffer {
   uint8_t *buffer_begin; // start of memory
@@ -93,6 +98,7 @@ struct Conn {
   bool want_read = false; // The the read and the write, is waiting for the fd api readiness
   bool want_write = false;
   bool want_close = false;
+  bool want_async_response = false; // waiting for a thread pool result
   // buffered input, output
   Buffer incoming; // This two are for the buffers that we are gonna parse // data
   Buffer outgoing; // the response 
@@ -111,6 +117,9 @@ static struct {
   DList io_list;  // list of waiting io (read and write)
   // timers for ttls
   std::vector<HeapItem> heap;
+  ThreadPool thread_pool;
+  ResultQueue result_queue;
+  int pipe_fds[2]; // 0 = read, 1 = write 
 } g_data;
 
 // callback when the socket is ready
@@ -247,8 +256,6 @@ static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::str
   out.assign(cur, cur + n);
   cur += n;
   return true;
-
-
 }
 
 static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
@@ -382,15 +389,111 @@ static Entry *entry_new(uint32_t type) {
   return ent;
 }
 
-// Definition later....
-static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
+struct AsyncDelArgs{
+  Entry *ent;
+  int fd;
+};
 
-static void entry_del(Entry *ent) {
+// Definition declared later....
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
+// Delete the actual work
+static void entry_del_sync(Entry *ent) {
   if (ent->type == T_ZSET) {
     zset_clear(&ent->zset);
   }
   entry_set_ttl(ent, -1);
   delete ent;
+}
+
+// Called by a worker thread to send result back to event loop
+static void send_result_to_event_loop(int fd, bool success){
+  // put result in queue
+  AsyncResult result;
+  result.fd = fd;
+  result.success = success;
+
+  pthread_mutex_lock(&g_data.result_queue.rmu);
+  g_data.result_queue.rqueue.push_back(result);
+  pthread_mutex_unlock(&g_data.result_queue.rmu);
+
+  // wake event loop with 1 junk byte
+  uint8_t byte = 1;
+  if (write(g_data.pipe_fds[1], &byte, 1) < 0){
+    fprintf(stderr, "pipe write failed: %s\n", strerror(errno));
+  }
+}
+
+// worker thread function for async deletion
+static void async_del_func(void *arg){
+  AsyncDelArgs *args = (AsyncDelArgs *)arg;
+
+  // do the slow work
+  entry_del_sync(args->ent);
+
+  // send result back to event loop
+  send_result_to_event_loop(args->fd, true);
+
+  delete args;
+}
+
+// a wrapper function for the thread pool
+static void entry_del_func(void *arg){
+  entry_del_sync((Entry *)arg);
+}
+
+static void handle_pipe_result(){
+  // need to drain the junk bytes from pipe
+  // multiple workers could have write
+  uint8_t buf[256];
+  while (read(g_data.pipe_fds[0], buf, sizeof(buf)) > 0) {}
+  // returns when pipe is empty
+
+  // process all the pending results
+  while (true){
+    pthread_mutex_lock(&g_data.result_queue.rmu);
+
+    if (g_data.result_queue.rqueue.empty()){
+      pthread_mutex_unlock(&g_data.result_queue.rmu);
+      break;
+    }
+
+    AsyncResult result = g_data.result_queue.rqueue.front();
+    g_data.result_queue.rqueue.pop_front();
+    pthread_mutex_unlock(&g_data.result_queue.rmu);
+
+    // find the fd and send the reply to the client
+    Conn *conn = g_data.fd2conn[result.fd];
+    if (!conn){
+      continue;
+    }
+
+    // clear the waiting flag
+    conn->want_async_response = false;
+
+    if (result.success){
+      out_int(&conn->outgoing, 1);
+    } else {
+      out_err(&conn->outgoing, ERR_UNKNOWN, "async operation failed");
+    }
+      
+    conn->want_write = true;
+    conn->want_read = false;
+  }
+}
+
+// When and where to delete
+static void entry_del(Entry *ent){ 
+  // remove from the heap first
+  entry_set_ttl(ent, -1);
+  // decide if use thread pool or synchronous
+  size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+  const size_t k_large_container_size = 1000;
+
+  if (set_size > k_large_container_size){
+    thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
+  } else {
+    entry_del_sync(ent);
+  }
 }
 
 // Key for searching in the hashtable
@@ -446,6 +549,7 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
     ent->key.swap(key.key);
     ent->node.hcode = key.node.hcode;
     ent->str.swap(cmd[2]);
+    ent->type = T_STR;
     hm_insert(&g_data.db, &ent->node);
   }
   return out_nil(out);
@@ -505,20 +609,6 @@ static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t){
   heap_update(a.data(), pos, a.size());
 }
 
-// set or remove the TTL
-static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
-  if (ttl_ms < 0 && ent->heap_idx != (size_t)-1){
-    // negative ttl -> remove ttl
-    heap_delete(g_data.heap, ent->heap_idx);
-    ent->heap_idx = -1;
-  } else if (ttl_ms >= 0){
-    // we add or update the data structure
-    uint64_t expire_at = get_monotonic_msec() - (uint64_t)ttl_ms;
-    HeapItem item = {expire_at, &ent->heap_idx};
-    heap_upsert(g_data.heap, ent->heap_idx, item);
-  }
-}
-
 static bool str2dbl(const std::string &s, double &out){
   char *endp = NULL;
   out = strtod(s.c_str(), &endp); // endp points to the first wrong character
@@ -529,6 +619,60 @@ static bool str2int(const std::string &s, int64_t &out){
   char *endp = NULL;
   out = strtoll(s.c_str(), &endp, 10);
   return endp == s.c_str() + s.size();
+}
+
+// set or remove the TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
+  if (ttl_ms < 0 && ent->heap_idx != (size_t)-1){
+    // negative ttl -> remove ttl
+    heap_delete(g_data.heap, ent->heap_idx);
+    ent->heap_idx = -1;
+  } else if (ttl_ms >= 0){
+    // we add or update the data structure
+    uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+    HeapItem item = {expire_at, &ent->heap_idx};
+    heap_upsert(g_data.heap, ent->heap_idx, item);
+  }
+}
+
+// PEXPIRE key ttl_ms
+static void do_expire(std::vector<std::string> &cmd, Buffer *out){
+  int64_t ttl_ms = 0;
+  if (!str2int(cmd[2], ttl_ms)){
+    return out_err(out, ERR_BAD_ARG, "expected int64");
+  }
+  // lookup the key
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  // we set the ttl
+  if (node){
+    Entry *ent = container_of(node, Entry, node);
+    entry_set_ttl(ent, ttl_ms);
+  }
+  return out_int(out, node ? 1 : 0);
+}
+
+// PTTL key
+static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node){
+    return out_int(out, -2); // not found
+  }
+
+  Entry *ent = container_of(node, Entry, node);
+  if (ent->heap_idx == (size_t)-1){
+    return out_int(out, -1); // not ttl
+  }
+
+  uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+  uint64_t now_ms = get_monotonic_msec();
+  return out_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
 }
 
 // zadd and zset (score, name)
@@ -639,7 +783,7 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer *out){
   size_t ctx = out_begin_arr(out);
   int64_t n = 0;
   while (znode && n < limit){
-    out_str(out, znode->name);
+    out_str(out, std::string(znode->name, znode->len));
     out_dbl(out, znode->score);
     znode = znode_offset(znode, +1);
     n += 2;
@@ -678,7 +822,7 @@ static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
   size_t ctx = out_begin_arr(out);
   int64_t n = 0;
   while (znode && n < limit){
-    out_str(out, znode->name);
+    out_str(out, std::string(znode->name, znode->len));
     out_dbl(out, znode->score);
     znode = znode_offset(znode, -1);
     n += 2;
@@ -704,6 +848,47 @@ static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
   int64_t rank = avl_rank(&znode->tree);
   return out_int(out, rank);
 }
+
+// asyncdel key - delete in background
+static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  // look the key
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+  if (!hnode){
+    return out_int(out, 0); // key does not exit
+  }
+  Entry *ent = container_of(hnode, Entry, node);
+  // remove from hashtable and heap
+  hm_delete(&g_data.db, &ent->node, &hnode_same);
+  entry_set_ttl(ent, -1);
+
+  // check if need offloading
+  size_t set_size = (ent->type ==  T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+
+  if (set_size > 1000){
+    // large offload to thread pool, reply later via pipe
+    // tell the event loop this connection is waiting
+    conn->want_async_response = true;
+    conn->want_read = false;
+    conn->want_write = false;
+
+    AsyncDelArgs *args = new AsyncDelArgs{ent, conn->fd};
+    thread_pool_queue(&g_data.thread_pool, async_del_func, args);
+
+    // we wait the response via the pipe
+    return;
+
+  } else {
+    // small enough
+    entry_del_sync(ent);
+    return out_int(out, 1);
+  }
+
+}
+
 // All the currents commands
 //
 // get key
@@ -759,13 +944,19 @@ static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
 // cmd[1] = "myzset"    ← the zset key
 // cmd[2] = "alice"     ← the member to get the rank of
 
-static void do_request(std::vector<std::string> &cmd, Buffer *out){
+static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (cmd.size() == 2 && cmd[0] == "get"){
     return do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set"){
     return do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del"){
     return do_del (cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "asyncdel" ) {
+    do_asyncdel(cmd, out, conn);
+  }else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+    return do_expire(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "pttl"){
+    return do_ttl(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys"){
     return do_keys(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "zadd"){
@@ -813,7 +1004,7 @@ static void response_end(Buffer *out, size_t header){
 
 // Timers logic 
 // secondes * miliseconds (5s -> 5000ms)
-constexpr uint64_t k_idle_timeout_ms = 5 * 5000;
+constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
 
 constexpr uint64_t k_io_timeout_ms = 5 * 1000;
 
@@ -828,24 +1019,24 @@ static int32_t next_timer_ms() {
   }
   // check the front of the io_list 
   if (!dlist_empty(&g_data.io_list)){
-    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
     next_ms = conn->last_active_ms + k_io_timeout_ms;
   }
+  // check the heap
+  if (!g_data.heap.empty()){
+    next_ms = std::min(next_ms, g_data.heap[0].val);
+  }
+
   // no timers 
   if (next_ms == (uint64_t)-1){
     return -1;
   }
   // already expired
-  if (next_ms == now_ms){
+  if (next_ms <= now_ms){
     return 0;
   }
   return (int32_t)(next_ms - now_ms);
 
-}
-
-// 
-static bool hnode_same(HNode *node, HNode *key){
-  return node == key;
 }
 
 static void process_timers(){
@@ -865,7 +1056,7 @@ static void process_timers(){
   // This handles expired io timers
   while (!dlist_empty(&g_data.io_list)){
     Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
-    uint64_t expired = conn->last_active_ms + k_idle_timeout_ms;
+    uint64_t expired = conn->last_active_ms + k_io_timeout_ms;
     if (expired > now_ms){
       //expired
       break;
@@ -933,8 +1124,11 @@ static bool try_one_request(Conn *conn){
  
   size_t header_pos = 0;
   response_begin(&conn->outgoing, &header_pos);
-  do_request(cmd, &conn->outgoing);
-  response_end(&conn->outgoing, header_pos);
+  do_request(cmd, &conn->outgoing, conn);
+
+  if (conn->want_async_response){
+    conn->outgoing.data_end -=4; // undo the 4 bytes placeholder
+  } else {response_end(&conn->outgoing, header_pos);}
 
   // application logic done
   buf_consume(&conn->incoming, 4 + len);
@@ -989,12 +1183,18 @@ static void handle_read(Conn *conn){
 
 int main(){
 
-  // initialiaze idle connection list
+  // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
-
-  // initializa io waiting list
   dlist_init(&g_data.io_list);
 
+  // Initialiaze the thread pool and result queue 
+  thread_pool_init(&g_data.thread_pool, 4);
+  pthread_mutex_init(&g_data.result_queue.rmu, NULL);
+
+  // we create the pipe and set it nonblock
+  int rv = pipe(g_data.pipe_fds);
+  assert(rv == 0);
+  fd_set_nb(g_data.pipe_fds[0]);
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
@@ -1008,7 +1208,7 @@ int main(){
   addr.sin_port = ntohs(1234);
   addr.sin_addr.s_addr = ntohl(0);
 
-  int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+  rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
   if (rv) {die("bind()");}
 
   fd_set_nb(fd);
@@ -1029,7 +1229,7 @@ int main(){
     for (Conn *conn : g_data.fd2conn){
       if(!conn){continue;}
 
-      struct pollfd pfd = {conn->fd,POLLERR, 0}; // This is for the flags of the aplication
+      struct pollfd pfd = {conn->fd, POLLERR, 0}; // This is for the flags of the aplication
       if (conn->want_read){
         pfd.events |= POLLIN;
       }
@@ -1038,6 +1238,10 @@ int main(){
       }
       poll_args.push_back(pfd);
     }
+    // add pipe read end so the event loop wakes up when a thread posts a result
+    struct pollfd pipe_pfd = {g_data.pipe_fds[0], POLLIN, 0};
+    poll_args.push_back(pipe_pfd);
+
     int32_t timeout_ms = next_timer_ms();
     int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
 
@@ -1055,8 +1259,20 @@ int main(){
       if (ready == 0){ // no events fired up
         continue;
       }
+
+      // check pipe if wakeup from a worker thread
+      if (poll_args[i].fd == g_data.pipe_fds[0]){
+        handle_pipe_result();
+        continue;
+      }
+
       // retrieve the object of every fd (in this case only i)
       Conn *conn = g_data.fd2conn[poll_args[i].fd];
+      if (!conn){continue;} // null check
+      // skip connections waiting for async results
+      if (conn->want_async_response){
+        continue;
+      }
 
       // update the idle timer and putting the conn at the end of the list
       conn->last_active_ms = get_monotonic_msec();

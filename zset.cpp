@@ -16,6 +16,10 @@ static ZNode *znode_new(const char *name, size_t len, double score){
     return node;
 }
 
+static size_t min(size_t lhs, size_t rhs){
+    return lhs < rhs ? lhs : rhs;
+}
+
 static void znode_del(ZNode *node){ free(node);}
 
 // (lhs.score, lhs.name) < (rhs.score, rhs.name)
