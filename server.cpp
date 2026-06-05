@@ -18,6 +18,7 @@
 // C++
 #include <string>
 #include <vector>
+#include <algorithm>
 // project 
 #include "hashtable.h"
 #include "common.h"
@@ -28,7 +29,7 @@
 
 constexpr size_t k_max_msg = 32 << 20;
 
-constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes
+constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes 5 * 60 * 1000
 constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
 
 // secondes * miliseconds (5s -> 5000ms)
@@ -559,6 +560,49 @@ static bool rdb_save(const char* filename){
   return true;
 }
 
+// Read RDB functions
+// tracks the current position in the file bytes
+struct RDBCursor {
+  const uint8_t *pos; // current
+  const uint8_t *end; // one past last byte
+};
+
+// read len bytes into dst
+static bool cursor_read(RDBCursor *c, void *dst, size_t len){
+  if (c->pos + len > c->end){
+    fprintf(stderr, "rdb_load: unexpected end of file\n");
+    return false;
+  }
+  memcpy(dst, c->pos, len);
+  c->pos += len;
+  return true;
+}
+
+static bool cursor_read_u8(RDBCursor *c, uint8_t *out){
+  return cursor_read(c, out, 1);
+}
+static bool cursor_read_u32(RDBCursor *c, uint32_t *out){
+  return cursor_read(c, out, 4);
+}
+static bool cursor_read_u64(RDBCursor *c, uint64_t *out){
+  return cursor_read(c, out, 8);
+}
+
+// read lenght-prefixed 
+static bool cursor_read_str(RDBCursor *c, std::string *out){
+  uint32_t len = 0;
+  if (!cursor_read_u32(c, &len)){
+    return false;
+  }
+  if (c->pos + len > c->end){
+    fprintf(stderr, "rdb_load: string out of bounds\n");
+    return false;
+  }
+  out->assign((const char *)c->pos, len);
+  c->pos += len;
+  return true;
+}
+
 // Key for searching in the hashtable
 struct LookupKey {
   struct HNode node; // hashtable node
@@ -1032,7 +1076,7 @@ static int32_t next_timer_ms() {
   if (!g_data.heap.empty()){
     next_ms = std::min(next_ms, g_data.heap[0].val);
   }
-  // check the periodic wake up 
+  // check the periodic wake up
   if (g_data.writes_since_save > 0){
     uint64_t next_save = g_data.last_save_ms + k_save_interval_ms;
     next_ms = std::min(next_ms, next_save);
@@ -1212,6 +1256,8 @@ int main(){
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
 
+  g_data.last_save_ms = get_monotonic_msec();
+
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
 
@@ -1234,8 +1280,6 @@ int main(){
   if (rv) {die("listen()");}
 
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
-
-  rdb_save("dump.rdb");
 
   while(!g_stop){
     
