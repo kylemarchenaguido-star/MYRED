@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <math.h> // for the isnan
+#include <signal.h>
 // system
 #include <time.h>
 #include <fcntl.h>
@@ -26,6 +27,13 @@
 #include "thread_pool.h"
 
 constexpr size_t k_max_msg = 32 << 20;
+
+constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes
+constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
+
+// secondes * miliseconds (5s -> 5000ms)
+constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
+constexpr uint64_t k_io_timeout_ms = 5 * 1000;
 
 //Helper function for syscalls 
 
@@ -59,6 +67,14 @@ static void fd_set_nb(int fd){
   if(errno) {
     die("fcntl error");
   }
+}
+
+// global flag — set to true when Ctrl+C is pressed
+static bool g_stop = false;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    g_stop = true;
 }
 
 static bool hnode_same(HNode *node, HNode *key){
@@ -98,7 +114,6 @@ struct Conn {
   bool want_read = false; // The the read and the write, is waiting for the fd api readiness
   bool want_write = false;
   bool want_close = false;
-  bool want_async_response = false; // waiting for a thread pool result
   // buffered input, output
   Buffer incoming; // This two are for the buffers that we are gonna parse // data
   Buffer outgoing; // the response 
@@ -118,8 +133,9 @@ static struct {
   // timers for ttls
   std::vector<HeapItem> heap;
   ThreadPool thread_pool;
-  ResultQueue result_queue;
-  int pipe_fds[2]; // 0 = read, 1 = write 
+  // global flag
+  uint64_t last_save_ms = 0;
+  uint32_t writes_since_save = 0;
 } g_data;
 
 // callback when the socket is ready
@@ -169,6 +185,8 @@ static void conn_destroy(Conn *conn){
   delete conn;
 }
 
+//Helper functions // Buffer
+
 // append to the front of the buffer 
 static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
 
@@ -207,6 +225,27 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
   buf->data_end += len;
 }
 
+// overload for bytes for the rdb file
+inline static void buf_append(Buffer *buf, uint8_t Byte){
+  buf_append(buf, &Byte, 1);
+}
+
+// append 32 bytes
+// static void buf_append_u32(Buffer *buf, uint32_t val) {
+//     buf_append(buf, (const uint8_t *)&val, 4);
+// }
+
+// append 64 bytes
+static void buf_append_u64(Buffer *buf, uint64_t val) {
+    buf_append(buf, (const uint8_t *)&val, 8);
+}
+
+// Append strings
+static void buf_append_str(Buffer *buf, const char *str, uint32_t len){
+  buf_append(buf, (const uint8_t *)&len, 4);
+  buf_append(buf, (const uint8_t *)str, len);
+}
+
 // remove form the front of the buffer and resize 
 static void buf_consume(Buffer *buf, size_t n){
   buf->data_begin += n; // we are just moving the pointer forward
@@ -217,8 +256,6 @@ static void buf_consume(Buffer *buf, size_t n){
     buf->data_end = buf->buffer_begin;
   }
 }
-
-//Helper functions // Buffer
 
 //bytes of the data available 
 size_t buf_size(Buffer *buf){
@@ -233,10 +270,14 @@ return buf->data_begin;
 //free memory
 void buf_destroy(Buffer *buf){
   delete[] buf->buffer_begin;
+  buf->buffer_begin = NULL;
+  buf->buffer_end = NULL;
+  buf->data_begin = NULL;
+  buf->data_end= NULL;
+
 }
 
 //Helper functions for parsing
-
 // Reads data from string 
 static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
   if (cur + 4 > end){
@@ -389,11 +430,6 @@ static Entry *entry_new(uint32_t type) {
   return ent;
 }
 
-struct AsyncDelArgs{
-  Entry *ent;
-  int fd;
-};
-
 // Definition declared later....
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 // Delete the actual work
@@ -405,80 +441,9 @@ static void entry_del_sync(Entry *ent) {
   delete ent;
 }
 
-// Called by a worker thread to send result back to event loop
-static void send_result_to_event_loop(int fd, bool success){
-  // put result in queue
-  AsyncResult result;
-  result.fd = fd;
-  result.success = success;
-
-  pthread_mutex_lock(&g_data.result_queue.rmu);
-  g_data.result_queue.rqueue.push_back(result);
-  pthread_mutex_unlock(&g_data.result_queue.rmu);
-
-  // wake event loop with 1 junk byte
-  uint8_t byte = 1;
-  if (write(g_data.pipe_fds[1], &byte, 1) < 0){
-    fprintf(stderr, "pipe write failed: %s\n", strerror(errno));
-  }
-}
-
-// worker thread function for async deletion
-static void async_del_func(void *arg){
-  AsyncDelArgs *args = (AsyncDelArgs *)arg;
-
-  // do the slow work
-  entry_del_sync(args->ent);
-
-  // send result back to event loop
-  send_result_to_event_loop(args->fd, true);
-
-  delete args;
-}
-
 // a wrapper function for the thread pool
 static void entry_del_func(void *arg){
   entry_del_sync((Entry *)arg);
-}
-
-static void handle_pipe_result(){
-  // need to drain the junk bytes from pipe
-  // multiple workers could have write
-  uint8_t buf[256];
-  while (read(g_data.pipe_fds[0], buf, sizeof(buf)) > 0) {}
-  // returns when pipe is empty
-
-  // process all the pending results
-  while (true){
-    pthread_mutex_lock(&g_data.result_queue.rmu);
-
-    if (g_data.result_queue.rqueue.empty()){
-      pthread_mutex_unlock(&g_data.result_queue.rmu);
-      break;
-    }
-
-    AsyncResult result = g_data.result_queue.rqueue.front();
-    g_data.result_queue.rqueue.pop_front();
-    pthread_mutex_unlock(&g_data.result_queue.rmu);
-
-    // find the fd and send the reply to the client
-    Conn *conn = g_data.fd2conn[result.fd];
-    if (!conn){
-      continue;
-    }
-
-    // clear the waiting flag
-    conn->want_async_response = false;
-
-    if (result.success){
-      out_int(&conn->outgoing, 1);
-    } else {
-      out_err(&conn->outgoing, ERR_UNKNOWN, "async operation failed");
-    }
-      
-    conn->want_write = true;
-    conn->want_read = false;
-  }
 }
 
 // When and where to delete
@@ -494,6 +459,104 @@ static void entry_del(Entry *ent){
   } else {
     entry_del_sync(ent);
   }
+}
+
+// RDB File functions and struct
+
+// Callback struct
+struct RDBWriteCtx {
+  uint32_t count; // entry that we wrote
+  Buffer *buf;
+};
+
+static bool cb_rdb_write(HNode *node, void *arg){
+  RDBWriteCtx *ctx = (RDBWriteCtx *)arg;
+  Entry *ent = container_of(node, Entry, node);
+  // we skip everything only strings
+  if (ent->type != T_STR){
+    return true;
+  }
+  buf_append(ctx->buf, 0);
+
+  if (ent->heap_idx != (size_t)-1){
+    buf_append(ctx->buf, 1);
+    buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
+  } else {
+    buf_append(ctx->buf, 0);
+  }
+
+  //append the key
+  buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
+  
+  //append the value
+  buf_append_str(ctx->buf, ent->str.data(), (uint32_t)ent->str.size());
+
+  ctx->count++;
+  return true;
+}
+
+static void rdb_serialize(Buffer *buf){
+  // magic
+  const char *magic = "MYRED";
+  buf_append(buf, (const uint8_t *)magic, 5);
+
+  // version
+  uint32_t version = 1;
+  buf_append(buf, (const uint8_t *)&version, 4);
+
+  // index of the buffer (even if the buffer reallocates)
+  size_t count_index = buf_size(buf);
+  uint32_t dummy = 0;
+  // we put dummy bytes
+  buf_append(buf, (const uint8_t *)&dummy, 4);
+
+  // this is what causes the buffer to reallocate
+  RDBWriteCtx ctx;
+  ctx.buf = buf;
+  ctx.count = 0;
+  hm_foreach(&g_data.db, &cb_rdb_write, &ctx);
+
+  //we repatch the dummy bytes
+  memcpy(buf->data_begin + count_index, &ctx.count, 4);
+
+  //EOF
+  buf_append(buf, 255);
+}
+
+// we build the rdb function
+static bool rdb_save(const char* filename){
+  // build the buffer
+  Buffer buf = buf_create(64 * 1024);
+  rdb_serialize(&buf);
+
+  // write to temp file first
+  std::string tmp = std::string(filename) + ".tmp";
+  FILE *fp = fopen(tmp.c_str(), "wb");
+  if (!fp){
+    fprintf(stderr, "rdb_save: cannot open %s: %s\n", tmp.c_str(), strerror(errno));
+    buf_destroy(&buf);
+    return false;
+  }
+  size_t data_size = buf_size(&buf);
+  size_t written = fwrite(buf.data_begin, 1, buf_size(&buf), fp);
+  fclose(fp);
+  buf_destroy(&buf);
+
+  if (written != data_size) {
+    fprintf(stderr, "rdb_save: short write\n");
+    remove(tmp.c_str());
+    return false;
+  }
+
+  // atomic rename
+  if (rename(tmp.c_str(), filename) != 0){
+    fprintf(stderr, "rdb_save: rename failed: %s\n", strerror(errno));
+    remove(tmp.c_str());
+    return false;
+  }
+
+  fprintf(stderr, "rdb_save: done (%zu bytes)\n", data_size);
+  return true;
 }
 
 // Key for searching in the hashtable
@@ -869,99 +932,45 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   size_t set_size = (ent->type ==  T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
 
   if (set_size > 1000){
-    // large offload to thread pool, reply later via pipe
-    // tell the event loop this connection is waiting
-    conn->want_async_response = true;
-    conn->want_read = false;
-    conn->want_write = false;
-
-    AsyncDelArgs *args = new AsyncDelArgs{ent, conn->fd};
-    thread_pool_queue(&g_data.thread_pool, async_del_func, args);
-
-    // we wait the response via the pipe
-    return;
-
+    thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
   } else {
-    // small enough
     entry_del_sync(ent);
-    return out_int(out, 1);
   }
+  return out_int(out, 1);
 
 }
 
-// All the currents commands
-//
-// get key
-// cmd[0] = "get"       ← command name
-// cmd[1] = "mykey"     ← the key to retrieve
-//
-// set key value
-// cmd[0] = "set"       ← command name
-// cmd[1] = "mykey"     ← the key
-// cmd[2] = "hello"     ← the value to store
-//
-// del key
-// cmd[0] = "del"       ← command name
-// cmd[1] = "mykey"     ← the key to delete
-//
-// keys
-// cmd[0] = "keys"      ← command name (no other args)
-//
-// zadd zset score name
-// cmd[0] = "zadd"      ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "3.14"      ← the score (double as string)
-// cmd[3] = "alice"     ← the member name
-//
-// zrem zset name
-// cmd[0] = "zrem"      ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "alice"     ← the member to remove
-//
-// zscore zset name
-// cmd[0] = "zscore"    ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "alice"     ← the member to get the score of
-//
-// zquery zset score name offset limit
-// cmd[0] = "zquery"    ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "1.0"       ← starting score
-// cmd[3] = "alice"     ← starting name
-// cmd[4] = "0"         ← how many results to skip
-// cmd[5] = "10"        ← max results to return
-//
-// zrevquery zset score name offset limit
-// cmd[0] = "zrevquery" ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "9.0"       ← starting score (search downward)
-// cmd[3] = "alice"     ← starting name
-// cmd[4] = "0"         ← how many results to skip
-// cmd[5] = "10"        ← max results to return
-//
-// zrank zset name
-// cmd[0] = "zrank"     ← command name
-// cmd[1] = "myzset"    ← the zset key
-// cmd[2] = "alice"     ← the member to get the rank of
+static void do_save(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  // we run in the thread pool
+  thread_pool_queue(&g_data.thread_pool, [] (void *) { rdb_save("dump.rdb"); }, nullptr);
+  out_str(out, "OK");
+}
 
 static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (cmd.size() == 2 && cmd[0] == "get"){
     return do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set"){
+    g_data.writes_since_save++;
     return do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del"){
+    g_data.writes_since_save++;
     return do_del (cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "asyncdel" ) {
+    g_data.writes_since_save++;
     do_asyncdel(cmd, out, conn);
   }else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+    g_data.writes_since_save++;
     return do_expire(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "pttl"){
     return do_ttl(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys"){
     return do_keys(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "zadd"){
+    g_data.writes_since_save++;
     return do_zadd(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "zrem"){
+    g_data.writes_since_save++;
     return do_zrem(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "zscore"){
     return do_zscore(cmd, out);
@@ -971,6 +980,8 @@ static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
     return do_zquery_reversed(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "zrank"){
     return do_zrank(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "save"){
+    return do_save(cmd, out);
   } else {
     return out_err(out, ERR_UNKNOWN, "unknown command");
   }
@@ -1003,11 +1014,6 @@ static void response_end(Buffer *out, size_t header){
 }
 
 // Timers logic 
-// secondes * miliseconds (5s -> 5000ms)
-constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
-
-constexpr uint64_t k_io_timeout_ms = 5 * 1000;
-
 static int32_t next_timer_ms() {
   uint64_t now_ms = get_monotonic_msec();
   uint64_t next_ms = (uint64_t)-1; // maximun value
@@ -1026,17 +1032,19 @@ static int32_t next_timer_ms() {
   if (!g_data.heap.empty()){
     next_ms = std::min(next_ms, g_data.heap[0].val);
   }
-
+  // check the periodic wake up 
+  if (g_data.writes_since_save > 0){
+    uint64_t next_save = g_data.last_save_ms + k_save_interval_ms;
+    next_ms = std::min(next_ms, next_save);
+  }
   // no timers 
-  if (next_ms == (uint64_t)-1){
-    return -1;
-  }
+  if (next_ms == (uint64_t)-1){ return -1; }
   // already expired
-  if (next_ms <= now_ms){
-    return 0;
-  }
-  return (int32_t)(next_ms - now_ms);
+  if (next_ms <= now_ms){ return 0; }
+  // rare case idk ??
+  if (next_ms == UINT64_MAX) {return -1;}
 
+  return (int32_t)(next_ms - now_ms);
 }
 
 static void process_timers(){
@@ -1080,6 +1088,17 @@ static void process_timers(){
       break;
     }
   }
+  // periodic RDB save
+  bool time_elapsed = (now_ms - g_data.last_save_ms) >= k_save_interval_ms;
+  bool dirty_enough = g_data.writes_since_save >= k_save_after_writes;
+
+  if (time_elapsed && dirty_enough){
+    g_data.last_save_ms = now_ms;
+    g_data.writes_since_save = 0;
+    // run it in thread pool
+    thread_pool_queue(&g_data.thread_pool, [] (void *) { rdb_save("dump.rdb"); }, nullptr);
+    fprintf(stderr, "periodic save triggered\n");
+  }
 }
 
 static void conn_set_timer(Conn *conn, ConnTimer type){
@@ -1096,6 +1115,8 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
     dlist_insert_before(&g_data.io_list, &conn->idle_node);
   }
 }
+
+// Process cmds functions
 
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
@@ -1126,9 +1147,7 @@ static bool try_one_request(Conn *conn){
   response_begin(&conn->outgoing, &header_pos);
   do_request(cmd, &conn->outgoing, conn);
 
-  if (conn->want_async_response){
-    conn->outgoing.data_end -=4; // undo the 4 bytes placeholder
-  } else {response_end(&conn->outgoing, header_pos);}
+  response_end(&conn->outgoing, header_pos);
 
   // application logic done
   buf_consume(&conn->incoming, 4 + len);
@@ -1189,12 +1208,9 @@ int main(){
 
   // Initialiaze the thread pool and result queue 
   thread_pool_init(&g_data.thread_pool, 4);
-  pthread_mutex_init(&g_data.result_queue.rmu, NULL);
 
-  // we create the pipe and set it nonblock
-  int rv = pipe(g_data.pipe_fds);
-  assert(rv == 0);
-  fd_set_nb(g_data.pipe_fds[0]);
+  signal(SIGINT,  signal_handler);
+  signal(SIGTERM, signal_handler);
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
@@ -1208,7 +1224,7 @@ int main(){
   addr.sin_port = ntohs(1234);
   addr.sin_addr.s_addr = ntohl(0);
 
-  rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+  int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
   if (rv) {die("bind()");}
 
   fd_set_nb(fd);
@@ -1219,7 +1235,9 @@ int main(){
 
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
 
-  while(true){
+  rdb_save("dump.rdb");
+
+  while(!g_stop){
     
     poll_args.clear(); //This just clean the arguments for poll.
     struct pollfd pfd = {fd, POLLIN, 0};
@@ -1238,10 +1256,6 @@ int main(){
       }
       poll_args.push_back(pfd);
     }
-    // add pipe read end so the event loop wakes up when a thread posts a result
-    struct pollfd pipe_pfd = {g_data.pipe_fds[0], POLLIN, 0};
-    poll_args.push_back(pipe_pfd);
-
     int32_t timeout_ms = next_timer_ms();
     int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
 
@@ -1260,19 +1274,10 @@ int main(){
         continue;
       }
 
-      // check pipe if wakeup from a worker thread
-      if (poll_args[i].fd == g_data.pipe_fds[0]){
-        handle_pipe_result();
-        continue;
-      }
 
       // retrieve the object of every fd (in this case only i)
       Conn *conn = g_data.fd2conn[poll_args[i].fd];
-      if (!conn){continue;} // null check
-      // skip connections waiting for async results
-      if (conn->want_async_response){
-        continue;
-      }
+      if (!conn){continue;}
 
       // update the idle timer and putting the conn at the end of the list
       conn->last_active_ms = get_monotonic_msec();
@@ -1297,5 +1302,7 @@ int main(){
     // handle timers
     process_timers();
   }
+  fprintf(stderr, "shutting down, saving...\n");
+  rdb_save("dump.rdb");
   return 0;
 }

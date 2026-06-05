@@ -17,17 +17,5 @@ struct ThreadPool{
     pthread_cond_t not_empty; 
 };
 
-// Results from worker to event loop
-struct AsyncResult {
-    int fd; // which client to reply
-    bool success; // Lolololo
-};
-
-// Thread safe queue for the results
-struct ResultQueue {
-    std::deque<AsyncResult> rqueue;
-    pthread_mutex_t rmu;
-};
-
 void thread_pool_queue(ThreadPool *tp, void(*f)(void *), void *arg);
 void thread_pool_init(ThreadPool *tp, size_t num_threads);
