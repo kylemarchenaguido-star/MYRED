@@ -462,36 +462,105 @@ static void entry_del(Entry *ent){
   }
 }
 
-// RDB File functions and struct
+// Persistence functions 
 
+// CRC32 
+static uint32_t g_crc32_table[256];
+static bool g_crc32_ready = false;
+
+static void crc32_init(){
+  for (uint32_t i = 0; i < 256; ++i){
+    uint32_t crc = i;
+    for (int j = 0; j < 8; ++j){
+      crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
+    }
+    g_crc32_table[i] = crc;
+  }
+  g_crc32_ready = true;
+}
+
+static uint32_t crc32_compute(const uint8_t *data, size_t len){
+  if (!g_crc32_ready){ crc32_init(); }
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; ++i){
+    crc = (crc >> 8) ^ g_crc32_table[(crc ^ data[i]) & 0xFF];
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// RDB File functions and struct
 // Callback struct
 struct RDBWriteCtx {
-  uint32_t count; // entry that we wrote
   Buffer *buf;
+  uint32_t count; // entry that we wrote
 };
+
+// for zset iterator
+struct ZSetSaveCtx {
+  Buffer *buf;
+  uint32_t count;
+};
+
+static bool cb_zset_member(HNode *node, void *arg){
+  ZSetSaveCtx *ctx = (ZSetSaveCtx *)arg;
+  ZNode *znode = container_of(node, ZNode, hmap);
+
+  // score -> 8 bytes
+  buf_append(ctx->buf, (const uint8_t *)&znode->score, 8);
+
+  // name - lenght prefixed
+  buf_append_str(ctx->buf, znode->name, (uint32_t)znode->len);
+
+  ctx->count++;
+  return true;
+}
 
 static bool cb_rdb_write(HNode *node, void *arg){
   RDBWriteCtx *ctx = (RDBWriteCtx *)arg;
   Entry *ent = container_of(node, Entry, node);
   // we skip everything only strings
-  if (ent->type != T_STR){
-    return true;
-  }
-  buf_append(ctx->buf, 0);
-
-  if (ent->heap_idx != (size_t)-1){
-    buf_append(ctx->buf, 1);
-    buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
-  } else {
+  if (ent->type == T_STR){
+    // type tag byte
     buf_append(ctx->buf, 0);
-  }
+    
+    if (ent->heap_idx != (size_t)-1){
+      buf_append(ctx->buf, 1); // has ttl
+      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val); // expire at
+    } else {
+      buf_append(ctx->buf, 0); // not ttl
+    }
+    //append the key and value
+    buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
+    buf_append_str(ctx->buf, ent->str.data(), (uint32_t)ent->str.size());
+  } else if (ent->type == T_ZSET){
+    // type tag byte
+    buf_append(ctx->buf, 1);
 
-  //append the key
-  buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
+    if (ent->heap_idx != (size_t)-1){
+      buf_append(ctx->buf, 1);
+      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
+    } else {
+      buf_append(ctx->buf, 0);
+    }
   
-  //append the value
-  buf_append_str(ctx->buf, ent->str.data(), (uint32_t)ent->str.size());
+    // key
+    buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
 
+    // member count placeholder
+    size_t member_count_index = (size_t)(buf_size(ctx->buf));
+    buf_append(ctx->buf, (const uint8_t *)"\0\0\0\0", 4);
+
+    // iterate all the members
+    ZSetSaveCtx zctx;
+    zctx.buf = ctx->buf;
+    zctx.count = 0;
+    // iterates over the zset and calls cb over each one
+    hm_foreach(&ent->zset.hmap, cb_zset_member, &zctx);
+
+    // patch real member count
+    memcpy(ctx->buf->data_begin + member_count_index, &zctx.count, 4);
+
+  }
   ctx->count++;
   return true;
 }
@@ -502,7 +571,7 @@ static void rdb_serialize(Buffer *buf){
   buf_append(buf, (const uint8_t *)magic, 5);
 
   // version
-  uint32_t version = 1;
+  uint32_t version = 2;
   buf_append(buf, (const uint8_t *)&version, 4);
 
   // index of the buffer (even if the buffer reallocates)
@@ -511,7 +580,7 @@ static void rdb_serialize(Buffer *buf){
   // we put dummy bytes
   buf_append(buf, (const uint8_t *)&dummy, 4);
 
-  // this is what causes the buffer to reallocate
+  // this is what can cause the buffer to reallocate
   RDBWriteCtx ctx;
   ctx.buf = buf;
   ctx.count = 0;
@@ -522,6 +591,13 @@ static void rdb_serialize(Buffer *buf){
 
   //EOF
   buf_append(buf, 255);
+
+  // CRC32 
+  size_t data_size = buf_size(buf);
+  uint32_t crc = crc32_compute(buf->data_begin, buf_size(buf));
+  buf_append(buf, (const uint8_t *)&crc, 4);
+
+  fprintf(stderr, "rdb_serialize: %zu bytes, crc=0x%08x\n", data_size + 4, crc);
 }
 
 // we build the rdb function
@@ -577,7 +653,6 @@ static bool cursor_read(RDBCursor *c, void *dst, size_t len){
   c->pos += len;
   return true;
 }
-
 static bool cursor_read_u8(RDBCursor *c, uint8_t *out){
   return cursor_read(c, out, 1);
 }
@@ -588,12 +663,13 @@ static bool cursor_read_u64(RDBCursor *c, uint64_t *out){
   return cursor_read(c, out, 8);
 }
 
-// read lenght-prefixed 
+// read lenght-prefixed string into std::string
 static bool cursor_read_str(RDBCursor *c, std::string *out){
   uint32_t len = 0;
   if (!cursor_read_u32(c, &len)){
     return false;
   }
+
   if (c->pos + len > c->end){
     fprintf(stderr, "rdb_load: string out of bounds\n");
     return false;
@@ -602,6 +678,240 @@ static bool cursor_read_str(RDBCursor *c, std::string *out){
   c->pos += len;
   return true;
 }
+
+static bool rdb_load_string_entry(RDBCursor *c){
+  // has a ttl flag
+  uint8_t has_ttl = 0;
+  if (!cursor_read_u8(c, &has_ttl)){ return false; }
+
+  // read expire_at if TTL exists
+  uint64_t expire_at = 0;
+  if (has_ttl){
+    if (!cursor_read_u64(c, &expire_at)){ return false; }
+    // check if expired 
+    uint64_t now_ms = get_monotonic_msec();
+    if (expire_at <= now_ms){
+      // expired
+      std::string key, val;
+      cursor_read_str(c, &key);
+      cursor_read_str(c, &val);
+      fprintf(stderr, "rdb_load: skipping expired key\n");
+      return true;
+    }
+  }
+
+  // read key
+  std::string key;
+  if (!cursor_read_str(c, &key)){
+    return false;
+  }
+  // read key
+  std::string val;
+  if (!cursor_read_str(c, &val)){
+    return false;
+  }
+
+  // reconstruct the entry in the database
+  Entry *ent = entry_new(T_STR);
+  ent->key = key;
+  ent->str = val;
+  ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
+  hm_insert(&g_data.db, &ent->node);
+  if (has_ttl){
+    uint64_t now_ms = get_monotonic_msec();
+    int64_t remaining_ms = (int64_t)(expire_at - now_ms);
+    entry_set_ttl(ent, remaining_ms);
+  }
+  return true;
+}
+
+static bool rdb_load_zset_entry(RDBCursor *c){
+  uint8_t has_ttl = 0;
+  if (!cursor_read_u8(c, &has_ttl)){ return false; }
+
+  uint64_t expire_at = 0;
+  if (has_ttl){
+    if (!cursor_read_u64(c, &expire_at)){ return false; }
+
+    // skip but still read all the bytes
+    uint64_t now_ms = get_monotonic_msec();
+    if (expire_at <= now_ms){
+      std::string key;
+      uint32_t n_members = 0;
+      cursor_read_str(c, &key); // skip key
+      cursor_read_u32(c, &n_members); // skip member count
+      for (uint32_t i = 0; i< n_members; ++i){
+        double score = 0;
+        std::string name;
+        cursor_read(c, &score, 8); // skip score
+        cursor_read_str(c, &name); // skip name
+      }
+      fprintf(stderr, "rdb_load: skipping expired zset\n");
+      return true;
+    }
+  }
+
+  // key 
+  std::string key;
+  if (!cursor_read_str(c, &key)){ return false; }
+
+  uint32_t n_members = 0;
+  if (!cursor_read_u32(c, &n_members)){ return false; }
+
+  // create the entry
+  Entry *ent = entry_new(T_ZSET);
+  ent->key = key;
+  ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
+
+  // read and insert each member
+  for (uint32_t i = 0; i < n_members; ++i){
+    double score = 0;
+    if (!cursor_read(c, &score, 8)){
+      entry_del(ent);
+      return false;
+    }
+
+    std::string name;
+    if (!cursor_read_str(c, &name)){
+      entry_del(ent);
+      return false;
+    }
+
+    // insert into the zset
+    zset_insert(&ent->zset, name.data(), name.size(), score); 
+  }
+
+  // insert entry into main hashtable
+  hm_insert(&g_data.db, &ent->node);
+
+  // restore the ttl
+  if (has_ttl){
+    uint64_t now_ms = get_monotonic_msec();
+    int64_t remaining_ms = (int64_t)(expire_at - now_ms);
+    entry_set_ttl(ent, remaining_ms);
+  }
+  
+  return true;
+}
+
+static bool rdb_load(const char *filename){
+  // open and read entire file into memory
+  FILE *fp = fopen(filename, "rb");
+  if (!fp){
+    fprintf(stderr, "rdb_load: no dump file found, starting fresh\n");
+    return true;
+  }
+
+  // get the file size
+  fseek(fp, 0, SEEK_END);
+  size_t file_size = (size_t)ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+
+  // minimun 18 bytes
+  if (file_size < 18){
+    fprintf(stderr, "rdb_load: file too samll, corrupted?\n");
+    fclose(fp);
+    return false;
+  }
+  // we load everything into memory
+  uint8_t *data = new uint8_t[file_size];
+  if (fread(data, 1, file_size, fp) != file_size){
+    fprintf(stderr, "rdb_load: short read\n");
+    fclose(fp);
+    delete [] data;
+    return false;
+  }
+  fclose(fp);
+
+  // verify headers
+  // magic
+  if (memcmp(data, "MYRED", 5) != 0){
+    fprintf(stderr, "rdb_load: bad magic number\n");
+    delete [] data;
+    return false;
+  }
+  // version
+  uint32_t version = 0;
+  memcpy(&version, data + 5, 4);
+  if (version != 2){
+    // old format — no CRC, load normally
+    fprintf(stderr, "rdb_load: unsopported version %u\n", version);
+    delete [] data;
+    return false;
+  }
+
+  // verify CRC
+  size_t content_size = file_size - 4;
+  uint32_t stored_crc = 0;
+  memcpy(&stored_crc, data + content_size, 4);
+
+  uint32_t computed_crc = crc32_compute(data, content_size);
+  if (stored_crc != computed_crc){
+    fprintf(stderr,"rdb_load: CRC mismatch, stored=0x%08x computed=0x%08x File is corrupted!\n", stored_crc, computed_crc);
+    delete [] data;
+    return false;
+  }
+
+  // parse entries 
+  // cursor starts after magic(5) + version(4) + count(4)
+  // cursor ends before eof(1) + crc(4)
+  uint32_t n_entries = 0;
+  memcpy(&n_entries, data + 9, 4);
+
+  // set up the cursor
+  RDBCursor c;
+  c.pos = data + 13;
+  c.end = data + content_size; // one past eof byte
+
+  // read entries
+  uint32_t loaded = 0;
+  for (uint32_t i = 0; i < n_entries ; ++i){
+    // read the type byte
+    uint8_t type = 0;
+    if (!cursor_read_u8(&c, &type)){
+      delete [] data;
+      return false;
+    }
+
+    bool ok = false;
+    if (type == 0x00){
+      // string entry
+      ok = rdb_load_string_entry(&c);
+    } else if (type == 0x01){
+      // zset entry
+      ok = rdb_load_zset_entry(&c);
+    } else {
+      // unknown type
+      fprintf(stderr, "rdb_load: unknown entry, type %u\n", type);
+      delete [] data;
+      return false;
+    }
+
+    if (!ok){
+      delete [] data;
+      return false;
+    }
+    loaded++;
+  }
+  // verify eof
+  uint8_t eof_marker = 0;
+  if (!cursor_read_u8(&c, &eof_marker)){
+    delete [] data;
+    return false;
+  }
+  
+  // eof
+  uint8_t eof = 0;
+  if (!cursor_read_u8(&c, &eof) || eof != 0xFF){
+    fprintf(stderr, "rdb_load: bad EOF marker 0x%02x, file may be truncated\n", eof_marker);
+    delete [] data;
+    return false;
+  }
+  fprintf(stderr, "rdb_load; loaded %u entries from %s\n", loaded, filename);
+  delete [] data;
+  return true;
+}
+
 
 // Key for searching in the hashtable
 struct LookupKey {
@@ -1246,6 +1556,12 @@ static void handle_read(Conn *conn){
 
 int main(){
 
+  // control for Ctrl-c
+  signal(SIGINT,  signal_handler);
+  signal(SIGTERM, signal_handler);
+
+  g_data.last_save_ms = get_monotonic_msec();
+
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
   dlist_init(&g_data.io_list);
@@ -1253,10 +1569,9 @@ int main(){
   // Initialiaze the thread pool and result queue 
   thread_pool_init(&g_data.thread_pool, 4);
 
-  signal(SIGINT,  signal_handler);
-  signal(SIGTERM, signal_handler);
-
-  g_data.last_save_ms = get_monotonic_msec();
+  if (!rdb_load("dump.rdb")){
+    fprintf(stderr, "rdb_load failed, starting with empty database\n");
+  }
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
