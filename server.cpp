@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+//libraries
+#include <zlib.h>
 // project 
 #include "hashtable.h"
 #include "common.h"
@@ -27,14 +29,17 @@
 #include "heap.h"
 #include "thread_pool.h"
 
-constexpr size_t k_max_msg = 32 << 20;
+static constexpr size_t k_max_msg = 32 << 20;
 
-constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes 5 * 60 * 1000
-constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
+static constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes 5 * 60 * 1000
+static constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
 
 // secondes * miliseconds (5s -> 5000ms)
-constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
-constexpr uint64_t k_io_timeout_ms = 5 * 1000;
+static constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
+static constexpr uint64_t k_io_timeout_ms = 5 * 1000;
+
+// Compress only if < 1KB
+static constexpr size_t k_compress_threshold = 1024; 
 
 //Helper function for syscalls 
 
@@ -69,7 +74,6 @@ static void fd_set_nb(int fd){
     die("fcntl error");
   }
 }
-
 // global flag — set to true when Ctrl+C is pressed
 static bool g_stop = false;
 
@@ -134,9 +138,10 @@ static struct {
   // timers for ttls
   std::vector<HeapItem> heap;
   ThreadPool thread_pool;
-  // global flag
-  uint64_t last_save_ms = 0;
-  uint32_t writes_since_save = 0;
+  bool g_saving = false; // flag to when is saving
+  uint64_t g_last_save_ms = 0; // timestamp last succesful save
+  bool g_last_save_ok = true; // did the last save succeded
+  uint32_t g_writes_since_save = 0; // how many keys we written
 } g_data;
 
 // callback when the socket is ready
@@ -327,6 +332,7 @@ enum {
   ERR_TOO_BIG = 2, // response too big
   ERR_BAD_TYP = 3, // unexpected value
   ERR_BAD_ARG = 4, // bad arguments
+  ERR_SAVING = 5 // err saving
 };
 
 // data types for tag types
@@ -488,6 +494,34 @@ static uint32_t crc32_compute(const uint8_t *data, size_t len){
   return crc ^ 0xFFFFFFFF;
 }
 
+// Compress and decompress functions
+static uint8_t *rdb_compress(const uint8_t *src, size_t src_len, size_t *out_len){
+  uLongf dest_len = compressBound((uLong)src_len);
+  uint8_t *dest = new uint8_t[dest_len];
+
+  int rv = compress2(dest, &dest_len, src, (uLong)src_len, Z_BEST_COMPRESSION);
+  if (rv != Z_OK){
+    fprintf(stderr, "rdb_compress: failed (%d)\n", rv);
+    delete [] dest;
+    return NULL;
+  }
+  *out_len = (size_t)dest_len;
+  return dest;
+}
+
+static uint8_t *rdb_decompress(const uint8_t *src, size_t src_len, size_t expected_len){
+  uint8_t *dest = new uint8_t[expected_len];
+  uLongf dest_len = (uLongf)expected_len;
+
+  int rv = uncompress(dest, &dest_len, src, (uLong)src_len);
+  if (rv != Z_OK){
+    fprintf(stderr, "rdb_decompress: failed (%d)\n", rv);
+    delete [] dest;
+    return NULL;
+  }
+  return dest;
+}
+
 // RDB File functions and struct
 // Callback struct
 struct RDBWriteCtx {
@@ -565,14 +599,24 @@ static bool cb_rdb_write(HNode *node, void *arg){
   return true;
 }
 
-static void rdb_serialize(Buffer *buf){
+struct RDBStats{
+  uint32_t entries;
+  size_t bytes;
+};
+
+static void rdb_serialize(Buffer *buf, RDBStats *stats){
   // magic
   const char *magic = "MYRED";
   buf_append(buf, (const uint8_t *)magic, 5);
 
   // version
-  uint32_t version = 2;
+  uint32_t version = 3;
   buf_append(buf, (const uint8_t *)&version, 4);
+
+  // flags placeholder
+  size_t flags_index = buf_size(buf);
+  // 0x01 compressed , 0x00 uncompressed
+  buf_append(buf, 1);
 
   // index of the buffer (even if the buffer reallocates)
   size_t count_index = buf_size(buf);
@@ -580,34 +624,73 @@ static void rdb_serialize(Buffer *buf){
   // we put dummy bytes
   buf_append(buf, (const uint8_t *)&dummy, 4);
 
+  // serialize entries into separate payload
+  Buffer payload = buf_create(4096);
+
   // this is what can cause the buffer to reallocate
   RDBWriteCtx ctx;
-  ctx.buf = buf;
+  ctx.buf = &payload;
   ctx.count = 0;
   hm_foreach(&g_data.db, &cb_rdb_write, &ctx);
+
+  // eof marker goes in payload
+  buf_append(&payload, 255);
 
   //we repatch the dummy bytes
   memcpy(buf->data_begin + count_index, &ctx.count, 4);
 
-  //EOF
-  buf_append(buf, 255);
+  size_t payload_size = buf_size(&payload);
+
+  // compress or store raw
+  if (payload_size >= k_compress_threshold){
+    size_t compressed_size = 0;
+    uint8_t *compressed = rdb_compress(payload.data_begin, payload_size, &compressed_size);
+    if (compressed && compressed_size < payload_size){
+      buf->data_begin[flags_index] = 0x01;
+
+      // uncompressed size so decompress knows how much to allocate
+      uint32_t uncompressed_u32 = (uint32_t)payload_size;
+      buf_append(buf, (const uint8_t *)&uncompressed_u32, 4);
+
+      // compressed data
+      buf_append(buf, compressed, compressed_size);
+
+      fprintf(stderr, "rdb_serialize: compressed %zu -> %zu bytes (%.1f%%)\n",
+      payload_size, compressed_size, 100.0 * compressed_size / payload_size);
+    } else {
+      // compression made it bigger
+      buf->data_begin[flags_index] = 0x00;
+      buf_append(buf, payload.data_begin, payload_size);
+    }
+
+    if (compressed) { delete [] compressed; }
+  } else {
+    // too small to compress
+    buf->data_begin[flags_index] = 0x00;
+    buf_append(buf, payload.data_begin, payload_size);
+  }
+  buf_destroy(&payload);
 
   // CRC32 
   size_t data_size = buf_size(buf);
   uint32_t crc = crc32_compute(buf->data_begin, buf_size(buf));
   buf_append(buf, (const uint8_t *)&crc, 4);
 
-  fprintf(stderr, "rdb_serialize: %zu bytes, crc=0x%08x\n", data_size + 4, crc);
+  stats->entries = ctx.count;
+  stats->bytes = data_size + 4;
+  fprintf(stderr, "rdb_serialize: %zu bytes, %u entries, crc=0x%08x\n", stats->bytes, stats->entries, crc);
 }
 
 // we build the rdb function
 static bool rdb_save(const char* filename){
   // build the buffer
   Buffer buf = buf_create(64 * 1024);
-  rdb_serialize(&buf);
+  RDBStats stats = {};
+  rdb_serialize(&buf, &stats);
 
   // write to temp file first
   std::string tmp = std::string(filename) + ".tmp";
+  std::string backup = std::string(filename) + ".bak";
   FILE *fp = fopen(tmp.c_str(), "wb");
   if (!fp){
     fprintf(stderr, "rdb_save: cannot open %s: %s\n", tmp.c_str(), strerror(errno));
@@ -616,15 +699,26 @@ static bool rdb_save(const char* filename){
   }
   size_t data_size = buf_size(&buf);
   size_t written = fwrite(buf.data_begin, 1, buf_size(&buf), fp);
-  fclose(fp);
-  buf_destroy(&buf);
+  buf_destroy(&buf); 
 
   if (written != data_size) {
     fprintf(stderr, "rdb_save: short write\n");
+    fclose(fp);
     remove(tmp.c_str());
     return false;
   }
 
+  // force the data into disk
+  if (fsync((fileno(fp))) != 0){
+    fprintf(stderr, "rdb_save; fsync failed: %s\n", strerror(errno));
+    fclose(fp);
+    remove(tmp.c_str());
+    return false;
+  }
+  fclose(fp);
+
+  // we just rotate names
+  rename(filename, backup.c_str());
   // atomic rename
   if (rename(tmp.c_str(), filename) != 0){
     fprintf(stderr, "rdb_save: rename failed: %s\n", strerror(errno));
@@ -632,7 +726,7 @@ static bool rdb_save(const char* filename){
     return false;
   }
 
-  fprintf(stderr, "rdb_save: done (%zu bytes)\n", data_size);
+  fprintf(stderr, "rdb_save: done (%zu bytes, %u entries)\n", stats.bytes, stats.entries);
   return true;
 }
 
@@ -679,6 +773,7 @@ static bool cursor_read_str(RDBCursor *c, std::string *out){
   return true;
 }
 
+// Entries 
 static bool rdb_load_string_entry(RDBCursor *c){
   // has a ttl flag
   uint8_t has_ttl = 0;
@@ -794,7 +889,41 @@ static bool rdb_load_zset_entry(RDBCursor *c){
   return true;
 }
 
-static bool rdb_load(const char *filename){
+static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint32_t n_entries){
+  RDBCursor c;
+  c.pos = payload;
+  c.end = payload + payload_size; 
+
+  uint32_t loaded = 0;
+  for (uint32_t i = 0; i < n_entries; ++i){
+    uint8_t type = 0;
+    if (!cursor_read_u8(&c, &type)) { return false; }
+
+    bool ok = false;
+    if (type == 0x00){
+      ok = rdb_load_string_entry(&c);
+    } else if (type == 0x01){
+      ok = rdb_load_zset_entry(&c);
+    } else {
+      fprintf(stderr, "rdb_parse: unknown type 0x%02x\n", type);
+      return false;
+    }
+    if (!ok) { return false; }
+    loaded++;
+  }
+  // verify eof marker
+  uint8_t eof = 0;
+  if (!cursor_read_u8(&c, &eof) || eof != 0xFF){
+    fprintf(stderr, "rdb_parse: bad EOF marker\n");
+    return false;
+  }
+
+  fprintf(stderr, "rdb_load: loaded %u entries\n", loaded);
+  return true;
+
+}
+
+static bool rdb_load_file(const char *filename){
   // open and read entire file into memory
   FILE *fp = fopen(filename, "rb");
   if (!fp){
@@ -808,8 +937,8 @@ static bool rdb_load(const char *filename){
   fseek(fp, 0, SEEK_SET);
 
   // minimun 18 bytes
-  if (file_size < 18){
-    fprintf(stderr, "rdb_load: file too samll, corrupted?\n");
+  if (file_size < 19){
+    fprintf(stderr, "rdb_load: file too small, corrupted?\n");
     fclose(fp);
     return false;
   }
@@ -833,7 +962,7 @@ static bool rdb_load(const char *filename){
   // version
   uint32_t version = 0;
   memcpy(&version, data + 5, 4);
-  if (version != 2){
+  if (version != 3){
     // old format — no CRC, load normally
     fprintf(stderr, "rdb_load: unsopported version %u\n", version);
     delete [] data;
@@ -851,67 +980,72 @@ static bool rdb_load(const char *filename){
     delete [] data;
     return false;
   }
+  fprintf(stderr, "rdb_load: CRC OK\n");
 
-  // parse entries 
-  // cursor starts after magic(5) + version(4) + count(4)
+  // read header files
+  // cursor starts after magic(5)+version(4)+flags(1)+count(4) = 14
   // cursor ends before eof(1) + crc(4)
+  uint8_t flags = data[9];
+  bool compressed = (flags & 0x01) != 0;
   uint32_t n_entries = 0;
-  memcpy(&n_entries, data + 9, 4);
+  memcpy(&n_entries, data + 10, 4);
 
-  // set up the cursor
-  RDBCursor c;
-  c.pos = data + 13;
-  c.end = data + content_size; // one past eof byte
+  const uint8_t *payload = data + 14;
+  size_t payload_size = content_size - 14;
 
-  // read entries
-  uint32_t loaded = 0;
-  for (uint32_t i = 0; i < n_entries ; ++i){
-    // read the type byte
-    uint8_t type = 0;
-    if (!cursor_read_u8(&c, &type)){
+  // decompress if needed
+  bool ok = false;
+  uint8_t *decompressed = NULL;
+
+  if (compressed){
+    // read uncompressed size
+    uint32_t uncompressed_size = 0;
+    memcpy(&uncompressed_size, payload, 4);
+
+    // compressed data starts after the 4 byte size field
+    const uint8_t *compressed_data = payload + 4;
+    size_t compressed_size = payload_size - 4;
+
+    decompressed = rdb_decompress(compressed_data, compressed_size, uncompressed_size);
+
+    if (!decompressed){
       delete [] data;
       return false;
     }
+    fprintf(stderr, "rdb_load: decompressed %zu -> %u bytes\n", compressed_size, uncompressed_size);
+    ok = rdb_parse_entries(decompressed, (size_t)uncompressed_size, n_entries);
 
-    bool ok = false;
-    if (type == 0x00){
-      // string entry
-      ok = rdb_load_string_entry(&c);
-    } else if (type == 0x01){
-      // zset entry
-      ok = rdb_load_zset_entry(&c);
-    } else {
-      // unknown type
-      fprintf(stderr, "rdb_load: unknown entry, type %u\n", type);
-      delete [] data;
-      return false;
-    }
-
-    if (!ok){
-      delete [] data;
-      return false;
-    }
-    loaded++;
+    delete [] decompressed;
+  } else {
+    ok = rdb_parse_entries(payload, payload_size, n_entries);
   }
-  // verify eof
-  uint8_t eof_marker = 0;
-  if (!cursor_read_u8(&c, &eof_marker)){
-    delete [] data;
-    return false;
-  }
-  
-  // eof
-  uint8_t eof = 0;
-  if (!cursor_read_u8(&c, &eof) || eof != 0xFF){
-    fprintf(stderr, "rdb_load: bad EOF marker 0x%02x, file may be truncated\n", eof_marker);
-    delete [] data;
-    return false;
-  }
-  fprintf(stderr, "rdb_load; loaded %u entries from %s\n", loaded, filename);
+ 
   delete [] data;
-  return true;
+  return ok;
 }
 
+static bool rdb_load(const char *filename){
+  // we try primary file first
+  if (access(filename, F_OK) == 0){
+    fprintf(stderr, "rdb_load: loading %s\n", filename);
+    if (rdb_load_file(filename)){ return true; }
+    fprintf(stderr, "rdb_load: primary file failed, trying backup");
+  }
+  
+  // try backup file
+  std::string backup = std::string(filename) + ".bak";
+  if (access(backup.c_str(), F_OK)){
+    fprintf(stderr, "rdb_load: loading backup %s\n", backup.c_str());
+    if (rdb_load_file(backup.c_str())){
+      fprintf(stderr, "rdb_load: recovered from backup\n");
+      return true;
+    }
+    fprintf(stderr, "rdb_load: backup also failed\n");
+  }
+
+  fprintf(stderr, "rdb_load: no valid dump found, starting fresh\n");
+  return true; // start empty 
+}
 
 // Key for searching in the hashtable
 struct LookupKey {
@@ -947,6 +1081,10 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out){
 
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
+
   // again with the dummy
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -969,11 +1107,15 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
     ent->type = T_STR;
     hm_insert(&g_data.db, &ent->node);
   }
+  g_data.g_writes_since_save++;
   return out_nil(out);
 }
 
 // deletes a key and value
 static void do_del(std::vector<std::string> &cmd, Buffer *out){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
   // a dummy again
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -984,6 +1126,7 @@ static void do_del(std::vector<std::string> &cmd, Buffer *out){
     //deallocate the memory
     entry_del(container_of(node, Entry, node));
   }
+  g_data.g_writes_since_save++;
   return out_int(out, node ? 1 : 0); // number of deleted keys
 }
 
@@ -1053,7 +1196,10 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
 }
 
 // PEXPIRE key ttl_ms
-static void do_expire(std::vector<std::string> &cmd, Buffer *out){
+static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
   int64_t ttl_ms = 0;
   if (!str2int(cmd[2], ttl_ms)){
     return out_err(out, ERR_BAD_ARG, "expected int64");
@@ -1068,6 +1214,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer *out){
     Entry *ent = container_of(node, Entry, node);
     entry_set_ttl(ent, ttl_ms);
   }
+  g_data.g_writes_since_save++;
   return out_int(out, node ? 1 : 0);
 }
 
@@ -1094,6 +1241,9 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
 
 // zadd and zset (score, name)
 static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
   double score = 0;
   if (!str2dbl(cmd[2], score)){
     return out_err(out, ERR_BAD_ARG, "expect float");
@@ -1123,6 +1273,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   // add or update the tuple
   const std::string &name = cmd[3];
   bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+  g_data.g_writes_since_save++;
   return out_int(out, (int64_t)added);
 }
 
@@ -1144,6 +1295,9 @@ static ZSet *expect_zset(std::string &s){
 
 // zrem zset name (search and remove)
 static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
   ZSet *zset = expect_zset(cmd[1]);
   if (!zset){
     return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -1154,6 +1308,7 @@ static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
   if (znode){
     zset_delete(zset, znode);
   }
+  g_data.g_writes_since_save++;
   return out_int(out, znode ? 1 : 0);
 }
 
@@ -1268,6 +1423,9 @@ static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
 
 // asyncdel key - delete in background
 static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (g_data.g_saving){
+    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  }
   // look the key
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -1290,14 +1448,23 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   } else {
     entry_del_sync(ent);
   }
+  g_data.g_writes_since_save++;
   return out_int(out, 1);
-
 }
 
+// wrapper for do save
+static void rdb_save_func(void *){
+  g_data.g_saving = true;
+  g_data.g_last_save_ok = rdb_save("dump.rdb");
+  g_data.g_writes_since_save = 0;
+  g_data.g_saving = false;
+}
+
+// Do save in thread pool
 static void do_save(std::vector<std::string> &cmd, Buffer *out){
   (void)cmd;
   // we run in the thread pool
-  thread_pool_queue(&g_data.thread_pool, [] (void *) { rdb_save("dump.rdb"); }, nullptr);
+  thread_pool_queue(&g_data.thread_pool, rdb_save_func, nullptr);
   out_str(out, "OK");
 }
 
@@ -1305,26 +1472,20 @@ static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (cmd.size() == 2 && cmd[0] == "get"){
     return do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set"){
-    g_data.writes_since_save++;
     return do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del"){
-    g_data.writes_since_save++;
-    return do_del (cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "asyncdel" ) {
-    g_data.writes_since_save++;
+    return do_del(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "asyncdel"){
     do_asyncdel(cmd, out, conn);
-  }else if (cmd.size() == 3 && cmd[0] == "pexpire") {
-    g_data.writes_since_save++;
-    return do_expire(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "pexpire"){
+    return do_pexpire(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "pttl"){
     return do_ttl(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys"){
     return do_keys(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "zadd"){
-    g_data.writes_since_save++;
     return do_zadd(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "zrem"){
-    g_data.writes_since_save++;
     return do_zrem(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "zscore"){
     return do_zscore(cmd, out);
@@ -1387,8 +1548,8 @@ static int32_t next_timer_ms() {
     next_ms = std::min(next_ms, g_data.heap[0].val);
   }
   // check the periodic wake up
-  if (g_data.writes_since_save > 0){
-    uint64_t next_save = g_data.last_save_ms + k_save_interval_ms;
+  if (g_data.g_writes_since_save > 0){
+    uint64_t next_save = g_data.g_last_save_ms + k_save_interval_ms;
     next_ms = std::min(next_ms, next_save);
   }
   // no timers 
@@ -1443,14 +1604,12 @@ static void process_timers(){
     }
   }
   // periodic RDB save
-  bool time_elapsed = (now_ms - g_data.last_save_ms) >= k_save_interval_ms;
-  bool dirty_enough = g_data.writes_since_save >= k_save_after_writes;
+  bool time_elapsed = (now_ms - g_data.g_last_save_ms) >= k_save_interval_ms;
+  bool dirty_enough = g_data.g_writes_since_save >= k_save_after_writes;
 
-  if (time_elapsed && dirty_enough){
-    g_data.last_save_ms = now_ms;
-    g_data.writes_since_save = 0;
-    // run it in thread pool
-    thread_pool_queue(&g_data.thread_pool, [] (void *) { rdb_save("dump.rdb"); }, nullptr);
+  if (time_elapsed && dirty_enough && !g_data.g_saving){
+    g_data.g_last_save_ms = now_ms;
+    thread_pool_queue(&g_data.thread_pool, rdb_save_func, nullptr);
     fprintf(stderr, "periodic save triggered\n");
   }
 }
@@ -1560,7 +1719,7 @@ int main(){
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
 
-  g_data.last_save_ms = get_monotonic_msec();
+  g_data.g_last_save_ms = get_monotonic_msec();
 
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
