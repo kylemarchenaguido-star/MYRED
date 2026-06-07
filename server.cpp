@@ -1029,12 +1029,12 @@ static bool rdb_load(const char *filename){
   if (access(filename, F_OK) == 0){
     fprintf(stderr, "rdb_load: loading %s\n", filename);
     if (rdb_load_file(filename)){ return true; }
-    fprintf(stderr, "rdb_load: primary file failed, trying backup");
+    fprintf(stderr, "rdb_load: primary file failed, trying backup\n");
   }
   
   // try backup file
   std::string backup = std::string(filename) + ".bak";
-  if (access(backup.c_str(), F_OK)){
+  if (access(backup.c_str(), F_OK) == 0){
     fprintf(stderr, "rdb_load: loading backup %s\n", backup.c_str());
     if (rdb_load_file(backup.c_str())){
       fprintf(stderr, "rdb_load: recovered from backup\n");
