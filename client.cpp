@@ -8,8 +8,11 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <poll.h>
 #include <string>
 #include <vector>
+#include <iostream>
+#include <sstream>
 
 static void msg(const char* message){
 	fprintf(stderr, "%s\n", message);
@@ -216,6 +219,14 @@ static int32_t read_res(int fd){
 	return rv;
 }
 
+static bool do_auth(int fd){
+	const char *password = getenv("REDIS_PASSWORD");
+	if (!password || strlen(password) == 0){ return true; }
+	std::vector<std::string>  cmd = {"auth", password};
+	if (send_req(fd, cmd) < 0) { return false; }
+	return read_res(fd) >= 0;
+}
+
 // This the client side of the server
 
 int main(int argc, char **argv){
@@ -230,20 +241,77 @@ int main(int argc, char **argv){
 	int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
 	if (rv){die("connect");}
 
-	std::vector<std::string> cmd;
-	for (int i = 1; i < argc; ++i){
-		cmd.push_back(argv[i]);
-	}
-	int32_t err = send_req(fd, cmd);
-	if (err){
-		goto L_DONE;
-	}
-	err = read_res(fd);
-	if (err){
-		goto L_DONE;
-	}
+	if (argc > 1){
+		if (!do_auth(fd)) { close(fd); return 1;}
 
-L_DONE:
+		std::vector<std::string> cmd;
+		for (int i = 1; i < argc; ++i){
+			cmd.push_back(argv[i]);
+		}
+		if (send_req(fd, cmd) < 0) { close(fd); return 1; }
+		if (read_res(fd) < 0){
+			fprintf(stderr, "server closes connection\n");
+			close(fd);
+			return 1;
+		}
+		close(fd);
+		return 0;
+	} else {
+		if (!do_auth(fd)) { close(fd); return 1; }
+		// REPL mode
+		printf("Connected to server. Type commands or 'quit' to exit.\n");
+		printf("> ");
+		fflush(stdout);
+
+		while (true){
+			struct pollfd pfds[2] = {
+				{fd,           POLLIN, 0},
+				{STDIN_FILENO, POLLIN, 0},
+			};
+			if (poll(pfds, 2, -1) < 0){ break; }
+
+			// server closed or sent unexpected data
+			if (pfds[0].revents & (POLLIN | POLLHUP)){
+				char c;
+				if (recv(fd, &c, 1, MSG_PEEK) == 0){
+					fprintf(stderr, "server closed connection\n");
+					break;
+				}
+			}
+
+			// user typed a line
+			if (pfds[1].revents & POLLIN){
+				std::string line;
+				if (!std::getline(std::cin, line)){ break; }
+
+				if (line.empty()){
+					printf("> ");
+					fflush(stdout);
+					continue;
+				}
+				if (line == "quit" || line == "exit"){ break; }
+
+				std::vector<std::string> cmd;
+				std::istringstream iss(line);
+				std::string token;
+				while (iss >> token){ cmd.push_back(token); }
+
+				if (cmd.empty()){
+					printf("> ");
+					fflush(stdout);
+					continue;
+				}
+
+				if (send_req(fd, cmd) < 0){ break; }
+				if (read_res(fd) < 0){
+					fprintf(stderr, "server closed connection\n");
+					break;
+				}
+				printf("> ");
+				fflush(stdout);
+			}
+		}
+	}
 	close(fd);
 	return 0;
 }

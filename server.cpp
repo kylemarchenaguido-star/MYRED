@@ -35,11 +35,14 @@ static constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes 5 * 
 static constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
 
 // secondes * miliseconds (5s -> 5000ms)
-static constexpr uint64_t k_idle_timeout_ms = 5 * 1000;
-static constexpr uint64_t k_io_timeout_ms = 5 * 1000;
+static constexpr uint64_t k_idle_timeout_ms = 30 * 1000;
+static constexpr uint64_t k_io_timeout_ms = 30 * 1000;
 
 // Compress only if < 1KB
 static constexpr size_t k_compress_threshold = 1024; 
+
+// limit of failed auths
+static constexpr uint32_t k_max_failed_auth = 3;
 
 //Helper function for syscalls 
 
@@ -126,6 +129,8 @@ struct Conn {
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
   DList idle_node;
+  bool authenticaded = false;
+  uint32_t failed_attemps = 0;
 };
 
 // global hashtable
@@ -138,11 +143,20 @@ static struct {
   // timers for ttls
   std::vector<HeapItem> heap;
   ThreadPool thread_pool;
+  // Data base globals
   bool g_saving = false; // flag to when is saving
   uint64_t g_last_save_ms = 0; // timestamp last succesful save
   bool g_last_save_ok = true; // did the last save succeded
   uint32_t g_writes_since_save = 0; // how many keys we written
+  uint64_t g_server_start_ms = 0;
+  uint64_t g_total_commands = 0;
+  uint64_t g_total_connections =0;
 } g_data;
+
+//global config
+static struct Config {
+  std::string password = "";
+}g_config;
 
 // callback when the socket is ready
 static int32_t handle_accept(int fd){
@@ -154,17 +168,18 @@ static int32_t handle_accept(int fd){
   if (connfd < 0) {
   msg_errno("accept() error");
   return -1;
-}
-uint32_t ip = client_addr.sin_addr.s_addr;
-fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
-  ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
-  ntohs(client_addr.sin_port)
-);
+  }
+  uint32_t ip = client_addr.sin_addr.s_addr;
+  fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+    ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+    ntohs(client_addr.sin_port)
+  );
 
   fd_set_nb(connfd);  // now we set the new connection to namb 
   // we create a new conn struct 
   Conn *conn = new Conn();
   conn->fd = connfd;
+  conn->authenticaded = g_config.password.empty();
   conn->want_read = true;
   conn->incoming = buf_create(64 * 1024);
   conn->outgoing = buf_create(64 * 1024);
@@ -172,16 +187,16 @@ fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
   conn->last_active_ms = get_monotonic_msec();
   dlist_insert_before(&g_data.io_list, &conn->idle_node);
 
-//put it into the map
-if (g_data.fd2conn.size() <= (size_t)conn->fd){
-  // resize if neccesary
-  g_data.fd2conn.resize(conn->fd + 1);
-}
-assert(!g_data.fd2conn[conn->fd]);
-// return the conn 
-g_data.fd2conn[conn->fd] = conn;
+  //put it into the map
+  if (g_data.fd2conn.size() <= (size_t)conn->fd){
+    // resize if neccesary
+    g_data.fd2conn.resize(conn->fd + 1);
+  }
+  assert(!g_data.fd2conn[conn->fd]);
+  // return the conn 
+  g_data.fd2conn[conn->fd] = conn;
 
-return 0;
+  return 0;
 }
 
 static void conn_destroy(Conn *conn){
@@ -332,7 +347,8 @@ enum {
   ERR_TOO_BIG = 2, // response too big
   ERR_BAD_TYP = 3, // unexpected value
   ERR_BAD_ARG = 4, // bad arguments
-  ERR_SAVING = 5 // err saving
+  ERR_SAVING = 5, // err saving
+  ERR_AUTH = 6, // Invalid auth
 };
 
 // data types for tag types
@@ -467,6 +483,7 @@ static void entry_del(Entry *ent){
     entry_del_sync(ent);
   }
 }
+
 
 // Persistence functions 
 
@@ -1130,6 +1147,11 @@ static void do_del(std::vector<std::string> &cmd, Buffer *out){
   return out_int(out, node ? 1 : 0); // number of deleted keys
 }
 
+struct KeyStats{
+  uint32_t total;
+  uint32_t with_ttl;
+};
+
 // Returns all the keys from the hashtable
 static bool cb_keys(HNode *node, void *arg){
   Buffer *out = (Buffer *)arg;
@@ -1138,9 +1160,26 @@ static bool cb_keys(HNode *node, void *arg){
   return true;
 }
 
+// Gets all the keys for the stats 
+static bool cb_count_keys(HNode *node, void *args){
+  KeyStats *stats = (KeyStats *)args;
+  Entry *ent = container_of(node, Entry, node);
+  stats->total++;
+  if (ent->heap_idx != (size_t)-1){
+    stats->with_ttl++;
+  }
+  return true;
+}
+
 static void do_keys(std::vector<std::string> &, Buffer *out){
   out_arr(out, (uint32_t)hm_size(&g_data.db));
   hm_foreach(&g_data.db, &cb_keys, (void *)out);
+}
+
+static KeyStats get_keys_stats(){
+  KeyStats stats = {0,0};
+  hm_foreach(&g_data.db, &cb_count_keys, &stats);
+  return stats;
 }
 
 // we use the duplicate trick
@@ -1468,37 +1507,64 @@ static void do_save(std::vector<std::string> &cmd, Buffer *out){
   out_str(out, "OK");
 }
 
+// Authenticate 
+static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (g_config.password.empty()){
+    return out_err(out, ERR_AUTH, "AUTH called but no password set");
+  }
+  if (cmd[1] == g_config.password){
+    conn->authenticaded = true;
+    conn->failed_attemps = 0;
+    return out_str(out, "OK");
+  }
+  conn->failed_attemps++;
+  if (conn->failed_attemps >= k_max_failed_auth){
+    fprintf(stderr, "auth; too many failed attempts on fd %d, closing\n", conn->fd);
+    conn->want_close =true;
+    return out_err(out, ERR_AUTH, "too many failed attempts");
+  }
+  out_err(out, ERR_AUTH, "invalid password");
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (cmd.size() == 2 && cmd[0] == "get"){
-    return do_get(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "set"){
-    return do_set(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "del"){
-    return do_del(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "asyncdel"){
-    do_asyncdel(cmd, out, conn);
-  } else if (cmd.size() == 3 && cmd[0] == "pexpire"){
-    return do_pexpire(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "pttl"){
-    return do_ttl(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "keys"){
-    return do_keys(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "zadd"){
-    return do_zadd(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zrem"){
-    return do_zrem(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zscore"){
-    return do_zscore(cmd, out);
-  } else if (cmd.size() == 6 && cmd[0] == "zquery"){
-    return do_zquery(cmd, out);
-  } else if (cmd.size() == 6 && cmd[0] == "zrevquery"){
-    return do_zquery_reversed(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zrank"){
-    return do_zrank(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "save"){
-    return do_save(cmd, out);
+  // auth always allowed
+  if (cmd.size() == 2 && cmd[0] == "auth"){
+    return do_auth(cmd, out, conn);
+  }
+  if (conn->authenticaded){
+    if (cmd.size() == 2 && cmd[0] == "get"){
+      return do_get(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "set"){
+      return do_set(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "del"){
+      return do_del(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "asyncdel"){
+      do_asyncdel(cmd, out, conn);
+    } else if (cmd.size() == 3 && cmd[0] == "pexpire"){
+      return do_pexpire(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "pttl"){
+      return do_ttl(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys"){
+      return do_keys(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "zadd"){
+      return do_zadd(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrem"){
+      return do_zrem(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zscore"){
+      return do_zscore(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zquery"){
+      return do_zquery(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zrevquery"){
+      return do_zquery_reversed(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrank"){
+      return do_zrank(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "save"){
+      return do_save(cmd, out);
+    } else {
+      return out_err(out, ERR_UNKNOWN, "unknown command");
+    }
   } else {
-    return out_err(out, ERR_UNKNOWN, "unknown command");
+    return out_err(out, ERR_AUTH, "Not authenticated yet");
   }
 }
 
@@ -1656,6 +1722,7 @@ static bool try_one_request(Conn *conn){
     return false;
   }
  
+  g_data.g_total_commands++;
   size_t header_pos = 0;
   response_begin(&conn->outgoing, &header_pos);
   do_request(cmd, &conn->outgoing, conn);
@@ -1715,11 +1782,13 @@ static void handle_read(Conn *conn){
 
 int main(){
 
+  g_config.password = "kek1234";
+
   // control for Ctrl-c
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
 
-  g_data.g_last_save_ms = get_monotonic_msec();
+  g_data.g_last_save_ms, g_data.g_server_start_ms = get_monotonic_msec();
 
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
