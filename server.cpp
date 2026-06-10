@@ -125,7 +125,7 @@ struct Conn {
   // buffered input, output
   Buffer incoming; // This two are for the buffers that we are gonna parse // data
   Buffer outgoing; // the response 
-  //time
+  //Info commands stadistics and functions
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
   DList idle_node;
@@ -135,8 +135,8 @@ struct Conn {
 
 // global hashtable
 static struct {
-  HMap db; // top level hashtable 
   std::vector<Conn *> fd2conn; // this a pointer to all conecctions in the file descriptor [3,4,5], and is key by this aswell
+  HMap db; // top level hashtable 
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)
@@ -145,12 +145,14 @@ static struct {
   ThreadPool thread_pool;
   // Data base globals
   bool g_saving = false; // flag to when is saving
-  uint64_t g_last_save_ms = 0; // timestamp last succesful save
   bool g_last_save_ok = true; // did the last save succeded
   uint32_t g_writes_since_save = 0; // how many keys we written
+  uint64_t g_last_save_ms = 0; // timestamp last succesful save
   uint64_t g_server_start_ms = 0;
   uint64_t g_total_commands = 0;
   uint64_t g_total_connections =0;
+  uint32_t connected_clients = 0;
+  size_t g_last_save_size_bytes = 0;
 } g_data;
 
 //global config
@@ -194,6 +196,7 @@ static int32_t handle_accept(int fd){
   }
   assert(!g_data.fd2conn[conn->fd]);
   // return the conn 
+  g_data.g_total_connections++;
   g_data.fd2conn[conn->fd] = conn;
 
   return 0;
@@ -204,6 +207,7 @@ static void conn_destroy(Conn *conn){
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
   delete conn;
+  g_data.g_total_connections--;
 }
 
 //Helper functions // Buffer
@@ -742,7 +746,7 @@ static bool rdb_save(const char* filename){
     remove(tmp.c_str());
     return false;
   }
-
+  g_data.g_last_save_size_bytes = stats.bytes;
   fprintf(stderr, "rdb_save: done (%zu bytes, %u entries)\n", stats.bytes, stats.entries);
   return true;
 }
@@ -1182,6 +1186,98 @@ static KeyStats get_keys_stats(){
   return stats;
 }
 
+// This is for the info command
+static size_t get_memory_usage(){
+  // we read it from proc/self/status on linux
+  FILE *fp = fopen("/proc/self/status", "r");
+  if (!fp){ return 0; }
+
+  char line[128];
+  size_t mem = 0;
+  while (fgets(line, sizeof(line), fp)){
+    if (strncmp(line, "VmRSS:", 6) == 0){
+      // VmRSS is in kb 
+      sscanf(line + 6,"%zu", &mem); // we skip the VmRSS; = 6 bytes
+      // we convert it to bytes
+      mem *= 1024;
+      break;
+    }
+  }
+  fclose(fp);
+  return mem;
+}
+
+static void do_info(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+
+  uint64_t now_ms = get_monotonic_msec();
+  uint64_t uptime_s = (now_ms - g_data.g_server_start_ms) / 1000;
+  KeyStats keystats = get_keys_stats();
+  size_t memory = get_memory_usage();
+
+  // build the info string 
+  char buf[2048];
+  int len = snprintf(buf, sizeof(buf),
+    "# Server\r\n"
+    "version:1.0.0\r\n"
+    "uptime_seconds:%llu\r\n"
+    "uptime_minutes:%llu\r\n"
+    "uptime_hours:%llu\r\n"
+    "\r\n"
+    "# Clients\r\n"
+    "connected_clients:%u\r\n"
+    "total_connections:%llu\r\n"
+    "\r\n"
+    "# Memory\r\n"
+    "used_memory_bytes:%zu\r\n"
+    "used_memory_mb:%.2f\r\n"
+    "\r\n"
+    "# Stats\r\n"
+    "total_commands:%llu\r\n"
+    "\r\n"
+    "# Keyspace\r\n"
+    "keys_total:%u\r\n"
+    "keys_with_ttl:%u\r\n"
+    "keys_no_ttl:%u\r\n"
+    "\r\n"
+    "# Persistence\r\n"
+    "rdb_last_save_time:%llu\r\n"
+    "rdb_changes_since_save:%u\r\n"
+    "rdb_last_save_ok:%d\r\n"
+    "rdb_last_save_size_bytes:%zu\r\n"
+    "\r\n"
+    "# Replication\r\n"
+    "role:master\r\n",
+    //server
+    (unsigned long long)uptime_s,
+    (unsigned long long)uptime_s / 60,
+    (unsigned long long)uptime_s / 3600,
+
+    // clients 
+    g_data,
+    (unsigned long long)g_data.g_total_connections,
+
+    // memory
+    memory,
+    (double)memory / (1024.0 * 1024.0),
+
+    //stats
+    (unsigned long long)g_data.g_total_commands,
+
+    // keyspace
+    keystats.total,
+    keystats.with_ttl,
+    keystats.total - keystats.with_ttl,
+
+    // persistence
+    (unsigned long long)(g_data.g_last_save_ms / 1000),
+    g_data.g_writes_since_save,
+    (int)g_data.g_last_save_ok,
+    g_data.g_last_save_size_bytes
+  );
+  out_str(out, std::string(buf, len));         
+
+}
 // we use the duplicate trick
 // Before:  [1, 3, 2, 7, 5]   delete pos=1 (value 3)
 // Step 1:  [1, 5, 2, 7, 5]   overwrite pos=1 with last (5)
@@ -1788,7 +1884,7 @@ int main(){
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
 
-  g_data.g_last_save_ms, g_data.g_server_start_ms = get_monotonic_msec();
+  g_data.g_last_save_ms = g_data.g_server_start_ms = get_monotonic_msec();
 
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
