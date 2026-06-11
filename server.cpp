@@ -250,8 +250,13 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len){
   buf->data_end += len;
 }
 
+// overload for the const uint8_t *
+static void buf_append(Buffer *buf, const char *s, size_t len){
+  buf_append(buf, (const uint8_t *)s, len);
+}
+
 // overload for bytes for the rdb file
-inline static void buf_append(Buffer *buf, uint8_t Byte){
+static void buf_append(Buffer *buf, uint8_t Byte){
   buf_append(buf, &Byte, 1);
 }
 
@@ -302,133 +307,111 @@ void buf_destroy(Buffer *buf){
 
 }
 
-//Helper functions for parsing
-// Reads data from string 
-static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
-  if (cur + 4 > end){
-    return false;
+//Parse the RESP protocol
+static int32_t parse_resp_request(Buffer *buf, std::vector<std::string> &cmd){
+  const char *data = (const char *)buf->data_begin;
+  size_t size = buf_size(buf);
+  size_t pos = 0;
+
+  if (size == 0){ return 0; }
+
+  // must start with '*'
+  if  (data[0] != '*') { return -1; }
+  pos = 1;
+
+  // read n_args
+  size_t n_start = pos;
+  while (pos < size && data[pos] != '\r') { pos++; }
+  if (pos + 1 >= size) { return 0; } // needs more data
+  if (data[pos + 1] != '\n') { return -1; }
+
+  int32_t n_args = 0;
+  for (size_t i = n_start; i < pos; ++i){
+    // ASCII code i am dumb stuped 
+    if (data[i] < '0' || data[i] > '9') { return -1; }
+    n_args = n_args * 10 + (data[i] - '0');   
   }
-  memcpy(&out, cur, 4);
-  cur += 4;
+  if (n_args > (int32_t)k_max_msg || n_args < 1) { return -1;}
+  pos += 2;
 
-  return true;
-}
+  // read each bulk string
+  for (int32_t i = 0; i < n_args; ++i){
+    if (pos >= size) { return -1; }
+    if (data[pos] != '$') { return -1;}
+    pos++;
 
-//Reads data length
-static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out){
-  if  (cur + n > end){
-    return false;
-  }
-  out.assign(cur, cur + n);
-  cur += n;
-  return true;
-}
+    size_t len_start = pos;
+    while (pos < size && data[pos] != '\r') { pos++; }
+    if (pos + 1 >= size) { return -1; }
+    if (data[pos + 1] != '\n') { return -1; }
 
-static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
-  const uint8_t *end = data + size;
-  uint32_t nstr = 0;
-
-  if(!read_u32(data, end, nstr)){return -1;}
-  if(nstr > k_max_msg){return -1;}
-  
-
-  while (out.size() < nstr) {
-    uint32_t len = 0;
-    if(!read_u32(data, end, len)){
-      return -1;
+    int32_t  str_len = 0;
+    for (size_t j = len_start; j < pos; ++j){
+      if (data[j] < '0' || data[j] > '9') { return -1; }
+      str_len = str_len * 10 + (data[j]- '0');
+      if (str_len > (int32_t)k_max_msg) { return -1;}
     }
-    out.push_back(std::string());
-    if (!read_str(data, end, len, out.back())){return 1;}
+    pos += 2; // this skips the \r\n
+
+    if (pos + (size_t)str_len + 2 > size) { return 0; } 
+
+    cmd.push_back(std::string(data + pos, (size_t)str_len));
+    pos += (size_t)str_len;
+
+    if (data[pos] != '\r' || data[pos + 1] != '\n') { return -1; }
+    pos += 2;
   }
-  if (data != end){return -1;}
-  return 0;
-
+  return (int32_t)pos;
 }
 
-//error codes for tag_err
-enum {
-  ERR_UNKNOWN = 1, // unknown command
-  ERR_TOO_BIG = 2, // response too big
-  ERR_BAD_TYP = 3, // unexpected value
-  ERR_BAD_ARG = 4, // bad arguments
-  ERR_SAVING = 5, // err saving
-  ERR_AUTH = 6, // Invalid auth
-};
+//RESP response helpers
 
-// data types for tag types
-enum {
-  TAG_NIL = 0, // nil
-  TAG_ERR = 1, //err + msg
-  TAG_STR = 2, //string
-  TAG_INT = 3, //integer
-  TAG_DBL = 4, //double
-  TAG_ARR = 5, //array
-};
-
-//append for serializaed data 
-
-// NIL values
-static void out_nil(Buffer *out){
-  uint8_t tag = TAG_NIL;
-  buf_append(out, &tag, 1);
+// NIL response
+static void resp_nil(Buffer *out){
+  buf_append(out, "$-1\r\n", sizeof("$-1\r\n") - 1);
 }
 
-// STRING values
-static void out_str(Buffer *out, const std::string &s){
-  uint8_t tag = TAG_STR;
-  uint32_t len = (uint32_t)s.size();
-  buf_append(out, &tag, 1);
-  buf_append(out, (const uint8_t *)&len, 4);
-  buf_append(out, (const uint8_t *)s.data(), s.size());
+// OK response
+static void resp_ok(Buffer *out){
+  buf_append(out, "+OK\r\n", sizeof("+OK\r\n") - 1);
 }
 
-// Integer values
-static void out_int(Buffer *out, int64_t val){
-  uint8_t tag = TAG_INT;
-  buf_append(out, &tag, 1);
-  buf_append(out, (const uint8_t *)&val, 8);
+// ERR response
+static void resp_err(Buffer *out, const char *msg){
+  buf_append(out, "-", 1);
+  buf_append(out, msg, strlen(msg));
+  buf_append(out, "\r\n", sizeof("\r\n") - 1);
 }
 
-// Double values
-static void out_dbl(Buffer *out, double val){
-  uint8_t tag = TAG_DBL;
-  buf_append(out, &tag, 1);
-  buf_append(out, (const uint8_t *)&val, 8);
+// INT response
+static void resp_int(Buffer *out, int64_t val){
+  char tmp[32];
+  // this put the null terminator and writes into the buffer 
+  int len = snprintf(tmp, sizeof(tmp), ":%lld\r\n", (long long)val);
+  buf_append(out, tmp, (size_t)len);
 }
 
-// err values
-static void out_err(Buffer *out, uint32_t code, const std::string &msg){
-  uint8_t tag = TAG_ERR;
-  uint32_t len = (uint32_t )msg.size();
-  buf_append(out, &tag, 1);
-  buf_append(out,(const uint8_t *)&code, 4);
-  buf_append(out,(const uint8_t *)&len, 4);
-  buf_append(out,(const uint8_t *)msg.data(), msg.size());
+// STR response
+static void resp_str(Buffer *out, const char *s, size_t len){
+  char tmp[32];
+  int hlen = snprintf(tmp, sizeof(tmp), "$%zu\r\n", len);
+  buf_append(out, tmp, (size_t)hlen);
+  buf_append(out, s, len);
+  buf_append(out, "\r\n", sizeof("\r\n") - 1);
 }
 
-// arr values 
-static void out_arr(Buffer *out, uint32_t n){
-  uint8_t tag = TAG_ARR;
-  buf_append(out, &tag, 1);
-  buf_append(out, (const uint8_t *)&n, 4); 
-};
-
-// reserve 4 bytes with the bookmark at the beggining
-static size_t out_begin_arr(Buffer *out){
-  uint8_t tag = TAG_ARR;
-  buf_append(out, &tag, 1);
-
-  // ctx is the bookmark
-  size_t ctx = buf_size(out);
-  uint32_t placeholder = 0;
-
-  buf_append(out, (const uint8_t *)&placeholder, 4); // reserves 4 bytes
-  return ctx;
+// DBL response
+static void resp_dbl(Buffer *out, double val){
+  char tmp[64];
+  int len = snprintf(tmp, sizeof(tmp), "%.17g", val);
+  resp_str(out, tmp, (size_t)len);
 }
 
-static void out_end_arr(Buffer *out, size_t ctx, uint32_t n){
-  assert(buf_data(out)[ctx - 1] == TAG_ARR);
-  memcpy(buf_data(out) + ctx, &n, 4);
+// ARR response
+static void resp_arr(Buffer *out, uint32_t n){
+  char tmp[32];
+  int len = snprintf(tmp, sizeof(tmp), "*%u\r\n", n);
+  buf_append(out, tmp, (size_t)len);
 }
 
 //value types 
@@ -747,6 +730,8 @@ static bool rdb_save(const char* filename){
     return false;
   }
   g_data.g_last_save_size_bytes = stats.bytes;
+  g_data.g_last_save_ms = get_monotonic_msec();
+  g_data.g_last_save_ok = true;
   fprintf(stderr, "rdb_save: done (%zu bytes, %u entries)\n", stats.bytes, stats.entries);
   return true;
 }
@@ -1090,20 +1075,20 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out){
   //hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node){
-    return out_nil(out);
+    return resp_nil(out);
   }
   // we copy the value
   Entry *ent = container_of(node, Entry, node);
   if (ent->type != T_STR) {
-    return out_err(out, ERR_BAD_TYP, "not a string value");
+    return resp_err(out, "WRONGTYPE wrong type");
   }
-  return out_str(out, ent->str);
+  return resp_str(out, ent->str.data(), ent->str.size());
 }
 
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out){
   if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
+    return resp_err(out, "ERR saving in progress");
   }
 
   // again with the dummy
@@ -1116,26 +1101,26 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
     //found, update the value
     Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_STR) {
-      return out_err(out, ERR_BAD_TYP, "a non-string value exists");
+      return resp_err(out, "WRONGTYPE wrong type");
     }
     ent->str.swap(cmd[2]);
   } else {
     //not found allocate & insert a new pair
-    Entry *ent = new Entry();
+    Entry *ent = entry_new(T_STR);
     ent->key.swap(key.key);
     ent->node.hcode = key.node.hcode;
     ent->str.swap(cmd[2]);
-    ent->type = T_STR;
+
     hm_insert(&g_data.db, &ent->node);
   }
   g_data.g_writes_since_save++;
-  return out_nil(out);
+  return resp_ok(out);
 }
 
 // deletes a key and value
 static void do_del(std::vector<std::string> &cmd, Buffer *out){
   if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
+    return resp_err(out, "ERR saving in progress");
   }
   // a dummy again
   LookupKey key;
@@ -1146,21 +1131,26 @@ static void do_del(std::vector<std::string> &cmd, Buffer *out){
   if (node){
     //deallocate the memory
     entry_del(container_of(node, Entry, node));
+    g_data.g_writes_since_save++;
+    return resp_int(out, 1);
   }
-  g_data.g_writes_since_save++;
-  return out_int(out, node ? 1 : 0); // number of deleted keys
+  return resp_int(out, 0); // number of deleted keys
 }
 
-struct KeyStats{
+struct KeyStats {
   uint32_t total;
   uint32_t with_ttl;
 };
 
+struct KeysCtx {
+  std::vector<std::string> *keys;
+};
+
 // Returns all the keys from the hashtable
 static bool cb_keys(HNode *node, void *arg){
-  Buffer *out = (Buffer *)arg;
-  const std::string &key = container_of(node, Entry, node)->key;
-  out_str(out, key);
+  auto *ctx = (KeysCtx *)arg;
+  Entry *ent = container_of(node, Entry, node);
+  ctx->keys->push_back(ent->key);
   return true;
 }
 
@@ -1175,9 +1165,16 @@ static bool cb_count_keys(HNode *node, void *args){
   return true;
 }
 
-static void do_keys(std::vector<std::string> &, Buffer *out){
-  out_arr(out, (uint32_t)hm_size(&g_data.db));
-  hm_foreach(&g_data.db, &cb_keys, (void *)out);
+static void do_keys(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  std::vector<std::string> keys;
+  KeysCtx ctx = {&keys};
+  hm_foreach(&g_data.db, cb_keys, &ctx);
+
+  resp_arr(out, (uint32_t)keys.size());
+  for (const auto &k : keys){
+    resp_str(out, k.data(), k.size());
+  }
 }
 
 static KeyStats get_keys_stats(){
@@ -1207,77 +1204,6 @@ static size_t get_memory_usage(){
   return mem;
 }
 
-static void do_info(std::vector<std::string> &cmd, Buffer *out){
-  (void)cmd;
-
-  uint64_t now_ms = get_monotonic_msec();
-  uint64_t uptime_s = (now_ms - g_data.g_server_start_ms) / 1000;
-  KeyStats keystats = get_keys_stats();
-  size_t memory = get_memory_usage();
-
-  // build the info string 
-  char buf[2048];
-  int len = snprintf(buf, sizeof(buf),
-    "# Server\r\n"
-    "version:1.0.0\r\n"
-    "uptime_seconds:%llu\r\n"
-    "uptime_minutes:%llu\r\n"
-    "uptime_hours:%llu\r\n"
-    "\r\n"
-    "# Clients\r\n"
-    "connected_clients:%u\r\n"
-    "total_connections:%llu\r\n"
-    "\r\n"
-    "# Memory\r\n"
-    "used_memory_bytes:%zu\r\n"
-    "used_memory_mb:%.2f\r\n"
-    "\r\n"
-    "# Stats\r\n"
-    "total_commands:%llu\r\n"
-    "\r\n"
-    "# Keyspace\r\n"
-    "keys_total:%u\r\n"
-    "keys_with_ttl:%u\r\n"
-    "keys_no_ttl:%u\r\n"
-    "\r\n"
-    "# Persistence\r\n"
-    "rdb_last_save_time:%llu\r\n"
-    "rdb_changes_since_save:%u\r\n"
-    "rdb_last_save_ok:%d\r\n"
-    "rdb_last_save_size_bytes:%zu\r\n"
-    "\r\n"
-    "# Replication\r\n"
-    "role:master\r\n",
-    //server
-    (unsigned long long)uptime_s,
-    (unsigned long long)uptime_s / 60,
-    (unsigned long long)uptime_s / 3600,
-
-    // clients 
-    g_data,
-    (unsigned long long)g_data.g_total_connections,
-
-    // memory
-    memory,
-    (double)memory / (1024.0 * 1024.0),
-
-    //stats
-    (unsigned long long)g_data.g_total_commands,
-
-    // keyspace
-    keystats.total,
-    keystats.with_ttl,
-    keystats.total - keystats.with_ttl,
-
-    // persistence
-    (unsigned long long)(g_data.g_last_save_ms / 1000),
-    g_data.g_writes_since_save,
-    (int)g_data.g_last_save_ok,
-    g_data.g_last_save_size_bytes
-  );
-  out_str(out, std::string(buf, len));         
-
-}
 // we use the duplicate trick
 // Before:  [1, 3, 2, 7, 5]   delete pos=1 (value 3)
 // Step 1:  [1, 5, 2, 7, 5]   overwrite pos=1 with last (5)
@@ -1333,11 +1259,11 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
 // PEXPIRE key ttl_ms
 static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
   if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
+    return resp_err(out, "ERR saving in progress");
   }
   int64_t ttl_ms = 0;
   if (!str2int(cmd[2], ttl_ms)){
-    return out_err(out, ERR_BAD_ARG, "expected int64");
+    return resp_err(out, "ERR invalid TTL");
   }
   // lookup the key
   LookupKey key;
@@ -1345,12 +1271,12 @@ static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   // we set the ttl
-  if (node){
-    Entry *ent = container_of(node, Entry, node);
-    entry_set_ttl(ent, ttl_ms);
-  }
+  if (!node) { return resp_int(out, 0); }
+
+  Entry *ent = container_of(node, Entry, node);
+  entry_set_ttl(ent, ttl_ms);
   g_data.g_writes_since_save++;
-  return out_int(out, node ? 1 : 0);
+  return resp_int(out, 1);
 }
 
 // PTTL key
@@ -1360,28 +1286,25 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  if (!node){
-    return out_int(out, -2); // not found
-  }
+  if (!node){ return resp_int(out, -2); } // not found
 
   Entry *ent = container_of(node, Entry, node);
   if (ent->heap_idx == (size_t)-1){
-    return out_int(out, -1); // not ttl
+    return resp_int(out, -1); // not ttl
   }
-
   uint64_t expire_at = g_data.heap[ent->heap_idx].val;
   uint64_t now_ms = get_monotonic_msec();
-  return out_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
+  return resp_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
 }
 
 // zadd and zset (score, name)
 static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
+    return resp_err(out, "ERR saving in progress");
   }
   double score = 0;
   if (!str2dbl(cmd[2], score)){
-    return out_err(out, ERR_BAD_ARG, "expect float");
+    return resp_err(out, "ERR invalid score");
   }
 
   // look up or create the zset
@@ -1401,7 +1324,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   } else { // check the existing key
     ent = container_of(hnode, Entry, node);
     if (ent->type != T_ZSET){
-      return out_err(out, ERR_BAD_TYP, "expect zset");
+      return resp_err(out, "WRONGTYPE wrong type");
     }
   }
 
@@ -1409,7 +1332,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   const std::string &name = cmd[3];
   bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
   g_data.g_writes_since_save++;
-  return out_int(out, (int64_t)added);
+  return resp_int(out, (int64_t)added);
 }
 
 // empty zset (?? i am going to explode myself)
@@ -1430,72 +1353,89 @@ static ZSet *expect_zset(std::string &s){
 
 // zrem zset name (search and remove)
 static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
-  }
+  if (g_data.g_saving) { return resp_err(out, "ERR saving in progress"); }
   ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){
-    return out_err(out, ERR_BAD_TYP, "expect zset");
-  }
 
+  if (!zset) { return resp_err(out, "WRONGTYPE wrong type"); }
   const std::string &name = cmd[2];
+
   ZNode *znode = zset_lookup(zset, name.data(), name.size());
-  if (znode){
-    zset_delete(zset, znode);
-  }
+  if (!znode) { return resp_int(out, 0); }
+  
+  zset_delete(zset, znode);
   g_data.g_writes_since_save++;
-  return out_int(out, znode ? 1 : 0);
+  return resp_int(out, 1);
 }
 
 // zscore zset name (search the score of a name)
 static void do_zscore(std::vector<std::string> &cmd, Buffer *out){
   ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){
-    return out_err(out, ERR_BAD_TYP, "expecte set");
-  }
+  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
 
   const std::string &name = cmd[2];
   ZNode *znode = zset_lookup(zset, name.data(), name.size());
-  return znode ? out_dbl(out, znode->score) : out_nil(out);
+  if (!znode) { return resp_nil(out); }
+  return resp_dbl(out, znode->score);
+  
 }
+
+//zrank key name (how many nodes comes before the actual one)
+static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
+  // cmd[1] = key
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset){ return resp_err(out,"WRONGTYPE wrong type"); }
+
+  // point query by name using the hashtable (cmd[2] = name)
+  const std::string &name = cmd[2];
+  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  if (!znode){ return resp_nil(out); }
+
+  int64_t rank = avl_rank(&znode->tree);
+  return resp_int(out, rank);
+}
+
+struct ZQueryResult {
+  std::string name;
+  double score;
+};
 
 // zquery zset score name offset limit (search by ascending order)
 static void do_zquery(std::vector<std::string> &cmd, Buffer *out){
   // we parse the args
   double score = 0;
   if (!str2dbl(cmd[2], score)){
-    return out_err(out, ERR_BAD_ARG, "expected dbl ");
+    return resp_err(out, "ERR invalid score");
   }
   const std::string &name = cmd[3];
   int64_t offset = 0, limit = 0;
   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
-    return out_err(out, ERR_BAD_ARG, "expected int");
+    return resp_err(out, "ERR invalid offset/limit");
   }
 
-  // we get the zset 
   ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){
-    return out_err(out, ERR_BAD_TYP, "expected zset");
-  }
+  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
 
-  //seek the key
-  if (limit <= 0){
-    return out_arr(out, 0);
-  }
+  // we collect into a vector first so we know the count up front
+  // (RESP wants the array length before the elements)
+  std::vector<ZQueryResult> results;
 
   ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
   znode = znode_offset(znode, offset);
 
-  // out put
-  size_t ctx = out_begin_arr(out);
-  int64_t n = 0;
-  while (znode && n < limit){
-    out_str(out, std::string(znode->name, znode->len));
-    out_dbl(out, znode->score);
-    znode = znode_offset(znode, +1);
-    n += 2;
+  // walk forward collecting until we hit the end (NULL) or fill the page (limit)
+  while (znode && (int64_t)results.size() < limit){
+    // znode->name is the flexible char[0] array, znode->len its length
+    results.push_back({std::string(znode->name, znode->len), znode->score});
+    znode = znode_offset(znode, +1); // next node in ascending order
   }
-  out_end_arr(out, ctx, (uint32_t)n);
+
+  // flat output: each result = name + score, so element count is size * 2
+  // -> [name1, score1, name2, score2, ...]
+  resp_arr(out, (uint32_t)(results.size() * 2));
+  for (auto &r : results){
+    resp_str(out, r.name.data(), r.name.size());
+    resp_dbl(out, r.score);
+  }
 }
 
 // reverse order from do_zquery (descending order)
@@ -1503,88 +1443,49 @@ static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
   // we parse the args
   double score = 0;
   if (!str2dbl(cmd[2], score)){
-    return out_err(out, ERR_BAD_ARG, "expected dbl ");
+    return resp_err(out, "ERR invalid score");
   }
   const std::string &name = cmd[3];
   int64_t offset = 0, limit = 0;
   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
-    return out_err(out, ERR_BAD_ARG, "expected int");
+    return resp_err(out, "ERR invalid offset/limit");
   }
 
   // we get the zset 
   ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){
-    return out_err(out, ERR_BAD_TYP, "expected zset");
-  }
+  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
 
-  //seek the key
-  if (limit <= 0){
-    return out_arr(out, 0);
-  }
-
+  std::vector<ZQueryResult> results;
   ZNode *znode = zset_seekle(zset, score, name.data(), name.size());
   znode = znode_offset(znode, -offset);
 
-  // out put
-  size_t ctx = out_begin_arr(out);
-  int64_t n = 0;
-  while (znode && n < limit){
-    out_str(out, std::string(znode->name, znode->len));
-    out_dbl(out, znode->score);
+  while (znode && (int64_t)results.size() < limit){
+    results.push_back({std::string(znode->name, znode->len), znode->score});
     znode = znode_offset(znode, -1);
-    n += 2;
   }
-  out_end_arr(out, ctx, (uint32_t)n);
+
+  resp_arr(out, (uint32_t)(results.size() * 2));
+  for (auto &r : results){
+    resp_str(out, r.name.data(), r.name.size());
+    resp_dbl(out, r.score);
+  }
+  
 }
-
-//zrank key name (how many nodes comes before the actual one)
-static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
-  // cmd[1] = key
-  ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){
-    return out_err(out, ERR_BAD_TYP, "expected zset");
+// Authenticate 
+static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (g_config.password.empty()){
+    return resp_err(out, "ERR no password configured");
   }
-
-  // point query by name using the hashtable (cmd[2] = name)
-  ZNode *znode = zset_lookup(zset, cmd[2].data(), cmd[2].size());
-  if (!znode){
-    // name do not exist
-    return out_nil(out);
+  if (cmd[1] == g_config.password){
+    conn->authenticaded = true;
+    conn->failed_attemps = 0;
+    return resp_ok(out);
   }
-
-  int64_t rank = avl_rank(&znode->tree);
-  return out_int(out, rank);
-}
-
-// asyncdel key - delete in background
-static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (g_data.g_saving){
-    return out_err(out, ERR_SAVING, "ERR saving in progress");
+  conn->failed_attemps++;
+  if (conn->failed_attemps >= k_max_failed_auth){
+    conn->want_close =true;
   }
-  // look the key
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
-
-  if (!hnode){
-    return out_int(out, 0); // key does not exit
-  }
-  Entry *ent = container_of(hnode, Entry, node);
-  // remove from hashtable and heap
-  hm_delete(&g_data.db, &ent->node, &hnode_same);
-  entry_set_ttl(ent, -1);
-
-  // check if need offloading
-  size_t set_size = (ent->type ==  T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
-
-  if (set_size > 1000){
-    thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
-  } else {
-    entry_del_sync(ent);
-  }
-  g_data.g_writes_since_save++;
-  return out_int(out, 1);
+  return resp_err(out, "ERR invalid password");
 }
 
 // wrapper for do save
@@ -1600,94 +1501,161 @@ static void do_save(std::vector<std::string> &cmd, Buffer *out){
   (void)cmd;
   // we run in the thread pool
   thread_pool_queue(&g_data.thread_pool, rdb_save_func, nullptr);
-  out_str(out, "OK");
+  resp_ok(out);
 }
 
-// Authenticate 
-static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (g_config.password.empty()){
-    return out_err(out, ERR_AUTH, "AUTH called but no password set");
+// asyncdel key - delete in background
+static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (g_data.g_saving){
+    return resp_err(out, "ERR saving in progress");
   }
-  if (cmd[1] == g_config.password){
-    conn->authenticaded = true;
-    conn->failed_attemps = 0;
-    return out_str(out, "OK");
-  }
-  conn->failed_attemps++;
-  if (conn->failed_attemps >= k_max_failed_auth){
-    fprintf(stderr, "auth; too many failed attempts on fd %d, closing\n", conn->fd);
-    conn->want_close =true;
-    return out_err(out, ERR_AUTH, "too many failed attempts");
-  }
-  out_err(out, ERR_AUTH, "invalid password");
-}
+  // look the key
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
-static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  // auth always allowed
-  if (cmd.size() == 2 && cmd[0] == "auth"){
-    return do_auth(cmd, out, conn);
+  if (!hnode){
+    return resp_int(out, 0); // key does not exit
   }
-  if (conn->authenticaded){
-    if (cmd.size() == 2 && cmd[0] == "get"){
-      return do_get(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "set"){
-      return do_set(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "del"){
-      return do_del(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "asyncdel"){
-      do_asyncdel(cmd, out, conn);
-    } else if (cmd.size() == 3 && cmd[0] == "pexpire"){
-      return do_pexpire(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "pttl"){
-      return do_ttl(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "keys"){
-      return do_keys(cmd, out);
-    } else if (cmd.size() == 4 && cmd[0] == "zadd"){
-      return do_zadd(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zrem"){
-      return do_zrem(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zscore"){
-      return do_zscore(cmd, out);
-    } else if (cmd.size() == 6 && cmd[0] == "zquery"){
-      return do_zquery(cmd, out);
-    } else if (cmd.size() == 6 && cmd[0] == "zrevquery"){
-      return do_zquery_reversed(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zrank"){
-      return do_zrank(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "save"){
-      return do_save(cmd, out);
-    } else {
-      return out_err(out, ERR_UNKNOWN, "unknown command");
-    }
+  Entry *ent = container_of(hnode, Entry, node);
+  // remove from hashtable and heap
+  hm_delete(&g_data.db, &ent->node, &hnode_same);
+  entry_set_ttl(ent, -1);
+
+  // check if need offloading
+  size_t set_size = (ent->type ==  T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+
+  if (set_size > 1000){
+    thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
   } else {
-    return out_err(out, ERR_AUTH, "Not authenticated yet");
+    entry_del_sync(ent);
   }
+  g_data.g_writes_since_save++;
+  return resp_int(out, 1);
 }
 
-// helper response functions
+static void do_info(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
 
-static void response_begin(Buffer *out, size_t *header){
-  *header = buf_size(out); //message header position 
-  uint32_t placeholder = 0;
-  buf_append(out, (uint8_t *)&placeholder, 4);
+  uint64_t now_ms = get_monotonic_msec();
+  uint64_t uptime_s = (now_ms - g_data.g_server_start_ms) / 1000;
+  KeyStats keystats = get_keys_stats();
+  size_t memory = get_memory_usage();
+
+  // build the info string 
+  char buf[2048];
+  int len = snprintf(buf, sizeof(buf),
+    "# Server\r\n"
+    "version:1.0.0\r\n"
+    "uptime_seconds:%llu\r\n"
+    "uptime_minutes:%llu\r\n"
+    "uptime_hours:%llu\r\n"
+    "\r\n"
+    "# Clients\r\n"
+    "connected_clients:%u\r\n"
+    "total_connections:%llu\r\n"
+    "\r\n"
+    "# Memory\r\n"
+    "used_memory_bytes:%zu\r\n"
+    "used_memory_mb:%.2f\r\n"
+    "\r\n"
+    "# Stats\r\n"
+    "total_commands:%llu\r\n"
+    "\r\n"
+    "# Keyspace\r\n"
+    "keys_total:%u\r\n"
+    "keys_with_ttl:%u\r\n"
+    "keys_no_ttl:%u\r\n"
+    "\r\n"
+    "# Persistence\r\n"
+    "rdb_last_save_time:%llu\r\n"
+    "rdb_changes_since_save:%u\r\n"
+    "rdb_last_save_ok:%d\r\n"
+    "rdb_last_save_size_bytes:%zu\r\n"
+    "\r\n"
+    "# Replication\r\n"
+    "role:master\r\n",
+    //server
+    (unsigned long long)uptime_s,
+    (unsigned long long)uptime_s / 60,
+    (unsigned long long)uptime_s / 3600,
+
+    // clients 
+    g_data.connected_clients,
+    (unsigned long long)g_data.g_total_connections,
+
+    // memory
+    memory,
+    (double)memory / (1024.0 * 1024.0),
+
+    //stats
+    (unsigned long long)g_data.g_total_commands,
+
+    // keyspace 
+    keystats.total,
+    keystats.with_ttl,
+    keystats.total - keystats.with_ttl,
+
+    // persistence
+    (unsigned long long)(g_data.g_last_save_ms / 1000),
+    g_data.g_writes_since_save,
+    (int)g_data.g_last_save_ok,
+    g_data.g_last_save_size_bytes
+  );
+  resp_str(out, buf, (size_t)len);         
+
 }
 
-static size_t response_size(Buffer *out, size_t header){
-  return buf_size(out) - header - 4;
-}
+static void do_request(std::vector<std::string> &cmd,
+                       Buffer *out, Conn *conn) {
+    if (cmd.empty()) {
+        return resp_err(out, "ERR empty command");
+    }
 
-static void response_end(Buffer *out, size_t header){
-  size_t msg_size = response_size(out, header);
+    // AUTH always allowed
+    if (cmd.size() == 2 && cmd[0] == "auth") {
+        return do_auth(cmd, out, conn);
+    }
 
-  if (msg_size > k_max_msg){
-    out->data_end =  out->data_begin + header + 4;
-    // reflects the error and not the original message
-    out_err(out, ERR_TOO_BIG, "message too big"); 
-    msg_size = response_size(out, header); 
-  }
-  // message header
-  uint32_t len = (uint32_t)msg_size;
-  memcpy(out->data_begin + header, &len, 4);
+    // check authentication
+    if (!conn->authenticaded) {
+        return resp_err(out, "NOAUTH authentication required");
+    }
+
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        do_get(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "set") {
+        do_set(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "del") {
+        do_del(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "asyncdel") {
+        do_asyncdel(cmd, out, conn);
+    } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+        do_pexpire(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+        do_ttl(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys") {
+        do_keys(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+        do_zadd(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+        do_zrem(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+        do_zscore(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+        do_zquery(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zrevquery") {
+        do_zquery_reversed(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrank") {
+        do_zrank(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "info") {
+        do_info(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "save") {
+        do_save(cmd, out);
+    } else {
+        resp_err(out, "ERR unknown command");
+    }
 }
 
 // Timers logic 
@@ -1795,41 +1763,23 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
 
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
-  // try to parse the accumulated buffer 
-  if(buf_size(&conn->incoming) < 4){return false;}
+  std::vector<std::string> cmd;
+  int32_t consumed = parse_resp_request(&conn->incoming, cmd);
 
-  uint32_t len = 0;
-  memcpy(&len, buf_data(&conn->incoming), 4);
-
-  //len is the message header
-  if (len > k_max_msg) {
-    conn->want_close = true;
+  if (consumed == 0) { return false; }
+  if (consumed < 0){
+    fprintf(stderr, "bad RESP from fd %d\n", conn->fd);
     return false;
   }
-  // this is the message body
-  if (4 + len > buf_size(&conn->incoming)){return false;}
 
-  
-  const uint8_t *request = buf_data(&conn->incoming) + 4;
-  // here we are going to procces the parsed message
-  std::vector<std::string> cmd ;
-  if (parse_req(request, len, cmd) < 0){
-    conn->want_close = true;
-    return false;
-  }
- 
+  buf_consume(&conn->incoming, (size_t)consumed);
   g_data.g_total_commands++;
-  size_t header_pos = 0;
-  response_begin(&conn->outgoing, &header_pos);
+
   do_request(cmd, &conn->outgoing, conn);
 
-  response_end(&conn->outgoing, header_pos);
-
-  // application logic done
-  buf_consume(&conn->incoming, 4 + len);
-  conn_set_timer(conn, ConnTimer::IDLE);
+  conn->want_read = false;
+  conn->want_write = true;
   return true;
-
 }
 
 static void handle_write(Conn *conn){
@@ -1884,7 +1834,7 @@ int main(){
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
 
-  g_data.g_last_save_ms = g_data.g_server_start_ms = get_monotonic_msec();
+  g_data.g_server_start_ms = get_monotonic_msec();
 
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
