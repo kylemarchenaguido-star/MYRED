@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <sys/wait.h>   // for waitpid
+#include <sys/types.h>
 // C++
 #include <string>
 #include <vector>
@@ -45,8 +47,10 @@ static constexpr size_t k_compress_threshold = 1024;
 // limit of failed auths
 static constexpr uint32_t k_max_failed_auth = 3;
 
-//Helper function for syscalls 
+// Tracks the current running background save child
+static pid_t g_rdb_child_pid = -1;
 
+//Helper function for syscalls 
 static void msg_errno(const char *msg) {
   fprintf(stderr, "[errno:%s\n]", msg);
 }
@@ -145,7 +149,6 @@ static struct {
   std::vector<HeapItem> heap;
   ThreadPool thread_pool;
   // Data base globals
-  bool g_saving = false; // flag to when is saving
   bool g_last_save_ok = true; // did the last save succeded
   uint32_t g_writes_since_save = 0; // how many keys we written
   uint64_t g_last_save_ms = 0; // timestamp last succesful save
@@ -693,12 +696,11 @@ static bool rdb_save(const char* filename){
   RDBStats stats = {};
   rdb_serialize(&buf, &stats);
 
-  // write to temp file first
-  std::string tmp = std::string(filename) + ".tmp";
-  std::string backup = std::string(filename) + ".bak";
-  FILE *fp = fopen(tmp.c_str(), "wb");
+  char tmp[256];
+  snprintf(tmp, sizeof(tmp), "%s.tmp.%d", filename, (int)getpid());
+  FILE *fp = fopen(tmp, "wb");
   if (!fp){
-    fprintf(stderr, "rdb_save: cannot open %s: %s\n", tmp.c_str(), strerror(errno));
+    fprintf(stderr, "rdb_save: cannot open %s: %s\n", tmp, strerror(errno));
     buf_destroy(&buf);
     return false;
   }
@@ -709,7 +711,7 @@ static bool rdb_save(const char* filename){
   if (written != data_size) {
     fprintf(stderr, "rdb_save: short write\n");
     fclose(fp);
-    remove(tmp.c_str());
+    remove(tmp);
     return false;
   }
 
@@ -717,22 +719,17 @@ static bool rdb_save(const char* filename){
   if (fsync((fileno(fp))) != 0){
     fprintf(stderr, "rdb_save; fsync failed: %s\n", strerror(errno));
     fclose(fp);
-    remove(tmp.c_str());
+    remove(tmp);
     return false;
   }
   fclose(fp);
 
-  // we just rotate names
-  rename(filename, backup.c_str());
-  // atomic rename
-  if (rename(tmp.c_str(), filename) != 0){
+  if (rename(tmp, filename) != 0){
     fprintf(stderr, "rdb_save: rename failed: %s\n", strerror(errno));
-    remove(tmp.c_str());
+    remove(tmp);
     return false;
   }
   g_data.g_last_save_size_bytes = stats.bytes;
-  g_data.g_last_save_ms = get_monotonic_msec();
-  g_data.g_last_save_ok = true;
   fprintf(stderr, "rdb_save: done (%zu bytes, %u entries)\n", stats.bytes, stats.entries);
   return true;
 }
@@ -1054,6 +1051,68 @@ static bool rdb_load(const char *filename){
   return true; // start empty 
 }
 
+//  rdb save with fork 
+static void rdb_save_background(){
+  // dont start a fork is one is running
+  if (g_rdb_child_pid != -1){
+    fprintf(stderr, "rdb_save_background: save already in progress (pid=%d)\n", g_rdb_child_pid);
+    return;
+  }
+
+  pid_t pid = fork();
+
+  if (pid < 0){
+    fprintf(stderr, "rdb_save_background: fork failed: %s\n", strerror(errno));
+    return;
+  }
+
+  if (pid == 0){
+    // this is the child proccess and cannot touch the event loop......
+    bool ok = rdb_save("dump.rdb");
+
+    // exits with status code
+    _exit(ok ? 0 : 1);
+  }
+
+  g_rdb_child_pid = pid;
+  fprintf(stderr, "rdb_save_background: started (pid=%d)\n", pid);
+}   
+
+static void rdb_check_background_save(){
+  if (g_rdb_child_pid == -1){
+    return; // no save running
+  }
+
+  int status = 0;
+  // returns immediately - don't block
+  pid_t result = waitpid(g_rdb_child_pid, &status, WNOHANG);
+
+  if (result == 0){
+    // child still running
+    return;
+  }
+
+  if (result == g_rdb_child_pid){
+    // child finished
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0){
+      fprintf(stderr, "rdb_save_background: completed succesfully\n");
+      g_data.g_last_save_ms = get_monotonic_msec();
+      g_data.g_writes_since_save = 0;
+      g_data.g_last_save_ok = true;
+    } else {
+      fprintf(stderr, "rdb_save_background: child failed (status=%d\n", status);
+      g_data.g_last_save_ok = false;
+    }
+    g_rdb_child_pid = -1; // ready for the next save
+  }
+
+  if (result < 0){
+    // error - clear the pid
+    fprintf(stderr, "rdb_save_background: waitpid failed: %s\n", strerror(errno));
+    g_rdb_child_pid = -1;
+  }
+}
+
 // Key for searching in the hashtable
 struct LookupKey {
   struct HNode node; // hashtable node
@@ -1088,9 +1147,6 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out){
 
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving){
-    return resp_err(out, "ERR saving in progress");
-  }
 
   // again with the dummy
   LookupKey key;
@@ -1120,9 +1176,6 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
 
 // deletes a key and value
 static void do_del(std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving){
-    return resp_err(out, "ERR saving in progress");
-  }
   // a dummy again
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -1259,9 +1312,6 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
 
 // PEXPIRE key ttl_ms
 static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving){
-    return resp_err(out, "ERR saving in progress");
-  }
   int64_t ttl_ms = 0;
   if (!str2int(cmd[2], ttl_ms)){
     return resp_err(out, "ERR invalid TTL");
@@ -1300,9 +1350,6 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
 
 // zadd and zset (score, name)
 static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving){
-    return resp_err(out, "ERR saving in progress");
-  }
   double score = 0;
   if (!str2dbl(cmd[2], score)){
     return resp_err(out, "ERR invalid score");
@@ -1354,7 +1401,6 @@ static ZSet *expect_zset(std::string &s){
 
 // zrem zset name (search and remove)
 static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
-  if (g_data.g_saving) { return resp_err(out, "ERR saving in progress"); }
   ZSet *zset = expect_zset(cmd[1]);
 
   if (!zset) { return resp_err(out, "WRONGTYPE wrong type"); }
@@ -1489,27 +1535,33 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   return resp_err(out, "ERR invalid password");
 }
 
-// wrapper for do save
-static void rdb_save_func(void *){
-  g_data.g_saving = true;
-  g_data.g_last_save_ok = rdb_save("dump.rdb");
-  g_data.g_writes_since_save = 0;
-  g_data.g_saving = false;
-}
-
-// Do save in thread pool
+// SAVE - Do save - stays blocking
 static void do_save(std::vector<std::string> &cmd, Buffer *out){
   (void)cmd;
-  // we run in the thread pool
-  thread_pool_queue(&g_data.thread_pool, rdb_save_func, nullptr);
-  resp_ok(out);
+  if (g_rdb_child_pid != -1){
+    return resp_err(out, "ERR background save in progress");
+  }
+  if (rdb_save("dump.rdb")){
+    g_data.g_last_save_ms = get_monotonic_msec();
+    g_data.g_writes_since_save = 0;
+    resp_ok(out);
+  } else {
+    resp_err(out, "ERR save failed");
+  }
+}
+
+// BGSAVE - fork , returns immediately
+static void do_bgsave(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  if (g_rdb_child_pid != -1){
+    return resp_err(out, "ERR background save already in progress");
+  }
+  rdb_save_background();
+  resp_str(out, "Background saving started", sizeof("Background saving started")-1);
 }
 
 // asyncdel key - delete in background
 static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (g_data.g_saving){
-    return resp_err(out, "ERR saving in progress");
-  }
   // look the key
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -1653,6 +1705,8 @@ static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_info(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "save") {
     do_save(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "bgsave") {
+    do_bgsave(cmd,out);
   } else {
     resp_err(out, "ERR unknown command");
   }
@@ -1737,9 +1791,9 @@ static void process_timers(){
   bool time_elapsed = (now_ms - g_data.g_last_save_ms) >= k_save_interval_ms;
   bool dirty_enough = g_data.g_writes_since_save >= k_save_after_writes;
 
-  if (time_elapsed && dirty_enough && !g_data.g_saving){
-    g_data.g_last_save_ms = now_ms;
-    thread_pool_queue(&g_data.thread_pool, rdb_save_func, nullptr);
+  if (time_elapsed && dirty_enough && g_rdb_child_pid == -1){
+    g_data.g_last_save_ms =now_ms;
+    rdb_save_background();
     fprintf(stderr, "periodic save triggered\n");
   }
 }
@@ -1934,8 +1988,18 @@ int main(){
     } // this if for each connection socket (fd)
     // handle timers
     process_timers();
+    rdb_check_background_save();
   }
   fprintf(stderr, "shutting down, saving...\n");
+
+  // if a background save is running, wait for it first
+  if (g_rdb_child_pid != -1){
+    int status = 0;
+    waitpid(g_rdb_child_pid, &status, 0); // blocking wait
+    g_rdb_child_pid = -1;
+  }
+
   rdb_save("dump.rdb");
+  fprintf(stderr, "saved. goodbye.\n");
   return 0;
 }

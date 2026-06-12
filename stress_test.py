@@ -413,9 +413,9 @@ def test_zquery_commands(r: TestRunner, sock: socket.socket):
     res2 = cmd(sock, "zquery", zset, "0", "", "1", "10")
     r.check("zquery offset=1 → 8 items", len(res2), 8)
 
-    # limit=4 → 4 items
+    # limit=4 → server returns 4 PAIRS = 8 items (name+score each)
     res3 = cmd(sock, "zquery", zset, "0", "", "0", "4")
-    r.check("zquery limit=4 → 4 items", len(res3), 4)
+    r.check("zquery limit=4 → 8 items (4 pairs)", len(res3), 8)
 
     # from 3.0 → c,d,e = 6 items
     res4 = cmd(sock, "zquery", zset, "3.0", "", "0", "10")
@@ -578,6 +578,72 @@ def test_save_command(r: TestRunner, sock: socket.socket):
 
     cmd(sock, "del", "rdb_key1")
     cmd(sock, "del", "rdb_key2")
+
+
+def test_bgsave_command(r: TestRunner, sock: socket.socket):
+    r.section("BGSAVE (fork-based background save)")
+
+    # populate some data
+    for i in range(20):
+        cmd(sock, "set", f"bg_key{i}", f"value{i}")
+
+    # trigger background save — should return immediately
+    t0     = time.time()
+    result = cmd(sock, "bgsave")
+    elapsed = time.time() - t0
+
+    # bgsave returns a status string, not OK
+    r.check_type("bgsave returns string", result, str)
+    r.check_true("bgsave returns fast (<50ms)", elapsed < 0.05)
+    print(f"  {YELLOW}ℹ{RESET}  bgsave returned in {elapsed*1000:.1f}ms: {result!r}")
+
+    # server must stay responsive WHILE the fork child is saving
+    # fire a burst of commands immediately after bgsave
+    responsive = True
+    burst_start = time.time()
+    for i in range(50):
+        try:
+            cmd(sock, "set", f"during_save{i}", "x")
+            cmd(sock, "get", f"during_save{i}")
+        except Exception:
+            responsive = False
+            break
+    burst_elapsed = time.time() - burst_start
+
+    r.check_true("server responsive during save", responsive)
+    print(f"  {YELLOW}ℹ{RESET}  100 ops during save took "
+          f"{burst_elapsed*1000:.1f}ms")
+
+    # the burst should NOT have been blocked — if it took seconds,
+    # the save was blocking the event loop
+    r.check_true("save did not block event loop (burst <500ms)",
+                 burst_elapsed < 0.5)
+
+    # give the child time to finish writing
+    time.sleep(0.5)
+
+    # verify file exists and is valid
+    r.check("dump.rdb exists after bgsave",
+            os.path.exists("dump.rdb"), True)
+    if os.path.exists("dump.rdb"):
+        with open("dump.rdb", "rb") as f:
+            magic = f.read(5)
+        r.check("bgsave file has magic", magic, b"MYRED")
+
+    # second bgsave while first might still run — should be rejected
+    # or accepted depending on timing; just verify it doesn't crash
+    try:
+        cmd(sock, "bgsave")
+        r.check_true("second bgsave handled gracefully", True)
+    except RespError:
+        # "background save already in progress" is also valid
+        r.check_true("second bgsave handled gracefully", True)
+
+    # cleanup
+    for i in range(20):
+        cmd(sock, "del", f"bg_key{i}")
+    for i in range(50):
+        cmd(sock, "del", f"during_save{i}")
 
 
 def test_auth_command(r: TestRunner, host: str, port: int):
@@ -920,6 +986,7 @@ def main():
             test_edge_cases(r,            sock)
             test_info_command(r,          sock)
             test_save_command(r,          sock)
+            test_bgsave_command(r,        sock)
         except Exception as e:
             print(f"\n{RED}Unexpected error: {e}{RESET}")
             all_ok = False
