@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
 // C++
 #include <string>
 #include <vector>
@@ -1607,55 +1608,54 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
 
 }
 
-static void do_request(std::vector<std::string> &cmd,
-                       Buffer *out, Conn *conn) {
-    if (cmd.empty()) {
-        return resp_err(out, "ERR empty command");
-    }
+static void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+  if (cmd.empty()) {
+    return resp_err(out, "ERR empty command");
+  }
 
-    // AUTH always allowed
-    if (cmd.size() == 2 && cmd[0] == "auth") {
-        return do_auth(cmd, out, conn);
-    }
+  // AUTH always allowed
+  if (cmd.size() == 2 && cmd[0] == "auth") {
+    return do_auth(cmd, out, conn);
+  }
 
-    // check authentication
-    if (!conn->authenticaded) {
-        return resp_err(out, "NOAUTH authentication required");
-    }
+  // check authentication
+  if (!conn->authenticaded) {
+    return resp_err(out, "NOAUTH authentication required");
+  }
 
-    if (cmd.size() == 2 && cmd[0] == "get") {
-        do_get(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "set") {
-        do_set(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "del") {
-        do_del(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "asyncdel") {
-        do_asyncdel(cmd, out, conn);
-    } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
-        do_pexpire(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
-        do_ttl(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "keys") {
-        do_keys(cmd, out);
-    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
-        do_zadd(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
-        do_zrem(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
-        do_zscore(cmd, out);
-    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
-        do_zquery(cmd, out);
-    } else if (cmd.size() == 6 && cmd[0] == "zrevquery") {
-        do_zquery_reversed(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "zrank") {
-        do_zrank(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "info") {
-        do_info(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "save") {
-        do_save(cmd, out);
-    } else {
-        resp_err(out, "ERR unknown command");
-    }
+  if (cmd.size() == 2 && cmd[0] == "get") {
+    do_get(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "set") {
+    do_set(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "del") {
+    do_del(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "asyncdel") {
+    do_asyncdel(cmd, out, conn);
+  } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+    do_pexpire(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+    do_ttl(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "keys") {
+    do_keys(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+    do_zadd(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+    do_zrem(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+    do_zscore(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+    do_zquery(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zrevquery") {
+    do_zquery_reversed(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrank") {
+    do_zrank(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "info") {
+    do_info(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "save") {
+    do_save(cmd, out);
+  } else {
+    resp_err(out, "ERR unknown command");
+  }
 }
 
 // Timers logic 
@@ -1841,7 +1841,7 @@ int main(){
   dlist_init(&g_data.io_list);
 
   // Initialiaze the thread pool and result queue 
-  thread_pool_init(&g_data.thread_pool, 4);
+  thread_pool_init(&g_data.thread_pool, 8);
 
   if (!rdb_load("dump.rdb")){
     fprintf(stderr, "rdb_load failed, starting with empty database\n");
@@ -1851,7 +1851,7 @@ int main(){
   if (fd < 0) {die("socket()");}
 
   int val = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)); // set the socket option like the time wait for the socket
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)); // set the socket option like the time wait for the socket
 
   // the is the parameter bind to 0.0.0.0: 1234
   struct sockaddr_in addr = {};
