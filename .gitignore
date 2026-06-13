@@ -1,0 +1,14 @@
+# CMake out-of-source build directory
+build/
+
+# compiled binaries (now produced under build/)
+/server
+/client
+
+# RDB persistence files
+dump.rdb
+dump.rdb.tmp
+dump.rdb.bak
+
+# editor / IDE
+.vs/
