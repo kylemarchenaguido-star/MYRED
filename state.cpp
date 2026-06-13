@@ -61,6 +61,8 @@ void entry_del(Entry *ent){
 void entry_del_sync(Entry *ent) {
   if (ent->type == T_ZSET) {
     zset_clear(&ent->zset);
+  } else if (ent->type ==  T_DLIST){
+    deque_free(&ent->deque);
   }
   entry_set_ttl(ent, -1);
   delete ent;

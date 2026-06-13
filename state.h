@@ -9,6 +9,7 @@
 #include "list.h"
 #include "heap.h"
 #include "thread_pool.h"
+#include "deque.h"
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
@@ -27,6 +28,7 @@ enum {
   T_INIT = 0,
   T_STR = 1, // string
   T_ZSET = 2, // sorted set
+  T_DLIST = 3, // deque list
 };
 
 // Timer for both linked lists
@@ -90,6 +92,7 @@ struct Entry {
   // one of the following 
   std::string str;
   ZSet zset;
+  Deque deque;
 };
 
 // Key for searching in the hashtable
