@@ -23,6 +23,11 @@ add_executable(server
   avl.cpp
   heap.cpp
   thread_pool.cpp
+  buffer.cpp
+  state.cpp
+  resp.cpp
+  rdb.cpp
+  commands.cpp
 )
 target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
 
