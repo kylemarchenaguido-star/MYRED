@@ -227,7 +227,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
 }
 
 // empty zset (?? i am going to explode myself)
-static const ZSet k_empty_zset;
+static constexpr ZSet k_empty_zset;
 
 // search an expected zset
 static ZSet *expect_zset(std::string &s){
@@ -501,6 +501,146 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
   );
   resp_str(out, buf, (size_t)len);         
 
+}
+
+static constexpr Deque k_empty_deque; // cap = 0, count = 0, 
+
+// helper for list (deque) 
+// if create is true, makes a new list entry if the key is missing
+Deque *get_deque(const std::string &key, bool create, Entry **out_ent = nullptr){
+  LookupKey lk;
+  lk.key = key;
+  lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+  HNode *found = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+
+  if (found){
+    Entry *ent = container_of(found, Entry, node);
+    if (ent->type != T_DLIST){
+      return nullptr;
+    }
+    if (out_ent) *out_ent = ent;
+    return &ent->deque;
+  }
+
+  if (!create) {
+    return (Deque *)&k_empty_deque;
+  }
+
+  // Create a new list (deque) entry
+  Entry *ent = entry_new(T_DLIST);
+  deque_init(&ent->deque);
+  ent->key = key;
+  ent->node.hcode = lk.node.hcode;
+  hm_insert(&g_data.db, &ent->node);
+  if (out_ent) *out_ent = ent;
+  return &ent->deque;
+}
+
+// LPUSH key
+void do_lpush(std::vector<std::string> &cmd, Buffer *out){
+  Deque *deque = get_deque(cmd[1], true);
+  if (!deque) {
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+  // push all values
+  for (size_t i = 2; i < cmd.size(); ++i){
+    deque_push_front(deque, cmd[i]);
+  }
+  g_data.g_writes_since_save++;
+  resp_int(out, (int64_t)deque->count);
+}
+
+// RPUSH key
+void do_rpush(std::vector<std::string> &cmd, Buffer *out){
+  Deque *deque = get_deque(cmd[1], true);
+  if (!deque){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+  for (size_t i = 2; i < cmd.size(); ++i){
+    deque_push_back(deque, cmd[i]);
+  }
+  g_data.g_writes_since_save++;
+  resp_int(out, (int64_t)deque->count);
+}
+
+// LPOP key
+void do_lpop(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque) {
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  std::string val;
+  if (!deque_pop_front(deque, &val)){
+    return resp_nil(out);
+  }
+
+  // if list is now empty, delete the key
+  if (deque->count == 0){
+    hm_delete(&g_data.db, &ent->node, &entry_eq);
+    entry_del(ent);
+  }
+
+  g_data.g_writes_since_save++;
+  resp_str(out, val.data(), val.size());
+}
+
+// RPOP key
+void do_rpop(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque) {
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  std::string val;
+  if (!deque_pop_back(deque, &val)){
+    return resp_nil(out);
+  }
+
+  // if list is now empty, delete the key
+  if (deque->count == 0){
+    hm_delete(&g_data.db, &ent->node, &entry_eq);
+    entry_del(ent);
+  }
+
+  g_data.g_writes_since_save++;
+  resp_str(out, val.data(), val.size());
+}
+
+// LLEN key
+void do_llen(std::vector<std::string> &cmd, Buffer *out){
+  Deque *deque = get_deque(cmd[1], false);
+  if (!deque){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+  resp_int(out, (int64_t)deque->count);
+}
+
+// LINDEX key index
+void do_lindex(std::vector<std::string> &cmd, Buffer *out){
+  Deque *deque = get_deque(cmd[1], false);
+  if (!deque){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+  int64_t idx = 0;
+  if (!str2int(cmd[2], idx)){
+    return resp_err(out, "ERR invalid index");
+  }
+  idx = deque_normalize(deque, idx);
+
+  if (idx < 0 || idx >= (int64_t)deque->count){
+    return resp_nil(out);
+  }
+
+  const std::string *val = deque_get(deque, (size_t)idx);
+  resp_str(out, val->data(), val->size());
+}
+
+// LRANGE key start stop
+void do_lrange(std::vector<std::string> &cmd, Buffer *out){
+  
 }
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
