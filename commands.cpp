@@ -640,7 +640,34 @@ void do_lindex(std::vector<std::string> &cmd, Buffer *out){
 
 // LRANGE key start stop
 void do_lrange(std::vector<std::string> &cmd, Buffer *out){
-  
+  Deque *deque =  get_deque(cmd[1], false);
+  if  (!deque){
+    return resp_arr(out, 0);
+  }
+
+  int64_t start = 0, stop = 0;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)){
+    return resp_err(out, "ERR invalid range");
+  }
+
+  int n = (int64_t)deque->count;
+  start = deque_normalize(deque, start);
+  stop = deque_normalize(deque, stop);
+
+  // clamp to valid bounds
+  if (start < 0) start = 0;
+  if (stop >= n) stop = n - 1;
+
+  if (start > stop || start >= n){
+    return resp_arr(out, 0); // empty range
+  }
+
+  uint32_t range_len = (uint32_t)(stop - start + 1);
+  resp_arr(out, range_len);
+  for (int64_t i = start; i <= stop; ++i){
+    const std::string *val = deque_get(deque, (size_t)i);
+    resp_str(out, val->data(), val->size());
+  }
 }
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
@@ -690,6 +717,20 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_save(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "bgsave") {
     do_bgsave(cmd,out);
+  } else if (cmd.size() >= 3 && cmd[0] == "lpush") {
+    do_lpush(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "rpush") {
+    do_rpush(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "lpop") {
+    do_lpop(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "rpop") {
+    do_rpop(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "llen") {
+    do_llen(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "lindex") {
+    do_lindex(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "lrange") {
+    do_lrange(cmd, out);
   } else {
     resp_err(out, "ERR unknown command");
   }

@@ -135,6 +135,23 @@ static bool cb_rdb_write(HNode *node, void *arg){
     // patch real member count
     memcpy(ctx->buf->data_begin + member_count_index, &zctx.count, 4);
 
+  } else if (ent->type == T_DLIST){
+    buf_append(ctx->buf, 2); // type list
+    // ttl
+    if (ent->heap_idx != (size_t)-1){
+      buf_append(ctx->buf, 1);
+      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
+    } else {
+      buf_append(ctx->buf, 0);
+    }
+
+    // key
+    buf_append_str(ctx->buf, ent->key.data(), ent->key.size());
+
+    // element count
+    uint32_t n = (uint32_t)ent->deque.count;
+    buf_append(ctx->buf, (const uint8_t *)&n, 4);
+
   }
   ctx->count++;
   return true;
