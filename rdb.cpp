@@ -93,7 +93,7 @@ static bool cb_zset_member(HNode *node, void *arg){
 static bool cb_rdb_write(HNode *node, void *arg){
   RDBWriteCtx *ctx = (RDBWriteCtx *)arg;
   Entry *ent = container_of(node, Entry, node);
-  // we skip everything only strings
+  // strings
   if (ent->type == T_STR){
     // type tag byte
     buf_append(ctx->buf, 0);
@@ -152,6 +152,11 @@ static bool cb_rdb_write(HNode *node, void *arg){
     uint32_t n = (uint32_t)ent->deque.count;
     buf_append(ctx->buf, (const uint8_t *)&n, 4);
 
+    // element in logical order
+    for (size_t i = 0; i < ent->deque.count; ++i){
+      const std::string *val = deque_get(&ent->deque, i);
+      buf_append_str(ctx->buf, val->data(), (uint32_t)val->size());
+    }
   }
   ctx->count++;
   return true;
@@ -443,6 +448,58 @@ static bool rdb_load_zset_entry(RDBCursor *c){
   return true;
 }
 
+static bool rdb_load_deque_entry(RDBCursor *c){
+  uint8_t has_ttl = 0;
+  if (!cursor_read_u8(c, &has_ttl)) {return false; }
+
+  uint64_t expire_at = 0;
+  if (has_ttl){
+     if (!cursor_read_u64(c, &expire_at)) { return false; }
+     uint64_t now_ms = get_monotonic_msec();
+     if (expire_at <= now_ms){
+      // expired so we read and discard
+      std::string key;
+      uint32_t n = 0;
+      cursor_read_str(c, &key);
+      cursor_read_u32(c, &n);
+      for (uint32_t i = 0; i < n; ++i){
+        std::string tmp;
+        cursor_read_str(c, &tmp);
+      }
+      return true;
+     }
+  }
+
+  std::string key;
+  if (!cursor_read_str(c, &key)) { return false; }
+  
+  uint32_t n = 0;
+  if (!cursor_read_u32(c, &n)) { return false; }
+
+  Entry  *ent = entry_new(T_DLIST);
+  deque_init(&ent->deque);
+  ent->key = key;
+  ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
+
+  for (uint32_t i = 0; i < n; ++i){
+    std::string val;
+    if (!cursor_read_str(c, &val)) {
+      entry_del_sync(ent);
+      return false;
+    }
+    deque_push_back(&ent->deque, val);
+  }
+
+  hm_insert(&g_data.db, &ent->node);
+  if (has_ttl){
+    uint64_t now_ms = get_monotonic_msec();
+    entry_set_ttl(ent, (int64_t)(expire_at - now_ms));
+  }
+  return true;
+}
+
+
+
 static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint32_t n_entries){
   RDBCursor c;
   c.pos = payload;
@@ -458,6 +515,8 @@ static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint3
       ok = rdb_load_string_entry(&c);
     } else if (type == 0x01){
       ok = rdb_load_zset_entry(&c);
+    } else if (type == 0x02){
+      ok = rdb_load_deque_entry(&c);
     } else {
       fprintf(stderr, "rdb_parse: unknown type 0x%02x\n", type);
       return false;

@@ -8,6 +8,7 @@
 #include "stdio.h"
 #include "stdlib.h"
 #include "math.h"
+#include "ctype.h"
 
 //gets a value from key
 static void do_get(std::vector<std::string> &cmd, Buffer *out){
@@ -642,7 +643,7 @@ void do_lindex(std::vector<std::string> &cmd, Buffer *out){
 void do_lrange(std::vector<std::string> &cmd, Buffer *out){
   Deque *deque =  get_deque(cmd[1], false);
   if  (!deque){
-    return resp_arr(out, 0);
+    return resp_err(out, "WRONGTYPE wrong type");
   }
 
   int64_t start = 0, stop = 0;
@@ -650,7 +651,7 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int n = (int64_t)deque->count;
+  int64_t n = (int64_t)deque->count;
   start = deque_normalize(deque, start);
   stop = deque_normalize(deque, stop);
 
@@ -673,6 +674,11 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
+  }
+
+  // command names are case-insesitve
+  for (char &ch : cmd[0]){
+    ch = (char)tolower((unsigned char)ch);
   }
 
   // AUTH always allowed
