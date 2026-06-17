@@ -7,7 +7,8 @@ Tests all commands:
   TTL:     pexpire, pttl
   Keys:    keys
   ZSet:    zadd, zrem, zscore, zquery, zrevquery, zrank
-  Admin:   auth, info, save
+  Lists:   lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim
+  Admin:   auth, info, save, bgsave
 
 Because the server now speaks RESP, this test also works against the
 real redis-cli for cross-validation.
@@ -239,6 +240,21 @@ class TestRunner:
     def check_true(self, name: str, condition: bool) -> bool:
         return self.check(name, condition, True)
 
+    def expect_error(self, name: str, sock: "socket.socket", *args: str) -> bool:
+        """Pass iff the command raises a RESP error (e.g. WRONGTYPE)."""
+        try:
+            got = cmd(sock, *args)
+        except RespError:
+            print(f"  {GREEN}✓{RESET} {name}")
+            self.passed += 1
+            return True
+        print(f"  {RED}✗{RESET} {name}\n"
+              f"    got:      {got!r}\n"
+              f"    expected: a RESP error")
+        self.errors.append(name)
+        self.failed += 1
+        return False
+
     def section(self, title: str):
         pad = max(0, 50 - len(title))
         print(f"\n{BOLD}{BLUE}── {title} {'─' * pad}{RESET}")
@@ -438,6 +454,99 @@ def test_zquery_commands(r: TestRunner, sock: socket.socket):
     r.check("zrevquery from 3.5 → 6 items", len(res7), 6)
 
     cmd(sock, "del", zset)
+
+
+def test_list_commands(r: TestRunner, sock: socket.socket):
+    r.section("Lists: LPUSH/RPUSH/LPOP/RPOP/LLEN/LINDEX/LRANGE")
+
+    key = "stress_list"
+    cmd(sock, "del", key)
+
+    # RPUSH appends, LPUSH prepends (each arg pushed in turn)
+    r.check("rpush a b c → 3", cmd(sock, "rpush", key, "a", "b", "c"), 3)
+    r.check("llen → 3", cmd(sock, "llen", key), 3)
+    r.check("lrange 0 -1 → [a,b,c]",
+            cmd(sock, "lrange", key, "0", "-1"), ["a", "b", "c"])
+
+    # lpush x then y → [y, x, a, b, c]
+    r.check("lpush x y → 5", cmd(sock, "lpush", key, "x", "y"), 5)
+    r.check("lrange after lpush",
+            cmd(sock, "lrange", key, "0", "-1"), ["y", "x", "a", "b", "c"])
+
+    # LINDEX incl. negative + out of range
+    r.check("lindex 0 → y",  cmd(sock, "lindex", key, "0"),  "y")
+    r.check("lindex -1 → c", cmd(sock, "lindex", key, "-1"), "c")
+    r.check("lindex 2 → a",  cmd(sock, "lindex", key, "2"),  "a")
+    r.check_none("lindex 100 → nil", cmd(sock, "lindex", key, "100"))
+
+    # LPOP / RPOP
+    r.check("lpop → y", cmd(sock, "lpop", key), "y")
+    r.check("rpop → c", cmd(sock, "rpop", key), "c")
+    r.check("lrange after pops",
+            cmd(sock, "lrange", key, "0", "-1"), ["x", "a", "b"])
+
+    cmd(sock, "del", key)
+
+    r.section("Lists: LSET / LINSERT")
+    cmd(sock, "del", key)
+    cmd(sock, "rpush", key, "a", "b", "c")               # [a, b, c]
+
+    r.check("lset 1 B → OK", cmd(sock, "lset", key, "1", "B"), "OK")
+    r.check("lindex 1 → B",  cmd(sock, "lindex", key, "1"), "B")
+    r.expect_error("lset out of range → error", sock, "lset", key, "100", "z")
+
+    # LINSERT: new length on success, -1 pivot-not-found, 0 missing key
+    r.check("linsert before B → 4",
+            cmd(sock, "linsert", key, "before", "B", "X"), 4)
+    r.check("lrange after insert before",
+            cmd(sock, "lrange", key, "0", "-1"), ["a", "X", "B", "c"])
+    r.check("linsert after c → 5",
+            cmd(sock, "linsert", key, "after", "c", "Y"), 5)
+    r.check("lrange after insert after",
+            cmd(sock, "lrange", key, "0", "-1"), ["a", "X", "B", "c", "Y"])
+    r.check("linsert pivot missing → -1",
+            cmd(sock, "linsert", key, "before", "ghost", "Z"), -1)
+    r.check("linsert missing key → 0",
+            cmd(sock, "linsert", "stress_nolist", "before", "a", "z"), 0)
+
+    cmd(sock, "del", key)
+
+    r.section("Lists: LREM / LTRIM")
+    cmd(sock, "del", key)
+    cmd(sock, "rpush", key, "a", "b", "a", "c", "a")     # [a, b, a, c, a]
+    r.check("lrem 2 a (head) → 2", cmd(sock, "lrem", key, "2", "a"), 2)
+    r.check("lrange after lrem head",
+            cmd(sock, "lrange", key, "0", "-1"), ["b", "c", "a"])
+    r.check("lrem -1 a (tail) → 1", cmd(sock, "lrem", key, "-1", "a"), 1)
+    r.check("lrange after lrem tail",
+            cmd(sock, "lrange", key, "0", "-1"), ["b", "c"])
+
+    cmd(sock, "del", key)
+    cmd(sock, "rpush", key, "a", "b", "c", "d", "e")     # [a..e]
+    r.check("ltrim 1 3 → OK", cmd(sock, "ltrim", key, "1", "3"), "OK")
+    r.check("lrange after ltrim",
+            cmd(sock, "lrange", key, "0", "-1"), ["b", "c", "d"])
+    r.check("ltrim 0 -1 keeps all", cmd(sock, "ltrim", key, "0", "-1"), "OK")
+    r.check("lrange unchanged",
+            cmd(sock, "lrange", key, "0", "-1"), ["b", "c", "d"])
+    # trimming to an empty range deletes the key
+    cmd(sock, "ltrim", key, "5", "10")
+    r.check("llen after empty ltrim → 0", cmd(sock, "llen", key), 0)
+
+    cmd(sock, "del", key)
+
+    r.section("Lists: wrong-type + missing-key behavior")
+    cmd(sock, "del", "stress_liststr")
+    cmd(sock, "set", "stress_liststr", "hello")
+    r.expect_error("lpush on string → WRONGTYPE",  sock, "lpush",  "stress_liststr", "x")
+    r.expect_error("lrange on string → WRONGTYPE", sock, "lrange", "stress_liststr", "0", "-1")
+    cmd(sock, "del", "stress_liststr")
+
+    cmd(sock, "del", "stress_nolist")
+    r.check("llen missing → 0",      cmd(sock, "llen",   "stress_nolist"), 0)
+    r.check("lrange missing → []",   cmd(sock, "lrange", "stress_nolist", "0", "-1"), [])
+    r.check_none("lpop missing → nil", cmd(sock, "lpop", "stress_nolist"))
+    r.check("lrem missing → 0",      cmd(sock, "lrem",   "stress_nolist", "0", "x"), 0)
 
 
 def test_asyncdel_command(r: TestRunner, sock: socket.socket):
@@ -795,15 +904,18 @@ def stress_worker(host: str, port: int, ops: int,
         return
 
     zset = f"stress_zset_{wid}"
+    lst  = f"stress_list_{wid}"
     try:
         cmd(sock, "del", zset)
+        cmd(sock, "del", lst)
         for i in range(10):
             cmd(sock, "zadd", zset, str(float(i)), f"m{i}")
+        cmd(sock, "rpush", lst, "a", "b", "c", "d", "e")
     except Exception:
         pass
 
     for _ in range(ops):
-        op = random.randint(0, 10)
+        op = random.randint(0, 14)
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -834,6 +946,17 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "keys")
             elif op == 10:
                 cmd(sock, "info")
+            elif op == 11:
+                cmd(sock, "rpush", lst, random_string(6))
+            elif op == 12:
+                cmd(sock, "lpush", lst, random_string(6))
+            elif op == 13:
+                cmd(sock, "lrange", lst, "0", "5")
+            elif op == 14:
+                # keep the list from growing unbounded: pop both ends, check len
+                cmd(sock, "lpop", lst)
+                cmd(sock, "rpop", lst)
+                cmd(sock, "llen", lst)
 
             stats.record((time.perf_counter() - t0) * 1000)
         except Exception:
@@ -841,6 +964,7 @@ def stress_worker(host: str, port: int, ops: int,
 
     try:
         cmd(sock, "del", zset)
+        cmd(sock, "del", lst)
         sock.close()
     except Exception:
         pass
@@ -982,6 +1106,7 @@ def main():
             test_ttl_commands(r,          sock)
             test_zset_commands(r,         sock)
             test_zquery_commands(r,       sock)
+            test_list_commands(r,         sock)
             test_asyncdel_command(r,      sock)
             test_edge_cases(r,            sock)
             test_info_command(r,          sock)

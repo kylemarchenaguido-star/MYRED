@@ -757,7 +757,7 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent = nullptr;
   Deque *deque = get_deque(cmd[1], false, &ent);
   if (!deque){
-    return resp_int(out, 0); // mising key
+    return resp_err(out, "WRONGTYPE wrong type"); // null = wrong type
   }
   for (char &ch : cmd[2]) { ch = (char)tolower((unsigned char)ch); }
 
@@ -765,6 +765,8 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   if (cmd[2] == "before") { before = true; }
   else if (cmd[2] == "after") { before = false; }
   else { return resp_err(out, "ERR syntax error"); }
+
+  if (!ent){ return resp_int(out, 0); } // key does not exist
 
   const std::string &pivot = cmd[3];
   const std::string &value = cmd[4];
@@ -777,7 +779,7 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
       break;
     }
   }
-  if (pivot_idx == SIZE_MAX) { return resp_int(out, 0); }
+  if (pivot_idx == SIZE_MAX) { return resp_int(out, -1); } // pivot not found
 
   size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
 
@@ -788,7 +790,7 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   deque->buf[deque_phys(deque, insert_idx)] = value;
 
   g_data.g_writes_since_save++;
-  resp_int(out, 0);
+  resp_int(out, (int64_t)deque->count); // new length
 }
 
 // LREM key count value
