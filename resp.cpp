@@ -72,6 +72,13 @@ void resp_ok(Buffer *out){
   buf_append(out, "+OK\r\n", sizeof("+OK\r\n") - 1);
 }
 
+// simple-string response: +<s>\r\n   (used by TYPE)
+void resp_simple(Buffer *out, const char *s){
+  buf_append(out, "+", 1);
+  buf_append(out, s, strlen(s));
+  buf_append(out, "\r\n", sizeof("\r\n") - 1);
+}
+
 // ERR response
 void resp_err(Buffer *out, const char *msg){
   buf_append(out, "-", 1);

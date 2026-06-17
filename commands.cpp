@@ -978,10 +978,129 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   resp_ok(out);
 }
 
+// glob-style pattern match (Redis MATCH semantics), case-sensitive:
+//   *        any sequence (including empty)
+//   ?        exactly one char
+//   [abc]    one of a set;  [a-z] range;  [^...] negation
+//   \x       escape: match x literally
+// p/plen = pattern, s/slen = string. recursive on '*'.
+static bool glob_match(const char *p, size_t plen, const char *s, size_t slen){
+  while (plen > 0){
+    switch (p[0]){
+      case '*':
+        while (plen > 1 && p[1] == '*'){ p++; plen--; }     // collapse "**"
+        if (plen == 1){ return true; }                       // trailing '*' eats the rest
+        // try matching the rest of the pattern at every split of s
+        for (size_t i = 0; i <= slen; i++){
+          if (glob_match(p + 1, plen - 1, s + i, slen - i)){ return true; }
+        }
+        return false;
+
+      case '?':
+        if (slen == 0){ return false; }                      // needs one char
+        s++; slen--;
+        break;
+        // this bombed is dark magic how iterate over the string 
+      case '[': {
+        if (slen == 0){ return false; }
+        const char *cp = p + 1; size_t crem = plen - 1;
+        bool negate = false;
+        if (crem > 0 && cp[0] == '^'){ negate = true; cp++; crem--; }
+        bool matched = false;
+        while (crem > 0 && cp[0] != ']'){
+          if (cp[0] == '\\' && crem >= 2){                   // escaped char in class
+            if (cp[1] == s[0]){ matched = true; }
+            cp += 2; crem -= 2;
+          } else if (crem >= 3 && cp[1] == '-' && cp[2] != ']'){  // range a-z
+            char lo = cp[0], hi = cp[2];
+            if (lo > hi){ char t = lo; lo = hi; hi = t; }
+            if (s[0] >= lo && s[0] <= hi){ matched = true; }
+            cp += 3; crem -= 3;
+          } else {                                           // single char
+            if (cp[0] == s[0]){ matched = true; }
+            cp++; crem--;
+          }
+        }
+        if (crem > 0 && cp[0] == ']'){ cp++; crem--; }        // step past ']'
+        if (negate){ matched = !matched; }
+        if (!matched){ return false; }
+        s++; slen--;
+        p = cp; plen = crem;                                 // pattern advanced past the class
+        continue;                                            // skip the p++ below
+      }
+
+      case '\\':
+        if (plen >= 2){ p++; plen--; }                       // consume the backslash
+        // fallthrough-style literal compare:
+        if (slen == 0 || p[0] != s[0]){ return false; }
+        s++; slen--;
+        break;
+
+      default:
+        if (slen == 0 || p[0] != s[0]){ return false; }
+        s++; slen--;
+        break;
+    }
+    p++; plen--;
+  }
+  return slen == 0;   // pattern consumed -> match iff string is also consumed
+}
+
 struct ScanCtx {
   std::vector<std::string> *keys;
-  const std::string *pattern; // nullptr if no match 
+  const std::string *pattern; // nullptr if no match
 };
+
+static void cb_scan(HNode *node, void *arg){
+  ScanCtx *ctx = (ScanCtx *)arg;
+  Entry *ent = container_of(node, Entry, node);
+
+  // skip expired keys, read only check
+  if (ent->heap_idx != (size_t)-1 && g_data.heap[ent->heap_idx].val <= get_monotonic_msec()){ return; }
+
+  // MATCH filter (if a pattern was given)
+  if (ctx->pattern && !glob_match(ctx->pattern->data(), ctx->pattern->size(), ent->key.data(), ent->key.size())){
+    return;
+  }
+
+  ctx->keys->push_back(ent->key);
+}
+
+// SCAN cursor [MATCH PATTERN] [COUNT n]
+static void do_scan(std::vector<std::string> &cmd, Buffer *out){
+  int64_t cursor = 0;
+  if (!str2int(cmd[1], cursor)) { return resp_err(out, "ERR invalid cursor"); }
+
+  size_t count = 10;
+  const std::string *pattern = nullptr;
+  std::string pat;
+  // search in pair
+  for (size_t i = 2; i + 1 < cmd.size(); i += 2){
+    std::string opt = cmd[i];
+    for (char &c: opt) { c = (char)tolower((unsigned char)c); }
+    if (opt == "count"){
+      int64_t n;
+      if (!str2int(cmd[i+1], n) || n <= 0) { return resp_err(out, "ERR invalid count"); }
+      count = (size_t)n;
+    } else if (opt == "match"){
+      pat = cmd[i+1];
+      pattern = &pat;
+    } else {
+      return resp_err(out, "ERR syntax error");
+    }
+  }
+
+  std::vector<std::string> keys;
+  ScanCtx ctx { &keys, pattern };
+  uint64_t next = hm_scan(&g_data.db, (uint64_t)cursor, count, cb_scan, &ctx);
+
+  // reply a 2 element array 
+  resp_arr(out, 2);
+  std::string cur = std::to_string(next);
+  resp_str(out, cur.data(), cur.size()); // element 1 cursor as string
+  resp_arr(out, (uint32_t)keys.size()); // element 2 array of keys
+  for (const auto &k : keys) { resp_str(out, k.data(), k.size()); }
+}
 
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
@@ -1058,6 +1177,18 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_lrem(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "ltrim") {
     do_ltrim(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "exists") {
+    do_exists(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "type") {
+    do_type(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "expire") {
+    do_expire(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "ttl") {
+    do_ttl_seconds(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "persist") {
+    do_persist(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "scan") {
+    do_scan(cmd, out);
   } else {
     resp_err(out, "ERR unknown command");
   }
