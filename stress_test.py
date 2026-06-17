@@ -41,6 +41,8 @@ import threading
 import argparse
 import sys
 import os
+import re
+import atexit
 from typing import Any, Optional
 
 # ─── configuration ────────────────────────────────────────────────────────────
@@ -61,6 +63,35 @@ YELLOW = "\033[93m"
 BLUE   = "\033[94m"
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
+
+
+# ─── output logging (tee console → file, ANSI stripped) ─────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+class _Tee:
+    """Mirror stdout to a file with color codes stripped, for a shareable log."""
+    def __init__(self, stream, fh):
+        self._stream = stream   # original stdout (keeps colors in the terminal)
+        self._fh     = fh       # log file (plain text)
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(_ANSI_RE.sub("", data))
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+
+
+def start_logging(path: str):
+    """Redirect stdout through a tee into `path` (markdown, fenced code block)."""
+    fh = open(path, "w", encoding="utf-8")
+    fh.write(f"# MYRED stress test — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n```\n")
+    sys.stdout = _Tee(sys.stdout, fh)
+
+    def _finish():
+        sys.stdout.flush()
+        fh.write("\n```\n")
+        fh.close()
+    atexit.register(_finish)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1068,10 +1099,18 @@ def main():
                     help="server password (if auth is enabled)")
     ap.add_argument("--correctness-only", action="store_true")
     ap.add_argument("--stress-only",      action="store_true")
+    ap.add_argument("--log",              default="stress_results.md",
+                    help="write a copy of all output here (ANSI stripped); "
+                         "pass --log '' to disable")
     args = ap.parse_args()
 
     host, port  = args.host, args.port
     G_PASSWORD  = args.password
+
+    # mirror everything to a shareable markdown log
+    if args.log:
+        start_logging(args.log)
+        print(f"(logging output to {args.log})")
 
     print(f"{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  Redis Server RESP Stress Test{RESET}")
