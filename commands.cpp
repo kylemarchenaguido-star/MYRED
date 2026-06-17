@@ -23,6 +23,7 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out){
   }
   // we copy the value
   Entry *ent = container_of(node, Entry, node);
+  if (expire_if_needed(ent)){ return resp_nil(out); } // expired -> treat as missing
   if (ent->type != T_STR) {
     return resp_err(out, "WRONGTYPE wrong type");
   }
@@ -169,6 +170,13 @@ static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
   if (!node) { return resp_int(out, 0); }
 
   Entry *ent = container_of(node, Entry, node);
+  if (ttl_ms <= 0){
+    // non-positive TTL means "already expired" -> delete now (Redis semantics)
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+    g_data.g_writes_since_save++;
+    return resp_int(out, 1);
+  }
   entry_set_ttl(ent, ttl_ms);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
@@ -184,6 +192,7 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
   if (!node){ return resp_int(out, -2); } // not found
 
   Entry *ent = container_of(node, Entry, node);
+  if (expire_if_needed(ent)){ return resp_int(out, -2); } // expired -> gone
   if (ent->heap_idx == (size_t)-1){
     return resp_int(out, -1); // not ttl
   }
@@ -406,6 +415,7 @@ static void do_bgsave(std::vector<std::string> &cmd, Buffer *out){
 
 // asyncdel key - delete in background
 static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  (void)conn; // not used; kept for dispatch signature symmetry
   // look the key
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -656,8 +666,8 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
   stop = deque_normalize(deque, stop);
 
   // clamp to valid bounds
-  if (start < 0) start = 0;
-  if (stop >= n) stop = n - 1;
+  if (start < 0) { start = 0; }
+  if (stop >= n) { stop = n - 1; }
 
   if (start > stop || start >= n){
     return resp_arr(out, 0); // empty range
@@ -670,6 +680,220 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
     resp_str(out, val->data(), val->size());
   }
 }
+
+// LSET key index value -- replace at index
+void do_lset(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  int64_t idx = 0;
+  if (!str2int(cmd[2], idx)){
+    return resp_err(out, "ERR invalid index");
+  }
+  idx = deque_normalize(deque, idx);
+
+  if (idx < 0 || idx >= (int64_t)deque->count){
+    return resp_err(out, "ERR index out of range");
+  }
+
+  // direct write
+  deque->buf[deque_phys(deque, (size_t)idx)] = cmd[3];
+  g_data.g_writes_since_save++;
+  resp_ok(out);
+}
+
+// Shifting helpers
+// helper that makes room for one new element at logical index idx
+static void deque_open_gap(Deque *d, size_t idx){
+  if (idx < d->count / 2){
+    // closer to the front - shift [ 0, idx] left by one, move head back
+    size_t new_head = (d->head + d->cap - 1) & (d->cap - 1);
+    for (size_t i = 0; i < idx; ++i){
+      size_t from = (new_head + 1 + i) & (d->cap - 1);
+      size_t  to = (new_head + i) & (d->cap - 1);
+      d->buf[to] = std::move(d->buf[from]);
+    }
+    d->head = new_head;
+  } else {
+    // closer to back - we shift [idx, count]to the right by one
+    for (size_t i = d->count; i > idx; --i ){
+      size_t from = deque_phys(d, i - 1);
+      size_t to = deque_phys(d, i);
+      d->buf[to] = std::move(d->buf[from]);
+    }
+  }
+  d->count++;
+}
+
+// helper that removes an item of the middle
+static void deque_close_gap(Deque *d, size_t idx){
+  if (idx < d->count / 2){
+    // closer to the front
+    for (size_t i = idx; i > 0; --i){
+      size_t from = deque_phys(d, i - 1);
+      size_t to = deque_phys(d, i);
+      d->buf[to] = std::move(d->buf[from]);
+    }
+    d->buf[d->head].clear();
+    d->head = (d->head + 1) & (d->cap - 1);
+  } else {
+    // closer to the back
+    for (size_t i = idx; i + 1 < d->count; ++i){
+      size_t from = deque_phys(d, i + 1);
+      size_t to = deque_phys(d, i);
+      d->buf[to] = std::move(d->buf[from]);
+    }
+    size_t last = deque_phys(d, d->count - 1);
+    d->buf[last].clear();
+  }
+  d->count--;
+}
+
+// LINSERT key before|after pivot value
+void do_linsert(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque){
+    return resp_int(out, 0); // mising key
+  }
+  for (char &ch : cmd[2]) { ch = (char)tolower((unsigned char)ch); }
+
+  bool before = false;
+  if (cmd[2] == "before") { before = true; }
+  else if (cmd[2] == "after") { before = false; }
+  else { return resp_err(out, "ERR syntax error"); }
+
+  const std::string &pivot = cmd[3];
+  const std::string &value = cmd[4];
+
+  // find the pivot - linear
+  size_t pivot_idx = SIZE_MAX;
+  for ( size_t i = 0; i < deque->count; ++i){
+    if (*deque_get(deque, i) == pivot){
+      pivot_idx = i;
+      break;
+    }
+  }
+  if (pivot_idx == SIZE_MAX) { return resp_int(out, 0); }
+
+  size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
+
+  // we ensure capaxity before opening the gap
+  if (deque->count == deque->cap){ deque_grow(deque); }
+
+  deque_open_gap(deque, insert_idx);
+  deque->buf[deque_phys(deque, insert_idx)] = value;
+
+  g_data.g_writes_since_save++;
+  resp_int(out, 0);
+}
+
+// LREM key count value
+void do_lrem(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque){ return resp_err(out, "WRONGTYPE wrong type"); }
+
+  int64_t count = 0;
+  if (!str2int(cmd[2], count)){ return resp_err(out, "ERR invalid count"); }
+
+  const std::string &value = cmd[3];
+  int64_t removed = 0;
+  int64_t limit = (count < 0) ? -count : count;
+  bool from_tail = (count < 0);
+
+  if (from_tail){
+    // scan from the back
+    size_t i = deque->count;
+    while (i > 0){
+      --i;
+      if (*deque_get(deque, i) == value){
+        deque_close_gap(deque, i);
+        removed++;
+        if (limit > 0 && removed >= limit) { break; }
+      }
+    }
+  } else {
+    // scan from the front
+    size_t i = 0;
+    while (i < deque->count){
+      if (*deque_get(deque, i) == value){
+        deque_close_gap(deque, i);
+        removed++;
+        if (limit > 0 && removed >= limit) { break; }
+        // don't advance i - the gap closed
+      } else {
+        ++i;
+      }
+    }
+  }
+
+  // delete the key if the list became empty
+  if (ent && deque->count == 0){
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+  }
+
+  if (removed > 0){ g_data.g_writes_since_save++; }
+  resp_int(out, removed);
+}
+
+// LTRIM key start stop
+void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Deque *deque = get_deque(cmd[1], false, &ent);
+  if (!deque){
+     return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  int64_t start = 0, stop = 0;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)){
+    return resp_err(out, "ERR invalid range");
+  }
+
+  int64_t n = (int64_t)deque->count;
+  start = deque_normalize(deque, start);
+  stop = deque_normalize(deque, stop);
+
+  if (start < 0) { start = 0; }
+  if (stop >= n) { stop = n - 1; }
+
+  // empty result - clear the whole list and delete the key
+  if (start > stop || start >= n){
+    if (ent){
+      hm_delete(&g_data.db, &ent->node, &hnode_same);
+      entry_del(ent);
+      g_data.g_writes_since_save++;
+    }
+    return resp_ok(out);
+  }
+
+  size_t keep = (size_t)(stop - start + 1);
+
+  // if we are keeping everything, no work needed
+  if (start == 0 && (size_t)(stop + 1) == deque->count){
+    return resp_ok(out);
+  }
+
+  // clear dropped slots, then resposition head/count, no alloc
+  for (int64_t i = 0; i < start; ++i){
+    deque->buf[deque_phys(deque, (size_t)i)].clear();
+  }
+  for (int64_t i = stop + 1; i < n; ++i){
+    deque->buf[deque_phys(deque, (size_t)i)].clear();
+  }
+
+  deque->head = deque_phys(deque, (size_t)start); // compute before changing count
+  deque->count = keep;
+
+
+  g_data.g_writes_since_save++;
+  resp_ok(out);
+}
+
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {
@@ -737,6 +961,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_lindex(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "lrange") {
     do_lrange(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "lset") {
+    do_lset(cmd, out);
+  } else if (cmd.size() == 5 && cmd[0] == "linsert") {
+    do_linsert(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "lrem") {
+    do_lrem(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "ltrim") {
+    do_ltrim(cmd, out);
   } else {
     resp_err(out, "ERR unknown command");
   }
