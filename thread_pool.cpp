@@ -27,11 +27,13 @@ void thread_pool_init(ThreadPool *tp, size_t num_threads){
     assert(rv == 0);
     rv = pthread_cond_init(&tp->not_empty, NULL);
     assert(rv == 0);
+    (void)rv; // asserts vanish in release (NDEBUG); avoid set-but-unused warning
 
     tp->threads.resize(num_threads);
     for (size_t i = 0; i < num_threads; ++i){
         int rv  = pthread_create(&tp->threads[i],  NULL, &worker, tp);
         assert(rv == 0);
+        (void)rv;
     }
 }
 

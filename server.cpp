@@ -179,10 +179,11 @@ static void process_timers(){
   size_t nworks = 0;
   const std::vector<HeapItem> &heap = g_data.heap;
   // This handles TTL timers
-  while(!heap.empty() && heap[0].val < now_ms){
+  while(!heap.empty() && heap[0].val <= now_ms){
     Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
     HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
     assert(node == &ent->node);
+    (void)node; // assert vanishes in release (NDEBUG)
     fprintf(stderr, "key expired: %s\n", ent->key.c_str());
     entry_del(ent);
     if (nworks++ >= k_max_works){

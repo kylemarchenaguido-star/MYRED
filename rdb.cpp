@@ -10,6 +10,17 @@
 
 pid_t g_rdb_child_pid = -1;
 
+// Convert an in memort monotonic expiry into a wall clock expirary for the rdb
+static uint64_t mono_expired_to_wall(uint64_t mono_expire){
+  uint64_t mono_now = get_monotonic_msec();
+  // ms left until expirary 
+  int64_t remaining = (int64_t)(mono_expire - mono_now);
+  // already expired
+  if (remaining < 0) { remaining = 0; }
+  return get_wall_msec() + (uint64_t)remaining;
+}
+
+
 // Persistence functions 
 // CRC32 
 static uint32_t g_crc32_table[256];
@@ -100,7 +111,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     
     if (ent->heap_idx != (size_t)-1){
       buf_append(ctx->buf, 1); // has ttl
-      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val); // expire at
+      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val)); // expire at
     } else {
       buf_append(ctx->buf, 0); // not ttl
     }
@@ -113,7 +124,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
 
     if (ent->heap_idx != (size_t)-1){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
+      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -140,7 +151,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     // ttl
     if (ent->heap_idx != (size_t)-1){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, g_data.heap[ent->heap_idx].val);
+      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -343,7 +354,7 @@ static bool rdb_load_string_entry(RDBCursor *c){
   if (has_ttl){
     if (!cursor_read_u64(c, &expire_at)){ return false; }
     // check if expired 
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_wall_msec();
     if (expire_at <= now_ms){
       // expired
       std::string key, val;
@@ -372,7 +383,7 @@ static bool rdb_load_string_entry(RDBCursor *c){
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
   hm_insert(&g_data.db, &ent->node);
   if (has_ttl){
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_wall_msec();
     int64_t remaining_ms = (int64_t)(expire_at - now_ms);
     entry_set_ttl(ent, remaining_ms);
   }
@@ -388,7 +399,7 @@ static bool rdb_load_zset_entry(RDBCursor *c){
     if (!cursor_read_u64(c, &expire_at)){ return false; }
 
     // skip but still read all the bytes
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_wall_msec();
     if (expire_at <= now_ms){
       std::string key;
       uint32_t n_members = 0;
@@ -440,7 +451,7 @@ static bool rdb_load_zset_entry(RDBCursor *c){
 
   // restore the ttl
   if (has_ttl){
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_wall_msec();
     int64_t remaining_ms = (int64_t)(expire_at - now_ms);
     entry_set_ttl(ent, remaining_ms);
   }
@@ -455,7 +466,7 @@ static bool rdb_load_deque_entry(RDBCursor *c){
   uint64_t expire_at = 0;
   if (has_ttl){
      if (!cursor_read_u64(c, &expire_at)) { return false; }
-     uint64_t now_ms = get_monotonic_msec();
+     uint64_t now_ms = get_wall_msec();
      if (expire_at <= now_ms){
       // expired so we read and discard
       std::string key;
@@ -492,7 +503,7 @@ static bool rdb_load_deque_entry(RDBCursor *c){
 
   hm_insert(&g_data.db, &ent->node);
   if (has_ttl){
-    uint64_t now_ms = get_monotonic_msec();
+    uint64_t now_ms = get_wall_msec();
     entry_set_ttl(ent, (int64_t)(expire_at - now_ms));
   }
   return true;

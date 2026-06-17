@@ -107,6 +107,7 @@ extern Config g_config;
 
 // Functions
 uint64_t get_monotonic_msec();
+uint64_t get_wall_msec();
 bool entry_eq(HNode *node, HNode *key);
 Entry *entry_new(uint32_t type);
 void entry_del(Entry *ent);
@@ -114,3 +115,4 @@ void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 void entry_del_sync(Entry *ent);
 void entry_del_func(void *arg);
 bool hnode_same(HNode *node, HNode *key);
+bool expire_if_needed(Entry *ent);

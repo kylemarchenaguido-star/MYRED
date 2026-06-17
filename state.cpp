@@ -9,9 +9,17 @@ Config g_config;
 static void heap_delete(std::vector<HeapItem> &a, size_t pos);
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t);
 
+// because CLOCK_MONOTONIC resets on reboot. in-memory timers stay monotonic.
 uint64_t get_monotonic_msec(){
   struct timespec tv = {0,0};
   clock_gettime(CLOCK_MONOTONIC, &tv);
+  return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
+}
+
+// wall-clock time (CLOCK_REALTIME). used ONLY for persisting TTLs to disk,
+uint64_t get_wall_msec(){
+  struct timespec tv = {0,0};
+  clock_gettime(CLOCK_REALTIME, &tv);
   return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
 }
 
@@ -101,4 +109,17 @@ static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t){
 
 bool hnode_same(HNode *node, HNode *key){
   return node == key;
+}
+
+// lazy expiration: if the entry's TTL has already passed, delete it and
+// report true so the caller can treat the key as missing. no TTL or not yet
+// expired -> false (entry stays).
+bool expire_if_needed(Entry *ent){
+  if (ent->heap_idx == (size_t)-1) { return false; }              // no TTL
+  if (g_data.heap[ent->heap_idx].val > get_monotonic_msec()) {    // not expired yet
+    return false;
+  }
+  hm_delete(&g_data.db, &ent->node, &hnode_same);
+  entry_del(ent);
+  return true;
 }
