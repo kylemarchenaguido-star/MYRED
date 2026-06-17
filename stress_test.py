@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Stress test for custom Redis server — RESP protocol edition.
-
+redis-benchmark -h 127.0.0.1 -p 1234 -a kek1234 \
+  -t set,get,lpush,rpush,lpop,rpop -n 200000 -c 50 -P 16
 Tests all commands:
   Strings: get, set, del, asyncdel
   TTL:     pexpire, pttl
@@ -399,11 +400,12 @@ def test_ttl_commands(r: TestRunner, sock: socket.socket):
     time.sleep(0.6)
     r.check_none("expired key → nil", cmd(sock, "get", "shortlived"))
 
-    # remove TTL with negative value
+    # PEXPIRE with a non-positive TTL deletes the key (Redis semantics)
     cmd(sock, "set", "removettl", "val")
     cmd(sock, "pexpire", "removettl", "5000")
-    cmd(sock, "pexpire", "removettl", "-1")
-    r.check("pttl after remove → -1", cmd(sock, "pttl", "removettl"), -1)
+    r.check("pexpire -1 deletes key → 1", cmd(sock, "pexpire", "removettl", "-1"), 1)
+    r.check("pttl after delete → -2",      cmd(sock, "pttl", "removettl"), -2)
+    r.check_none("get after delete → nil", cmd(sock, "get", "removettl"))
     cmd(sock, "del", "removettl")
     cmd(sock, "del", "ttlkey")
 

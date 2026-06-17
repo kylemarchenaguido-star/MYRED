@@ -155,23 +155,25 @@ static bool str2int(const std::string &s, int64_t &out){
   return endp == s.c_str() + s.size();
 }
 
-// PEXPIRE key ttl_ms
-static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
-  int64_t ttl_ms = 0;
-  if (!str2int(cmd[2], ttl_ms)){
+// shared by PEXPIRE (mult=1) and EXPIRE (mult=1000): set a TTL on a key.
+// non-positive TTL deletes the key (Redis semantics). returns 1 if the key
+// existed (ttl set or key deleted), 0 if missing.
+static void expire_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mult){
+  int64_t ttl = 0;
+  if (!str2int(cmd[2], ttl)){
     return resp_err(out, "ERR invalid TTL");
   }
-  // lookup the key
+  int64_t ttl_ms = ttl * mult;
+
   LookupKey key;
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  // we set the ttl
   if (!node) { return resp_int(out, 0); }
 
   Entry *ent = container_of(node, Entry, node);
   if (ttl_ms <= 0){
-    // non-positive TTL means "already expired" -> delete now (Redis semantics)
+    // non-positive TTL means "already expired" -> delete now
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
     g_data.g_writes_since_save++;
@@ -182,8 +184,19 @@ static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, 1);
 }
 
-// PTTL key
-static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
+// PEXPIRE key ttl_ms (set a ttl in seconds)
+static void do_pexpire(std::vector<std::string> &cmd, Buffer *out){
+  return expire_generic(cmd, out, 1);
+}
+
+// EXPIRE key ttl_seconds (set a ttl in miliseconds)
+static void do_expire(std::vector<std::string> &cmd, Buffer *out){
+  return expire_generic(cmd, out, 1000);
+}
+
+// shared by PTTL (div=1, ms) and TTL (div=1000, seconds rounded).
+// -2 = no such key, -1 = no TTL, else remaining time.
+static void ttl_generic(std::vector<std::string> &cmd, Buffer *out, int64_t div){
   LookupKey key;
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -193,12 +206,81 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
 
   Entry *ent = container_of(node, Entry, node);
   if (expire_if_needed(ent)){ return resp_int(out, -2); } // expired -> gone
+
   if (ent->heap_idx == (size_t)-1){
-    return resp_int(out, -1); // not ttl
+    return resp_int(out, -1); // no ttl
   }
+
   uint64_t expire_at = g_data.heap[ent->heap_idx].val;
   uint64_t now_ms = get_monotonic_msec();
-  return resp_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
+  int64_t remaining = expire_at > now_ms ? (int64_t)(expire_at - now_ms) : 0;
+
+  if (div > 1){ remaining = (remaining + div / 2) / div; } // round to seconds
+  return resp_int(out, remaining);
+}
+
+// PTTL key  (remaining time in milliseconds)
+static void do_ttl(std::vector<std::string> &cmd, Buffer *out){
+  return ttl_generic(cmd, out, 1);
+}
+
+// TTL key  (remaining time in seconds)
+static void do_ttl_seconds(std::vector<std::string> &cmd, Buffer *out){
+  return ttl_generic(cmd, out, 1000);
+}
+
+// EXISTS key  -> 1 if present (and not expired), else 0
+static void do_exists(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+  if (!node){ return resp_int(out, 0); }
+
+  Entry *ent = container_of(node, Entry, node);
+  if (expire_if_needed(ent)){ return resp_int(out, 0); } // expired -> gone
+  return resp_int(out, 1);
+}
+
+// TYPE key  -> simple string: string | zset | list | none
+static void do_type(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+  if (!node){ return resp_simple(out, "none"); }
+  Entry *ent = container_of(node, Entry, node);
+
+  if (expire_if_needed(ent)){ return resp_simple(out, "none"); }
+  const char *t = "none";
+
+  if (ent->type == T_STR)        { t = "string"; }
+  else if (ent->type == T_ZSET)  { t = "zset"; }
+  else if (ent->type == T_DLIST) { t = "list"; }
+
+  return resp_simple(out, t);
+}
+
+// PERSIST key  -> remove the TTL but keep the key. 1 if a TTL was removed, else 0
+static void do_persist(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+  if (!node){ return resp_int(out, 0); }
+  Entry *ent = container_of(node, Entry, node);
+
+  if (expire_if_needed(ent)){ return resp_int(out, 0); } // expired -> gone
+  if (ent->heap_idx == (size_t)-1){ return resp_int(out, 0); } // no TTL to remove
+  entry_set_ttl(ent, -1); // detach from the TTL heap
+
+  g_data.g_writes_since_save++;
+  return resp_int(out, 1);
 }
 
 // zadd and zset (score, name)
