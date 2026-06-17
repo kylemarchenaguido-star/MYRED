@@ -978,6 +978,11 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   resp_ok(out);
 }
 
+struct ScanCtx {
+  std::vector<std::string> *keys;
+  const std::string *pattern; // nullptr if no match 
+};
+
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {

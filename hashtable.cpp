@@ -134,3 +134,52 @@ static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *), void *arg){
 void hm_foreach(HMap *hmap, bool(*f)(HNode *, void *), void *arg){
     h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
 }
+
+// 64-bit bit reversal helper (just reverses a 64 bit with a mask in 6 steps)
+static uint64_t rev_bits(uint64_t v){
+    // swaps adjacent bits 
+  v = ((v >> 1)  & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
+    // swaps adjacents pair
+  v = ((v >> 2)  & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
+    // swaps nibbles (4 bits-groups)
+  v = ((v >> 4)  & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
+    // swaps bytes
+  v = ((v >> 8)  & 0x00FF00FF00FF00FFULL) | ((v & 0x00FF00FF00FF00FFULL) << 8);
+    // swap 16-bit Groups
+  v = ((v >> 16) & 0x0000FFFF0000FFFFULL) | ((v & 0x0000FFFF0000FFFFULL) << 16);
+    // swap 32-bit Halves
+  v = (v >> 32) | (v << 32);
+  return v;
+}
+
+uint64_t hm_scan(HMap *hmap, uint64_t cursor, size_t count, void(*cb)(HNode *, void *), void *arg){
+    // empty db
+    if (hmap->newer.tab == NULL) { return 0; }
+
+    bool rehashing = (hmap->older.tab != NULL);
+    size_t mbig = hmap->newer.mask;
+    // during shrink case
+    if (rehashing && hmap->older.mask > mbig) { mbig = hmap->older.mask; }
+
+    size_t scanned = 0;
+    do {
+        // scan the bucket in the active table (callback on every node)
+        for (HNode *n = hmap->newer.tab[cursor & hmap->newer.mask]; n; n = n->next){
+            cb(n, arg);
+        }
+        // and the corresponding bucket in the draining table, if mid rehash
+        if (rehashing){
+            for (HNode *n = hmap->older.tab[cursor * hmap->older.mask]; n; n = n->next){
+                cb(n, arg);
+            }
+        }
+
+        cursor |= ~mbig;
+        cursor = rev_bits(cursor);
+        cursor += 1;
+        cursor = rev_bits(cursor);
+        scanned++;
+    } while (cursor != 0 && scanned < count);
+
+    return cursor;
+}
