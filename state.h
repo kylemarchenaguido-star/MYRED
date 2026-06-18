@@ -29,6 +29,7 @@ enum {
   T_STR = 1, // string
   T_ZSET = 2, // sorted set
   T_DLIST = 3, // deque list
+  T_HASH = 4, // hash set
 };
 
 // Timer for both linked lists
@@ -89,10 +90,11 @@ struct Entry {
   size_t heap_idx = -1;
   // value
   uint32_t type = 0;
-  // one of the following 
-  std::string str;
-  ZSet zset;
-  Deque deque;
+  // one of the following :
+  std::string str; // T_STR
+  ZSet zset; // T_ZSET
+  Deque deque; // T_DLIST
+  HMap hash; // T_HASH
 };
 
 // Key for searching in the hashtable

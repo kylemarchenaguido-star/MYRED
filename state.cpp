@@ -1,6 +1,7 @@
  #include "state.h"
  #include "common.h"
  #include <time.h>
+ #include "hash.h"
 
 GlobalData g_data;
 Config g_config;
@@ -66,15 +67,14 @@ void entry_del(Entry *ent){
 }
 
 // Delete the actual work
-void entry_del_sync(Entry *ent) {
-  if (ent->type == T_ZSET) {
-    zset_clear(&ent->zset);
-  } else if (ent->type ==  T_DLIST){
-    deque_free(&ent->deque);
-  }
+void entry_del_sync(Entry *ent){
+  if (ent->type == T_ZSET)       { zset_clear(&ent->zset); }
+  else if (ent->type == T_DLIST) { deque_free(&ent->deque); }
+  else if (ent->type == T_HASH)  { hash_clear(&ent->hash); }
   entry_set_ttl(ent, -1);
   delete ent;
 }
+
 
 // a wrapper function for the thread pool
 void entry_del_func(void *arg){

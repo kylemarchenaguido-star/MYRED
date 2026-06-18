@@ -29,6 +29,7 @@ add_executable(server
   rdb.cpp
   commands.cpp
   deque.cpp
+  hash.cpp
 )
 target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
 
