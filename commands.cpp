@@ -1226,11 +1226,30 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out, int mode
   HLookup r = get_hash(cmd[1], false, &h, nullptr);
   if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
   if (r == HLookup::MISSING){ return resp_int(out, 0); }
+
   std::vector<std::string> items;
   HCollect c { &items, mode };
+
   hm_foreach(h, cb_hcollect, &c);
-  resp_arr(out,(uint32_t)items.size());\
+  resp_arr(out,(uint32_t)items.size());
   for (const auto &s : items){ resp_str(out, s.data(), s.size()); }
+}
+
+static void do_hgetall(std::vector<std::string> &cmd, Buffer *out){ h_collect_reply(cmd, out, 0); }
+static void do_hkeys(std::vector<std::string> &cmd, Buffer *out){ h_collect_reply(cmd, out, 1); }
+static void do_hvals(std::vector<std::string> &cmd, Buffer *out){ h_collect_reply(cmd, out, 2); }
+
+// HMGET key field [field..] -> array
+static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
+  HMap *h;
+  HLookup r = get_hash(cmd[1], false, &h, nullptr);
+  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE worng type"); }
+  resp_arr(out, (uint32_t)(cmd.size() - 2));
+  for (size_t i = 2; i < cmd.size(); ++i){
+    HashNode *hn = (r == HLookup::OK) ? hash_get(h, cmd[1]) : nullptr;
+    if (hn){ resp_str(out, hn->value.data(), hn->value.size()); }
+    else { resp_nil(out); }
+  }
 }
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
