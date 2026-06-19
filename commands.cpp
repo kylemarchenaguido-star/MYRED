@@ -1177,7 +1177,7 @@ static void do_hvals(std::vector<std::string> &cmd, Buffer *out){ h_collect_repl
 static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent = nullptr;
   Lookup r = lookup_entry(cmd[1], T_HASH,  false, &ent);
-  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE worng type"); }
+  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
 
   resp_arr(out, (uint32_t)(cmd.size() - 2));
   for (size_t i = 2; i < cmd.size(); ++i){
@@ -1185,6 +1185,45 @@ static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
     if (hn){ resp_str(out, hn->value.data(), hn->value.size()); }
     else { resp_nil(out); }
   }
+}
+// HSETNX key field value, 1 if set and 0 if already existed
+static void do_hsetnx(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_HASH, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+  // already there
+  if (hash_get(&ent->hash, cmd[2])){ return resp_int(out, 0); } 
+
+  hash_set(&ent->hash, cmd[2], cmd[3]);
+  g_data.g_writes_since_save++;
+  return resp_int(out, 1);
+}
+
+// HINCRBY key field increment -> new integer value
+static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
+  int64_t incr = 0;
+  if (!str2int(cmd[3], incr)){ 
+    return resp_err(out, "ERR value is not an integer or out of range"); 
+  }
+
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_HASH, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  int64_t cur = 0;
+  HashNode *hn = hash_get(&ent->hash, cmd[2]);
+  if (hn && !str2int(hn->value, cur)){
+    return resp_err(out, "ERR hash value is not an integer");
+  }
+  if ((incr > 0 && cur > INT64_MAX - incr) || (incr < 0 && cur < INT64_MIN - incr)){
+    return resp_err(out, "ERR increment or decrement would overflow");
+  }
+  cur += incr;
+  hash_set(&ent->hash, cmd[2], std::to_string(cur));
+  g_data.g_writes_since_save++;
+  return resp_int(out, cur);
 }
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
