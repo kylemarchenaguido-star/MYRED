@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-18 23:01:56
+# MYRED stress test — 2026-06-18 23:38:12
 
 ```
 (logging output to list_run.md)
@@ -22,7 +22,7 @@
   ✓ get long value
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc', 'h']
+  ✓ keys returns list → ['kb', 'ka', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -72,23 +72,15 @@
   ✓ zrevquery from 3.5 → 6 items
 
 ── Lists: LPUSH/RPUSH/LPOP/RPOP/LLEN/LINDEX/LRANGE ───
-  ✗ rpush a b c → 3
-    got:      110674906339208
-    expected: 3
-  ✗ llen → 3
-    got:      110674906339208
-    expected: 3
+  ✓ rpush a b c → 3
+  ✓ llen → 3
   ✓ lrange 0 -1 → [a,b,c]
-  ✗ lpush x y → 5
-    got:      110674906339208
-    expected: 5
+  ✓ lpush x y → 5
   ✓ lrange after lpush
   ✓ lindex 0 → y
   ✓ lindex -1 → c
   ✓ lindex 2 → a
-  ✗ lindex 100 → nil
-    got:      'c'
-    expected: None
+  ✓ lindex 100 → nil
   ✓ lpop → y
   ✓ rpop → c
   ✓ lrange after pops
@@ -96,16 +88,10 @@
 ── Lists: LSET / LINSERT ─────────────────────────────
   ✓ lset 1 B → OK
   ✓ lindex 1 → B
-  ✗ lset out of range → error
-    got:      'OK'
-    expected: a RESP error
-  ✗ linsert before B → 4
-    got:      110674906339208
-    expected: 4
+  ✓ lset out of range → error
+  ✓ linsert before B → 4
   ✓ lrange after insert before
-  ✗ linsert after c → 5
-    got:      110674906339208
-    expected: 5
+  ✓ linsert after c → 5
   ✓ lrange after insert after
   ✓ linsert pivot missing → -1
   ✓ linsert missing key → 0
@@ -115,47 +101,190 @@
   ✓ lrange after lrem head
   ✓ lrem -1 a (tail) → 1
   ✓ lrange after lrem tail
+  ✓ ltrim 1 3 → OK
+  ✓ lrange after ltrim
+  ✓ ltrim 0 -1 keeps all
+  ✓ lrange unchanged
+  ✓ llen after empty ltrim → 0
 
-Unexpected error: timed out
+── Lists: wrong-type + missing-key behavior ──────────
+  ✓ lpush on string → WRONGTYPE
+  ✓ lrange on string → WRONGTYPE
+  ✓ llen missing → 0
+  ✓ lrange missing → []
+  ✓ lpop missing → nil
+  ✓ lrem missing → 0
+
+── Hashes: HSET / HGET / HDEL / HEXISTS / HLEN / HGETALL / HKEYS / HVALS / HMGET 
+  ✓ hset a b (2 new) → 2
+  ✓ hset a update → 0
+  ✓ hget a → 9
+  ✓ hget missing → nil
+  ✓ hlen → 2
+  ✓ hexists a → 1
+  ✓ hexists zzz → 0
+  ✓ hmget a b zzz
+  ✓ hkeys = {a,b}
+  ✓ hvals = {9,2}
+  ✓ hgetall = {a:9,b:2}
+  ✓ hdel a → 1
+  ✓ hdel a again → 0
+  ✓ hdel b → 1
+  ✓ type after empty → none
+  ✓ hlen missing → 0
+  ✓ hget missing → nil
+  ✓ hexists missing → 0
+  ✓ hgetall missing → []
+  ✓ hmget missing → [nil,nil]
+  ✓ hget on string → WRONGTYPE
+  ✓ hset on string → WRONGTYPE
+
+── Generic: EXISTS / TYPE / EXPIRE / TTL / PERSIST ───
+  ✓ exists missing → 0
+  ✓ exists present → 1
+  ✓ type string
+  ✓ type zset
+  ✓ type list
+  ✓ type hash
+  ✓ type missing → none
+  ✓ expire gk 100 → 1
+  ✓ ttl in (0,100]
+  ✓ ttl no-such-key → -2
+  ✓ persist gk → 1
+  ✓ ttl after persist → -1
+  ✓ persist again → 0
+  ✓ expire gk -1 deletes → 1
+  ✓ exists after expire -1 → 0
+
+── SCAN (cursor iteration + MATCH) ───────────────────
+  ✓ scan sees user:1
+  ✓ scan sees user:2
+  ✓ scan sees user:3
+  ✓ scan sees order:1
+  ✓ scan sees order:2
+  ✓ scan match user:* → only users
+  ✓ scan match excludes orders
+  ✓ scan match order:? → both orders
+
+── ASYNCDEL Command ──────────────────────────────────
+  ✓ asyncdel missing → 0
+  ✓ asyncdel string → 1
+  ✓ string gone
+  ✓ asyncdel small zset → 1
+  ✓ small zset gone
+  ℹ  inserting 1500 entries...
+  ✓ large zset created → 0
+  ℹ  sending asyncdel (thread pool path)...
+  ✓ asyncdel large → 1
+  ✓ asyncdel fast (<100ms)
+  ✓ large zset immediately gone
+  ℹ  returned in 0.2ms
+
+── Edge Cases ────────────────────────────────────────
+  ✓ zscore negative → -5
+  ✓ zscore zero → 0
+  ✓ same score sorted by name
+  ✓ special chars in value
+  ✓ get on zset → WRONGTYPE error
+  ✓ 100 rapid get correct
+  ℹ  100 rapid set/get/del complete
+
+── INFO Command ──────────────────────────────────────
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4063232\r\nused_memory_mb:3.88\r\n\r\n# Stats\r\ntotal_commands:2042\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:11736\r\nrdb_changes_since_save:1691\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ has # Server section
+  ✓ has # Clients section
+  ✓ has # Memory section
+  ✓ has # Stats section
+  ✓ has # Keyspace section
+  ✓ has # Persistence section
+  ✓ has version field
+  ✓ has uptime_seconds field
+  ✓ has connected_clients field
+  ✓ has total_commands field
+  ✓ has keys_total field
+  ✓ has keys_with_ttl field
+
+  INFO output:
+    # Server
+    version:1.0.0
+    uptime_seconds:2
+    uptime_minutes:0
+    uptime_hours:0
+    # Clients
+    connected_clients:0
+    total_connections:1
+    # Memory
+    used_memory_bytes:4063232
+    used_memory_mb:3.88
+    # Stats
+    total_commands:2042
+    # Keyspace
+    keys_total:0
+    keys_with_ttl:0
+    keys_no_ttl:0
+    # Persistence
+    rdb_last_save_time:11736
+    rdb_changes_since_save:1691
+    rdb_last_save_ok:1
+    rdb_last_save_size_bytes:0
+    # Replication
+    role:master
+
+── SAVE / RDB Persistence ────────────────────────────
+  ✓ save → OK
+  ✓ dump.rdb exists
+  ✓ dump.rdb not empty
+  ℹ  dump.rdb size: 75 bytes
+  ✓ magic number correct
+
+── BGSAVE (fork-based background save) ───────────────
+  ✓ bgsave returns string → 'Background saving started'
+  ✓ bgsave returns fast (<50ms)
+  ℹ  bgsave returned in 0.6ms: 'Background saving started'
+  ✓ server responsive during save
+  ℹ  100 ops during save took 14.2ms
+  ✓ save did not block event loop (burst <500ms)
+  ✓ dump.rdb exists after bgsave
+  ✓ bgsave file has magic
+  ✓ second bgsave handled gracefully
 
 ── Authentication ────────────────────────────────────
+  ✓ wrong password → error
+  ✓ unauthenticated → NOAUTH error
+  ✓ correct password → OK
+  ✓ authenticated set works
 
-Unexpected error: timed out
+── Persistence Round-trip (in-memory) ────────────────
+  ✓ save → OK
+  ✓ string still readable
+  ✓ zset alice still readable → 10
+  ✓ zset bob still readable → 20
+  ✓ zrank alice → 0
+  ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 68/75 passed
-Failed tests:
-  • rpush a b c → 3
-  • llen → 3
-  • lpush x y → 5
-  • lindex 100 → nil
-  • lset out of range → error
-  • linsert before B → 4
-  • linsert after c → 5
+Results: 180/180 passed
+All tests passed!
 ═══════════════════════════════════════════════════════
 
 ── Concurrent Write Safety ─────────────────────────────
-  ✗ 10 errors during concurrent writes
-    timed out
-    timed out
-    timed out
+  ✓ 10 threads × 50 ops, no errors
 
 ── Stress Test ────────────────────────────────────────
   Threads:    8
   Ops/thread: 500
   Total ops:  4000
-  Worker 1 connect failed: timed out  Worker 3 connect failed: timed out
 
-  Worker 0 connect failed: timed out  Worker 7 connect failed: timed out
-
-  Worker 2 connect failed: timed out
-  Worker 4 connect failed: timed out
-  Worker 5 connect failed: timed out
-  Worker 6 connect failed: timed out
-
-  Elapsed:    5.01s
-  Throughput: 0 ops/sec
-  No operations recorded.
+  Elapsed:    9.40s
+  Throughput: 129 ops/sec
+  Total ops:   1216
+  Errors:      2784
+  Latency avg: 58.59ms
+  Latency min: 0.89ms
+  Latency max: 634.32ms
+  Latency p95: 514.40ms
+  Latency p99: 591.84ms
+  2784 errors!
 
 ═══════════════════════════════════════════════════════
   SOME TESTS FAILED

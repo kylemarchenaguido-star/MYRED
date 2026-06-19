@@ -593,7 +593,7 @@ void do_lpush(std::vector<std::string> &cmd, Buffer *out){
     deque_push_front(&ent->deque, cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)&ent->deque.count); 
+  resp_int(out, (int64_t)ent->deque.count); 
 }
 
 // RPUSH key
@@ -606,7 +606,7 @@ void do_rpush(std::vector<std::string> &cmd, Buffer *out){
     deque_push_back(&ent->deque, cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)&ent->deque.count);
+  resp_int(out, (int64_t)ent->deque.count);
 }
 
 // LPOP key
@@ -658,7 +658,7 @@ void do_llen(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING:   return resp_int(out, 0);
     case Lookup::OK:        break;
   }
-  resp_int(out, (int64_t)&ent->deque.count);
+  resp_int(out, (int64_t)ent->deque.count);
 }
 
 // LINDEX key index
@@ -675,7 +675,7 @@ void do_lindex(std::vector<std::string> &cmd, Buffer *out){
   }
   idx = deque_normalize(&ent->deque, idx);
 
-  if (idx < 0 || idx >= (int64_t)&ent->deque.count){
+  if (idx < 0 || idx >= (int64_t)ent->deque.count){
     return resp_nil(out);
   }
 
@@ -697,7 +697,7 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)&ent->deque.count;
+  int64_t n = (int64_t)ent->deque.count;
   start = deque_normalize(&ent->deque, start);
   stop = deque_normalize(&ent->deque, stop);
 
@@ -732,7 +732,7 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
   }
   idx = deque_normalize(&ent->deque, idx);
 
-  if (idx < 0 || idx >= (int64_t)&ent->deque.count){
+  if (idx < 0 || idx >= (int64_t)ent->deque.count){
     return resp_err(out, "ERR index out of range");
   }
 
@@ -822,13 +822,13 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
 
   // we ensure capaxity before opening the gap
-  if (&ent->deque.count == &ent->deque.cap){ deque_grow(&ent->deque); }
+  if (ent->deque.count == ent->deque.cap){ deque_grow(&ent->deque); }
 
   deque_open_gap(&ent->deque, insert_idx);
   ent->deque.buf[deque_phys(&ent->deque, insert_idx)] = value;
 
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)&ent->deque.count); // new length
+  resp_int(out, (int64_t)ent->deque.count); // new length
 }
 
 // LREM key count value
@@ -898,7 +898,7 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)&ent->deque.count;
+  int64_t n = (int64_t)ent->deque.count;
   start = deque_normalize(&ent->deque, start);
   stop = deque_normalize(&ent->deque, stop);
 
