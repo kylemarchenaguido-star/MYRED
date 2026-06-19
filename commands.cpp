@@ -262,6 +262,8 @@ static void do_type(std::vector<std::string> &cmd, Buffer *out){
   if (ent->type == T_STR)        { t = "string"; }
   else if (ent->type == T_ZSET)  { t = "zset"; }
   else if (ent->type == T_DLIST) { t = "list"; }
+  else if (ent->type == T_HASH)  { t = "hash"; }
+
 
   return resp_simple(out, t);
 }
@@ -1127,7 +1129,7 @@ static HLookup get_hash(std::string &keystr, bool create, HMap **out, Entry **ou
   if (!create){ return HLookup::MISSING; }
 
   Entry *ent = entry_new(T_HASH);
-  ent->key.swap(keystr);
+  ent->key.swap(key.key);
   ent->node.hcode = key.node.hcode;
   hm_insert(&g_data.db, &ent->node);
   if (out) { *out = &ent->hash; }
@@ -1139,7 +1141,7 @@ static HLookup get_hash(std::string &keystr, bool create, HMap **out, Entry **ou
 // HSET key field value 
 static void do_hset(std::vector<std::string> &cmd, Buffer *out){
   if ((cmd.size() - 2) % 2 != 0){
-    return resp_err(out, "WRONGTYPE wrong type");
+    return resp_err(out, "ERR wrong number of arguments for 'hset'");
   }
   HMap *h; Entry *ent;
   if (get_hash(cmd[1], true, &h, &ent) == HLookup::WRONGTYPE){
@@ -1225,7 +1227,7 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out, int mode
   HMap *h;
   HLookup r = get_hash(cmd[1], false, &h, nullptr);
   if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_int(out, 0); }
+  if (r == HLookup::MISSING){ return resp_arr(out, 0); }
 
   std::vector<std::string> items;
   HCollect c { &items, mode };
@@ -1246,7 +1248,7 @@ static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
   if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE worng type"); }
   resp_arr(out, (uint32_t)(cmd.size() - 2));
   for (size_t i = 2; i < cmd.size(); ++i){
-    HashNode *hn = (r == HLookup::OK) ? hash_get(h, cmd[1]) : nullptr;
+    HashNode *hn = (r == HLookup::OK) ? hash_get(h, cmd[i]) : nullptr;
     if (hn){ resp_str(out, hn->value.data(), hn->value.size()); }
     else { resp_nil(out); }
   }
@@ -1338,6 +1340,24 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_persist(cmd, out);
   } else if (cmd.size() >= 2 && cmd[0] == "scan") {
     do_scan(cmd, out);
+    } else if (cmd.size() >= 4 && cmd[0] == "hset") {
+    do_hset(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "hget") {
+    do_hget(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "hdel") {
+    do_hdel(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "hexists") {
+    do_hexists(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "hlen") {
+    do_hlen(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "hgetall") {
+    do_hgetall(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "hkeys") {
+    do_hkeys(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "hvals") {
+    do_hvals(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "hmget") {
+    do_hmget(cmd, out);
   } else {
     resp_err(out, "ERR unknown command");
   }

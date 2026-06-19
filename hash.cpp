@@ -49,7 +49,7 @@ bool hash_del(HMap *h, const std::string &field){
     key.field = &field;
     key.node.hcode = str_hash((const uint8_t *)field.data(), field.size());
 
-    HNode *found = hm_lookup(h, &key.node, &hnode_field_eq);
+    HNode *found = hm_delete(h, &key.node, &hnode_field_eq);
     if(!found){ return false; }
 
     delete container_of(found, HashNode, node);
