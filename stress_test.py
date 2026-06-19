@@ -5,10 +5,10 @@ redis-benchmark -h 127.0.0.1 -p 1234 -a kek1234 \
   -t set,get,lpush,rpush,lpop,rpop -n 200000 -c 50 -P 16
 Tests all commands:
   Strings: get, set, del, asyncdel
-  TTL:     pexpire, pttl
-  Keys:    keys
+  Generic: exists, type, expire, ttl, pexpire, pttl, persist, keys, scan
   ZSet:    zadd, zrem, zscore, zquery, zrevquery, zrank
   Lists:   lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim
+  Hashes:  hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget
   Admin:   auth, info, save, bgsave
 
 Because the server now speaks RESP, this test also works against the
@@ -582,6 +582,130 @@ def test_list_commands(r: TestRunner, sock: socket.socket):
     r.check("lrem missing → 0",      cmd(sock, "lrem",   "stress_nolist", "0", "x"), 0)
 
 
+def test_generic_commands(r: TestRunner, sock: socket.socket):
+    r.section("Generic: EXISTS / TYPE / EXPIRE / TTL / PERSIST")
+
+    cmd(sock, "del", "gk")
+    r.check("exists missing → 0", cmd(sock, "exists", "gk"), 0)
+    cmd(sock, "set", "gk", "v")
+    r.check("exists present → 1", cmd(sock, "exists", "gk"), 1)
+
+    # TYPE for each value type
+    r.check("type string", cmd(sock, "type", "gk"), "string")
+    cmd(sock, "del", "gz"); cmd(sock, "zadd", "gz", "1", "m")
+    r.check("type zset", cmd(sock, "type", "gz"), "zset")
+    cmd(sock, "del", "gl"); cmd(sock, "rpush", "gl", "a")
+    r.check("type list", cmd(sock, "type", "gl"), "list")
+    cmd(sock, "del", "gh"); cmd(sock, "hset", "gh", "f", "v")
+    r.check("type hash", cmd(sock, "type", "gh"), "hash")
+    r.check("type missing → none", cmd(sock, "type", "nope"), "none")
+    for k in ("gz", "gl", "gh"):
+        cmd(sock, "del", k)
+
+    # EXPIRE (seconds) + TTL (seconds) + PERSIST
+    r.check("expire gk 100 → 1", cmd(sock, "expire", "gk", "100"), 1)
+    ttl = cmd(sock, "ttl", "gk")
+    r.check_true("ttl in (0,100]", isinstance(ttl, int) and 0 < ttl <= 100)
+    r.check("ttl no-such-key → -2", cmd(sock, "ttl", "nope"), -2)
+    r.check("persist gk → 1", cmd(sock, "persist", "gk"), 1)
+    r.check("ttl after persist → -1", cmd(sock, "ttl", "gk"), -1)
+    r.check("persist again → 0", cmd(sock, "persist", "gk"), 0)
+
+    # EXPIRE with non-positive ttl deletes the key (Redis semantics)
+    r.check("expire gk -1 deletes → 1", cmd(sock, "expire", "gk", "-1"), 1)
+    r.check("exists after expire -1 → 0", cmd(sock, "exists", "gk"), 0)
+
+    cmd(sock, "del", "gk")
+
+
+def test_hash_commands(r: TestRunner, sock: socket.socket):
+    r.section("Hashes: HSET / HGET / HDEL / HEXISTS / HLEN / HGETALL / HKEYS / HVALS / HMGET")
+
+    h = "stress_hash"
+    cmd(sock, "del", h)
+
+    r.check("hset a b (2 new) → 2", cmd(sock, "hset", h, "a", "1", "b", "2"), 2)
+    r.check("hset a update → 0",    cmd(sock, "hset", h, "a", "9"), 0)
+    r.check("hget a → 9",          cmd(sock, "hget", h, "a"), "9")
+    r.check_none("hget missing → nil", cmd(sock, "hget", h, "zzz"))
+    r.check("hlen → 2",            cmd(sock, "hlen", h), 2)
+    r.check("hexists a → 1",       cmd(sock, "hexists", h, "a"), 1)
+    r.check("hexists zzz → 0",     cmd(sock, "hexists", h, "zzz"), 0)
+
+    # HMGET: value or nil per field
+    r.check("hmget a b zzz", cmd(sock, "hmget", h, "a", "b", "zzz"), ["9", "2", None])
+
+    # HKEYS / HVALS (order not guaranteed → compare as sets)
+    keys = cmd(sock, "hkeys", h)
+    r.check("hkeys = {a,b}", set(keys), {"a", "b"})
+    vals = cmd(sock, "hvals", h)
+    r.check("hvals = {9,2}", set(vals), {"9", "2"})
+
+    # HGETALL → flat [field,value,...]; rebuild a dict to compare
+    flat = cmd(sock, "hgetall", h)
+    d = {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+    r.check("hgetall = {a:9,b:2}", d, {"a": "9", "b": "2"})
+
+    # HDEL + empty-hash deletes the key
+    r.check("hdel a → 1",   cmd(sock, "hdel", h, "a"), 1)
+    r.check("hdel a again → 0", cmd(sock, "hdel", h, "a"), 0)
+    r.check("hdel b → 1",   cmd(sock, "hdel", h, "b"), 1)
+    r.check("type after empty → none", cmd(sock, "type", h), "none")  # key gone
+
+    # missing-key behavior
+    cmd(sock, "del", h)
+    r.check("hlen missing → 0",    cmd(sock, "hlen", h), 0)
+    r.check_none("hget missing → nil", cmd(sock, "hget", h, "a"))
+    r.check("hexists missing → 0", cmd(sock, "hexists", h, "a"), 0)
+    r.check("hgetall missing → []", cmd(sock, "hgetall", h), [])
+    r.check("hmget missing → [nil,nil]", cmd(sock, "hmget", h, "a", "b"), [None, None])
+
+    # wrong-type
+    cmd(sock, "del", "hstr"); cmd(sock, "set", "hstr", "x")
+    r.expect_error("hget on string → WRONGTYPE", sock, "hget", "hstr", "f")
+    r.expect_error("hset on string → WRONGTYPE", sock, "hset", "hstr", "f", "v")
+    cmd(sock, "del", "hstr")
+
+
+def test_scan_command(r: TestRunner, sock: socket.socket):
+    r.section("SCAN (cursor iteration + MATCH)")
+
+    # seed a known keyspace
+    for k in ("user:1", "user:2", "user:3", "order:1", "order:2"):
+        cmd(sock, "del", k)
+        cmd(sock, "set", k, "v")
+
+    def scan_all(*opts):
+        """Drive a full SCAN loop and return the set of keys seen."""
+        seen, cursor = set(), "0"
+        for _ in range(10000):  # safety bound
+            reply = cmd(sock, "scan", cursor, *opts)
+            cursor, batch = reply[0], reply[1]
+            for k in batch:
+                seen.add(k)
+            if cursor == "0":
+                break
+        return seen
+
+    all_keys = scan_all()
+    for k in ("user:1", "user:2", "user:3", "order:1", "order:2"):
+        r.check_true(f"scan sees {k}", k in all_keys)
+
+    users = scan_all("match", "user:*")
+    r.check("scan match user:* → only users",
+            {k for k in users if k.startswith("user:") or k.startswith("order:")},
+            {"user:1", "user:2", "user:3"})
+    r.check_true("scan match excludes orders",
+                 not any(k.startswith("order:") for k in users))
+
+    one = scan_all("match", "order:?")  # ? = exactly one char
+    r.check("scan match order:? → both orders",
+            {k for k in one if k.startswith("order:")}, {"order:1", "order:2"})
+
+    for k in ("user:1", "user:2", "user:3", "order:1", "order:2"):
+        cmd(sock, "del", k)
+
+
 def test_asyncdel_command(r: TestRunner, sock: socket.socket):
     r.section("ASYNCDEL Command")
 
@@ -938,17 +1062,20 @@ def stress_worker(host: str, port: int, ops: int,
 
     zset = f"stress_zset_{wid}"
     lst  = f"stress_list_{wid}"
+    hsh  = f"stress_hash_{wid}"
     try:
         cmd(sock, "del", zset)
         cmd(sock, "del", lst)
+        cmd(sock, "del", hsh)
         for i in range(10):
             cmd(sock, "zadd", zset, str(float(i)), f"m{i}")
         cmd(sock, "rpush", lst, "a", "b", "c", "d", "e")
+        cmd(sock, "hset", hsh, "f0", "0", "f1", "1")
     except Exception:
         pass
 
     for _ in range(ops):
-        op = random.randint(0, 14)
+        op = random.randint(0, 18)
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -990,6 +1117,18 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "lpop", lst)
                 cmd(sock, "rpop", lst)
                 cmd(sock, "llen", lst)
+            elif op == 15:
+                cmd(sock, "hset", hsh, f"f{random.randint(0, 20)}", random_string(5))
+            elif op == 16:
+                cmd(sock, "hget", hsh, f"f{random.randint(0, 20)}")
+            elif op == 17:
+                cmd(sock, "hgetall", hsh)
+            elif op == 18:
+                k = random_key()
+                cmd(sock, "set", k, "v")
+                cmd(sock, "exists", k)
+                cmd(sock, "type", k)
+                cmd(sock, "scan", "0", "count", "20")
 
             stats.record((time.perf_counter() - t0) * 1000)
         except Exception:
@@ -998,6 +1137,7 @@ def stress_worker(host: str, port: int, ops: int,
     try:
         cmd(sock, "del", zset)
         cmd(sock, "del", lst)
+        cmd(sock, "del", hsh)
         sock.close()
     except Exception:
         pass
@@ -1148,6 +1288,9 @@ def main():
             test_zset_commands(r,         sock)
             test_zquery_commands(r,       sock)
             test_list_commands(r,         sock)
+            test_hash_commands(r,         sock)
+            test_generic_commands(r,      sock)
+            test_scan_command(r,          sock)
             test_asyncdel_command(r,      sock)
             test_edge_cases(r,            sock)
             test_info_command(r,          sock)

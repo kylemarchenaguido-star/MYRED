@@ -11,51 +11,58 @@
 #include "ctype.h"
 #include "hash.h"
 
+enum class Lookup{
+  OK,
+  MISSING,
+  WRONGTYPE
+};
+
+// Find (or optionally create) a key holding a specific type
+static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create, Entry **out_ent){
+  LookupKey key;
+  key.key.swap(keystr);
+  key.node.hcode = str_hash((const uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node){
+    Entry *ent = container_of(node, Entry, node);
+    if (!expire_if_needed(ent)){                 // alive
+      if (ent->type != want_type) return Lookup::WRONGTYPE;
+      if (out_ent) *out_ent = ent;
+      return Lookup::OK;
+    }
+    // expired & deleted -> fall through as missing
+  }
+
+  if (!create) return Lookup::MISSING;
+
+  Entry *ent = entry_new(want_type);
+  ent->key.swap(key.key);                        // key.key holds the real key
+  ent->node.hcode = key.node.hcode;
+  hm_insert(&g_data.db, &ent->node);
+  if (out_ent) *out_ent = ent;
+  return Lookup::OK;                             // create never returns MISSING
+}
+
+
 //gets a value from key
 static void do_get(std::vector<std::string> &cmd, Buffer *out){
-  // we create a dummy entry just for the lookup
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  //hashtable lookup
-  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  if (!node){
-    return resp_nil(out);
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_STR, false, &ent)){
+  case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+  case Lookup::MISSING: return resp_nil(out);
+  case Lookup::OK:  break;
   }
-  // we copy the value
-  Entry *ent = container_of(node, Entry, node);
-  if (expire_if_needed(ent)){ return resp_nil(out); } // expired -> treat as missing
-  if (ent->type != T_STR) {
-    return resp_err(out, "WRONGTYPE wrong type");
-  }
-  return resp_str(out, ent->str.data(), ent->str.size());
+  resp_str(out, ent->str.data(), ent->str.size());
 }
 
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out){
-
-  // again with the dummy
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  //hashtable lookup
-  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  if (node){
-    //found, update the value
-    Entry *ent = container_of(node, Entry, node);
-    if (ent->type != T_STR) {
-      return resp_err(out, "WRONGTYPE wrong type");
-    }
-    ent->str.swap(cmd[2]);
-  } else {
-    //not found allocate & insert a new pair
-    Entry *ent = entry_new(T_STR);
-    ent->key.swap(key.key);
-    ent->node.hcode = key.node.hcode;
-    ent->str.swap(cmd[2]);
-
-    hm_insert(&g_data.db, &ent->node);
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE wrong type");
   }
+  ent->str.swap(cmd[2]);
   g_data.g_writes_since_save++;
   return resp_ok(out);
 }
@@ -292,87 +299,58 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   if (!str2dbl(cmd[2], score)){
     return resp_err(out, "ERR invalid score");
   }
-
-  // look up or create the zset
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
-
-  Entry *ent = NULL;
-  //insert a new key
-  if (!hnode){
-    ent = entry_new(T_ZSET);
-    ent->key.swap(key.key);
-    ent->node.hcode = key.node.hcode;
-    hm_insert(&g_data.db, &ent->node);
-    
-  } else { // check the existing key
-    ent = container_of(hnode, Entry, node);
-    if (ent->type != T_ZSET){
-      return resp_err(out, "WRONGTYPE wrong type");
-    }
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_ZSET, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE wrong type");
   }
 
   // add or update the tuple
-  const std::string &name = cmd[3];
-  bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+  bool added = zset_insert(&ent->zset, cmd[3].data(), cmd[3].size(), score);
   g_data.g_writes_since_save++;
   return resp_int(out, (int64_t)added);
 }
 
-// empty zset (?? i am going to explode myself)
-static constexpr ZSet k_empty_zset;
-
-// search an expected zset
-static ZSet *expect_zset(std::string &s){
-  LookupKey key;
-  key.key.swap(s);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  if (!hnode) { // no key == treated as an empty zset
-    return (ZSet *)&k_empty_zset;
-  }
-  Entry *ent = container_of(hnode, Entry, node);
-  return ent->type == T_ZSET ? &ent->zset : NULL;
-}
-
 // zrem zset name (search and remove)
 static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
-  ZSet *zset = expect_zset(cmd[1]);
-
-  if (!zset) { return resp_err(out, "WRONGTYPE wrong type"); }
-  const std::string &name = cmd[2];
-
-  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+ Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
+  }
+  
+  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
   if (!znode) { return resp_int(out, 0); }
   
-  zset_delete(zset, znode);
+  zset_delete(&ent->zset, znode);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
 
 // zscore zset name (search the score of a name)
 static void do_zscore(std::vector<std::string> &cmd, Buffer *out){
-  ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
-
-  const std::string &name = cmd[2];
-  ZNode *znode = zset_lookup(zset, name.data(), name.size());
-  if (!znode) { return resp_nil(out); }
-  return resp_dbl(out, znode->score);
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
+  }
+  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
+  return znode ? resp_dbl(out, znode->score) : resp_nil(out);
   
 }
 
 //zrank key name (how many nodes comes before the actual one)
 static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
   // cmd[1] = key
-  ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){ return resp_err(out,"WRONGTYPE wrong type"); }
-
+ Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
+  }
   // point query by name using the hashtable (cmd[2] = name)
-  const std::string &name = cmd[2];
-  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
   if (!znode){ return resp_nil(out); }
 
   int64_t rank = avl_rank(&znode->tree);
@@ -391,20 +369,23 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer *out){
   if (!str2dbl(cmd[2], score)){
     return resp_err(out, "ERR invalid score");
   }
-  const std::string &name = cmd[3];
+
   int64_t offset = 0, limit = 0;
   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
     return resp_err(out, "ERR invalid offset/limit");
   }
 
-  ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
-
+ Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_arr(out, 0);
+    case Lookup::OK:        break;
+  }
   // we collect into a vector first so we know the count up front
   // (RESP wants the array length before the elements)
   std::vector<ZQueryResult> results;
 
-  ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+  ZNode *znode = zset_seekge(&ent->zset, score, cmd[3].data(), cmd[3].size());
   znode = znode_offset(znode, offset);
 
   // walk forward collecting until we hit the end (NULL) or fill the page (limit)
@@ -430,18 +411,20 @@ static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
   if (!str2dbl(cmd[2], score)){
     return resp_err(out, "ERR invalid score");
   }
-  const std::string &name = cmd[3];
   int64_t offset = 0, limit = 0;
   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
     return resp_err(out, "ERR invalid offset/limit");
   }
 
   // we get the zset 
-  ZSet *zset = expect_zset(cmd[1]);
-  if (!zset){ return resp_err(out, "WRONGTYPE wrong type"); }
-
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_arr(out, 0);
+    case Lookup::OK:        break;
+  }
   std::vector<ZQueryResult> results;
-  ZNode *znode = zset_seekle(zset, score, name.data(), name.size());
+  ZNode *znode = zset_seekle(&ent->zset, score, cmd[3].data(), cmd[3].size());
   znode = znode_offset(znode, -offset);
 
   while (znode && (int64_t)results.size() < limit){
@@ -599,146 +582,114 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
 
 }
 
-static constexpr Deque k_empty_deque; // cap = 0, count = 0, 
-
-// helper for list (deque) 
-// if create is true, makes a new list entry if the key is missing
-Deque *get_deque(const std::string &key, bool create, Entry **out_ent = nullptr){
-  LookupKey lk;
-  lk.key = key;
-  lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
-  HNode *found = hm_lookup(&g_data.db, &lk.node, &entry_eq);
-
-  if (found){
-    Entry *ent = container_of(found, Entry, node);
-    if (ent->type != T_DLIST){
-      return nullptr;
-    }
-    if (out_ent) *out_ent = ent;
-    return &ent->deque;
-  }
-
-  if (!create) {
-    return (Deque *)&k_empty_deque;
-  }
-
-  // Create a new list (deque) entry
-  Entry *ent = entry_new(T_DLIST);
-  deque_init(&ent->deque);
-  ent->key = key;
-  ent->node.hcode = lk.node.hcode;
-  hm_insert(&g_data.db, &ent->node);
-  if (out_ent) *out_ent = ent;
-  return &ent->deque;
-}
-
 // LPUSH key
 void do_lpush(std::vector<std::string> &cmd, Buffer *out){
-  Deque *deque = get_deque(cmd[1], true);
-  if (!deque) {
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_DLIST, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   // push all values
   for (size_t i = 2; i < cmd.size(); ++i){
-    deque_push_front(deque, cmd[i]);
+    deque_push_front(&ent->deque, cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)deque->count);
+  resp_int(out, (int64_t)&ent->deque.count); 
 }
 
 // RPUSH key
 void do_rpush(std::vector<std::string> &cmd, Buffer *out){
-  Deque *deque = get_deque(cmd[1], true);
-  if (!deque){
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_DLIST, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   for (size_t i = 2; i < cmd.size(); ++i){
-    deque_push_back(deque, cmd[i]);
+    deque_push_back(&ent->deque, cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)deque->count);
+  resp_int(out, (int64_t)&ent->deque.count);
 }
 
 // LPOP key
 void do_lpop(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque) {
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
   }
 
   std::string val;
-  if (!deque_pop_front(deque, &val)){
-    return resp_nil(out);
-  }
+  if (!deque_pop_front(&ent->deque, &val)){ return resp_nil(out); }
 
   // if list is now empty, delete the key
-  if (deque->count == 0){
+  if (ent->deque.count == 0){
     hm_delete(&g_data.db, &ent->node, &entry_eq);
     entry_del(ent);
   }
-
   g_data.g_writes_since_save++;
   resp_str(out, val.data(), val.size());
 }
 
 // RPOP key
 void do_rpop(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque) {
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
   }
 
   std::string val;
-  if (!deque_pop_back(deque, &val)){
-    return resp_nil(out);
-  }
-
+  if (!deque_pop_back(&ent->deque, &val)){ return resp_nil(out); }
   // if list is now empty, delete the key
-  if (deque->count == 0){
+  if (ent->deque.count == 0){
     hm_delete(&g_data.db, &ent->node, &entry_eq);
     entry_del(ent);
   }
-
   g_data.g_writes_since_save++;
   resp_str(out, val.data(), val.size());
 }
 
 // LLEN key
 void do_llen(std::vector<std::string> &cmd, Buffer *out){
-  Deque *deque = get_deque(cmd[1], false);
-  if (!deque){
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
   }
-  resp_int(out, (int64_t)deque->count);
+  resp_int(out, (int64_t)&ent->deque.count);
 }
 
 // LINDEX key index
 void do_lindex(std::vector<std::string> &cmd, Buffer *out){
-  Deque *deque = get_deque(cmd[1], false);
-  if (!deque){
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
   }
   int64_t idx = 0;
   if (!str2int(cmd[2], idx)){
     return resp_err(out, "ERR invalid index");
   }
-  idx = deque_normalize(deque, idx);
+  idx = deque_normalize(&ent->deque, idx);
 
-  if (idx < 0 || idx >= (int64_t)deque->count){
+  if (idx < 0 || idx >= (int64_t)&ent->deque.count){
     return resp_nil(out);
   }
 
-  const std::string *val = deque_get(deque, (size_t)idx);
+  const std::string *val = deque_get(&ent->deque, (size_t)idx);
   resp_str(out, val->data(), val->size());
 }
 
 // LRANGE key start stop
 void do_lrange(std::vector<std::string> &cmd, Buffer *out){
-  Deque *deque =  get_deque(cmd[1], false);
-  if  (!deque){
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_arr(out, 0);
+    case Lookup::OK:        break;
   }
 
   int64_t start = 0, stop = 0;
@@ -746,9 +697,9 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)deque->count;
-  start = deque_normalize(deque, start);
-  stop = deque_normalize(deque, stop);
+  int64_t n = (int64_t)&ent->deque.count;
+  start = deque_normalize(&ent->deque, start);
+  stop = deque_normalize(&ent->deque, stop);
 
   // clamp to valid bounds
   if (start < 0) { start = 0; }
@@ -761,31 +712,32 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
   uint32_t range_len = (uint32_t)(stop - start + 1);
   resp_arr(out, range_len);
   for (int64_t i = start; i <= stop; ++i){
-    const std::string *val = deque_get(deque, (size_t)i);
+    const std::string *val = deque_get(&ent->deque, (size_t)i);
     resp_str(out, val->data(), val->size());
   }
 }
 
 // LSET key index value -- replace at index
 void do_lset(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque){
-    return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
   }
 
   int64_t idx = 0;
   if (!str2int(cmd[2], idx)){
     return resp_err(out, "ERR invalid index");
   }
-  idx = deque_normalize(deque, idx);
+  idx = deque_normalize(&ent->deque, idx);
 
-  if (idx < 0 || idx >= (int64_t)deque->count){
+  if (idx < 0 || idx >= (int64_t)&ent->deque.count){
     return resp_err(out, "ERR index out of range");
   }
 
   // direct write
-  deque->buf[deque_phys(deque, (size_t)idx)] = cmd[3];
+  ent->deque.buf[deque_phys(&ent->deque, (size_t)idx)] = cmd[3];
   g_data.g_writes_since_save++;
   resp_ok(out);
 }
@@ -839,10 +791,11 @@ static void deque_close_gap(Deque *d, size_t idx){
 
 // LINSERT key before|after pivot value
 void do_linsert(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque){
-    return resp_err(out, "WRONGTYPE wrong type"); // null = wrong type
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
   }
   for (char &ch : cmd[2]) { ch = (char)tolower((unsigned char)ch); }
 
@@ -858,8 +811,8 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
 
   // find the pivot - linear
   size_t pivot_idx = SIZE_MAX;
-  for ( size_t i = 0; i < deque->count; ++i){
-    if (*deque_get(deque, i) == pivot){
+  for ( size_t i = 0; i < ent->deque.count; ++i){
+    if (*deque_get(&ent->deque, i) == pivot){
       pivot_idx = i;
       break;
     }
@@ -869,20 +822,23 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
 
   // we ensure capaxity before opening the gap
-  if (deque->count == deque->cap){ deque_grow(deque); }
+  if (&ent->deque.count == &ent->deque.cap){ deque_grow(&ent->deque); }
 
-  deque_open_gap(deque, insert_idx);
-  deque->buf[deque_phys(deque, insert_idx)] = value;
+  deque_open_gap(&ent->deque, insert_idx);
+  ent->deque.buf[deque_phys(&ent->deque, insert_idx)] = value;
 
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)deque->count); // new length
+  resp_int(out, (int64_t)&ent->deque.count); // new length
 }
 
 // LREM key count value
 void do_lrem(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque){ return resp_err(out, "WRONGTYPE wrong type"); }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
+  }
 
   int64_t count = 0;
   if (!str2int(cmd[2], count)){ return resp_err(out, "ERR invalid count"); }
@@ -894,11 +850,11 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
 
   if (from_tail){
     // scan from the back
-    size_t i = deque->count;
+    size_t i = ent->deque.count;
     while (i > 0){
       --i;
-      if (*deque_get(deque, i) == value){
-        deque_close_gap(deque, i);
+      if (*deque_get(&ent->deque, i) == value){
+        deque_close_gap(&ent->deque, i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
       }
@@ -906,9 +862,9 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
   } else {
     // scan from the front
     size_t i = 0;
-    while (i < deque->count){
-      if (*deque_get(deque, i) == value){
-        deque_close_gap(deque, i);
+    while (i < ent->deque.count){
+      if (*deque_get(&ent->deque, i) == value){
+        deque_close_gap(&ent->deque, i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
         // don't advance i - the gap closed
@@ -919,7 +875,7 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
   }
 
   // delete the key if the list became empty
-  if (ent && deque->count == 0){
+  if (ent && ent->deque.count == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
@@ -930,10 +886,11 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
 
 // LTRIM key start stop
 void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
-  Entry *ent = nullptr;
-  Deque *deque = get_deque(cmd[1], false, &ent);
-  if (!deque){
-     return resp_err(out, "WRONGTYPE wrong type");
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::OK:        break;
   }
 
   int64_t start = 0, stop = 0;
@@ -941,9 +898,9 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)deque->count;
-  start = deque_normalize(deque, start);
-  stop = deque_normalize(deque, stop);
+  int64_t n = (int64_t)&ent->deque.count;
+  start = deque_normalize(&ent->deque, start);
+  stop = deque_normalize(&ent->deque, stop);
 
   if (start < 0) { start = 0; }
   if (stop >= n) { stop = n - 1; }
@@ -961,20 +918,20 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   size_t keep = (size_t)(stop - start + 1);
 
   // if we are keeping everything, no work needed
-  if (start == 0 && (size_t)(stop + 1) == deque->count){
+  if (start == 0 && (size_t)(stop + 1) == ent->deque.count){
     return resp_ok(out);
   }
 
   // clear dropped slots, then resposition head/count, no alloc
   for (int64_t i = 0; i < start; ++i){
-    deque->buf[deque_phys(deque, (size_t)i)].clear();
+    ent->deque.buf[deque_phys(&ent->deque, (size_t)i)].clear();
   }
   for (int64_t i = stop + 1; i < n; ++i){
-    deque->buf[deque_phys(deque, (size_t)i)].clear();
+    ent->deque.buf[deque_phys(&ent->deque, (size_t)i)].clear();
   }
 
-  deque->head = deque_phys(deque, (size_t)start); // compute before changing count
-  deque->count = keep;
+  ent->deque.head = deque_phys(&ent->deque, (size_t)start); // compute before changing count
+  ent->deque.count = keep;
 
 
   g_data.g_writes_since_save++;
@@ -998,7 +955,6 @@ static bool glob_match(const char *p, size_t plen, const char *s, size_t slen){
           if (glob_match(p + 1, plen - 1, s + i, slen - i)){ return true; }
         }
         return false;
-
       case '?':
         if (slen == 0){ return false; }                      // needs one char
         s++; slen--;
@@ -1014,7 +970,7 @@ static bool glob_match(const char *p, size_t plen, const char *s, size_t slen){
           if (cp[0] == '\\' && crem >= 2){                   // escaped char in class
             if (cp[1] == s[0]){ matched = true; }
             cp += 2; crem -= 2;
-          } else if (crem >= 3 && cp[1] == '-' && cp[2] != ']'){  // range a-z
+          } else if (crem >= 3 && cp[1] == '-' && cp[2] != ']'){  // range a-z // what is this bomboclat ???
             char lo = cp[0], hi = cp[2];
             if (lo > hi){ char t = lo; lo = hi; hi = t; }
             if (s[0] >= lo && s[0] <= hi){ matched = true; }
@@ -1105,81 +1061,52 @@ static void do_scan(std::vector<std::string> &cmd, Buffer *out){
   for (const auto &k : keys) { resp_str(out, k.data(), k.size()); }
 }
 
-// distinguish missing vs wrong-type
-enum class HLookup { OK, MISSING, WRONGTYPE };
-
-// find or create a hash optionally
-static HLookup get_hash(std::string &keystr, bool create, HMap **out, Entry **out_ent){ 
-  LookupKey key;
-  key.key.swap(keystr);
-  key.node.hcode = str_hash((const uint8_t *)key.key.data(), key.key.size());
-
-  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-  if (node){
-    Entry *ent = container_of(node, Entry, node);
-    if (!expire_if_needed(ent)){ // still alive
-      if (ent->type != T_HASH){ return HLookup::WRONGTYPE; }
-      if (out) { *out = &ent->hash; }
-      if (out_ent) { *out_ent = ent; }
-      return HLookup::OK;
-    }
-    // else: it was expired & deleted, falls trought as missing
-  }
-
-  if (!create){ return HLookup::MISSING; }
-
-  Entry *ent = entry_new(T_HASH);
-  ent->key.swap(key.key);
-  ent->node.hcode = key.node.hcode;
-  hm_insert(&g_data.db, &ent->node);
-  if (out) { *out = &ent->hash; }
-  if (out_ent) { *out_ent = ent; }
-  return HLookup::OK;
-}
-
 // set a key in a hash
 // HSET key field value 
 static void do_hset(std::vector<std::string> &cmd, Buffer *out){
   if ((cmd.size() - 2) % 2 != 0){
     return resp_err(out, "ERR wrong number of arguments for 'hset'");
   }
-  HMap *h; Entry *ent;
-  if (get_hash(cmd[1], true, &h, &ent) == HLookup::WRONGTYPE){
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_HASH, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   int64_t added = 0;
   for (size_t i = 2; i + 1 < cmd.size(); i += 2){
-    if (hash_set(h, cmd[i], cmd[i + 1])){ added++; }
+    if (hash_set(&ent->hash, cmd[i], cmd[i + 1])){ added++; }
   }
- g_data.g_writes_since_save++;
- resp_int(out, added); 
+  g_data.g_writes_since_save++;
+  resp_int(out, added); 
 }
 
 // HGET key field
 static void do_hget(std::vector<std::string> &cmd, Buffer *out){
-  HMap *h;
-  HLookup r = get_hash(cmd[1], false, &h, nullptr); 
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_nil(out);
+    case Lookup::OK:  break;
+  }
 
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_nil(out);}
-
-  HashNode *hn = hash_get(h, cmd[2]);
+  HashNode *hn = hash_get(&ent->hash, cmd[2]);
   if (!hn){ return resp_nil(out); }
   resp_str(out, hn->value.data(), hn->value.size());
 }
 
 // HDEL key field 
 static void do_hdel(std::vector<std::string> &cmd, Buffer *out){
-  HMap *h; Entry *ent;
-  HLookup r =  get_hash(cmd[1], false, &h, &ent);
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_int(out, 0); }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
   int64_t removed = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
-    if (hash_del(h, cmd[i])){ removed++; }
+    if (hash_del(&ent->hash, cmd[i])){ removed++; }
   }
   // if empty hash we drop the key
-  if (hm_size(h) == 0){
+  if (hm_size(&ent->hash) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
@@ -1189,20 +1116,24 @@ static void do_hdel(std::vector<std::string> &cmd, Buffer *out){
 
 // HEXISTS key field
 static void do_hexists(std::vector<std::string> &cmd, Buffer *out){
-  HMap *h;
-  HLookup r = get_hash(cmd[1], false, &h, nullptr);
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_int(out, 0); }
-  resp_int(out, hash_get(h, cmd[2]) ? 1 : 0);
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  resp_int(out, hash_get(&ent->hash, cmd[2]) ? 1 : 0);
 }
 
 // HLEN key field
 static void do_hlen(std::vector<std::string> &cmd, Buffer *out){
-  HMap *h;
-  HLookup r = get_hash(cmd[1], false, &h, nullptr);
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_int(out, 0); }
-  resp_int(out, (int64_t)hm_size(h));
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  resp_int(out, (int64_t)hm_size(&ent->hash));
 }
 
 // shared by HGETALL(0), HKEYS(1), HVALS(2)
@@ -1224,15 +1155,16 @@ static bool cb_hcollect(HNode *node, void *arg){
 }
 
 static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out, int mode){
-  HMap *h;
-  HLookup r = get_hash(cmd[1], false, &h, nullptr);
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
-  if (r == HLookup::MISSING){ return resp_arr(out, 0); }
-
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_arr(out, 0);
+    case Lookup::OK:  break;
+  }
   std::vector<std::string> items;
   HCollect c { &items, mode };
 
-  hm_foreach(h, cb_hcollect, &c);
+  hm_foreach(&ent->hash, cb_hcollect, &c);
   resp_arr(out,(uint32_t)items.size());
   for (const auto &s : items){ resp_str(out, s.data(), s.size()); }
 }
@@ -1243,12 +1175,13 @@ static void do_hvals(std::vector<std::string> &cmd, Buffer *out){ h_collect_repl
 
 // HMGET key field [field..] -> array
 static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
-  HMap *h;
-  HLookup r = get_hash(cmd[1], false, &h, nullptr);
-  if (r == HLookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE worng type"); }
+  Entry *ent = nullptr;
+  Lookup r = lookup_entry(cmd[1], T_HASH,  false, &ent);
+  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE worng type"); }
+
   resp_arr(out, (uint32_t)(cmd.size() - 2));
   for (size_t i = 2; i < cmd.size(); ++i){
-    HashNode *hn = (r == HLookup::OK) ? hash_get(h, cmd[i]) : nullptr;
+    HashNode *hn = (r == Lookup::OK) ? hash_get(&ent->hash, cmd[i]) : nullptr;
     if (hn){ resp_str(out, hn->value.data(), hn->value.size()); }
     else { resp_nil(out); }
   }
