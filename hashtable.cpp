@@ -169,7 +169,7 @@ uint64_t hm_scan(HMap *hmap, uint64_t cursor, size_t count, void(*cb)(HNode *, v
         }
         // and the corresponding bucket in the draining table, if mid rehash
         if (rehashing){
-            for (HNode *n = hmap->older.tab[cursor * hmap->older.mask]; n; n = n->next){
+            for (HNode *n = hmap->older.tab[cursor & hmap->older.mask]; n; n = n->next){
                 cb(n, arg);
             }
         }
