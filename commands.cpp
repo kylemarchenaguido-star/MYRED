@@ -1410,7 +1410,7 @@ static void do_touch(std::vector<std::string> &cmd, Buffer *out){
 // EXPIREAT (mult=10000, seconds) / PEXPIREAT (multi=1, ms): absoulute wall clock expiry
 static void expireat_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mult){
   int64_t when = 0;
-  if (!str2int(cmd[1], when)){ return resp_err(out, "ERR invalid expire time"); }
+  if (!str2int(cmd[2], when)){ return resp_err(out, "ERR invalid expire time"); }
   int64_t abs_ms = when * mult;
 
   LookupKey key; key.key.swap(cmd[1]);
