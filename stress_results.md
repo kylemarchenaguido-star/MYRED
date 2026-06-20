@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-19 00:42:31
+# MYRED stress test — 2026-06-20 01:59:16
 
 ```
 (logging output to stress_results.md)
@@ -22,7 +22,7 @@
   ✓ get long value
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc']
+  ✓ keys returns list → ['kb', 'eat1', 'ka', 'eg2', 'eg1new', 'eg3', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -139,6 +139,26 @@
   ✓ hget on string → WRONGTYPE
   ✓ hset on string → WRONGTYPE
 
+── Hashes extended: HSETNX / HINCRBY / HSTRLEN / HSCAN 
+  ✓ hsetnx new field → 1
+  ✓ hsetnx existing → 0
+  ✓ score unchanged after nx
+  ✓ hincrby score +5 → 15
+  ✓ hincrby score -3 → 12
+  ✓ hincrby new field → 7
+  ✓ hincrby non-int increment → error
+  ✓ hincrby on string value → error
+  ✓ hstrlen greeting → 5
+  ✓ hstrlen missing field → 0
+  ✓ hstrlen missing key → 0
+  ✓ hscan sees all 4 fields
+  ✓ hscan field1 value
+  ✓ hscan match field* → 3
+  ✓ hscan match excludes other
+  ✓ hscan missing key cursor → 0
+  ✓ hscan missing key array → []
+  ✓ hscan on string → WRONGTYPE
+
 ── Generic: EXISTS / TYPE / EXPIRE / TTL / PERSIST ───
   ✓ exists missing → 0
   ✓ exists present → 1
@@ -166,19 +186,56 @@
   ✓ scan match excludes orders
   ✓ scan match order:? → both orders
 
-── ASYNCDEL Command ──────────────────────────────────
-  ✓ asyncdel missing → 0
-  ✓ asyncdel string → 1
+── Generic: DBSIZE / RANDOMKEY / RENAME / RENAMENX / TOUCH 
+  ✓ dbsize empty DB → 0
+  ✓ randomkey empty DB → nil
+  ✓ dbsize after 3 sets → 3
+  ✓ randomkey returns string
+  ✓ randomkey is a real key
+  ✓ rename eg1 → eg1new
+  ✓ get eg1new → a
+  ✓ eg1 gone after rename
+  ✓ rename missing → error
+  ✓ rename preserves TTL
+  ✓ renamenx existing dst → 0
+  ✓ nx_src still alive
+  ✓ renamenx free dst → 1
+  ✓ nx_new has value
+  ✓ nx_src gone
+  ✓ touch 2 existing → 2
+  ✓ touch 1 existing 1 missing → 1
+  ✓ touch all missing → 0
+
+── Generic: EXPIREAT / PEXPIREAT ─────────────────────
+  ✓ expireat future → 1
+  ✓ ttl after expireat in (0,120]
+  ✓ expireat past → 1
+  ✓ key gone after past expireat
+  ✓ expireat missing → 0
+  ✓ pexpireat future → 1
+  ✓ pttl after pexpireat in (0,60000]
+  ✓ pexpireat past → 1
+  ✓ key gone after past pexpireat
+
+── Generic: FLUSHALL ─────────────────────────────────
+  ✓ dbsize > 0 before flush
+  ✓ flushall → OK
+  ✓ dbsize 0 after flush
+  ✓ randomkey after flush → nil
+
+── UNLINK Command (async delete) ─────────────────────
+  ✓ unlink missing → 0
+  ✓ unlink string → 1
   ✓ string gone
-  ✓ asyncdel small zset → 1
+  ✓ unlink small zset → 1
   ✓ small zset gone
   ℹ  inserting 1500 entries...
   ✓ large zset created → 0
-  ℹ  sending asyncdel (thread pool path)...
-  ✓ asyncdel large → 1
-  ✓ asyncdel fast (<100ms)
+  ℹ  sending unlink (thread pool path)...
+  ✓ unlink large → 1
+  ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.1ms
+  ℹ  returned in 0.0ms
 
 ── Edge Cases ────────────────────────────────────────
   ✓ zscore negative → -5
@@ -190,7 +247,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:12\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4603904\r\nused_memory_mb:4.39\r\n\r\n# Stats\r\ntotal_commands:2042\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:5167\r\nrdb_changes_since_save:1435\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:5\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4456448\r\nused_memory_mb:4.25\r\n\r\n# Stats\r\ntotal_commands:2124\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:0\r\nrdb_changes_since_save:1852\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -207,24 +264,24 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:12
+    uptime_seconds:5
     uptime_minutes:0
     uptime_hours:0
     # Clients
     connected_clients:0
     total_connections:1
     # Memory
-    used_memory_bytes:4603904
-    used_memory_mb:4.39
+    used_memory_bytes:4456448
+    used_memory_mb:4.25
     # Stats
-    total_commands:2042
+    total_commands:2124
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:5167
-    rdb_changes_since_save:1435
+    rdb_last_save_time:0
+    rdb_changes_since_save:1852
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
     # Replication
@@ -240,9 +297,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 0.7ms: 'Background saving started'
+  ℹ  bgsave returned in 0.8ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 9.2ms
+  ℹ  100 ops during save took 8.0ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -263,7 +320,7 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 180/180 passed
+Results: 229/229 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -275,17 +332,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    7.07s
-  Throughput: 566 ops/sec
+  Elapsed:    2.49s
+  Throughput: 1605 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 13.78ms
+  Latency avg: 4.79ms
   Latency min: 0.03ms
-  Latency max: 161.39ms
-  Latency p95: 111.98ms
-  Latency p99: 139.33ms
+  Latency max: 54.81ms
+  Latency p95: 39.38ms
+  Latency p99: 50.10ms
   No errors!
-  ℹ  cleaned 152 leftover keys
+  ℹ  cleaned 157 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
