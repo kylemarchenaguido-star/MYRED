@@ -173,8 +173,8 @@ uint64_t hm_scan(HMap *hmap, uint64_t cursor, size_t count, void(*cb)(HNode *, v
                 cb(n, arg);
             }
         }
-
-        cursor |= ~mbig;
+        // picks the next bucket to visit in an order that survives table resizes.
+        cursor |= ~mbig; // <---- magic 
         cursor = rev_bits(cursor);
         cursor += 1;
         cursor = rev_bits(cursor);

@@ -1226,6 +1226,219 @@ static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, cur);
 }
 
+// HSTRLEN key field -> lenght of the fiels value (0 if field/key is missing)
+static void do_hstrlen(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_HASH, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  HashNode *hn = hash_get(&ent->hash, cmd[2]);
+  return resp_int(out, hn ? (int64_t)hn->value.size() : 0);
+}
+
+// HSCAN support
+struct HScanCtx{
+  std::vector<std::string> *out; // flat (field, value ...)
+  const std::string *pattern; // match applies to the field name
+};
+
+static void cb_hscan(HNode *node, void *arg){
+  HScanCtx *c = (HScanCtx *)arg;
+  HashNode *hn = container_of(node, HashNode, node);
+  if (c->pattern && !glob_match(c->pattern->data(), c->pattern->size(), hn->field.data(), hn->field.size())){
+    return;
+  }
+  c->out->push_back(hn->field);
+  c->out->push_back(hn->value);
+}
+
+// HSCAN key cursor [MATCH pat] [COUNT n] -> [cursor, [field, value, ...]]
+static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  Lookup r = lookup_entry(cmd[1], T_HASH, false, &ent);
+  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
+
+  int64_t cursor = 0;
+  if (!str2int(cmd[1], cursor)){ return resp_err(out, "ERR invalid cursor"); }
+
+  size_t count = 10;
+  const std::string *pattern = nullptr;
+  std::string pat;
+  // the opts starts at cmd[3]
+  for (size_t i = 3; i + 1< cmd.size(); i += 2){
+    std::string opt = cmd[3];
+    for (char &c : opt){ c = (char)tolower((unsigned char)c); }
+    if (opt == "count"){
+      int64_t n;
+      if (!str2int(cmd[i + 1], n) || n <= 0){ return resp_err(out, "ERR invalid count"); }
+      count = (size_t)n;
+    } else if (opt == "match"){
+      pat = cmd[i + 1];
+      pattern = &pat;
+    } else {
+      return resp_err(out, "ERR syntax error");
+    }
+  }
+
+  resp_arr(out, 2);
+  // missing key -> cursor 0, empty list
+  if (r == Lookup::MISSING){
+    resp_str(out, "0", 1);
+    resp_arr(out, 0);
+    return;
+  }
+  std::vector<std::string> items;
+  HScanCtx ctx { &items, pattern };
+  uint64_t next = hm_scan(&ent->hash, (uint64_t)cursor, count ,cb_hscan, &ctx);
+
+  std::string cur = std::to_string(next);
+  resp_str(out, cur.data(), cur.size());
+  resp_arr(out, (uint32_t)items.size());
+  for (const auto &s : items){ resp_str(out, s.data(), s.size()); }
+}
+
+// DBSIZE -> number of keys
+static void do_dbsize(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  return resp_int(out, (int64_t)hm_size(&g_data.db));
+}
+
+// FLUSHALL / FLUSHDB -> delete every key
+static bool cb_collect_entry(HNode *node, void *arg){
+  ((std::vector<Entry *> *)arg)->push_back(container_of(node, Entry, node));
+  return true;
+}
+
+static void do_flushall(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  std::vector<Entry *> ents;
+  // collect (dont free mid iteration)
+  hm_foreach(&g_data.db, cb_collect_entry, &ents);
+  // free the table arrays
+  hm_clear(&g_data.db);
+  // free each entry (per-type + TTL heap)
+  for (Entry *e : ents){ entry_del(e); }
+  g_data.g_writes_since_save++;
+  return resp_ok(out);
+}
+
+// RANDOMKEY -> a random key (crazy this trash (garbage))
+struct RandKeyCtx{ 
+  std::string key;
+  size_t seen;
+};
+
+static bool cb_randomkey(HNode *node, void *arg){
+  RandKeyCtx *ctx = (RandKeyCtx *)arg; 
+  ctx->seen++;
+  if ((size_t)(rand() % ctx->seen) == 0){
+    ctx->key = container_of(node, Entry, node)->key;
+  }
+  return true;
+}
+
+static void do_randomkey(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  if (hm_size(&g_data.db) == 0){ return resp_nil(out); }
+  RandKeyCtx ctx { std::string(), 0};
+  hm_foreach(&g_data.db, cb_randomkey, &ctx);
+  return resp_str(out, ctx.key.data(), ctx.key.size());
+}
+
+// sharead rename: nx=true -> fail(0) if dest exists. returns 1 ok, 0 dest-exits, -1 no source
+static int rename_key(const std::string &src, const std::string &dst, bool nx){
+  LookupKey sk; sk.key = src;
+  sk.node.hcode = str_hash((const uint8_t *)src.data(), src.size());
+  HNode *snode = hm_lookup(&g_data.db, &sk.node, &entry_eq);
+  if (!snode){ return -1; }
+  Entry *sent = container_of(snode, Entry, node);
+  if (expire_if_needed(sent)){ return -1; } // source expired
+  if (src == dst){ return 1; } // rename to self
+
+  LookupKey dk; dk.key = dst;
+  dk.node.hcode = str_hash((const u_int8_t *)dst.data(), dst.size());
+  HNode *dnode = hm_lookup(&g_data.db, &dk.node, &entry_eq);
+  if (dnode){
+    Entry *dent = container_of(dnode, Entry, node);
+    // if dest exist & alive
+    if (!expire_if_needed(dent)){
+      // nx refuses
+      if (nx){ return 0;}
+      hm_delete(&g_data.db, &dent->node, &hnode_same);
+      // we are gonna overwrite so we dtop the old dest
+      entry_del(dent);
+    }
+  }
+  // we just move the source
+  hm_delete(&g_data.db, &sent->node, &hnode_same);
+  sent->key = dst;
+  sent->node.hcode = dk.node.hcode;
+  hm_insert(&g_data.db, &sent->node);
+  return 1;
+}
+
+static void do_rename(std::vector<std::string> &cmd, Buffer *out){
+  int rc = rename_key(cmd[1], cmd[2], false);
+  if (rc == 1){ return resp_err(out, "ERR no such key"); }
+  g_data.g_writes_since_save++;
+  return resp_ok(out);
+}
+
+static void do_renamenx(std::vector<std::string> &cmd, Buffer *out){
+  int rc = rename_key(cmd[1], cmd[2], true);
+  if (rc == -1){ return resp_err(out, "ERR no such key"); }
+  if (rc == 1){ g_data.g_writes_since_save++; }
+  return resp_int(out, rc);
+}
+
+// TOUCH key [key...] -> count of keys that exists
+static void do_touch(std::vector<std::string> &cmd, Buffer *out){
+  int64_t n = 0;
+  for (size_t i = 1; i < cmd.size(); ++i){
+    LookupKey key; key.key = cmd[i];
+    key.node.hcode = str_hash((const uint8_t *)cmd[i].data(), cmd[i].size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node){
+      Entry *ent = container_of(node, Entry, node);
+      if (!expire_if_needed(ent)){ ++n;}
+    }
+  }
+  return resp_int(out, n);
+}
+
+// EXPIREAT (mult=10000, seconds) / PEXPIREAT (multi=1, ms): absoulute wall clock expiry
+static void expireat_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mult){
+  int64_t when = 0;
+  if (!str2int(cmd[1], when)){ return resp_err(out, "ERR invalid expire time"); }
+  int64_t abs_ms = when * mult;
+
+  LookupKey key; key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((const uint8_t *)key.key.data(), key.key.size());
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node){ return resp_int(out, 0); }
+  Entry *ent = container_of(node, Entry, node);
+  
+  // absolute -> remamining 
+  int64_t remaining = abs_ms - (int64_t)get_wall_msec();
+  // already past -> delete
+  if (remaining <= 0){
+    hm_delete(&g_data.db, &ent->node, *hnode_same);
+    entry_del(ent);
+    g_data.g_writes_since_save++;
+    return resp_int(out, 1);
+  }
+  entry_set_ttl(ent, remaining);
+  g_data.g_writes_since_save++;
+  return resp_int(out, 1);
+
+}
+
+// Both expire at (ms and s)
+static void do_expireat(std::vector<std::string> &cmd, Buffer *out){ expireat_generic(cmd, out, 1000); }
+static void do_pexpireat(std::vector<std::string> &cmd, Buffer *out){ expireat_generic(cmd, out, 1); }
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -1252,8 +1465,6 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del") {
     do_del(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "asyncdel") {
-    do_asyncdel(cmd, out, conn);
   } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
     do_pexpire(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "pttl") {
@@ -1330,6 +1541,32 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_hvals(cmd, out);
   } else if (cmd.size() >= 3 && cmd[0] == "hmget") {
     do_hmget(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "dbsize") {
+    do_dbsize(cmd, out);
+  } else if (cmd.size() == 1 && (cmd[0] == "flushall" || cmd[0] == "flushdb")) {
+    do_flushall(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "randomkey") {
+    do_randomkey(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "rename") {
+    do_rename(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "renamenx") {
+    do_renamenx(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "touch") {
+    do_touch(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "unlink") {
+    do_asyncdel(cmd, out, conn);
+  } else if (cmd.size() == 3 && cmd[0] == "expireat") {
+    do_expireat(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "pexpireat") {
+    do_pexpireat(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "hsetnx") {
+    do_hsetnx(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "hincrby") {
+    do_hincrby(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "hstrlen") {
+    do_hstrlen(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "hscan") {
+    do_hscan(cmd, out);  
   } else {
     resp_err(out, "ERR unknown command");
   }

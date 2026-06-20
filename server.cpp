@@ -286,6 +286,7 @@ static void handle_read(Conn *conn){
 int main(){
 
   g_config.password = "kek1234";
+  srand(time(NULL)); 
 
   // control for Ctrl-c
   signal(SIGINT,  signal_handler);
