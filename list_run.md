@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-18 23:38:12
+# MYRED stress test — 2026-06-20 01:50:50
 
 ```
 (logging output to list_run.md)
@@ -22,7 +22,7 @@
   ✓ get long value
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc']
+  ✓ keys returns list → ['kb', 'ka', 'eg2', 'persist_zset', 'eg1new', 'eg3', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -139,6 +139,26 @@
   ✓ hget on string → WRONGTYPE
   ✓ hset on string → WRONGTYPE
 
+── Hashes extended: HSETNX / HINCRBY / HSTRLEN / HSCAN 
+  ✓ hsetnx new field → 1
+  ✓ hsetnx existing → 0
+  ✓ score unchanged after nx
+  ✓ hincrby score +5 → 15
+  ✓ hincrby score -3 → 12
+  ✓ hincrby new field → 7
+  ✓ hincrby non-int increment → error
+  ✓ hincrby on string value → error
+  ✓ hstrlen greeting → 5
+  ✓ hstrlen missing field → 0
+  ✓ hstrlen missing key → 0
+  ✓ hscan sees all 4 fields
+  ✓ hscan field1 value
+  ✓ hscan match field* → 3
+  ✓ hscan match excludes other
+  ✓ hscan missing key cursor → 0
+  ✓ hscan missing key array → []
+  ✓ hscan on string → WRONGTYPE
+
 ── Generic: EXISTS / TYPE / EXPIRE / TTL / PERSIST ───
   ✓ exists missing → 0
   ✓ exists present → 1
@@ -166,87 +186,29 @@
   ✓ scan match excludes orders
   ✓ scan match order:? → both orders
 
-── ASYNCDEL Command ──────────────────────────────────
-  ✓ asyncdel missing → 0
-  ✓ asyncdel string → 1
-  ✓ string gone
-  ✓ asyncdel small zset → 1
-  ✓ small zset gone
-  ℹ  inserting 1500 entries...
-  ✓ large zset created → 0
-  ℹ  sending asyncdel (thread pool path)...
-  ✓ asyncdel large → 1
-  ✓ asyncdel fast (<100ms)
-  ✓ large zset immediately gone
-  ℹ  returned in 0.2ms
+── Generic: DBSIZE / RANDOMKEY / RENAME / RENAMENX / TOUCH 
+  ✓ dbsize empty DB → 0
+  ✓ randomkey empty DB → nil
+  ✓ dbsize after 3 sets → 3
+  ✓ randomkey returns string
+  ✓ randomkey is a real key
+  ✓ rename eg1 → eg1new
+  ✓ get eg1new → a
+  ✓ eg1 gone after rename
+  ✓ rename missing → error
+  ✓ rename preserves TTL
+  ✓ renamenx existing dst → 0
+  ✓ nx_src still alive
+  ✓ renamenx free dst → 1
+  ✓ nx_new has value
+  ✓ nx_src gone
+  ✓ touch 2 existing → 2
+  ✓ touch 1 existing 1 missing → 1
+  ✓ touch all missing → 0
 
-── Edge Cases ────────────────────────────────────────
-  ✓ zscore negative → -5
-  ✓ zscore zero → 0
-  ✓ same score sorted by name
-  ✓ special chars in value
-  ✓ get on zset → WRONGTYPE error
-  ✓ 100 rapid get correct
-  ℹ  100 rapid set/get/del complete
+── Generic: EXPIREAT / PEXPIREAT ─────────────────────
 
-── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4063232\r\nused_memory_mb:3.88\r\n\r\n# Stats\r\ntotal_commands:2042\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:11736\r\nrdb_changes_since_save:1691\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
-  ✓ has # Server section
-  ✓ has # Clients section
-  ✓ has # Memory section
-  ✓ has # Stats section
-  ✓ has # Keyspace section
-  ✓ has # Persistence section
-  ✓ has version field
-  ✓ has uptime_seconds field
-  ✓ has connected_clients field
-  ✓ has total_commands field
-  ✓ has keys_total field
-  ✓ has keys_with_ttl field
-
-  INFO output:
-    # Server
-    version:1.0.0
-    uptime_seconds:2
-    uptime_minutes:0
-    uptime_hours:0
-    # Clients
-    connected_clients:0
-    total_connections:1
-    # Memory
-    used_memory_bytes:4063232
-    used_memory_mb:3.88
-    # Stats
-    total_commands:2042
-    # Keyspace
-    keys_total:0
-    keys_with_ttl:0
-    keys_no_ttl:0
-    # Persistence
-    rdb_last_save_time:11736
-    rdb_changes_since_save:1691
-    rdb_last_save_ok:1
-    rdb_last_save_size_bytes:0
-    # Replication
-    role:master
-
-── SAVE / RDB Persistence ────────────────────────────
-  ✓ save → OK
-  ✓ dump.rdb exists
-  ✓ dump.rdb not empty
-  ℹ  dump.rdb size: 75 bytes
-  ✓ magic number correct
-
-── BGSAVE (fork-based background save) ───────────────
-  ✓ bgsave returns string → 'Background saving started'
-  ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 0.6ms: 'Background saving started'
-  ✓ server responsive during save
-  ℹ  100 ops during save took 14.2ms
-  ✓ save did not block event loop (burst <500ms)
-  ✓ dump.rdb exists after bgsave
-  ✓ bgsave file has magic
-  ✓ second bgsave handled gracefully
+Unexpected error: ERR invalid expire time
 
 ── Authentication ────────────────────────────────────
   ✓ wrong password → error
@@ -263,7 +225,7 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 180/180 passed
+Results: 177/177 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -275,16 +237,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    9.40s
-  Throughput: 129 ops/sec
-  Total ops:   1216
-  Errors:      2784
-  Latency avg: 58.59ms
-  Latency min: 0.89ms
-  Latency max: 634.32ms
-  Latency p95: 514.40ms
-  Latency p99: 591.84ms
-  2784 errors!
+  Elapsed:    45.46s
+  Throughput: 88 ops/sec
+  Total ops:   4000
+  Errors:      0
+  Latency avg: 89.03ms
+  Latency min: 0.09ms
+  Latency max: 972.82ms
+  Latency p95: 782.33ms
+  Latency p99: 875.92ms
+  No errors!
+  ℹ  cleaned 136 leftover keys
 
 ═══════════════════════════════════════════════════════
   SOME TESTS FAILED

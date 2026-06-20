@@ -16,7 +16,6 @@
 // C++
 #include <string>
 #include <vector>
-#include <algorithm>
 // project
 #include "hashtable.h"
 #include "common.h"

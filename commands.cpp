@@ -10,6 +10,8 @@
 #include "math.h"
 #include "ctype.h"
 #include "hash.h"
+#include "set.h"
+#include <algorithm>
 
 enum class Lookup{
   OK,
@@ -1437,6 +1439,78 @@ static void expireat_generic(std::vector<std::string> &cmd, Buffer *out, int64_t
 // Both expire at (ms and s)
 static void do_expireat(std::vector<std::string> &cmd, Buffer *out){ expireat_generic(cmd, out, 1000); }
 static void do_pexpireat(std::vector<std::string> &cmd, Buffer *out){ expireat_generic(cmd, out, 1); }
+
+
+// Set commands
+
+// Collects all member strings from a set's HMap (used by multi-key ops and bulk commands)
+static bool cb_collect_members(HNode *node, void *arg){
+  auto *v = (std::vector<std::string> *)arg;
+  v->push_back(container_of(node, SetNode, node)->member);
+  return true;
+}
+
+// Read-only lookup 
+static Entry *lookup_set_ro(const std::string &key, bool *wrongtype){
+  LookupKey lk; lk.key = key;
+  lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
+  HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+
+  if (!node){ return nullptr; }
+  Entry *ent= container_of(node, Entry, node);
+  // key is missing ?? i am dumb asfck
+  if (expire_if_needed(ent)){ return nullptr; }
+  if (ent->type != T_SET){ *wrongtype = true; return nullptr; }
+  return ent;
+}
+
+// Delete a key (any type) and create a fresh empty T_SET
+static Entry *set_make_dest(const std::string &key){
+  LookupKey lk; lk.key = key;
+  lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
+  HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+  if (node){
+    Entry *old = container_of(node, Entry, node);
+    hm_delete(&g_data.db, &old->node, &hnode_same);
+    entry_del(old);
+  }
+  Entry *ent = entry_new(T_SET);
+  ent->key = lk.key;
+  ent->node.hcode = lk.node.hcode;
+  hm_insert(&g_data.db, &ent->node);
+  return ent;
+}
+
+// Result is filled on success (may be empty)
+// return false if wrongtype
+static bool sinter_impl(std::vector<std::string> &cmd, size_t start, std::vector<std::string> &result){
+  bool wt = false;
+  std::vector<Entry *> sets;
+  for (size_t i = start; i < cmd.size(); ++i){
+    Entry *e = lookup_set_ro(cmd[i], &wt);
+    if (wt){ return false; }
+    if (!e){ result.clear(); return true; } // intersection with empty = empty
+    sets.push_back(e);
+  }
+  size_t smallest_idx = 0;
+  for (size_t i = 1; i < sets.size(); ++i){
+    if (hm_size(&sets[i]->set) < hm_size(&sets[smallest_idx]->set)){
+      smallest_idx = i;
+    }
+  }
+
+  std::vector<std::string> candidates;
+  hm_foreach(&sets[smallest_idx]->set, cb_collect_members, &candidates);
+  for (auto &m : candidates){
+    bool in_all = true;
+    for (size_t i = 1; i < sets.size(); ++i){
+      if (i == smallest_idx){ continue; }
+      if (!set_is_member(&sets[i]->set, m)){ in_all = false; break; }
+    }
+    if (in_all){ result.push_back(m); }
+  }
+  return true;
+}
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {

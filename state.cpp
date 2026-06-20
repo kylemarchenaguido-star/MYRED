@@ -56,8 +56,11 @@ void entry_del(Entry *ent){
   // remove from the heap first
   entry_set_ttl(ent, -1);
   // decide if use thread pool or synchronous
-  size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
-  const size_t k_large_container_size = 1000;
+  size_t set_size = 0;
+  if ((ent->type == T_ZSET)){ hm_size(&ent->zset.hmap);} 
+  else if ((ent->type == T_SET)){ hm_size(&ent->set); } 
+
+  constexpr size_t k_large_container_size = 1000;
 
   if (set_size > k_large_container_size){
     thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
@@ -71,6 +74,7 @@ void entry_del_sync(Entry *ent){
   if (ent->type == T_ZSET)       { zset_clear(&ent->zset); }
   else if (ent->type == T_DLIST) { deque_free(&ent->deque); }
   else if (ent->type == T_HASH)  { hash_clear(&ent->hash); }
+  else if (ent->type == T_SET)  { set_clear(&ent->hash); }
   entry_set_ttl(ent, -1);
   delete ent;
 }
