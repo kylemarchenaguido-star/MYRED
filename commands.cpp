@@ -1261,14 +1261,13 @@ static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
   if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
 
   int64_t cursor = 0;
-  if (!str2int(cmd[1], cursor)){ return resp_err(out, "ERR invalid cursor"); }
+  if (!str2int(cmd[2], cursor)){ return resp_err(out, "ERR invalid cursor"); }
 
   size_t count = 10;
   const std::string *pattern = nullptr;
   std::string pat;
-  // the opts starts at cmd[3]
-  for (size_t i = 3; i + 1< cmd.size(); i += 2){
-    std::string opt = cmd[3];
+  for (size_t i = 3; i + 1 < cmd.size(); i += 2){
+    std::string opt = cmd[i];
     for (char &c : opt){ c = (char)tolower((unsigned char)c); }
     if (opt == "count"){
       int64_t n;
@@ -1381,7 +1380,7 @@ static int rename_key(const std::string &src, const std::string &dst, bool nx){
 
 static void do_rename(std::vector<std::string> &cmd, Buffer *out){
   int rc = rename_key(cmd[1], cmd[2], false);
-  if (rc == 1){ return resp_err(out, "ERR no such key"); }
+  if (rc == -1){ return resp_err(out, "ERR no such key"); }
   g_data.g_writes_since_save++;
   return resp_ok(out);
 }

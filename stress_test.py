@@ -4,11 +4,14 @@ Stress test for custom Redis server — RESP protocol edition.
 redis-benchmark -h 127.0.0.1 -p 1234 -a kek1234 \
   -t set,get,lpush,rpush,lpop,rpop -n 200000 -c 50 -P 16
 Tests all commands:
-  Strings: get, set, del, asyncdel
-  Generic: exists, type, expire, ttl, pexpire, pttl, persist, keys, scan
+  Strings: get, set, del
+  Generic: exists, type, expire, pexpire, ttl, pttl, persist, keys, scan,
+           dbsize, randomkey, rename, renamenx, touch, unlink,
+           expireat, pexpireat, flushall
   ZSet:    zadd, zrem, zscore, zquery, zrevquery, zrank
   Lists:   lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim
-  Hashes:  hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget
+  Hashes:  hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget,
+           hsetnx, hincrby, hstrlen, hscan
   Admin:   auth, info, save, bgsave
 
 Because the server now speaks RESP, this test also works against the
@@ -706,22 +709,186 @@ def test_scan_command(r: TestRunner, sock: socket.socket):
         cmd(sock, "del", k)
 
 
-def test_asyncdel_command(r: TestRunner, sock: socket.socket):
-    r.section("ASYNCDEL Command")
+def test_extended_generic_commands(r: TestRunner, sock: socket.socket):
+    r.section("Generic: DBSIZE / RANDOMKEY / RENAME / RENAMENX / TOUCH")
 
-    cmd(sock, "del", "asynctest")
-    r.check("asyncdel missing → 0", cmd(sock, "asyncdel", "asynctest"), 0)
+    # flush to get a clean, known DB state
+    cmd(sock, "flushall")
+    r.check("dbsize empty DB → 0", cmd(sock, "dbsize"), 0)
+    r.check_none("randomkey empty DB → nil", cmd(sock, "randomkey"))
 
-    cmd(sock, "set", "asynctest", "hello")
-    r.check("asyncdel string → 1", cmd(sock, "asyncdel", "asynctest"), 1)
-    r.check_none("string gone", cmd(sock, "get", "asynctest"))
+    cmd(sock, "set", "eg1", "a")
+    cmd(sock, "set", "eg2", "b")
+    cmd(sock, "set", "eg3", "c")
+    r.check("dbsize after 3 sets → 3", cmd(sock, "dbsize"), 3)
+
+    # RANDOMKEY — can't check exact value, but must be a live key
+    rk = cmd(sock, "randomkey")
+    r.check_true("randomkey returns string", isinstance(rk, str))
+    r.check_true("randomkey is a real key", cmd(sock, "get", rk) is not None)
+
+    # RENAME
+    r.check("rename eg1 → eg1new", cmd(sock, "rename", "eg1", "eg1new"), "OK")
+    r.check("get eg1new → a",       cmd(sock, "get", "eg1new"), "a")
+    r.check_none("eg1 gone after rename", cmd(sock, "get", "eg1"))
+    r.expect_error("rename missing → error", sock, "rename", "nope", "x")
+
+    # RENAME preserves TTL
+    cmd(sock, "set", "ttlsrc", "v")
+    cmd(sock, "expire", "ttlsrc", "100")
+    cmd(sock, "rename", "ttlsrc", "ttldst")
+    ttl = cmd(sock, "ttl", "ttldst")
+    r.check_true("rename preserves TTL", isinstance(ttl, int) and ttl > 0)
+    cmd(sock, "del", "ttldst")
+
+    # RENAMENX
+    cmd(sock, "set", "nx_src", "hello")
+    cmd(sock, "set", "nx_dst", "world")
+    r.check("renamenx existing dst → 0", cmd(sock, "renamenx", "nx_src", "nx_dst"), 0)
+    r.check("nx_src still alive",        cmd(sock, "get", "nx_src"), "hello")
+    r.check("renamenx free dst → 1",     cmd(sock, "renamenx", "nx_src", "nx_new"), 1)
+    r.check("nx_new has value",          cmd(sock, "get", "nx_new"), "hello")
+    r.check_none("nx_src gone",          cmd(sock, "get", "nx_src"))
+    for k in ("nx_dst", "nx_new"): cmd(sock, "del", k)
+
+    # TOUCH
+    cmd(sock, "set", "tk1", "a")
+    cmd(sock, "set", "tk2", "b")
+    r.check("touch 2 existing → 2",          cmd(sock, "touch", "tk1", "tk2"), 2)
+    r.check("touch 1 existing 1 missing → 1", cmd(sock, "touch", "tk1", "nope"), 1)
+    r.check("touch all missing → 0",          cmd(sock, "touch", "nope1", "nope2"), 0)
+    for k in ("tk1", "tk2"): cmd(sock, "del", k)
+
+    r.section("Generic: EXPIREAT / PEXPIREAT")
+
+    now_s  = int(time.time())
+    now_ms = int(time.time() * 1000)
+
+    # EXPIREAT future timestamp
+    cmd(sock, "set", "eat1", "v")
+    r.check("expireat future → 1", cmd(sock, "expireat", "eat1", str(now_s + 120)), 1)
+    ttl = cmd(sock, "ttl", "eat1")
+    r.check_true("ttl after expireat in (0,120]",
+                 isinstance(ttl, int) and 0 < ttl <= 120)
+    cmd(sock, "del", "eat1")
+
+    # EXPIREAT past timestamp deletes key immediately
+    cmd(sock, "set", "eat2", "v")
+    r.check("expireat past → 1", cmd(sock, "expireat", "eat2", "1"), 1)
+    r.check("key gone after past expireat", cmd(sock, "exists", "eat2"), 0)
+
+    # EXPIREAT missing key → 0
+    r.check("expireat missing → 0",
+            cmd(sock, "expireat", "nope", str(now_s + 60)), 0)
+
+    # PEXPIREAT future timestamp (milliseconds)
+    cmd(sock, "set", "peat1", "v")
+    r.check("pexpireat future → 1",
+            cmd(sock, "pexpireat", "peat1", str(now_ms + 60000)), 1)
+    pttl = cmd(sock, "pttl", "peat1")
+    r.check_true("pttl after pexpireat in (0,60000]",
+                 isinstance(pttl, int) and 0 < pttl <= 60000)
+    cmd(sock, "del", "peat1")
+
+    # PEXPIREAT past ms → deletes
+    cmd(sock, "set", "peat2", "v")
+    r.check("pexpireat past → 1", cmd(sock, "pexpireat", "peat2", "1"), 1)
+    r.check("key gone after past pexpireat", cmd(sock, "exists", "peat2"), 0)
+
+    r.section("Generic: FLUSHALL")
+
+    for i in range(5):
+        cmd(sock, "set", f"fg{i}", "x")
+    r.check_true("dbsize > 0 before flush", cmd(sock, "dbsize") > 0)
+    r.check("flushall → OK",              cmd(sock, "flushall"), "OK")
+    r.check("dbsize 0 after flush",       cmd(sock, "dbsize"), 0)
+    r.check_none("randomkey after flush → nil", cmd(sock, "randomkey"))
+
+
+def test_extended_hash_commands(r: TestRunner, sock: socket.socket):
+    r.section("Hashes extended: HSETNX / HINCRBY / HSTRLEN / HSCAN")
+
+    h = "stress_hash_ext"
+    cmd(sock, "del", h)
+
+    # HSETNX
+    r.check("hsetnx new field → 1",    cmd(sock, "hsetnx", h, "score", "10"), 1)
+    r.check("hsetnx existing → 0",     cmd(sock, "hsetnx", h, "score", "99"), 0)
+    r.check("score unchanged after nx", cmd(sock, "hget", h, "score"), "10")
+
+    # HINCRBY
+    r.check("hincrby score +5 → 15",  cmd(sock, "hincrby", h, "score", "5"), 15)
+    r.check("hincrby score -3 → 12",  cmd(sock, "hincrby", h, "score", "-3"), 12)
+    r.check("hincrby new field → 7",   cmd(sock, "hincrby", h, "counter", "7"), 7)
+    # non-integer increment
+    r.expect_error("hincrby non-int increment → error",
+                   sock, "hincrby", h, "counter", "five")
+    # non-integer stored value
+    cmd(sock, "hset", h, "name", "alice")
+    r.expect_error("hincrby on string value → error",
+                   sock, "hincrby", h, "name", "1")
+
+    # HSTRLEN
+    cmd(sock, "hset", h, "greeting", "hello")
+    r.check("hstrlen greeting → 5",    cmd(sock, "hstrlen", h, "greeting"), 5)
+    r.check("hstrlen missing field → 0", cmd(sock, "hstrlen", h, "nope"), 0)
+    r.check("hstrlen missing key → 0",  cmd(sock, "hstrlen", "nohash", "f"), 0)
+
+    # HSCAN
+    cmd(sock, "del", h)
+    cmd(sock, "hset", h,
+        "field1", "v1", "field2", "v2", "field3", "v3", "other", "vx")
+
+    def hscan_all(key, *opts):
+        """Drive a full HSCAN loop; return dict of field→value."""
+        seen, cursor = {}, "0"
+        for _ in range(10000):
+            reply  = cmd(sock, "hscan", key, cursor, *opts)
+            cursor = reply[0]
+            items  = reply[1]
+            for i in range(0, len(items), 2):
+                seen[items[i]] = items[i + 1]
+            if cursor == "0":
+                break
+        return seen
+
+    all_fields = hscan_all(h)
+    r.check("hscan sees all 4 fields",   len(all_fields), 4)
+    r.check("hscan field1 value",        all_fields.get("field1"), "v1")
+
+    filtered = hscan_all(h, "match", "field*")
+    r.check("hscan match field* → 3",    len(filtered), 3)
+    r.check_true("hscan match excludes other", "other" not in filtered)
+
+    # missing key → cursor "0", empty array
+    reply = cmd(sock, "hscan", "nohash", "0")
+    r.check("hscan missing key cursor → 0", reply[0], "0")
+    r.check("hscan missing key array → []", reply[1], [])
+
+    # wrong type
+    cmd(sock, "del", "hstr2"); cmd(sock, "set", "hstr2", "x")
+    r.expect_error("hscan on string → WRONGTYPE", sock, "hscan", "hstr2", "0")
+    cmd(sock, "del", "hstr2")
+
+    cmd(sock, "del", h)
+
+
+def test_unlink_command(r: TestRunner, sock: socket.socket):
+    r.section("UNLINK Command (async delete)")
+
+    cmd(sock, "del", "unlinktest")
+    r.check("unlink missing → 0", cmd(sock, "unlink", "unlinktest"), 0)
+
+    cmd(sock, "set", "unlinktest", "hello")
+    r.check("unlink string → 1", cmd(sock, "unlink", "unlinktest"), 1)
+    r.check_none("string gone", cmd(sock, "get", "unlinktest"))
 
     # small zset — synchronous path
     small = "small_async_zset"
     cmd(sock, "del", small)
     for i in range(10):
         cmd(sock, "zadd", small, str(float(i)), f"m{i}")
-    r.check("asyncdel small zset → 1", cmd(sock, "asyncdel", small), 1)
+    r.check("unlink small zset → 1", cmd(sock, "unlink", small), 1)
     r.check_none("small zset gone", cmd(sock, "zscore", small, "m0"))
 
     # large zset — thread pool path (>1000 entries)
@@ -734,12 +901,12 @@ def test_asyncdel_command(r: TestRunner, sock: socket.socket):
     r.check_approx("large zset created",
                    cmd(sock, "zscore", large, "member0"), 0.0)
 
-    print(f"  {YELLOW}ℹ{RESET}  sending asyncdel (thread pool path)...")
+    print(f"  {YELLOW}ℹ{RESET}  sending unlink (thread pool path)...")
     t0      = time.time()
-    result  = cmd(sock, "asyncdel", large)
+    result  = cmd(sock, "unlink", large)
     elapsed = time.time() - t0
-    r.check("asyncdel large → 1", result, 1)
-    r.check_true("asyncdel fast (<100ms)", elapsed < 0.1)
+    r.check("unlink large → 1", result, 1)
+    r.check_true("unlink fast (<100ms)", elapsed < 0.1)
     r.check_none("large zset immediately gone",
                  cmd(sock, "zscore", large, "member0"))
     print(f"  {YELLOW}ℹ{RESET}  returned in {elapsed*1000:.1f}ms")
@@ -1288,10 +1455,12 @@ def main():
             test_zset_commands(r,         sock)
             test_zquery_commands(r,       sock)
             test_list_commands(r,         sock)
-            test_hash_commands(r,         sock)
-            test_generic_commands(r,      sock)
-            test_scan_command(r,          sock)
-            test_asyncdel_command(r,      sock)
+            test_hash_commands(r,                  sock)
+            test_extended_hash_commands(r,         sock)
+            test_generic_commands(r,               sock)
+            test_scan_command(r,                   sock)
+            test_extended_generic_commands(r,      sock)
+            test_unlink_command(r,                 sock)
             test_edge_cases(r,            sock)
             test_info_command(r,          sock)
             test_save_command(r,          sock)
