@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-20 01:59:16
+# MYRED stress test — 2026-06-21 02:58:47
 
 ```
 (logging output to stress_results.md)
@@ -22,7 +22,7 @@
   ✓ get long value
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'eat1', 'ka', 'eg2', 'eg1new', 'eg3', 'kc']
+  ✓ keys returns list → ['kb', 'ts_str', 'ka', 'kc', 'ts1']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -235,7 +235,84 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.0ms
+  ℹ  returned in 0.2ms
+
+── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
+  ✓ sadd 3 new → 3
+  ✓ sadd 1 new 1 dup → 1
+  ✓ scard after sadd → 4
+  ✓ type ts1 → set
+  ✓ sadd on string → WRONGTYPE
+  ✓ sismember existing → 1
+  ✓ sismember missing → 0
+  ✓ sismember missing key → 0
+  ✓ smismember a d z
+  ✓ smismember missing key
+  ✓ scard → 4
+  ✓ scard missing → 0
+  ✓ smembers returns 4 items
+  ✓ smembers has a
+  ✓ smembers has d
+  ✓ smembers missing → []
+  ✓ srem existing → 1
+  ✓ srem same again → 0
+  ✓ scard after srem → 3
+  ✓ srem multi: b c → 2
+  ✓ scard → 1
+  ✓ srem missing key → 0
+  ✓ srem on string → WRONGTYPE
+
+── Sets: SPOP / SRANDMEMBER ──────────────────────────
+  ✓ spop returns string
+  ✓ spop reduces card by 1
+  ✓ spop missing → nil
+  ✓ spop count=3 list of 3
+  ✓ spop count=3 distinct
+  ✓ scard after spop 3 → 2
+  ✓ srandmember returns string
+  ✓ card unchanged after srandmember
+  ✓ srandmember count=3 list
+  ✓ srandmember count=3 distinct
+  ✓ srandmember -5 returns 5
+  ✓ srandmember count>size → all
+  ✓ srandmember missing → nil
+
+── Sets: SSCAN ───────────────────────────────────────
+  ✓ sscan sees all 4
+  ✓ sscan has apple
+  ✓ sscan has cherry
+  ✓ sscan match a* → 2
+  ✓ sscan excludes banana
+  ✓ sscan missing key cursor → 0
+  ✓ sscan missing key array → []
+  ✓ sscan on string → WRONGTYPE
+
+── Sets: SINTER / SUNION / SDIFF ─────────────────────
+  ✓ sinter s1∩s2∩s3 = {c}
+  ✓ sinter s1∩s2 = {b,c}
+  ✓ sunion = {a,b,c,d,e,f}
+  ✓ sdiff s1-s2 = {a,d}
+  ✓ sdiff s1-s2-s3 = {a,d}
+  ✓ sinter wrong type → WRONGTYPE
+
+── Sets: SINTERSTORE / SUNIONSTORE / SDIFFSTORE ──────
+  ✓ sinterstore tsdest ts1 ts2 → 2
+  ✓ sinterstore result = {b,c}
+  ✓ sunionstore tsdest ts1 ts2 → 5
+  ✓ sunionstore result = {a,b,c,d,e}
+  ✓ sdiffstore tsdest ts1 ts2 → 2
+  ✓ sdiffstore result = {a,d}
+  ✓ sinterstore ts1←ts1∩ts2 → 2
+  ✓ ts1 is now {b,c}
+
+── Sets: SMOVE ───────────────────────────────────────
+  ✓ smove existing → 1
+  ✓ src no longer has x
+  ✓ dst now has x
+  ✓ smove non-existent → 0
+  ✓ smove missing src → 0
+  ✓ smove already-in-dst → 1
+  ✓ src size → 1 (just z)
 
 ── Edge Cases ────────────────────────────────────────
   ✓ zscore negative → -5
@@ -247,7 +324,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:5\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4456448\r\nused_memory_mb:4.25\r\n\r\n# Stats\r\ntotal_commands:2124\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:0\r\nrdb_changes_since_save:1852\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:4\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4571136\r\nused_memory_mb:4.36\r\n\r\n# Stats\r\ntotal_commands:2216\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:1091\r\nrdb_changes_since_save:1558\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -264,24 +341,24 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:5
+    uptime_seconds:4
     uptime_minutes:0
     uptime_hours:0
     # Clients
     connected_clients:0
     total_connections:1
     # Memory
-    used_memory_bytes:4456448
-    used_memory_mb:4.25
+    used_memory_bytes:4571136
+    used_memory_mb:4.36
     # Stats
-    total_commands:2124
+    total_commands:2216
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:0
-    rdb_changes_since_save:1852
+    rdb_last_save_time:1091
+    rdb_changes_since_save:1558
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
     # Replication
@@ -297,9 +374,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 0.8ms: 'Background saving started'
+  ℹ  bgsave returned in 1.0ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 8.0ms
+  ℹ  100 ops during save took 8.3ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -320,7 +397,7 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 229/229 passed
+Results: 294/294 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -332,17 +409,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    2.49s
-  Throughput: 1605 ops/sec
+  Elapsed:    2.19s
+  Throughput: 1823 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 4.79ms
-  Latency min: 0.03ms
-  Latency max: 54.81ms
-  Latency p95: 39.38ms
-  Latency p99: 50.10ms
+  Latency avg: 4.22ms
+  Latency min: 0.02ms
+  Latency max: 52.07ms
+  Latency p95: 39.10ms
+  Latency p99: 47.77ms
   No errors!
-  ℹ  cleaned 157 leftover keys
+  ℹ  cleaned 138 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
