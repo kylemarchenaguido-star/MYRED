@@ -353,6 +353,179 @@ def test_string_commands(r: TestRunner, sock: socket.socket):
     cmd(sock, "del", "big")
 
 
+def test_numeric_commands(r: TestRunner, sock: socket.socket):
+    r.section("String Numerics: INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT")
+
+    for k in ("nc", "nc2", "nc3", "nf", "nf2"):
+        cmd(sock, "del", k)
+
+    # INCR on missing key → starts at 0, returns 1
+    r.check("incr missing → 1",      cmd(sock, "incr", "nc"), 1)
+    r.check("incr again → 2",        cmd(sock, "incr", "nc"), 2)
+    r.check("incr again → 3",        cmd(sock, "incr", "nc"), 3)
+
+    # DECR
+    r.check("decr → 2",              cmd(sock, "decr", "nc"), 2)
+    r.check("decr → 1",              cmd(sock, "decr", "nc"), 1)
+
+    # INCRBY
+    r.check("incrby 10 → 11",        cmd(sock, "incrby", "nc", "10"), 11)
+    r.check("incrby -5 → 6",         cmd(sock, "incrby", "nc", "-5"), 6)
+
+    # DECRBY
+    r.check("decrby 3 → 3",          cmd(sock, "decrby", "nc", "3"), 3)
+    r.check("decrby -2 → 5",         cmd(sock, "decrby", "nc", "-2"), 5)
+
+    # operations on a key with an explicit string value
+    cmd(sock, "set", "nc", "100")
+    r.check("incr from '100' → 101", cmd(sock, "incr", "nc"), 101)
+    cmd(sock, "set", "nc", "0")
+    r.check("decr from '0' → -1",    cmd(sock, "decr", "nc"), -1)
+
+    # non-integer value → error
+    cmd(sock, "set", "nc2", "notanumber")
+    r.expect_error("incr on non-int value → error",    sock, "incr",   "nc2")
+    r.expect_error("incrby on non-int value → error",  sock, "incrby", "nc2", "5")
+    r.expect_error("decrby on non-int value → error",  sock, "decrby", "nc2", "1")
+
+    # wrong type → WRONGTYPE
+    cmd(sock, "del", "nc3")
+    cmd(sock, "sadd", "nc3", "x")
+    r.expect_error("incr on set → WRONGTYPE",   sock, "incr",   "nc3")
+    r.expect_error("incrby on set → WRONGTYPE", sock, "incrby", "nc3", "1")
+
+    # INCRBYFLOAT
+    cmd(sock, "set", "nf", "10.5")
+    r.check_approx("incrbyfloat 0.1 → ~10.6",  cmd(sock, "incrbyfloat", "nf", "0.1"),  10.6)
+    r.check_approx("incrbyfloat -3.5 → ~7.1",  cmd(sock, "incrbyfloat", "nf", "-3.5"), 7.1)
+    r.check_approx("incrbyfloat 0 → ~7.1",     cmd(sock, "incrbyfloat", "nf", "0"),    7.1)
+
+    # incrbyfloat on missing key → delta as value
+    r.check_approx("incrbyfloat missing → 1.5", cmd(sock, "incrbyfloat", "nf2", "1.5"), 1.5)
+
+    # incrbyfloat produces a string result, not an integer
+    r.check_type("incrbyfloat returns str", cmd(sock, "incrbyfloat", "nf", "0"), str)
+
+    # NaN / infinity → error
+    r.expect_error("incrbyfloat inf → error",  sock, "incrbyfloat", "nf", "inf")
+    r.expect_error("incrbyfloat -inf → error", sock, "incrbyfloat", "nf", "-inf")
+
+    # overflow / underflow → error
+    cmd(sock, "set", "nc", str(2**63 - 1))
+    r.expect_error("incr at INT64_MAX → overflow", sock, "incr", "nc")
+
+    cmd(sock, "set", "nc", str(-2**63))
+    r.expect_error("decr at INT64_MIN → overflow", sock, "decr", "nc")
+
+    for k in ("nc", "nc2", "nc3", "nf", "nf2"):
+        cmd(sock, "del", k)
+
+
+def test_setvariant_commands(r: TestRunner, sock: socket.socket):
+    r.section("String Variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL")
+
+    for k in ("sv1", "sv2", "sv3", "sv4", "sv5", "sv_wt"):
+        cmd(sock, "del", k)
+
+    # ── SETNX ─────────────────────────────────────────────────────────────────
+    r.check("setnx missing → 1",       cmd(sock, "setnx", "sv1", "hello"), 1)
+    r.check("get after setnx → hello", cmd(sock, "get",   "sv1"),          "hello")
+    r.check("setnx existing → 0",      cmd(sock, "setnx", "sv1", "world"), 0)
+    r.check("value unchanged → hello", cmd(sock, "get",   "sv1"),          "hello")
+
+    # any existing type counts as "exists" → 0
+    cmd(sock, "sadd", "sv_wt", "x")
+    r.check("setnx on set → 0 (key exists)", cmd(sock, "setnx", "sv_wt", "v"), 0)
+    cmd(sock, "del", "sv_wt")
+
+    # ── SETEX ─────────────────────────────────────────────────────────────────
+    r.check("setex 10s → OK",         cmd(sock, "setex", "sv2", "10", "exval"), "OK")
+    r.check("get sv2 → exval",        cmd(sock, "get", "sv2"),                  "exval")
+    ttl = cmd(sock, "pttl", "sv2")
+    r.check_true("setex ttl > 0",     ttl > 0)
+    r.check_true("setex ttl ≤ 10000", ttl <= 10000)
+    r.expect_error("setex ttl=0 → error",  sock, "setex", "sv2", "0",   "v")
+    r.expect_error("setex ttl=-1 → error", sock, "setex", "sv2", "-1",  "v")
+    r.expect_error("setex non-int → error",sock, "setex", "sv2", "abc", "v")
+
+    # ── PSETEX ────────────────────────────────────────────────────────────────
+    r.check("psetex 5000ms → OK",      cmd(sock, "psetex", "sv3", "5000", "msval"), "OK")
+    r.check("get sv3 → msval",         cmd(sock, "get", "sv3"),                     "msval")
+    ttl = cmd(sock, "pttl", "sv3")
+    r.check_true("psetex ttl > 0",     ttl > 0)
+    r.check_true("psetex ttl ≤ 5000",  ttl <= 5000)
+    r.expect_error("psetex ttl=0 → error", sock, "psetex", "sv3", "0", "v")
+
+    # actual expiry: set a very short TTL and wait
+    r.check("psetex 200ms → OK",       cmd(sock, "psetex", "sv3", "200", "gone"), "OK")
+    print(f"  \033[33mℹ\033[0m  waiting 400ms for psetex key to expire...")
+    time.sleep(0.4)
+    r.check_none("sv3 expired → nil",  cmd(sock, "get", "sv3"))
+
+    # ── GETSET ────────────────────────────────────────────────────────────────
+    cmd(sock, "set", "sv4", "old")
+    r.check("getset returns old value", cmd(sock, "getset", "sv4", "new"),  "old")
+    r.check("get after getset → new",   cmd(sock, "get",    "sv4"),         "new")
+
+    # getset on missing key → nil, then creates the key
+    cmd(sock, "del", "sv5")
+    r.check_none("getset missing → nil",     cmd(sock, "getset", "sv5", "first"))
+    r.check("key created by getset → first", cmd(sock, "get", "sv5"),             "first")
+
+    # getset on wrong type → WRONGTYPE
+    cmd(sock, "sadd", "sv_wt", "x")
+    r.expect_error("getset on set → WRONGTYPE", sock, "getset", "sv_wt", "v")
+    cmd(sock, "del", "sv_wt")
+
+    # ── GETEX ─────────────────────────────────────────────────────────────────
+    cmd(sock, "set", "sv4", "gxval")
+    cmd(sock, "persist", "sv4")
+
+    # bare: just get, no TTL change
+    r.check("getex bare → value",      cmd(sock, "getex", "sv4"),        "gxval")
+    r.check("pttl unchanged → -1",     cmd(sock, "pttl", "sv4"),         -1)
+
+    # EX
+    r.check("getex EX 5 → value",      cmd(sock, "getex", "sv4", "EX", "5"), "gxval")
+    ttl = cmd(sock, "pttl", "sv4")
+    r.check_true("getex EX set ttl > 0",     ttl > 0)
+    r.check_true("getex EX set ttl ≤ 5000",  ttl <= 5000)
+
+    # PERSIST clears the TTL
+    r.check("getex PERSIST → value",   cmd(sock, "getex", "sv4", "PERSIST"), "gxval")
+    r.check("pttl after PERSIST → -1", cmd(sock, "pttl", "sv4"),             -1)
+
+    # PX
+    r.check("getex PX 3000 → value",   cmd(sock, "getex", "sv4", "PX", "3000"), "gxval")
+    ttl = cmd(sock, "pttl", "sv4")
+    r.check_true("getex PX set ttl > 0",     ttl > 0)
+    r.check_true("getex PX set ttl ≤ 3000",  ttl <= 3000)
+    cmd(sock, "persist", "sv4")
+
+    # missing key → nil (no option)
+    cmd(sock, "del", "sv5")
+    r.check_none("getex missing → nil", cmd(sock, "getex", "sv5"))
+
+    # invalid option → error
+    r.expect_error("getex bad opt → error",  sock, "getex", "sv4", "BADOPT", "5")
+    r.expect_error("getex EX 0 → error",     sock, "getex", "sv4", "EX", "0")
+    r.expect_error("getex PX -1 → error",    sock, "getex", "sv4", "PX", "-1")
+
+    # ── GETDEL ────────────────────────────────────────────────────────────────
+    cmd(sock, "set", "sv5", "delval")
+    r.check("getdel → value",               cmd(sock, "getdel", "sv5"), "delval")
+    r.check_none("key gone after getdel",   cmd(sock, "get", "sv5"))
+
+    cmd(sock, "del", "sv5")
+    r.check_none("getdel missing → nil",    cmd(sock, "getdel", "sv5"))
+
+    cmd(sock, "sadd", "sv_wt", "x")
+    r.expect_error("getdel on set → WRONGTYPE", sock, "getdel", "sv_wt")
+
+    for k in ("sv1", "sv2", "sv3", "sv4", "sv5", "sv_wt"):
+        cmd(sock, "del", k)
+
+
 def test_keys_command(r: TestRunner, sock: socket.socket):
     r.section("KEYS Command")
 
@@ -1416,21 +1589,24 @@ def stress_worker(host: str, port: int, ops: int,
     lst  = f"stress_list_{wid}"
     hsh  = f"stress_hash_{wid}"
     sset = f"stress_set_{wid}"
+    ctr  = f"stress_ctr_{wid}"
     try:
         cmd(sock, "del", zset)
         cmd(sock, "del", lst)
         cmd(sock, "del", hsh)
         cmd(sock, "del", sset)
+        cmd(sock, "del", ctr)
         for i in range(10):
             cmd(sock, "zadd", zset, str(float(i)), f"m{i}")
         cmd(sock, "rpush", lst, "a", "b", "c", "d", "e")
         cmd(sock, "hset", hsh, "f0", "0", "f1", "1")
         cmd(sock, "sadd", sset, "x", "y", "z", "w")
+        cmd(sock, "set", ctr, "0")
     except Exception:
         pass
 
     for _ in range(ops):
-        op = random.randint(0, 22)
+        op = random.randint(0, 25)
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -1492,6 +1668,12 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "smembers", sset)
             elif op == 22:
                 cmd(sock, "srem", sset, random_string(4))
+            elif op == 23:
+                cmd(sock, "incr", ctr)
+            elif op == 24:
+                cmd(sock, "setnx", random_key(), random_string(4))
+            elif op == 25:
+                cmd(sock, "getdel", random_key())
 
             stats.record((time.perf_counter() - t0) * 1000)
         except Exception:
@@ -1502,6 +1684,7 @@ def stress_worker(host: str, port: int, ops: int,
         cmd(sock, "del", lst)
         cmd(sock, "del", hsh)
         cmd(sock, "del", sset)
+        cmd(sock, "del", ctr)
         sock.close()
     except Exception:
         pass
@@ -1647,6 +1830,8 @@ def main():
         sock = make_conn(host, port)
         try:
             test_string_commands(r,       sock)
+            test_numeric_commands(r,      sock)
+            test_setvariant_commands(r,   sock)
             test_keys_command(r,          sock)
             test_ttl_commands(r,          sock)
             test_zset_commands(r,         sock)

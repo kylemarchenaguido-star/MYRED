@@ -38,7 +38,7 @@ Complete the String type to near-Redis parity. All changes in `commands.cpp` onl
 - `DEL key [key...]` — loop `cmd[1..N]`, swap each key into `LookupKey`, `hm_delete` + `entry_del`, count hits, batch `g_writes_since_save += deleted`. Dispatch changed from `== 2` to `>= 2`.
 - `EXISTS key [key...]` — same loop but copy (not swap) into `LookupKey` so duplicate keys are each counted. `expire_if_needed` check before counting. Dispatch changed from `== 2` to `>= 2`.
 
-### ⬜ Step 2 — Numeric: INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT
+### ✅ Step 2 — Numeric: INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT (DONE 2026-06-21)
 
 One shared helper `incr_generic(cmd, out, delta)` used by all four integer commands.
 
@@ -58,7 +58,7 @@ Key implementation details:
 - `INCRBYFLOAT`: check `isinf(result) || isnan(result)` after addition. Format: `snprintf(buf, 64, "%.17g", result)`. Returns bulk string (`resp_str`), not integer.
 - `str2int` and `str2dbl` already exist in `commands.cpp` (~line 156–165).
 
-### ⬜ Step 3 — Set variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL
+### ✅ Step 3 — Set variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL (DONE 2026-06-21)
 
 ```
 SETNX key val              → 1 if set, 0 if key existed

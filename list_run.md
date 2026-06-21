@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-21 03:54:22
+# MYRED stress test — 2026-06-21 16:03:21
 
 ```
 (logging output to list_run.md)
@@ -20,6 +20,78 @@
   ✓ del missing → 0
   ✓ get empty → ''
   ✓ get long value
+
+── String Numerics: INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT 
+  ✓ incr missing → 1
+  ✓ incr again → 2
+  ✓ incr again → 3
+  ✓ decr → 2
+  ✓ decr → 1
+  ✓ incrby 10 → 11
+  ✓ incrby -5 → 6
+  ✓ decrby 3 → 3
+  ✓ decrby -2 → 5
+  ✓ incr from '100' → 101
+  ✓ decr from '0' → -1
+  ✓ incr on non-int value → error
+  ✓ incrby on non-int value → error
+  ✓ decrby on non-int value → error
+  ✓ incr on set → WRONGTYPE
+  ✓ incrby on set → WRONGTYPE
+  ✓ incrbyfloat 0.1 → ~10.6 → 10.6
+  ✓ incrbyfloat -3.5 → ~7.1 → 7.0999999999999996
+  ✓ incrbyfloat 0 → ~7.1 → 7.0999999999999996
+  ✓ incrbyfloat missing → 1.5 → 1.5
+  ✓ incrbyfloat returns str → '7.0999999999999996'
+  ✓ incrbyfloat inf → error
+  ✓ incrbyfloat -inf → error
+  ✓ incr at INT64_MAX → overflow
+  ✓ decr at INT64_MIN → overflow
+
+── String Variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL 
+  ✓ setnx missing → 1
+  ✓ get after setnx → hello
+  ✓ setnx existing → 0
+  ✓ value unchanged → hello
+  ✓ setnx on set → 0 (key exists)
+  ✓ setex 10s → OK
+  ✓ get sv2 → exval
+  ✓ setex ttl > 0
+  ✓ setex ttl ≤ 10000
+  ✓ setex ttl=0 → error
+  ✓ setex ttl=-1 → error
+  ✓ setex non-int → error
+  ✓ psetex 5000ms → OK
+  ✓ get sv3 → msval
+  ✓ psetex ttl > 0
+  ✓ psetex ttl ≤ 5000
+  ✓ psetex ttl=0 → error
+  ✓ psetex 200ms → OK
+  ℹ  waiting 400ms for psetex key to expire...
+  ✓ sv3 expired → nil
+  ✓ getset returns old value
+  ✓ get after getset → new
+  ✓ getset missing → nil
+  ✓ key created by getset → first
+  ✓ getset on set → WRONGTYPE
+  ✓ getex bare → value
+  ✓ pttl unchanged → -1
+  ✓ getex EX 5 → value
+  ✓ getex EX set ttl > 0
+  ✓ getex EX set ttl ≤ 5000
+  ✓ getex PERSIST → value
+  ✓ pttl after PERSIST → -1
+  ✓ getex PX 3000 → value
+  ✓ getex PX set ttl > 0
+  ✓ getex PX set ttl ≤ 3000
+  ✓ getex missing → nil
+  ✓ getex bad opt → error
+  ✓ getex EX 0 → error
+  ✓ getex PX -1 → error
+  ✓ getdel → value
+  ✓ key gone after getdel
+  ✓ getdel missing → nil
+  ✓ getdel on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
   ✓ keys returns list → ['kb', 'ka', 'kc']
@@ -235,7 +307,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.3ms
+  ℹ  returned in 0.2ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -324,7 +396,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:8\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4063232\r\nused_memory_mb:3.88\r\n\r\n# Stats\r\ntotal_commands:2216\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:31349\r\nrdb_changes_since_save:1772\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:7\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:3932160\r\nused_memory_mb:3.75\r\n\r\n# Stats\r\ntotal_commands:2322\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:11098\r\nrdb_changes_since_save:1830\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -341,24 +413,24 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:8
+    uptime_seconds:7
     uptime_minutes:0
     uptime_hours:0
     # Clients
     connected_clients:0
     total_connections:1
     # Memory
-    used_memory_bytes:4063232
-    used_memory_mb:3.88
+    used_memory_bytes:3932160
+    used_memory_mb:3.75
     # Stats
-    total_commands:2216
+    total_commands:2322
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:31349
-    rdb_changes_since_save:1772
+    rdb_last_save_time:11098
+    rdb_changes_since_save:1830
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
     # Replication
@@ -376,7 +448,7 @@
   ✓ bgsave returns fast (<50ms)
   ℹ  bgsave returned in 0.6ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 13.1ms
+  ℹ  100 ops during save took 17.4ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -397,7 +469,7 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 294/294 passed
+Results: 361/361 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -409,17 +481,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    33.99s
-  Throughput: 118 ops/sec
+  Elapsed:    32.71s
+  Throughput: 122 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 63.01ms
-  Latency min: 0.13ms
-  Latency max: 922.38ms
-  Latency p95: 569.20ms
-  Latency p99: 821.79ms
+  Latency avg: 62.43ms
+  Latency min: 0.09ms
+  Latency max: 993.98ms
+  Latency p95: 602.35ms
+  Latency p99: 801.04ms
   No errors!
-  ℹ  cleaned 133 leftover keys
+  ℹ  cleaned 130 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

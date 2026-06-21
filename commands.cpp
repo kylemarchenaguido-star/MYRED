@@ -69,6 +69,134 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
   return resp_ok(out);
 }
 
+static bool str2dbl(const std::string &s, double &out);
+static bool str2int(const std::string &s, int64_t &out);
+
+// mult = 1000 for SETEX (s), mult = 1 for PSETEX (ms)
+static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mult){
+  int64_t ttl = 0;
+  if (!str2int(cmd[2], ttl) || ttl <= 0){
+    return resp_err(out, "ERR invalid expire time in setex command");
+  }
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE Opreation against a key holding the wrong kind of value");
+  }
+  ent->str.swap(cmd[3]);
+  entry_set_ttl(ent, ttl * mult);
+  return resp_ok(out);
+}
+
+static void do_setex(std::vector<std::string> &cmd, Buffer *out){ setex_generic(cmd, out, 1000); }
+static void do_psetex(std::vector<std::string> &cmd, Buffer *out){ setex_generic(cmd, out, 1); }
+
+static void do_setnx(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey lk;
+  lk.key = cmd[1]; // we copy, not swap we need cmd[1]
+  lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+  HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+  if (node){
+    Entry *e = container_of(node, Entry, node);
+    if (!expire_if_needed(e)){
+      return resp_int(out, 0); // alive so we dont do nothing
+    }
+    // expired -> fall through
+  }
+  // now we use the cmd[1]
+  Entry *ent;
+  lookup_entry(cmd[1], T_STR, true, &ent);
+  ent->str.swap(cmd[2]);
+  g_data.g_writes_since_save++;
+  resp_int(out, 1);
+}
+
+static void do_getset(std::vector<std::string> &cmd, Buffer *out){
+  LookupKey lk;
+  lk.key = cmd[1]; // we copy
+  lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+  HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+
+  if (node){
+    Entry *ent = container_of(node, Entry, node);
+    if (!expire_if_needed(ent)){
+      if (ent->type != T_STR){
+        return resp_err(out, "WRONGTYPE Operation against a key holding the wrong type of value");
+      }
+      std::string old = std::move(ent->str); // extract the old value
+      ent->str.swap(cmd[2]); // set the new value
+      g_data.g_writes_since_save++;
+      return resp_str(out, old.data(), old.size());
+    }
+    // expired and deleted, falls through
+  }
+  // key missing create entry and return  nil
+  Entry *ent = entry_new(T_STR);
+  ent->key = std::move(lk.key);
+  ent->node.hcode = lk.node.hcode;
+  ent->str.swap(cmd[2]);
+  hm_insert(&g_data.db, &ent->node);
+  g_data.g_writes_since_save++;
+  resp_nil(out);
+}
+
+static void do_getdel(std::vector<std::string> &cmd, Buffer *out){
+ Entry *ent;
+  switch (lookup_entry(cmd[1], T_STR, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
+  }
+  std::string val = std::move(ent->str); // we extract the values before freeing
+  hm_delete(&g_data.db, &ent->node, &hnode_same);
+  entry_del(ent);
+  g_data.g_writes_since_save++;
+  resp_str(out, val.data(), val.size());
+}
+
+static void do_getex(std::vector<std::string> &cmd, Buffer *out){
+ Entry *ent;
+  switch (lookup_entry(cmd[1], T_STR, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING:   return resp_nil(out);
+    case Lookup::OK:        break;
+  }
+  // it just a bare getex key, just get no ttl change
+  if (cmd.size() == 2){
+    return resp_str(out, ent->str.data(), ent->str.size());
+  }
+
+  std::string opt = cmd[2];
+  for (char &c : opt){ c = (char)tolower((unsigned char)c); }
+
+  if (opt == "persist"){
+    if (cmd.size() != 3){ return resp_err(out, "ERR syntax error"); }
+    entry_set_ttl(ent, -1);
+    return resp_str(out, ent->str.data(), ent->str.size());
+  }
+
+  if (cmd.size() != 4){ return resp_err(out, "ERR syntax error"); }
+  int64_t v = 0;
+  if (!str2int(cmd[3], v)){ return resp_err(out, "ERR value is not an integer or out of range"); }
+
+  int64_t ttl_ms = 0;
+  if (opt == "ex"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v * 1000; }
+  else if (opt == "px"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v; }
+  else if (opt == "exat"){ ttl_ms = v * 1000 - (int64_t)get_wall_msec(); }
+  else if (opt == "pxat"){ ttl_ms = v - (int64_t)get_wall_msec(); }
+  else { return resp_err(out, "ERR syntax error"); }
+
+  if (ttl_ms <= 0){
+    // past timestamp so we get the value then delete the key
+    std::string val = std::move(ent->str);
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+    g_data.g_writes_since_save++;
+    return resp_str(out, val.data(), val.size());
+  }
+  entry_set_ttl(ent, ttl_ms);
+  resp_str(out, ent->str.data(), ent->str.size());
+}
+
 // delta already carries the correct sign (+1, -1, +N, -N)
 static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t delta){
   Entry *ent;
@@ -1968,6 +2096,18 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "incr") {
       do_incr(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "setex") {
+    do_setex(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "psetex") {
+      do_psetex(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "setnx") {
+      do_setnx(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "getset") {
+      do_getset(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "getdel") {
+      do_getdel(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "getex") {
+    do_getex(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "decr") {
       do_decr(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "incrby") {
@@ -2036,7 +2176,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_persist(cmd, out);
   } else if (cmd.size() >= 2 && cmd[0] == "scan") {
     do_scan(cmd, out);
-    } else if (cmd.size() >= 4 && cmd[0] == "hset") {
+  } else if (cmd.size() >= 4 && cmd[0] == "hset") {
     do_hset(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "hget") {
     do_hget(cmd, out);

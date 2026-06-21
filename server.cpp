@@ -54,6 +54,7 @@ static void fd_set_nb(int fd){
     die("fcntl error");
   }
 }
+
 // global flag — set to true when Ctrl+C is pressed
 static bool g_stop = false;
 
