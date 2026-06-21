@@ -1505,7 +1505,7 @@ static bool sinter_impl(std::vector<std::string> &cmd, size_t start, std::vector
   hm_foreach(&sets[smallest_idx]->set, cb_collect_members, &candidates);
   for (auto &m : candidates){
     bool in_all = true;
-    for (size_t i = 1; i < sets.size(); ++i){
+    for (size_t i = 0; i < sets.size(); ++i){
       if (i == smallest_idx){ continue; }
       if (!set_is_member(&sets[i]->set, m)){ in_all = false; break; }
     }
@@ -1535,7 +1535,7 @@ static bool sdiff_impl(std::vector<std::string> &cmd, size_t start, std::vector<
   if (!base){ return true; }// empty base, empty diff
 
   std::vector<Entry *> others;
-  for (size_t i = start; i < cmd.size(); ++i){
+  for (size_t i = start + 1; i < cmd.size(); ++i){
     Entry *e = lookup_set_ro(cmd[i], &wt);
     if (wt){ return false; }
     if (e){ others.push_back(e); }

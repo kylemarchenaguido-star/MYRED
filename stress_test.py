@@ -1027,7 +1027,9 @@ def test_set_commands(r: TestRunner, sock: socket.socket):
 
     r.section("Sets: SINTER / SUNION / SDIFF")
 
-    cmd(sock, "del", "ts1", "ts2", "ts3")
+    cmd(sock, "del", "ts1")
+    cmd(sock, "del", "ts2")
+    cmd(sock, "del", "ts3")
     cmd(sock, "sadd", "ts1", "a", "b", "c", "d")
     cmd(sock, "sadd", "ts2", "b", "c", "e")
     cmd(sock, "sadd", "ts3", "c", "f")
@@ -1074,7 +1076,8 @@ def test_set_commands(r: TestRunner, sock: socket.socket):
 
     r.section("Sets: SMOVE")
 
-    cmd(sock, "del", "tsmv_src", "tsmv_dst")
+    cmd(sock, "del", "tsmv_src")
+    cmd(sock, "del", "tsmv_dst")
     cmd(sock, "sadd", "tsmv_src", "x", "y", "z")
     cmd(sock, "sadd", "tsmv_dst", "p", "q")
 
