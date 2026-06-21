@@ -1596,7 +1596,7 @@ static void do_sismember(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  return resp_int(out, set_is_member(&g_data.db, cmd[2]) ? 1 : 0);
+  return resp_int(out, set_is_member(&ent->set, cmd[2]) ? 1 : 0);
 }
 
 // SMISMEMBER key member [member...] -> array of 0/1
@@ -1627,7 +1627,7 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   switch (lookup_entry(cmd[1], T_SET, false, &ent)){
     case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
-    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::MISSING: return resp_arr(out, 0);
     case Lookup::OK:  break;
   }
   std::vector<std::string> members;
@@ -1793,7 +1793,7 @@ static void do_sinter(std::vector<std::string> &cmd, Buffer *out){
 // SUNION key [key...]
 static void do_sunion(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
-  if (!sinter_impl(cmd, 1, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  if (!sunion_impl(cmd, 1, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   resp_arr(out, (uint32_t)result.size());
   for (auto &m : result){ resp_str(out, m.data(), m.size()); }
 }
