@@ -69,21 +69,92 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
   return resp_ok(out);
 }
 
+// delta already carries the correct sign (+1, -1, +N, -N)
+static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t delta){
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) ==  Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+  }
+  int64_t cur = 0;
+  if (!ent->str.empty() && !str2int(ent->str, cur)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+  }
+  if ((delta > 0 && cur > INT64_MAX - delta) || (delta < 0 && cur < INT64_MIN - delta)){
+    return resp_err(out, "ERR increment or decrement would overflow");
+  }
+  cur += delta;
+  ent->str = std::to_string(cur);
+  g_data.g_writes_since_save++;
+  resp_int(out, cur);
+}
+
+static void do_incr(std::vector<std::string> &cmd, Buffer *out){
+  incr_generic(cmd, out, 1);
+}
+
+static void do_decr(std::vector<std::string> &cmd, Buffer *out){
+  incr_generic(cmd, out, -1);
+}
+
+static void do_incrby(std::vector<std::string> &cmd, Buffer *out){
+  int64_t delta = 0;
+  if (!str2int(cmd[2], delta)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+  }
+  incr_generic(cmd, out, delta);
+} 
+
+static void do_decrby(std::vector<std::string> &cmd, Buffer *out){
+  int64_t by = 0;
+  if (!str2int(cmd[2], by)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+  }
+  // -INT64_MIN overflows int64
+  if (by == INT64_MIN){
+    return resp_err(out, "ERR increment or decrement would overflow");
+  }
+  incr_generic(cmd, out, -by);
+} 
+
+static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out){
+  double delta;
+  if (!str2dbl(cmd[2], delta)){
+    return resp_err(out, "ERR value is not a float or out of range");
+  }
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+  }
+  double cur = 0.0;
+  if (!ent->str.empty() && !str2dbl(ent->str, cur)){
+    return resp_err(out, "ERR value is not a float or out of range");
+  }
+  double result = cur + delta;
+  if (isinf(result) || isnan(result)){
+    return resp_err(out, "ERR increment would produce NaN or infinity");
+  }
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%.17g", result);
+  ent->str = buf;
+  g_data.g_writes_since_save++;
+  resp_str(out, ent->str.data(), ent->str.size());
+}
+
 // deletes a key and value
 static void do_del(std::vector<std::string> &cmd, Buffer *out){
-  // a dummy again
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-  //hashtable delete
-  HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
-  if (node){
-    //deallocate the memory
-    entry_del(container_of(node, Entry, node));
-    g_data.g_writes_since_save++;
-    return resp_int(out, 1);
+  int64_t deleted = 0;
+  for (size_t i = 1; i < cmd.size(); ++i){
+    LookupKey lk;
+    lk.key.swap(cmd[i]);
+    lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+    HNode *node = hm_delete(&g_data.db, &lk.node, &entry_eq);
+    if (node){
+      entry_del(container_of(node, Entry, node));
+      ++deleted;
+    }
   }
-  return resp_int(out, 0); // number of deleted keys
+  if (deleted > 0){ g_data.g_writes_since_save += (uint32_t)deleted; }
+  resp_int(out, deleted);
 }
 
 struct KeyStats {
@@ -241,17 +312,17 @@ static void do_ttl_seconds(std::vector<std::string> &cmd, Buffer *out){
 
 // EXISTS key  -> 1 if present (and not expired), else 0
 static void do_exists(std::vector<std::string> &cmd, Buffer *out){
-  LookupKey key;
-  key.key.swap(cmd[1]);
-  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-
-  if (!node){ return resp_int(out, 0); }
-
-  Entry *ent = container_of(node, Entry, node);
-  if (expire_if_needed(ent)){ return resp_int(out, 0); } // expired -> gone
-  return resp_int(out, 1);
+  int64_t count = 0;
+  for (size_t i = 1; i < cmd.size(); ++i){
+    LookupKey lk;
+    lk.key = cmd[i];
+    lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+    HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+    if (!node){ continue; }
+    Entry *ent = container_of(node, Entry, node);
+    if (!expire_if_needed(ent)){ ++count; }
+  }
+  resp_int(out, count);
 }
 
 // TYPE key  -> simple string: string | zset | list | none
@@ -1895,7 +1966,17 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set") {
     do_set(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "del") {
+  } else if (cmd.size() == 2 && cmd[0] == "incr") {
+      do_incr(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "decr") {
+      do_decr(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "incrby") {
+      do_incrby(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "decrby") {
+      do_decrby(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "incrbyfloat") {
+      do_incrbyfloat(cmd, out);  
+  } else if (cmd.size() >= 2 && cmd[0] == "del") {
     do_del(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
     do_pexpire(cmd, out);
@@ -1943,7 +2024,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_lrem(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "ltrim") {
     do_ltrim(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "exists") {
+  } else if (cmd.size() >= 2 && cmd[0] == "exists") {
     do_exists(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "type") {
     do_type(cmd, out);

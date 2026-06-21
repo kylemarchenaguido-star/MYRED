@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-20 01:50:50
+# MYRED stress test — 2026-06-21 03:54:22
 
 ```
 (logging output to list_run.md)
@@ -22,7 +22,7 @@
   ✓ get long value
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'eg2', 'persist_zset', 'eg1new', 'eg3', 'kc']
+  ✓ keys returns list → ['kb', 'ka', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -207,8 +207,180 @@
   ✓ touch all missing → 0
 
 ── Generic: EXPIREAT / PEXPIREAT ─────────────────────
+  ✓ expireat future → 1
+  ✓ ttl after expireat in (0,120]
+  ✓ expireat past → 1
+  ✓ key gone after past expireat
+  ✓ expireat missing → 0
+  ✓ pexpireat future → 1
+  ✓ pttl after pexpireat in (0,60000]
+  ✓ pexpireat past → 1
+  ✓ key gone after past pexpireat
 
-Unexpected error: ERR invalid expire time
+── Generic: FLUSHALL ─────────────────────────────────
+  ✓ dbsize > 0 before flush
+  ✓ flushall → OK
+  ✓ dbsize 0 after flush
+  ✓ randomkey after flush → nil
+
+── UNLINK Command (async delete) ─────────────────────
+  ✓ unlink missing → 0
+  ✓ unlink string → 1
+  ✓ string gone
+  ✓ unlink small zset → 1
+  ✓ small zset gone
+  ℹ  inserting 1500 entries...
+  ✓ large zset created → 0
+  ℹ  sending unlink (thread pool path)...
+  ✓ unlink large → 1
+  ✓ unlink fast (<100ms)
+  ✓ large zset immediately gone
+  ℹ  returned in 0.3ms
+
+── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
+  ✓ sadd 3 new → 3
+  ✓ sadd 1 new 1 dup → 1
+  ✓ scard after sadd → 4
+  ✓ type ts1 → set
+  ✓ sadd on string → WRONGTYPE
+  ✓ sismember existing → 1
+  ✓ sismember missing → 0
+  ✓ sismember missing key → 0
+  ✓ smismember a d z
+  ✓ smismember missing key
+  ✓ scard → 4
+  ✓ scard missing → 0
+  ✓ smembers returns 4 items
+  ✓ smembers has a
+  ✓ smembers has d
+  ✓ smembers missing → []
+  ✓ srem existing → 1
+  ✓ srem same again → 0
+  ✓ scard after srem → 3
+  ✓ srem multi: b c → 2
+  ✓ scard → 1
+  ✓ srem missing key → 0
+  ✓ srem on string → WRONGTYPE
+
+── Sets: SPOP / SRANDMEMBER ──────────────────────────
+  ✓ spop returns string
+  ✓ spop reduces card by 1
+  ✓ spop missing → nil
+  ✓ spop count=3 list of 3
+  ✓ spop count=3 distinct
+  ✓ scard after spop 3 → 2
+  ✓ srandmember returns string
+  ✓ card unchanged after srandmember
+  ✓ srandmember count=3 list
+  ✓ srandmember count=3 distinct
+  ✓ srandmember -5 returns 5
+  ✓ srandmember count>size → all
+  ✓ srandmember missing → nil
+
+── Sets: SSCAN ───────────────────────────────────────
+  ✓ sscan sees all 4
+  ✓ sscan has apple
+  ✓ sscan has cherry
+  ✓ sscan match a* → 2
+  ✓ sscan excludes banana
+  ✓ sscan missing key cursor → 0
+  ✓ sscan missing key array → []
+  ✓ sscan on string → WRONGTYPE
+
+── Sets: SINTER / SUNION / SDIFF ─────────────────────
+  ✓ sinter s1∩s2∩s3 = {c}
+  ✓ sinter s1∩s2 = {b,c}
+  ✓ sunion = {a,b,c,d,e,f}
+  ✓ sdiff s1-s2 = {a,d}
+  ✓ sdiff s1-s2-s3 = {a,d}
+  ✓ sinter wrong type → WRONGTYPE
+
+── Sets: SINTERSTORE / SUNIONSTORE / SDIFFSTORE ──────
+  ✓ sinterstore tsdest ts1 ts2 → 2
+  ✓ sinterstore result = {b,c}
+  ✓ sunionstore tsdest ts1 ts2 → 5
+  ✓ sunionstore result = {a,b,c,d,e}
+  ✓ sdiffstore tsdest ts1 ts2 → 2
+  ✓ sdiffstore result = {a,d}
+  ✓ sinterstore ts1←ts1∩ts2 → 2
+  ✓ ts1 is now {b,c}
+
+── Sets: SMOVE ───────────────────────────────────────
+  ✓ smove existing → 1
+  ✓ src no longer has x
+  ✓ dst now has x
+  ✓ smove non-existent → 0
+  ✓ smove missing src → 0
+  ✓ smove already-in-dst → 1
+  ✓ src size → 1 (just z)
+
+── Edge Cases ────────────────────────────────────────
+  ✓ zscore negative → -5
+  ✓ zscore zero → 0
+  ✓ same score sorted by name
+  ✓ special chars in value
+  ✓ get on zset → WRONGTYPE error
+  ✓ 100 rapid get correct
+  ℹ  100 rapid set/get/del complete
+
+── INFO Command ──────────────────────────────────────
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:8\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4063232\r\nused_memory_mb:3.88\r\n\r\n# Stats\r\ntotal_commands:2216\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:31349\r\nrdb_changes_since_save:1772\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ has # Server section
+  ✓ has # Clients section
+  ✓ has # Memory section
+  ✓ has # Stats section
+  ✓ has # Keyspace section
+  ✓ has # Persistence section
+  ✓ has version field
+  ✓ has uptime_seconds field
+  ✓ has connected_clients field
+  ✓ has total_commands field
+  ✓ has keys_total field
+  ✓ has keys_with_ttl field
+
+  INFO output:
+    # Server
+    version:1.0.0
+    uptime_seconds:8
+    uptime_minutes:0
+    uptime_hours:0
+    # Clients
+    connected_clients:0
+    total_connections:1
+    # Memory
+    used_memory_bytes:4063232
+    used_memory_mb:3.88
+    # Stats
+    total_commands:2216
+    # Keyspace
+    keys_total:0
+    keys_with_ttl:0
+    keys_no_ttl:0
+    # Persistence
+    rdb_last_save_time:31349
+    rdb_changes_since_save:1772
+    rdb_last_save_ok:1
+    rdb_last_save_size_bytes:0
+    # Replication
+    role:master
+
+── SAVE / RDB Persistence ────────────────────────────
+  ✓ save → OK
+  ✓ dump.rdb exists
+  ✓ dump.rdb not empty
+  ℹ  dump.rdb size: 75 bytes
+  ✓ magic number correct
+
+── BGSAVE (fork-based background save) ───────────────
+  ✓ bgsave returns string → 'Background saving started'
+  ✓ bgsave returns fast (<50ms)
+  ℹ  bgsave returned in 0.6ms: 'Background saving started'
+  ✓ server responsive during save
+  ℹ  100 ops during save took 13.1ms
+  ✓ save did not block event loop (burst <500ms)
+  ✓ dump.rdb exists after bgsave
+  ✓ bgsave file has magic
+  ✓ second bgsave handled gracefully
 
 ── Authentication ────────────────────────────────────
   ✓ wrong password → error
@@ -225,7 +397,7 @@ Unexpected error: ERR invalid expire time
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 177/177 passed
+Results: 294/294 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -237,20 +409,20 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    45.46s
-  Throughput: 88 ops/sec
+  Elapsed:    33.99s
+  Throughput: 118 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 89.03ms
-  Latency min: 0.09ms
-  Latency max: 972.82ms
-  Latency p95: 782.33ms
-  Latency p99: 875.92ms
+  Latency avg: 63.01ms
+  Latency min: 0.13ms
+  Latency max: 922.38ms
+  Latency p95: 569.20ms
+  Latency p99: 821.79ms
   No errors!
-  ℹ  cleaned 136 leftover keys
+  ℹ  cleaned 133 leftover keys
 
 ═══════════════════════════════════════════════════════
-  SOME TESTS FAILED
+  ALL TESTS PASSED
 ═══════════════════════════════════════════════════════
 
 
