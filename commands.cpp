@@ -272,7 +272,7 @@ static void do_type(std::vector<std::string> &cmd, Buffer *out){
   else if (ent->type == T_ZSET)  { t = "zset"; }
   else if (ent->type == T_DLIST) { t = "list"; }
   else if (ent->type == T_HASH)  { t = "hash"; }
-
+  else if (ent->type == T_SET)   { t = "set"; }
 
   return resp_simple(out, t);
 }
@@ -501,7 +501,9 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   entry_set_ttl(ent, -1);
 
   // check if need offloading
-  size_t set_size = (ent->type ==  T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+  size_t set_size = 0;
+  if (ent->type ==  T_ZSET){ set_size = hm_size(&ent->zset.hmap); }
+  else if (ent->type == T_SET){ set_size = hm_size(&ent->set); }
 
   if (set_size > 1000){
     thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
@@ -1512,6 +1514,363 @@ static bool sinter_impl(std::vector<std::string> &cmd, size_t start, std::vector
   return true;
 }
 
+static bool sunion_impl(std::vector<std::string> &cmd, size_t start, std::vector<std::string> &result){
+  bool wt = false;
+  for (size_t i = start; i < cmd.size(); ++i){
+    Entry *e = lookup_set_ro(cmd[i], &wt);
+    if (wt){ return false; }
+    if (!e){ continue; } // missing key contributes nothing
+    hm_foreach(&e->set, cb_collect_members, &result);
+  }
+  // deduplicate in O(N log N);
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return true;
+}
+
+static bool sdiff_impl(std::vector<std::string> &cmd, size_t start, std::vector<std::string> &result){
+  bool wt = false;
+  Entry *base = lookup_set_ro(cmd[start], &wt);
+  if (wt){ return false;}
+  if (!base){ return true; }// empty base, empty diff
+
+  std::vector<Entry *> others;
+  for (size_t i = start; i < cmd.size(); ++i){
+    Entry *e = lookup_set_ro(cmd[i], &wt);
+    if (wt){ return false; }
+    if (e){ others.push_back(e); }
+  }
+
+  std::vector<std::string> candidates;
+  hm_foreach(&base->set, cb_collect_members, &candidates);
+  for (auto &m : candidates){
+    bool found = false;
+    for (Entry *e : others){
+      if (set_is_member(&e->set, m)){ found = true; break; }
+    }
+    if (!found){ result.push_back(m); }
+  }
+  return true;
+}
+
+// SADD key member [member...]
+static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent; 
+  if (lookup_entry(cmd[1], T_SET, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTPE wrong type");
+  }
+  int64_t added = 0;
+  for (size_t i = 2; i < cmd.size(); ++i){
+    if (set_add(&ent->set, cmd[i])){ ++added;}
+  }
+  g_data.g_writes_since_save++;
+  return resp_int(out, added);
+}
+
+// SREM key member [member...]
+static void do_srem(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  int64_t removed = 0;
+  for (size_t i = 2; i < cmd.size(); ++i){
+    if (set_remove(&ent->set, cmd[i])){ ++removed; }
+  }
+  if (hm_size(&ent->set) == 0){
+    hm_delete
+    (&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+  }
+  if (removed){ g_data.g_writes_since_save++; }
+  return resp_int(out, removed);
+}
+
+// SISMEMBER key member
+static void do_sismember(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  return resp_int(out, set_is_member(&g_data.db, cmd[2]) ? 1 : 0);
+}
+
+// SMISMEMBER key member [member...] -> array of 0/1
+static void do_smismember(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent = nullptr;
+  Lookup r = lookup_entry(cmd[1], T_SET, false, &ent);
+  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
+  resp_arr(out, (uint32_t)(cmd.size() - 2));
+  for (size_t i = 2; i < cmd.size(); ++i){
+    bool found = (r == Lookup::OK) && set_is_member(&ent->set, cmd[i]);
+    resp_int(out, found ? 1 : 0);
+  }
+}
+
+// SCARD key
+static void do_scard(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  return resp_int(out, (int64_t)hm_size(&ent->set));
+}
+
+// SMEMBERS key
+static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  std::vector<std::string> members;
+  hm_foreach(&ent->set, cb_collect_members, &members);
+  resp_arr(out, (uint32_t)members.size());
+  for (auto &m : members){ resp_str(out, m.data(), m.size()); }
+}
+
+// SPOP key [count]
+static void do_spop(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+    case Lookup::OK:  break;
+  }
+  std::vector<std::string> members;
+  hm_foreach(&ent->set, cb_collect_members, &members);
+  if (members.empty()){
+    return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+  }
+
+  if (cmd.size() == 2){
+    // single pop - pick one random member
+    size_t idx = (size_t)(rand() % members.size());
+    const std::string &picked = members[idx];
+    resp_str(out, picked.data(), picked.size());
+    set_remove(&ent->set, picked);
+  } else {
+    int64_t count = 0;
+    if (!str2int(cmd[2], count) || count < 0){
+      return resp_arr(out, 0);
+    }
+    if (count == 0){ return resp_err(out, 0); }
+    // partial Fisher-Yates: shuffle the first 'n' slots
+    size_t n = ((size_t)count < members.size()) ? (size_t)count : members.size();
+    for (size_t i =0; i < n; ++i){
+      size_t j = i + (size_t)(rand() % (members.size() - i));
+      std::swap(members[i], members[j]);
+    }
+    resp_arr(out, (uint32_t)n);
+    for (size_t i = 0; i < n; ++i){
+      resp_str(out, members[i].data(), members[i].size());
+      set_remove(&ent->set, members[i]);
+    }
+  }
+  if (hm_size(&ent->set) == 0){
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+  }
+  g_data.g_writes_since_save++;
+}
+
+// SRANDMEMBER key [count]
+static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+    case Lookup::OK:  break;
+  }
+  std::vector<std::string> members;
+  hm_foreach(&ent->set, cb_collect_members, &members);
+  if (members.empty()){
+    return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+  }
+ if (cmd.size() == 2){
+    size_t idx = (size_t)(rand() % members.size());
+    return resp_str(out, members[idx].data(), members[idx].size());
+ }
+
+ int64_t count = 0;
+ if (!str2int(cmd[2], count)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+ }
+ if (count == 0){ return resp_arr(out, 0); }
+
+ if (count > 0){
+  // distinct members up to min(count, size)
+  size_t n = ((size_t)count < members.size() ? (size_t)count : members.size());
+  for (size_t i = 0; i < n; ++i){
+    size_t j = i + (size_t)(rand() % (members.size() - i));
+    std::swap(members[i], members[j]);
+  }
+  resp_arr(out, (uint32_t)n);
+  for (size_t i = 0; i < n; ++i){
+    resp_str(out, members[i].data(), members.size());
+  }
+ } else {
+  // negative count: |count| members with replacement
+  size_t n = (size_t)(-count);
+  resp_arr(out, (uint32_t)n);
+  for (size_t i = 0; i < n; ++i){
+    size_t idx = (size_t)(rand() % members.size());
+    resp_str(out, members[idx].data(), members[idx].size());
+  }
+ }
+}
+
+// SSCAN key cursor [MATCH pat] [COUNT n]
+struct SScanCtx{
+  std::vector<std::string> *out;
+  const std::string *pattern; // nullptr = no filter
+};
+
+static void cb_sscan(HNode *node, void *arg){
+  SScanCtx *c = (SScanCtx *)arg;
+  SetNode *sn = container_of(node, SetNode, node);
+  if (c->pattern && !glob_match(c->pattern->data(),c->pattern->size(), sn->member.data(),sn->member.size())){
+    return;
+  }
+  c->out->push_back(sn->member);
+}
+
+static void do_sscan(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  Lookup r = lookup_entry(cmd[1], T_SET, false, &ent);
+  if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
+
+  int64_t cursor = 0;
+  if (!str2int(cmd[2], cursor)){ return resp_err(out, "ERR invalid cursor"); }
+
+  size_t count = 10;
+  const std::string *pattern = nullptr;
+  std::string pat;
+  for (size_t i = 3; i + 1 < cmd.size(); i += 2){
+    std::string opt = cmd[i];
+    for (char &c : opt){ c = (char)tolower((unsigned char)c); }
+    if (opt == "count"){
+      int64_t n;
+      if (!str2int(cmd[i + 1], n) || n <= 0){ return resp_err(out, "ERR invalid count"); }
+      count = (size_t)n;
+    } else if (opt == "match"){
+      pat = cmd[i + 1];
+      pattern = &pat;
+    } else {
+      return resp_err(out, "ERR syntax error");
+    }
+  }
+  resp_arr(out, 2);
+  if (r == Lookup::MISSING){
+    resp_str(out, "0", 1);
+    resp_arr(out, 0);
+    return;
+  }
+  std::vector<std::string> items;
+  SScanCtx ctx { &items, pattern };
+  uint64_t next = hm_scan(&ent->set, (uint64_t)cursor, count, cb_sscan, &ctx);
+  std::string cur = std::to_string(next);
+  resp_str(out, cur.data(), cur.size());
+  resp_arr(out, (uint32_t)items.size());
+  for (auto &s : items){ resp_str(out, s.data(), s.size()); }
+}
+
+// SINTER key [key...]
+static void do_sinter(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sinter_impl(cmd, 1, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  resp_arr(out, (uint32_t)result.size());
+  for (auto &m : result){ resp_str(out, m.data(), m.size()); }
+}
+
+// SUNION key [key...]
+static void do_sunion(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sinter_impl(cmd, 1, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  resp_arr(out, (uint32_t)result.size());
+  for (auto &m : result){ resp_str(out, m.data(), m.size()); }
+}
+
+// SDIFF key [key...]
+static void do_sdiff(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sdiff_impl(cmd, 1, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  resp_arr(out, (uint32_t)result.size());
+  for (auto &m : result){ resp_str(out, m.data(), m.size()); }
+}
+
+// SINTERSTORE dest key [key...] -- compute first, then store, so dest can be a source
+static void do_sinterstore(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sinter_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  Entry *dest = set_make_dest(cmd[1]);
+  for (auto &m : result){ set_add(&dest->set, m); }
+  g_data.g_writes_since_save++;
+  return resp_int(out, (int64_t)hm_size(&dest->set));
+}
+
+// SUNIONSTORE dest key [key...] -- compute first, then store, so dest can be a source
+static void do_sunionstore(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sunion_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  Entry *dest = set_make_dest(cmd[1]);
+  for (auto &m : result){ set_add(&dest->set, m); }
+  g_data.g_writes_since_save++;
+  return resp_int(out, (int64_t)hm_size(&dest->set));
+}
+
+// SDIFFSTORE dest key [key...] -- compute first, then store, so dest can be a source
+static void do_sdiffstore(std::vector<std::string> &cmd, Buffer *out){
+  std::vector<std::string> result;
+  if (!sdiff_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
+  Entry *dest = set_make_dest(cmd[1]);
+  for (auto &m : result){ set_add(&dest->set, m); }
+  g_data.g_writes_since_save++;
+  return resp_int(out, (int64_t)hm_size(&dest->set));
+}
+
+// SMOVE src dst member
+static void do_smove(std::vector<std::string> &cmd, Buffer *out){
+  std::string src_name = cmd[1]; // save before swapping
+  Entry *src_ent;
+  switch (lookup_entry(cmd[1], T_SET, false, &src_ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
+    case Lookup::MISSING: return resp_int(out, 0);
+    case Lookup::OK:  break;
+  }
+  if (!set_is_member(&src_ent->set, cmd[3])){ return resp_int(out, 0); }
+
+  // type check dst before modifying src
+  bool wt = false;
+  Entry *dst_ent = lookup_set_ro(cmd[2], &wt);
+  if (wt){ return resp_err(out, "WRONGTYPE wrong type"); }
+
+  if (src_name == cmd[2]){ return resp_int(out, 1); } // move to self
+
+  set_remove(&src_ent->set, cmd[3]);
+  if (hm_size(&src_ent->set) == 0){
+    // if move and 0 the set is empty
+    hm_delete(&g_data.db, &src_ent->node, &hnode_same);
+    entry_del(src_ent);
+  }
+  if (!dst_ent){
+    dst_ent = entry_new(T_SET);
+    dst_ent->key = cmd[2];
+    dst_ent->node.hcode = str_hash((const uint8_t *)dst_ent->key.data(), dst_ent->key.size());
+    hm_insert(&g_data.db, &dst_ent->node);
+  }
+  set_add(&dst_ent->set, cmd[3]);
+  g_data.g_writes_since_save++;
+  return resp_int(out, 1);
+}
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -1640,6 +1999,38 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     do_hstrlen(cmd, out);
   } else if (cmd.size() >= 3 && cmd[0] == "hscan") {
     do_hscan(cmd, out);  
+  } else if (cmd.size() >= 3 && cmd[0] == "sadd") {
+    do_sadd(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "srem") {
+    do_srem(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "sismember") {
+    do_sismember(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "smismember") {
+    do_smismember(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "scard") {
+    do_scard(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "smembers") {
+    do_smembers(cmd, out);
+  } else if (cmd.size() >= 2 && cmd.size() <= 3 && cmd[0] == "spop") {
+    do_spop(cmd, out);
+  } else if (cmd.size() >= 2 && cmd.size() <= 3 && cmd[0] == "srandmember") {
+    do_srandmember(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "sscan") {
+    do_sscan(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "sinter") {
+    do_sinter(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "sunion") {
+    do_sunion(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "sdiff") {
+    do_sdiff(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "sinterstore") {
+    do_sinterstore(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "sunionstore") {
+    do_sunionstore(cmd, out);
+  } else if (cmd.size() >= 3 && cmd[0] == "sdiffstore") {
+    do_sdiffstore(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "smove") {
+    do_smove(cmd, out);
   } else {
     resp_err(out, "ERR unknown command");
   }

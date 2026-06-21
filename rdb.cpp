@@ -4,6 +4,7 @@
 #include "common.h"
 #include "buffer.h"
 #include "hash.h"
+#include "set.h"
 #include <zlib.h>  
 #include <stdio.h> 
 #include <string.h>
@@ -89,12 +90,21 @@ struct ZSetSaveCtx {
   uint32_t count;
 };
 
+/*
+  T_DLIST does not need a iterator because this data structure has a count implement in it
+*/
+
 // for the hash iterator
-struct HashSaveCtx{
+struct HashSaveCtx {
   Buffer *buf;
   uint32_t count;
 };
 
+// for the set iterator
+struct SetSaveCtx {
+  Buffer *buf;
+  uint32_t count;
+};
 
 static bool cb_zset_member(HNode *node, void *arg){
   ZSetSaveCtx *ctx = (ZSetSaveCtx *)arg;
@@ -102,7 +112,6 @@ static bool cb_zset_member(HNode *node, void *arg){
 
   // score -> 8 bytes
   buf_append(ctx->buf, (const uint8_t *)&znode->score, 8);
-
   // name - lenght prefixed
   buf_append_str(ctx->buf, znode->name, (uint32_t)znode->len);
 
@@ -115,6 +124,14 @@ static bool cb_hash_member(HNode *node, void *arg){
   HashNode *hn = container_of(node, HashNode, node);
   buf_append_str(ctx->buf, hn->field.data(), (uint32_t)hn->field.size());
   buf_append_str(ctx->buf, hn->value.data(), (uint32_t)hn->value.size());
+  ctx->count++;
+  return true;
+}
+
+static bool cb_set_member(HNode *node, void *arg){
+  SetSaveCtx *ctx = (SetSaveCtx *)arg;
+  SetNode *sn = container_of(node, SetNode, node);
+  buf_append_str(ctx->buf, sn->member.data(), (uint32_t)sn->member.size());
   ctx->count++;
   return true;
 }
@@ -201,6 +218,20 @@ static bool cb_rdb_write(HNode *node, void *arg){
     HashSaveCtx hctx { ctx->buf, 0 };
     hm_foreach(&ent->hash, cb_hash_member, &hctx);
     memcpy(ctx->buf->data_begin + cnt_idx, &hctx.count, 4);
+  } else if (ent->type == T_SET){
+    buf_append(ctx->buf, 4); 
+    if (ent->heap_idx != (size_t)-1){
+      buf_append(ctx->buf, 1);
+      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
+    } else {
+      buf_append(ctx->buf, 0);
+    }
+    buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
+    size_t cnt_idx = buf_size(ctx->buf);
+    buf_append(ctx->buf, (const uint8_t *)"\0\0\0\0", 4);
+    SetSaveCtx sctx { ctx->buf, 0 };
+    hm_foreach(&ent->set, cb_set_member, &sctx);
+    memcpy(ctx->buf->data_begin + cnt_idx, &sctx.count, 4);
   }
   ctx->count++;
   return true;
@@ -587,6 +618,42 @@ static bool rdb_load_hash_entry(RDBCursor *c){
   return true;
 }
 
+static bool rdb_load_set_entry(RDBCursor *c){
+  uint8_t has_ttl = 0;
+
+  if (!cursor_read_u8(c, &has_ttl)){ return false; }
+  uint64_t expire_at = 0;
+  if (has_ttl){
+    if (!cursor_read_u64(c, &expire_at)){ return false; }
+    if (expire_at <= get_wall_msec()){
+      std::string key; uint32_t n = 0;
+      cursor_read_str(c, &key);
+      cursor_read_u32(c, &n);
+      for (uint32_t i = 0; i < n; ++i){ std::string m; cursor_read_str(c, &m); }
+      fprintf(stderr, "rdb_load: skipping expired set\n");
+      return true;
+    }
+  }
+  std::string key;
+  if (!cursor_read_str(c, &key)){ return false; }
+  uint32_t n = 0;
+  if (!cursor_read_u32(c, &n)) { return false; }
+
+  Entry *ent = entry_new(T_SET);
+  ent->key = key;
+  ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
+  for (uint32_t i = 0; i < n; ++i){
+    std::string m;
+    if (!cursor_read_str(c, &m)){ return false; }
+    set_add(&ent->set, m);
+  }
+  hm_insert(&g_data.db, &ent->node);
+  if (has_ttl){
+    entry_set_ttl(ent, (int64_t)(expire_at - get_wall_msec()));
+  }
+  return true;
+}
+
 static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint32_t n_entries){
   RDBCursor c;
   c.pos = payload;
@@ -606,6 +673,8 @@ static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint3
       ok = rdb_load_deque_entry(&c);
     } else if (type == 0x03){
       ok = rdb_load_hash_entry(&c);
+    } else if (type == 0x04){
+      ok = rdb_load_set_entry(&c);
     } else {
       fprintf(stderr, "rdb_parse: unknown type 0x%02x\n", type);
       return false;

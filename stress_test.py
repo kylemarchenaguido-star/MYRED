@@ -913,6 +913,188 @@ def test_unlink_command(r: TestRunner, sock: socket.socket):
     time.sleep(0.5)
 
 
+def test_set_commands(r: TestRunner, sock: socket.socket):
+    r.section("Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS")
+
+    for k in ["ts1", "ts2", "ts3", "tsdest", "tsmv_src", "tsmv_dst", "ts_str"]:
+        cmd(sock, "del", k)
+    cmd(sock, "set", "ts_str", "hello")
+
+    # SADD
+    r.check("sadd 3 new → 3",       cmd(sock, "sadd", "ts1", "a", "b", "c"), 3)
+    r.check("sadd 1 new 1 dup → 1", cmd(sock, "sadd", "ts1", "c", "d"), 1)
+    r.check("scard after sadd → 4", cmd(sock, "scard", "ts1"), 4)
+    r.check("type ts1 → set",       cmd(sock, "type", "ts1"), "set")
+    r.expect_error("sadd on string → WRONGTYPE", sock, "sadd", "ts_str", "x")
+
+    # SISMEMBER / SMISMEMBER
+    r.check("sismember existing → 1",    cmd(sock, "sismember", "ts1", "a"), 1)
+    r.check("sismember missing → 0",     cmd(sock, "sismember", "ts1", "z"), 0)
+    r.check("sismember missing key → 0", cmd(sock, "sismember", "nosuch", "a"), 0)
+    r.check("smismember a d z",          cmd(sock, "smismember", "ts1", "a", "d", "z"), [1, 1, 0])
+    r.check("smismember missing key",    cmd(sock, "smismember", "nosuch", "a", "b"), [0, 0])
+
+    # SCARD / SMEMBERS
+    r.check("scard → 4",         cmd(sock, "scard", "ts1"), 4)
+    r.check("scard missing → 0", cmd(sock, "scard", "nosuch"), 0)
+    members = cmd(sock, "smembers", "ts1")
+    r.check_true("smembers returns 4 items", isinstance(members, list) and len(members) == 4)
+    r.check_true("smembers has a",           members is not None and "a" in members)
+    r.check_true("smembers has d",           members is not None and "d" in members)
+    r.check("smembers missing → []",         cmd(sock, "smembers", "nosuch"), [])
+
+    # SREM
+    r.check("srem existing → 1",     cmd(sock, "srem", "ts1", "a"), 1)
+    r.check("srem same again → 0",   cmd(sock, "srem", "ts1", "a"), 0)
+    r.check("scard after srem → 3",  cmd(sock, "scard", "ts1"), 3)
+    r.check("srem multi: b c → 2",   cmd(sock, "srem", "ts1", "b", "c"), 2)
+    r.check("scard → 1",             cmd(sock, "scard", "ts1"), 1)
+    r.check("srem missing key → 0",  cmd(sock, "srem", "nosuch", "a"), 0)
+    r.expect_error("srem on string → WRONGTYPE", sock, "srem", "ts_str", "x")
+
+    # restore ts1 for next sections
+    cmd(sock, "del", "ts1")
+    cmd(sock, "sadd", "ts1", "a", "b", "c", "d", "e")
+
+    r.section("Sets: SPOP / SRANDMEMBER")
+
+    # SPOP single
+    before = cmd(sock, "scard", "ts1")
+    popped = cmd(sock, "spop", "ts1")
+    after  = cmd(sock, "scard", "ts1")
+    r.check_true("spop returns string",       isinstance(popped, str))
+    r.check_true("spop reduces card by 1",    after == before - 1)
+    r.check("spop missing → nil",             cmd(sock, "spop", "nosuch"), None)
+
+    # SPOP with count
+    cmd(sock, "del", "ts1")
+    cmd(sock, "sadd", "ts1", "a", "b", "c", "d", "e")
+    popped2 = cmd(sock, "spop", "ts1", "3")
+    r.check_true("spop count=3 list of 3",   isinstance(popped2, list) and len(popped2) == 3)
+    r.check_true("spop count=3 distinct",    len(set(popped2)) == 3)
+    r.check("scard after spop 3 → 2",        cmd(sock, "scard", "ts1"), 2)
+
+    # SRANDMEMBER single (no removal)
+    cmd(sock, "del", "ts1")
+    cmd(sock, "sadd", "ts1", "a", "b", "c", "d", "e")
+    rnd = cmd(sock, "srandmember", "ts1")
+    r.check_true("srandmember returns string",  isinstance(rnd, str))
+    r.check("card unchanged after srandmember", cmd(sock, "scard", "ts1"), 5)
+
+    # SRANDMEMBER positive count (distinct)
+    rnd3 = cmd(sock, "srandmember", "ts1", "3")
+    r.check_true("srandmember count=3 list",    isinstance(rnd3, list) and len(rnd3) == 3)
+    r.check_true("srandmember count=3 distinct", len(set(rnd3)) == 3)
+
+    # SRANDMEMBER negative count (with replacement)
+    rnd_neg = cmd(sock, "srandmember", "ts1", "-5")
+    r.check_true("srandmember -5 returns 5",    isinstance(rnd_neg, list) and len(rnd_neg) == 5)
+
+    # SRANDMEMBER count > cardinality → all distinct members
+    rnd_big = cmd(sock, "srandmember", "ts1", "100")
+    r.check_true("srandmember count>size → all", isinstance(rnd_big, list) and len(rnd_big) == 5)
+
+    r.check("srandmember missing → nil", cmd(sock, "srandmember", "nosuch"), None)
+
+    r.section("Sets: SSCAN")
+
+    def sscan_all(key: str, *opts) -> list:
+        seen, cursor = [], "0"
+        for _ in range(10000):
+            reply  = cmd(sock, "sscan", key, cursor, *opts)
+            cursor = reply[0]
+            seen.extend(reply[1])
+            if cursor == "0":
+                break
+        return seen
+
+    cmd(sock, "del", "ts1")
+    cmd(sock, "sadd", "ts1", "apple", "apricot", "banana", "cherry")
+
+    all_m = sscan_all("ts1")
+    r.check_true("sscan sees all 4",      len(all_m) == 4)
+    r.check_true("sscan has apple",       "apple" in all_m)
+    r.check_true("sscan has cherry",      "cherry" in all_m)
+
+    ap_m = sscan_all("ts1", "match", "a*")
+    r.check_true("sscan match a* → 2",    len(ap_m) == 2)
+    r.check_true("sscan excludes banana", "banana" not in ap_m)
+
+    miss = cmd(sock, "sscan", "nosuch", "0")
+    r.check("sscan missing key cursor → 0", miss[0], "0")
+    r.check("sscan missing key array → []", miss[1], [])
+    r.expect_error("sscan on string → WRONGTYPE", sock, "sscan", "ts_str", "0")
+
+    r.section("Sets: SINTER / SUNION / SDIFF")
+
+    cmd(sock, "del", "ts1", "ts2", "ts3")
+    cmd(sock, "sadd", "ts1", "a", "b", "c", "d")
+    cmd(sock, "sadd", "ts2", "b", "c", "e")
+    cmd(sock, "sadd", "ts3", "c", "f")
+
+    inter = cmd(sock, "sinter", "ts1", "ts2", "ts3")
+    r.check_true("sinter s1∩s2∩s3 = {c}",      sorted(inter) == ["c"])
+
+    inter2 = cmd(sock, "sinter", "ts1", "ts2")
+    r.check_true("sinter s1∩s2 = {b,c}",        sorted(inter2) == ["b", "c"])
+
+    union = cmd(sock, "sunion", "ts1", "ts2", "ts3")
+    r.check_true("sunion = {a,b,c,d,e,f}",      sorted(union) == ["a", "b", "c", "d", "e", "f"])
+
+    diff = cmd(sock, "sdiff", "ts1", "ts2")
+    r.check_true("sdiff s1-s2 = {a,d}",         sorted(diff) == ["a", "d"])
+
+    diff3 = cmd(sock, "sdiff", "ts1", "ts2", "ts3")
+    r.check_true("sdiff s1-s2-s3 = {a,d}",      sorted(diff3) == ["a", "d"])
+
+    r.expect_error("sinter wrong type → WRONGTYPE", sock, "sinter", "ts1", "ts_str")
+
+    r.section("Sets: SINTERSTORE / SUNIONSTORE / SDIFFSTORE")
+
+    r.check("sinterstore tsdest ts1 ts2 → 2",
+            cmd(sock, "sinterstore", "tsdest", "ts1", "ts2"), 2)
+    r.check_true("sinterstore result = {b,c}",
+                 sorted(cmd(sock, "smembers", "tsdest")) == ["b", "c"])
+
+    r.check("sunionstore tsdest ts1 ts2 → 5",
+            cmd(sock, "sunionstore", "tsdest", "ts1", "ts2"), 5)
+    r.check_true("sunionstore result = {a,b,c,d,e}",
+                 sorted(cmd(sock, "smembers", "tsdest")) == ["a", "b", "c", "d", "e"])
+
+    r.check("sdiffstore tsdest ts1 ts2 → 2",
+            cmd(sock, "sdiffstore", "tsdest", "ts1", "ts2"), 2)
+    r.check_true("sdiffstore result = {a,d}",
+                 sorted(cmd(sock, "smembers", "tsdest")) == ["a", "d"])
+
+    # dest == source (compute-then-store)
+    r.check("sinterstore ts1←ts1∩ts2 → 2",
+            cmd(sock, "sinterstore", "ts1", "ts1", "ts2"), 2)
+    r.check_true("ts1 is now {b,c}",
+                 sorted(cmd(sock, "smembers", "ts1")) == ["b", "c"])
+
+    r.section("Sets: SMOVE")
+
+    cmd(sock, "del", "tsmv_src", "tsmv_dst")
+    cmd(sock, "sadd", "tsmv_src", "x", "y", "z")
+    cmd(sock, "sadd", "tsmv_dst", "p", "q")
+
+    r.check("smove existing → 1",
+            cmd(sock, "smove", "tsmv_src", "tsmv_dst", "x"), 1)
+    r.check("src no longer has x",     cmd(sock, "sismember", "tsmv_src", "x"), 0)
+    r.check("dst now has x",           cmd(sock, "sismember", "tsmv_dst", "x"), 1)
+    r.check("smove non-existent → 0",  cmd(sock, "smove", "tsmv_src", "tsmv_dst", "nope"), 0)
+    r.check("smove missing src → 0",   cmd(sock, "smove", "nosuch", "tsmv_dst", "y"), 0)
+
+    # move when dst already has the member (y added to dst; move y from src→dst)
+    cmd(sock, "sadd", "tsmv_dst", "y")
+    r.check("smove already-in-dst → 1",
+            cmd(sock, "smove", "tsmv_src", "tsmv_dst", "y"), 1)
+    r.check("src size → 1 (just z)",   cmd(sock, "scard", "tsmv_src"), 1)
+
+    for k in ["ts1", "ts2", "ts3", "tsdest", "tsmv_src", "tsmv_dst", "ts_str"]:
+        cmd(sock, "del", k)
+
+
 def test_edge_cases(r: TestRunner, sock: socket.socket):
     r.section("Edge Cases")
 
@@ -1230,19 +1412,22 @@ def stress_worker(host: str, port: int, ops: int,
     zset = f"stress_zset_{wid}"
     lst  = f"stress_list_{wid}"
     hsh  = f"stress_hash_{wid}"
+    sset = f"stress_set_{wid}"
     try:
         cmd(sock, "del", zset)
         cmd(sock, "del", lst)
         cmd(sock, "del", hsh)
+        cmd(sock, "del", sset)
         for i in range(10):
             cmd(sock, "zadd", zset, str(float(i)), f"m{i}")
         cmd(sock, "rpush", lst, "a", "b", "c", "d", "e")
         cmd(sock, "hset", hsh, "f0", "0", "f1", "1")
+        cmd(sock, "sadd", sset, "x", "y", "z", "w")
     except Exception:
         pass
 
     for _ in range(ops):
-        op = random.randint(0, 18)
+        op = random.randint(0, 22)
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -1296,6 +1481,14 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "exists", k)
                 cmd(sock, "type", k)
                 cmd(sock, "scan", "0", "count", "20")
+            elif op == 19:
+                cmd(sock, "sadd", sset, random_string(4))
+            elif op == 20:
+                cmd(sock, "sismember", sset, random_string(4))
+            elif op == 21:
+                cmd(sock, "smembers", sset)
+            elif op == 22:
+                cmd(sock, "srem", sset, random_string(4))
 
             stats.record((time.perf_counter() - t0) * 1000)
         except Exception:
@@ -1305,6 +1498,7 @@ def stress_worker(host: str, port: int, ops: int,
         cmd(sock, "del", zset)
         cmd(sock, "del", lst)
         cmd(sock, "del", hsh)
+        cmd(sock, "del", sset)
         sock.close()
     except Exception:
         pass
@@ -1461,6 +1655,7 @@ def main():
             test_scan_command(r,                   sock)
             test_extended_generic_commands(r,      sock)
             test_unlink_command(r,                 sock)
+            test_set_commands(r,                   sock)
             test_edge_cases(r,            sock)
             test_info_command(r,          sock)
             test_save_command(r,          sock)
