@@ -526,6 +526,161 @@ def test_setvariant_commands(r: TestRunner, sock: socket.socket):
         cmd(sock, "del", k)
 
 
+def test_multikey_commands(r: TestRunner, sock: socket.socket):
+    r.section("String Multi-key: MSET / MGET / MSETNX")
+
+    for k in ("mk1", "mk2", "mk3", "mk4", "mk_wt"):
+        cmd(sock, "del", k)
+
+    # ── MSET ──────────────────────────────────────────────────────────────────
+    r.check("mset 3 pairs → OK",  cmd(sock, "mset", "mk1", "a", "mk2", "b", "mk3", "c"), "OK")
+    r.check("get mk1 → a",        cmd(sock, "get", "mk1"), "a")
+    r.check("get mk2 → b",        cmd(sock, "get", "mk2"), "b")
+    r.check("get mk3 → c",        cmd(sock, "get", "mk3"), "c")
+
+    # mset replaces existing values
+    r.check("mset overwrites → OK", cmd(sock, "mset", "mk1", "x", "mk2", "y"), "OK")
+    r.check("mk1 now x",            cmd(sock, "get", "mk1"), "x")
+    r.check("mk2 now y",            cmd(sock, "get", "mk2"), "y")
+
+    # mset with duplicate keys: last value wins
+    r.check("mset dup key → OK", cmd(sock, "mset", "mk4", "first", "mk4", "second"), "OK")
+    r.check("mk4 → second (last wins)", cmd(sock, "get", "mk4"), "second")
+
+    # ── MGET ──────────────────────────────────────────────────────────────────
+    r.check("mget 3 keys → list",  cmd(sock, "mget", "mk1", "mk2", "mk3"), ["x", "y", "c"])
+
+    # mget: missing key → nil in that slot
+    cmd(sock, "del", "mk4")
+    result = cmd(sock, "mget", "mk1", "mk4", "mk3")
+    r.check_type("mget returns list",      result, list)
+    r.check("mget[0] → x",                result[0], "x")
+    r.check_none("mget[1] → nil (missing)", result[1])
+    r.check("mget[2] → c",                result[2], "c")
+
+    # mget: wrong type → nil (NOT a WRONGTYPE error)
+    cmd(sock, "sadd", "mk_wt", "x")
+    result = cmd(sock, "mget", "mk1", "mk_wt", "mk3")
+    r.check("mget list has 3 elements", len(result), 3)
+    r.check("mget[0] → x",              result[0], "x")
+    r.check_none("mget wrong-type → nil", result[1])
+    r.check("mget[2] → c",              result[2], "c")
+    cmd(sock, "del", "mk_wt")
+
+    # mget single key
+    r.check("mget 1 key → [x]", cmd(sock, "mget", "mk1"), ["x"])
+
+    # ── MSETNX ────────────────────────────────────────────────────────────────
+    for k in ("mn1", "mn2", "mn3"):
+        cmd(sock, "del", k)
+
+    # all missing → sets all, returns 1
+    r.check("msetnx all missing → 1", cmd(sock, "msetnx", "mn1", "v1", "mn2", "v2"), 1)
+    r.check("mn1 → v1",              cmd(sock, "get", "mn1"), "v1")
+    r.check("mn2 → v2",              cmd(sock, "get", "mn2"), "v2")
+
+    # one key exists → sets nothing, returns 0
+    r.check("msetnx one exists → 0", cmd(sock, "msetnx", "mn1", "new", "mn3", "v3"), 0)
+    r.check("mn1 unchanged → v1",    cmd(sock, "get", "mn1"), "v1")
+    r.check_none("mn3 not created",  cmd(sock, "get", "mn3"))
+
+    # any existing type blocks msetnx
+    cmd(sock, "sadd", "mk_wt", "x")
+    r.check("msetnx blocks on any type → 0",
+            cmd(sock, "msetnx", "mk_wt", "v", "mn3", "v3"), 0)
+    r.check_none("mn3 still not set", cmd(sock, "get", "mn3"))
+    cmd(sock, "del", "mk_wt")
+
+    for k in ("mk1", "mk2", "mk3", "mk4", "mn1", "mn2", "mn3", "mk_wt"):
+        cmd(sock, "del", k)
+
+
+def test_bulkrange_commands(r: TestRunner, sock: socket.socket):
+    r.section("String Bulk/Range: APPEND / STRLEN / GETRANGE / SETRANGE")
+
+    for k in ("br1", "br2", "br3", "br_wt"):
+        cmd(sock, "del", k)
+
+    # ── APPEND ────────────────────────────────────────────────────────────────
+    # append to missing key → creates it
+    r.check("append missing → 5",  cmd(sock, "append", "br1", "hello"), 5)
+    r.check("get br1 → hello",     cmd(sock, "get", "br1"), "hello")
+
+    # append to existing
+    r.check("append ` world` → 11", cmd(sock, "append", "br1", " world"), 11)
+    r.check("get br1 → hello world", cmd(sock, "get", "br1"), "hello world")
+
+    # append empty string → length unchanged
+    r.check("append '' → 11",  cmd(sock, "append", "br1", ""), 11)
+
+    # append on wrong type → WRONGTYPE
+    cmd(sock, "sadd", "br_wt", "x")
+    r.expect_error("append on set → WRONGTYPE", sock, "append", "br_wt", "v")
+
+    # ── STRLEN ────────────────────────────────────────────────────────────────
+    r.check("strlen br1 → 11",       cmd(sock, "strlen", "br1"), 11)
+    r.check("strlen missing → 0",    cmd(sock, "strlen", "br2"), 0)
+
+    cmd(sock, "set", "br2", "")
+    r.check("strlen empty str → 0",  cmd(sock, "strlen", "br2"), 0)
+
+    r.expect_error("strlen on set → WRONGTYPE", sock, "strlen", "br_wt")
+
+    # ── GETRANGE ──────────────────────────────────────────────────────────────
+    cmd(sock, "set", "br3", "Hello, World!")   # len=13, indices 0-12
+
+    r.check("getrange 0 4 → Hello",     cmd(sock, "getrange", "br3", "0",  "4"),  "Hello")
+    r.check("getrange 7 11 → World",    cmd(sock, "getrange", "br3", "7",  "11"), "World")
+    r.check("getrange 0 -1 → full str", cmd(sock, "getrange", "br3", "0",  "-1"), "Hello, World!")
+    r.check("getrange -6 -1 → World!",  cmd(sock, "getrange", "br3", "-6", "-1"), "World!")
+    r.check("getrange 0 0 → H",         cmd(sock, "getrange", "br3", "0",  "0"),  "H")
+    r.check("getrange -1 -1 → !",       cmd(sock, "getrange", "br3", "-1", "-1"), "!")
+
+    # out-of-range: clamp, never error
+    r.check("getrange 0 999 → full",    cmd(sock, "getrange", "br3", "0",   "999"),  "Hello, World!")
+    r.check("getrange 5 3 → ''",        cmd(sock, "getrange", "br3", "5",   "3"),    "")
+    r.check("getrange 99 100 → ''",     cmd(sock, "getrange", "br3", "99",  "100"),  "")
+    r.check("getrange -99 -99 → ''",    cmd(sock, "getrange", "br3", "-99", "-99"),  "")
+
+    # missing key → empty string (not nil)
+    r.check("getrange missing → ''",    cmd(sock, "getrange", "no_such_key", "0", "-1"), "")
+
+    r.expect_error("getrange on set → WRONGTYPE", sock, "getrange", "br_wt", "0", "-1")
+
+    # ── SETRANGE ──────────────────────────────────────────────────────────────
+    cmd(sock, "set", "br3", "Hello World")   # len=11
+
+    r.check("setrange offset 6 → 11",   cmd(sock, "setrange", "br3", "6", "Redis"), 11)
+    r.check("get br3 → Hello Redis",    cmd(sock, "get", "br3"), "Hello Redis")
+
+    # setrange extending the string (zero-pad)
+    cmd(sock, "del", "br2")
+    r.check("setrange offset 5 on empty → 8",
+            cmd(sock, "setrange", "br2", "5", "abc"), 8)
+    result = cmd(sock, "get", "br2")
+    r.check("first 5 bytes are null-padded",
+            result[5:], "abc")
+    r.check("setrange result length", len(result), 8)
+
+    # setrange on missing key (create + zero-pad)
+    cmd(sock, "del", "br3")
+    r.check("setrange missing key → 5", cmd(sock, "setrange", "br3", "0", "hello"), 5)
+    r.check("get br3 → hello",          cmd(sock, "get", "br3"), "hello")
+
+    # setrange with empty value on missing → creates zero-padded key
+    cmd(sock, "del", "br3")
+    r.check("setrange empty val offset=3 → 3",
+            cmd(sock, "setrange", "br3", "3", ""), 3)
+    r.check("strlen br3 → 3", cmd(sock, "strlen", "br3"), 3)
+
+    # error cases
+    r.expect_error("setrange offset -1 → error", sock, "setrange", "br3", "-1", "v")
+    r.expect_error("setrange on set → WRONGTYPE", sock, "setrange", "br_wt", "0", "v")
+
+    for k in ("br1", "br2", "br3", "br_wt"):
+        cmd(sock, "del", k)
+
+
 def test_keys_command(r: TestRunner, sock: socket.socket):
     r.section("KEYS Command")
 
@@ -1606,7 +1761,7 @@ def stress_worker(host: str, port: int, ops: int,
         pass
 
     for _ in range(ops):
-        op = random.randint(0, 25)
+        op = random.randint(0, 29)
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -1674,6 +1829,15 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "setnx", random_key(), random_string(4))
             elif op == 25:
                 cmd(sock, "getdel", random_key())
+            elif op == 26:
+                k1, k2 = random_key(), random_key()
+                cmd(sock, "mset", k1, random_string(4), k2, random_string(4))
+            elif op == 27:
+                cmd(sock, "mget", random_key(), random_key(), random_key())
+            elif op == 28:
+                cmd(sock, "append", random_key(), random_string(4))
+            elif op == 29:
+                cmd(sock, "strlen", random_key())
 
             stats.record((time.perf_counter() - t0) * 1000)
         except Exception:
@@ -1832,6 +1996,8 @@ def main():
             test_string_commands(r,       sock)
             test_numeric_commands(r,      sock)
             test_setvariant_commands(r,   sock)
+            test_multikey_commands(r,     sock)
+            test_bulkrange_commands(r,    sock)
             test_keys_command(r,          sock)
             test_ttl_commands(r,          sock)
             test_zset_commands(r,         sock)

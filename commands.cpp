@@ -197,6 +197,150 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
   resp_str(out, ent->str.data(), ent->str.size());
 }
 
+// MGET key [key..]
+static void do_mget(std::vector<std::string> &cmd, Buffer *out){
+  resp_arr(out, (uint32_t)(cmd.size() - 1)); // emit N header first
+  for (size_t i = 1; i < cmd.size(); ++i){
+    Entry *ent;
+    switch (lookup_entry(cmd[i], T_STR, false, &ent)){
+      case Lookup::WRONGTYPE: resp_nil(out); break; // type mismatch -> nil, NOT error
+      case Lookup::MISSING:   resp_nil(out); break;
+      case Lookup::OK:        resp_str(out, ent->str.data(), ent->str.size()); break;
+    }
+  }
+}
+
+// APPEND key value -> new lenght (integer)
+static void do_append(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+  }
+  ent->str += cmd[2];
+  g_data.g_writes_since_save++;
+  resp_int(out, (int64_t)ent->str.size());
+}
+
+// STRLEN key -> byte length (integer), 0 if missing
+static void do_strlen(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_STR, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    case Lookup::MISSING:   return resp_int(out, 0);  // missing -> 0, not nil
+    case Lookup::OK:        break;
+  }
+  resp_int(out, (int64_t)ent->str.size());
+}
+
+// GETRANGE key start end -> bulk string
+static void do_getrange(std::vector<std::string> &cmd, Buffer *out){
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_STR, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    case Lookup::MISSING:   return resp_str(out, "", 0);
+    case Lookup::OK:        break;
+  }
+
+  int64_t start, end;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], end)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+  }
+
+  int64_t len = (int64_t)ent->str.size();
+  // resolve negatives (Redis: -1 = last byte and .....)
+  if (start < 0){ start += len; }
+  if (end < 0){ end += len; }
+  // clamp to valid range
+  if (start < 0){ start = 0; }
+  if (end <  0){ return resp_str(out, "", 0); } // still negative negative -> empty 
+  if (end >= len){ end = len - 1; }
+  if (start > end){ return resp_str(out, "", 0); }
+
+  size_t offset = (size_t)start;
+  size_t count = (size_t)(end - start + 1);
+  resp_str(out, ent->str.data() + offset, count);
+}
+
+// SETRANGE key offset value -> new length (integer)
+static void do_setrange(std::vector<std::string> &cmd, Buffer *out){
+  int64_t offset = 0 ;
+  if (!str2int(cmd[2], offset)){
+    return resp_err(out, "ERR value is not an integer or out of range");
+  }
+  if (offset < 0){
+    return resp_err(out, "ERR offset is not an integer or out of range");
+  }
+  const int64_t MAX_OFFSET = 512LL * 1024 * 1024;
+  if (offset >= MAX_OFFSET){
+    return resp_err(out, "ERR string excessds maximun allowed size (512MB)");
+  }
+
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
+    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong the kind of value");
+  }
+
+  size_t new_end = (size_t)offset + cmd[3].size();
+  if (ent->str.size() < new_end){
+    ent->str.resize(new_end, '\0'); // zero-pad any gap
+  }
+  if (!cmd[3].empty()){
+    memcpy(&ent->str[offset], cmd[3].data(), cmd[3].size());
+  }
+  g_data.g_writes_since_save++;
+  resp_int(out, (int64_t)ent->str.size());
+}
+
+// MSET key val [key val ...]
+static void do_mset(std::vector<std::string> &cmd, Buffer *out){
+  // pre-scan: non-destructive check (copy, not swap) so cmd[i] survives for write pass
+  for (size_t i = 1; i < cmd.size(); i += 2){
+    LookupKey lk;
+    lk.key = cmd[i];
+    lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+    HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+    if (node){
+      Entry *e = container_of(node, Entry, node);
+      if (!expire_if_needed(e) && e->type != T_STR){
+        return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+      }
+    }
+  }
+  // write pass: lookup_entry consumes cmd[i] here, that's fine
+  for (size_t i = 1; i < cmd.size(); i += 2){
+    Entry *ent;
+    lookup_entry(cmd[i], T_STR, true, &ent);
+    ent->str.swap(cmd[i + 1]);
+  }
+  g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
+  resp_ok(out);
+}
+
+// MSETNX key val [key val ...]
+static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
+  // existence check: copy, don't swap — cmd[i] must survive for the write pass
+  for (size_t i = 1; i < cmd.size(); i += 2){
+    LookupKey lk;
+    lk.key = cmd[i];   // was cmd[1] — always checked the same key
+    lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
+    HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+    if (node){
+      Entry *e = container_of(node, Entry, node);
+      if (!expire_if_needed(e)){
+        return resp_int(out, 0);  // any key exists -> set nothing
+      }
+    }
+  }
+  // no key exists -> set all
+  for (size_t i = 1; i < cmd.size(); i += 2){
+    Entry *ent;
+    lookup_entry(cmd[i], T_STR, true, &ent);  // was cmd[1]
+    ent->str.swap(cmd[i + 1]);
+  }
+  g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
+  resp_int(out, 1);
+}
+
 // delta already carries the correct sign (+1, -1, +N, -N)
 static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t delta){
   Entry *ent;
@@ -2108,6 +2252,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
       do_getdel(cmd, out);
   } else if (cmd.size() >= 2 && cmd[0] == "getex") {
     do_getex(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "append") {
+    do_append(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "strlen") {
+    do_strlen(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "getrange") {
+    do_getrange(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "setrange") {
+    do_setrange(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "decr") {
       do_decr(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "incrby") {
@@ -2115,7 +2267,13 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   } else if (cmd.size() == 3 && cmd[0] == "decrby") {
       do_decrby(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "incrbyfloat") {
-      do_incrbyfloat(cmd, out);  
+      do_incrbyfloat(cmd, out);
+  } else if (cmd.size() >= 2 && cmd[0] == "mget") {
+      do_mget(cmd, out);
+  } else if (cmd.size() >= 3 && (cmd.size() & 1) == 1 && cmd[0] == "mset") {
+      do_mset(cmd, out);
+  } else if (cmd.size() >= 3 && (cmd.size() & 1) == 1 && cmd[0] == "msetnx") {
+      do_msetnx(cmd, out);
   } else if (cmd.size() >= 2 && cmd[0] == "del") {
     do_del(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "pexpire") {

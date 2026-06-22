@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-21 16:03:21
+# MYRED stress test — 2026-06-22 03:12:28
 
 ```
 (logging output to list_run.md)
@@ -92,6 +92,70 @@
   ✓ key gone after getdel
   ✓ getdel missing → nil
   ✓ getdel on set → WRONGTYPE
+
+── String Multi-key: MSET / MGET / MSETNX ────────────
+  ✓ mset 3 pairs → OK
+  ✓ get mk1 → a
+  ✓ get mk2 → b
+  ✓ get mk3 → c
+  ✓ mset overwrites → OK
+  ✓ mk1 now x
+  ✓ mk2 now y
+  ✓ mset dup key → OK
+  ✓ mk4 → second (last wins)
+  ✓ mget 3 keys → list
+  ✓ mget returns list → ['x', None, 'c']
+  ✓ mget[0] → x
+  ✓ mget[1] → nil (missing)
+  ✓ mget[2] → c
+  ✓ mget list has 3 elements
+  ✓ mget[0] → x
+  ✓ mget wrong-type → nil
+  ✓ mget[2] → c
+  ✓ mget 1 key → [x]
+  ✓ msetnx all missing → 1
+  ✓ mn1 → v1
+  ✓ mn2 → v2
+  ✓ msetnx one exists → 0
+  ✓ mn1 unchanged → v1
+  ✓ mn3 not created
+  ✓ msetnx blocks on any type → 0
+  ✓ mn3 still not set
+
+── String Bulk/Range: APPEND / STRLEN / GETRANGE / SETRANGE 
+  ✓ append missing → 5
+  ✓ get br1 → hello
+  ✓ append ` world` → 11
+  ✓ get br1 → hello world
+  ✓ append '' → 11
+  ✓ append on set → WRONGTYPE
+  ✓ strlen br1 → 11
+  ✓ strlen missing → 0
+  ✓ strlen empty str → 0
+  ✓ strlen on set → WRONGTYPE
+  ✓ getrange 0 4 → Hello
+  ✓ getrange 7 11 → World
+  ✓ getrange 0 -1 → full str
+  ✓ getrange -6 -1 → World!
+  ✓ getrange 0 0 → H
+  ✓ getrange -1 -1 → !
+  ✓ getrange 0 999 → full
+  ✓ getrange 5 3 → ''
+  ✓ getrange 99 100 → ''
+  ✓ getrange -99 -99 → ''
+  ✓ getrange missing → ''
+  ✓ getrange on set → WRONGTYPE
+  ✓ setrange offset 6 → 11
+  ✓ get br3 → Hello Redis
+  ✓ setrange offset 5 on empty → 8
+  ✓ first 5 bytes are null-padded
+  ✓ setrange result length
+  ✓ setrange missing key → 5
+  ✓ get br3 → hello
+  ✓ setrange empty val offset=3 → 3
+  ✓ strlen br3 → 3
+  ✓ setrange offset -1 → error
+  ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
   ✓ keys returns list → ['kb', 'ka', 'kc']
@@ -396,7 +460,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:7\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:3932160\r\nused_memory_mb:3.75\r\n\r\n# Stats\r\ntotal_commands:2322\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:11098\r\nrdb_changes_since_save:1830\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:7\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:0\r\ntotal_connections:1\r\n\r\n# Memory\r\nused_memory_bytes:4063232\r\nused_memory_mb:3.88\r\n\r\n# Stats\r\ntotal_commands:2411\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:4804\r\nrdb_changes_since_save:1868\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -420,17 +484,17 @@
     connected_clients:0
     total_connections:1
     # Memory
-    used_memory_bytes:3932160
-    used_memory_mb:3.75
+    used_memory_bytes:4063232
+    used_memory_mb:3.88
     # Stats
-    total_commands:2322
+    total_commands:2411
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:11098
-    rdb_changes_since_save:1830
+    rdb_last_save_time:4804
+    rdb_changes_since_save:1868
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
     # Replication
@@ -446,9 +510,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 0.6ms: 'Background saving started'
+  ℹ  bgsave returned in 0.5ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 17.4ms
+  ℹ  100 ops during save took 13.1ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -469,7 +533,7 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 361/361 passed
+Results: 421/421 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
@@ -481,17 +545,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    32.71s
-  Throughput: 122 ops/sec
+  Elapsed:    29.60s
+  Throughput: 135 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 62.43ms
-  Latency min: 0.09ms
-  Latency max: 993.98ms
-  Latency p95: 602.35ms
-  Latency p99: 801.04ms
+  Latency avg: 56.51ms
+  Latency min: 0.08ms
+  Latency max: 1083.02ms
+  Latency p95: 568.14ms
+  Latency p99: 961.90ms
   No errors!
-  ℹ  cleaned 130 leftover keys
+  ℹ  cleaned 146 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

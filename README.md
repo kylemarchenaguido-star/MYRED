@@ -116,6 +116,8 @@ REDIS_PASSWORD=kek1234 ./build/client                  # interactive REPL
 `GET`, `SET`, `DEL key [key...]`, `EXISTS key [key...]`
 `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`
 `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETEX`, `GETDEL`
+`MSET`, `MGET`, `MSETNX`
+`APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`
 
 ### Generic / keyspace
 `TYPE`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,

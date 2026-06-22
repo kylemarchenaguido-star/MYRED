@@ -71,7 +71,7 @@ GETDEL key                 → get + delete atomically. nil if missing.
 
 `SETEX`/`PSETEX` reuse `entry_set_ttl` from `state.h` (same as EXPIRE/PEXPIRE path).
 
-### ⬜ Step 4 — Multi-key: MSET / MGET / MSETNX
+### ✅ Step 4 — Multi-key: MSET / MGET / MSETNX (DONE 2026-06-22)
 
 ```
 MSET key val [key val...]    → always OK (dispatch: cmd.size() >= 3 && size odd)
@@ -79,7 +79,7 @@ MGET key [key...]            → array of bulk strings / nil per key (type misma
 MSETNX key val [key val...]  → set ALL or NONE. Scan all keys first; if any exist → return 0.
 ```
 
-### ⬜ Step 5 — Bulk/range: APPEND / STRLEN / GETRANGE / SETRANGE
+### ✅ Step 5 — Bulk/range: APPEND / STRLEN / GETRANGE / SETRANGE (DONE 2026-06-22)
 
 ```
 APPEND key val             → ent->str += val, return new length. Create if missing.
