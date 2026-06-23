@@ -24,22 +24,22 @@ int32_t parse_resp_request(Buffer *buf, std::vector<std::string> &cmd){
 
   int32_t n_args = 0;
   for (size_t i = n_start; i < pos; ++i){
-    // ASCII code i am dumb stuped 
     if (data[i] < '0' || data[i] > '9') { return -1; }
-    n_args = n_args * 10 + (data[i] - '0');   
+    n_args = n_args * 10 + (data[i] - '0');
+    if (n_args > (int32_t)k_max_args){ return -1; }
   }
-  if (n_args > (int32_t)k_max_msg || n_args < 1) { return -1;}
+  if (n_args < 1) { return -1;}
   pos += 2;
 
   // read each bulk string
   for (int32_t i = 0; i < n_args; ++i){
-    if (pos >= size) { return -1; }
+    if (pos >= size) { return 0; }
     if (data[pos] != '$') { return -1;}
     pos++;
 
     size_t len_start = pos;
     while (pos < size && data[pos] != '\r') { pos++; }
-    if (pos + 1 >= size) { return -1; }
+    if (pos + 1 >= size) { return 0; }
     if (data[pos + 1] != '\n') { return -1; }
 
     int32_t  str_len = 0;

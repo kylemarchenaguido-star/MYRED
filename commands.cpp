@@ -55,7 +55,7 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out){
   case Lookup::MISSING: return resp_nil(out);
   case Lookup::OK:  break;
   }
-  resp_str(out, ent->str.data(), ent->str.size());
+  resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
 
 // sets a key with value in the hashtab
@@ -64,7 +64,7 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE wrong type");
   }
-  ent->str.swap(cmd[2]);
+  entry_str(ent).swap(cmd[2]);
   g_data.g_writes_since_save++;
   return resp_ok(out);
 }
@@ -82,7 +82,7 @@ static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mu
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE Opreation against a key holding the wrong kind of value");
   }
-  ent->str.swap(cmd[3]);
+  entry_str(ent).swap(cmd[3]);
   entry_set_ttl(ent, ttl * mult);
   return resp_ok(out);
 }
@@ -105,7 +105,7 @@ static void do_setnx(std::vector<std::string> &cmd, Buffer *out){
   // now we use the cmd[1]
   Entry *ent;
   lookup_entry(cmd[1], T_STR, true, &ent);
-  ent->str.swap(cmd[2]);
+  entry_str(ent).swap(cmd[2]);
   g_data.g_writes_since_save++;
   resp_int(out, 1);
 }
@@ -122,8 +122,8 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
       if (ent->type != T_STR){
         return resp_err(out, "WRONGTYPE Operation against a key holding the wrong type of value");
       }
-      std::string old = std::move(ent->str); // extract the old value
-      ent->str.swap(cmd[2]); // set the new value
+      std::string old = std::move(entry_str(ent)); // extract the old value
+      entry_str(ent).swap(cmd[2]); // set the new value
       g_data.g_writes_since_save++;
       return resp_str(out, old.data(), old.size());
     }
@@ -133,7 +133,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent = entry_new(T_STR);
   ent->key = std::move(lk.key);
   ent->node.hcode = lk.node.hcode;
-  ent->str.swap(cmd[2]);
+  entry_str(ent).swap(cmd[2]);
   hm_insert(&g_data.db, &ent->node);
   g_data.g_writes_since_save++;
   resp_nil(out);
@@ -146,7 +146,7 @@ static void do_getdel(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING:   return resp_nil(out);
     case Lookup::OK:        break;
   }
-  std::string val = std::move(ent->str); // we extract the values before freeing
+  std::string val = std::move(entry_str(ent)); // we extract the values before freeing
   hm_delete(&g_data.db, &ent->node, &hnode_same);
   entry_del(ent);
   g_data.g_writes_since_save++;
@@ -162,7 +162,7 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
   }
   // it just a bare getex key, just get no ttl change
   if (cmd.size() == 2){
-    return resp_str(out, ent->str.data(), ent->str.size());
+    return resp_str(out, entry_str(ent).data(), entry_str(ent).size());
   }
 
   std::string opt = cmd[2];
@@ -171,7 +171,7 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
   if (opt == "persist"){
     if (cmd.size() != 3){ return resp_err(out, "ERR syntax error"); }
     entry_set_ttl(ent, -1);
-    return resp_str(out, ent->str.data(), ent->str.size());
+    return resp_str(out, entry_str(ent).data(), entry_str(ent).size());
   }
 
   if (cmd.size() != 4){ return resp_err(out, "ERR syntax error"); }
@@ -187,14 +187,14 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
 
   if (ttl_ms <= 0){
     // past timestamp so we get the value then delete the key
-    std::string val = std::move(ent->str);
+    std::string val = std::move(entry_str(ent));
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
     g_data.g_writes_since_save++;
     return resp_str(out, val.data(), val.size());
   }
   entry_set_ttl(ent, ttl_ms);
-  resp_str(out, ent->str.data(), ent->str.size());
+  resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
 
 // MGET key [key..]
@@ -205,7 +205,7 @@ static void do_mget(std::vector<std::string> &cmd, Buffer *out){
     switch (lookup_entry(cmd[i], T_STR, false, &ent)){
       case Lookup::WRONGTYPE: resp_nil(out); break; // type mismatch -> nil, NOT error
       case Lookup::MISSING:   resp_nil(out); break;
-      case Lookup::OK:        resp_str(out, ent->str.data(), ent->str.size()); break;
+      case Lookup::OK:        resp_str(out, entry_str(ent).data(), entry_str(ent).size()); break;
     }
   }
 }
@@ -216,9 +216,9 @@ static void do_append(std::vector<std::string> &cmd, Buffer *out){
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
-  ent->str += cmd[2];
+  entry_str(ent) += cmd[2];
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)ent->str.size());
+  resp_int(out, (int64_t)entry_str(ent).size());
 }
 
 // STRLEN key -> byte length (integer), 0 if missing
@@ -229,7 +229,7 @@ static void do_strlen(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING:   return resp_int(out, 0);  // missing -> 0, not nil
     case Lookup::OK:        break;
   }
-  resp_int(out, (int64_t)ent->str.size());
+  resp_int(out, (int64_t)entry_str(ent).size());
 }
 
 // GETRANGE key start end -> bulk string
@@ -246,7 +246,7 @@ static void do_getrange(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR value is not an integer or out of range");
   }
 
-  int64_t len = (int64_t)ent->str.size();
+  int64_t len = (int64_t)entry_str(ent).size();
   // resolve negatives (Redis: -1 = last byte and .....)
   if (start < 0){ start += len; }
   if (end < 0){ end += len; }
@@ -258,7 +258,7 @@ static void do_getrange(std::vector<std::string> &cmd, Buffer *out){
 
   size_t offset = (size_t)start;
   size_t count = (size_t)(end - start + 1);
-  resp_str(out, ent->str.data() + offset, count);
+  resp_str(out, entry_str(ent).data() + offset, count);
 }
 
 // SETRANGE key offset value -> new length (integer)
@@ -281,14 +281,14 @@ static void do_setrange(std::vector<std::string> &cmd, Buffer *out){
   }
 
   size_t new_end = (size_t)offset + cmd[3].size();
-  if (ent->str.size() < new_end){
-    ent->str.resize(new_end, '\0'); // zero-pad any gap
+  if (entry_str(ent).size() < new_end){
+    entry_str(ent).resize(new_end, '\0'); // zero-pad any gap
   }
   if (!cmd[3].empty()){
-    memcpy(&ent->str[offset], cmd[3].data(), cmd[3].size());
+    memcpy(&entry_str(ent)[offset], cmd[3].data(), cmd[3].size());
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)ent->str.size());
+  resp_int(out, (int64_t)entry_str(ent).size());
 }
 
 // MSET key val [key val ...]
@@ -310,7 +310,7 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 1; i < cmd.size(); i += 2){
     Entry *ent;
     lookup_entry(cmd[i], T_STR, true, &ent);
-    ent->str.swap(cmd[i + 1]);
+    entry_str(ent).swap(cmd[i + 1]);
   }
   g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
   resp_ok(out);
@@ -335,7 +335,7 @@ static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 1; i < cmd.size(); i += 2){
     Entry *ent;
     lookup_entry(cmd[i], T_STR, true, &ent);  // was cmd[1]
-    ent->str.swap(cmd[i + 1]);
+    entry_str(ent).swap(cmd[i + 1]);
   }
   g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
   resp_int(out, 1);
@@ -348,14 +348,14 @@ static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t del
     return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
   int64_t cur = 0;
-  if (!ent->str.empty() && !str2int(ent->str, cur)){
+  if (!entry_str(ent).empty() && !str2int(entry_str(ent), cur)){
     return resp_err(out, "ERR value is not an integer or out of range");
   }
   if ((delta > 0 && cur > INT64_MAX - delta) || (delta < 0 && cur < INT64_MIN - delta)){
     return resp_err(out, "ERR increment or decrement would overflow");
   }
   cur += delta;
-  ent->str = std::to_string(cur);
+  entry_str(ent) = std::to_string(cur);
   g_data.g_writes_since_save++;
   resp_int(out, cur);
 }
@@ -398,7 +398,7 @@ static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
   double cur = 0.0;
-  if (!ent->str.empty() && !str2dbl(ent->str, cur)){
+  if (!entry_str(ent).empty() && !str2dbl(entry_str(ent), cur)){
     return resp_err(out, "ERR value is not a float or out of range");
   }
   double result = cur + delta;
@@ -407,9 +407,9 @@ static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out){
   }
   char buf[64];
   snprintf(buf, sizeof(buf), "%.17g", result);
-  ent->str = buf;
+  entry_str(ent) = buf;
   g_data.g_writes_since_save++;
-  resp_str(out, ent->str.data(), ent->str.size());
+  resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
 
 // deletes a key and value
@@ -451,7 +451,7 @@ static bool cb_count_keys(HNode *node, void *args){
   KeyStats *stats = (KeyStats *)args;
   Entry *ent = container_of(node, Entry, node);
   stats->total++;
-  if (ent->heap_idx != (size_t)-1){
+  if (entry_has_ttl(ent)){
     stats->with_ttl++;
   }
   return true;
@@ -560,7 +560,7 @@ static void ttl_generic(std::vector<std::string> &cmd, Buffer *out, int64_t div)
   Entry *ent = container_of(node, Entry, node);
   if (expire_if_needed(ent)){ return resp_int(out, -2); } // expired -> gone
 
-  if (ent->heap_idx == (size_t)-1){
+  if (!entry_has_ttl(ent)){
     return resp_int(out, -1); // no ttl
   }
 
@@ -631,7 +631,7 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent = container_of(node, Entry, node);
 
   if (expire_if_needed(ent)){ return resp_int(out, 0); } // expired -> gone
-  if (ent->heap_idx == (size_t)-1){ return resp_int(out, 0); } // no TTL to remove
+  if (!entry_has_ttl(ent)){ return resp_int(out, 0); } // no TTL to remove
   entry_set_ttl(ent, -1); // detach from the TTL heap
 
   g_data.g_writes_since_save++;
@@ -650,7 +650,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
   }
 
   // add or update the tuple
-  bool added = zset_insert(&ent->zset, cmd[3].data(), cmd[3].size(), score);
+  bool added = zset_insert(&entry_zset(ent), cmd[3].data(), cmd[3].size(), score);
   g_data.g_writes_since_save++;
   return resp_int(out, (int64_t)added);
 }
@@ -664,10 +664,10 @@ static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:        break;
   }
   
-  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
+  ZNode *znode = zset_lookup(&entry_zset(ent), cmd[2].data(), cmd[2].size());
   if (!znode) { return resp_int(out, 0); }
   
-  zset_delete(&ent->zset, znode);
+  zset_delete(&entry_zset(ent), znode);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
@@ -680,7 +680,7 @@ static void do_zscore(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING:   return resp_nil(out);
     case Lookup::OK:        break;
   }
-  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
+  ZNode *znode = zset_lookup(&entry_zset(ent), cmd[2].data(), cmd[2].size());
   return znode ? resp_dbl(out, znode->score) : resp_nil(out);
   
 }
@@ -695,7 +695,7 @@ static void do_zrank(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:        break;
   }
   // point query by name using the hashtable (cmd[2] = name)
-  ZNode *znode = zset_lookup(&ent->zset, cmd[2].data(), cmd[2].size());
+  ZNode *znode = zset_lookup(&entry_zset(ent), cmd[2].data(), cmd[2].size());
   if (!znode){ return resp_nil(out); }
 
   int64_t rank = avl_rank(&znode->tree);
@@ -730,7 +730,7 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer *out){
   // (RESP wants the array length before the elements)
   std::vector<ZQueryResult> results;
 
-  ZNode *znode = zset_seekge(&ent->zset, score, cmd[3].data(), cmd[3].size());
+  ZNode *znode = zset_seekge(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
   znode = znode_offset(znode, offset);
 
   // walk forward collecting until we hit the end (NULL) or fill the page (limit)
@@ -769,7 +769,7 @@ static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:        break;
   }
   std::vector<ZQueryResult> results;
-  ZNode *znode = zset_seekle(&ent->zset, score, cmd[3].data(), cmd[3].size());
+  ZNode *znode = zset_seekle(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
   znode = znode_offset(znode, -offset);
 
   while (znode && (int64_t)results.size() < limit){
@@ -804,6 +804,7 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 // SAVE - Do save - stays blocking
 static void do_save(std::vector<std::string> &cmd, Buffer *out){
   (void)cmd;
+  rdb_check_background_save(); // reap child before checking
   if (g_rdb_child_pid != -1){
     return resp_err(out, "ERR background save in progress");
   }
@@ -845,8 +846,8 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
   // check if need offloading
   size_t set_size = 0;
-  if (ent->type ==  T_ZSET){ set_size = hm_size(&ent->zset.hmap); }
-  else if (ent->type == T_SET){ set_size = hm_size(&ent->set); }
+  if (ent->type ==  T_ZSET){ set_size = hm_size(&entry_zset(ent).hmap); }
+  else if (ent->type == T_SET){ set_size = hm_size(&entry_set(ent)); }
 
   if (set_size > 1000){
     thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
@@ -937,10 +938,10 @@ void do_lpush(std::vector<std::string> &cmd, Buffer *out){
   }
   // push all values
   for (size_t i = 2; i < cmd.size(); ++i){
-    deque_push_front(&ent->deque, cmd[i]);
+    deque_push_front(&entry_deque(ent), cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)ent->deque.count); 
+  resp_int(out, (int64_t)entry_deque(ent).count); 
 }
 
 // RPUSH key
@@ -950,10 +951,10 @@ void do_rpush(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   for (size_t i = 2; i < cmd.size(); ++i){
-    deque_push_back(&ent->deque, cmd[i]);
+    deque_push_back(&entry_deque(ent), cmd[i]);
   }
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)ent->deque.count);
+  resp_int(out, (int64_t)entry_deque(ent).count);
 }
 
 // LPOP key
@@ -966,10 +967,10 @@ void do_lpop(std::vector<std::string> &cmd, Buffer *out){
   }
 
   std::string val;
-  if (!deque_pop_front(&ent->deque, &val)){ return resp_nil(out); }
+  if (!deque_pop_front(&entry_deque(ent), &val)){ return resp_nil(out); }
 
   // if list is now empty, delete the key
-  if (ent->deque.count == 0){
+  if (entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &entry_eq);
     entry_del(ent);
   }
@@ -987,9 +988,9 @@ void do_rpop(std::vector<std::string> &cmd, Buffer *out){
   }
 
   std::string val;
-  if (!deque_pop_back(&ent->deque, &val)){ return resp_nil(out); }
+  if (!deque_pop_back(&entry_deque(ent), &val)){ return resp_nil(out); }
   // if list is now empty, delete the key
-  if (ent->deque.count == 0){
+  if (entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &entry_eq);
     entry_del(ent);
   }
@@ -1005,7 +1006,7 @@ void do_llen(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING:   return resp_int(out, 0);
     case Lookup::OK:        break;
   }
-  resp_int(out, (int64_t)ent->deque.count);
+  resp_int(out, (int64_t)entry_deque(ent).count);
 }
 
 // LINDEX key index
@@ -1020,13 +1021,13 @@ void do_lindex(std::vector<std::string> &cmd, Buffer *out){
   if (!str2int(cmd[2], idx)){
     return resp_err(out, "ERR invalid index");
   }
-  idx = deque_normalize(&ent->deque, idx);
+  idx = deque_normalize(&entry_deque(ent), idx);
 
-  if (idx < 0 || idx >= (int64_t)ent->deque.count){
+  if (idx < 0 || idx >= (int64_t)entry_deque(ent).count){
     return resp_nil(out);
   }
 
-  const std::string *val = deque_get(&ent->deque, (size_t)idx);
+  const std::string *val = deque_get(&entry_deque(ent), (size_t)idx);
   resp_str(out, val->data(), val->size());
 }
 
@@ -1044,9 +1045,9 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)ent->deque.count;
-  start = deque_normalize(&ent->deque, start);
-  stop = deque_normalize(&ent->deque, stop);
+  int64_t n = (int64_t)entry_deque(ent).count;
+  start = deque_normalize(&entry_deque(ent), start);
+  stop = deque_normalize(&entry_deque(ent), stop);
 
   // clamp to valid bounds
   if (start < 0) { start = 0; }
@@ -1059,7 +1060,7 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out){
   uint32_t range_len = (uint32_t)(stop - start + 1);
   resp_arr(out, range_len);
   for (int64_t i = start; i <= stop; ++i){
-    const std::string *val = deque_get(&ent->deque, (size_t)i);
+    const std::string *val = deque_get(&entry_deque(ent), (size_t)i);
     resp_str(out, val->data(), val->size());
   }
 }
@@ -1077,14 +1078,14 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
   if (!str2int(cmd[2], idx)){
     return resp_err(out, "ERR invalid index");
   }
-  idx = deque_normalize(&ent->deque, idx);
+  idx = deque_normalize(&entry_deque(ent), idx);
 
-  if (idx < 0 || idx >= (int64_t)ent->deque.count){
+  if (idx < 0 || idx >= (int64_t)entry_deque(ent).count){
     return resp_err(out, "ERR index out of range");
   }
 
   // direct write
-  ent->deque.buf[deque_phys(&ent->deque, (size_t)idx)] = cmd[3];
+  entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)idx)] = cmd[3];
   g_data.g_writes_since_save++;
   resp_ok(out);
 }
@@ -1158,8 +1159,8 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
 
   // find the pivot - linear
   size_t pivot_idx = SIZE_MAX;
-  for ( size_t i = 0; i < ent->deque.count; ++i){
-    if (*deque_get(&ent->deque, i) == pivot){
+  for ( size_t i = 0; i < entry_deque(ent).count; ++i){
+    if (*deque_get(&entry_deque(ent), i) == pivot){
       pivot_idx = i;
       break;
     }
@@ -1169,13 +1170,13 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
 
   // we ensure capaxity before opening the gap
-  if (ent->deque.count == ent->deque.cap){ deque_grow(&ent->deque); }
+  if (entry_deque(ent).count == entry_deque(ent).cap){ deque_grow(&entry_deque(ent)); }
 
-  deque_open_gap(&ent->deque, insert_idx);
-  ent->deque.buf[deque_phys(&ent->deque, insert_idx)] = value;
+  deque_open_gap(&entry_deque(ent), insert_idx);
+  entry_deque(ent).buf[deque_phys(&entry_deque(ent), insert_idx)] = value;
 
   g_data.g_writes_since_save++;
-  resp_int(out, (int64_t)ent->deque.count); // new length
+  resp_int(out, (int64_t)entry_deque(ent).count); // new length
 }
 
 // LREM key count value
@@ -1197,11 +1198,11 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
 
   if (from_tail){
     // scan from the back
-    size_t i = ent->deque.count;
+    size_t i = entry_deque(ent).count;
     while (i > 0){
       --i;
-      if (*deque_get(&ent->deque, i) == value){
-        deque_close_gap(&ent->deque, i);
+      if (*deque_get(&entry_deque(ent), i) == value){
+        deque_close_gap(&entry_deque(ent), i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
       }
@@ -1209,9 +1210,9 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
   } else {
     // scan from the front
     size_t i = 0;
-    while (i < ent->deque.count){
-      if (*deque_get(&ent->deque, i) == value){
-        deque_close_gap(&ent->deque, i);
+    while (i < entry_deque(ent).count){
+      if (*deque_get(&entry_deque(ent), i) == value){
+        deque_close_gap(&entry_deque(ent), i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
         // don't advance i - the gap closed
@@ -1222,7 +1223,7 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
   }
 
   // delete the key if the list became empty
-  if (ent && ent->deque.count == 0){
+  if (ent && entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
@@ -1245,9 +1246,9 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR invalid range");
   }
 
-  int64_t n = (int64_t)ent->deque.count;
-  start = deque_normalize(&ent->deque, start);
-  stop = deque_normalize(&ent->deque, stop);
+  int64_t n = (int64_t)entry_deque(ent).count;
+  start = deque_normalize(&entry_deque(ent), start);
+  stop = deque_normalize(&entry_deque(ent), stop);
 
   if (start < 0) { start = 0; }
   if (stop >= n) { stop = n - 1; }
@@ -1265,20 +1266,20 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   size_t keep = (size_t)(stop - start + 1);
 
   // if we are keeping everything, no work needed
-  if (start == 0 && (size_t)(stop + 1) == ent->deque.count){
+  if (start == 0 && (size_t)(stop + 1) == entry_deque(ent).count){
     return resp_ok(out);
   }
 
   // clear dropped slots, then resposition head/count, no alloc
   for (int64_t i = 0; i < start; ++i){
-    ent->deque.buf[deque_phys(&ent->deque, (size_t)i)].clear();
+    entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)].clear();
   }
   for (int64_t i = stop + 1; i < n; ++i){
-    ent->deque.buf[deque_phys(&ent->deque, (size_t)i)].clear();
+    entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)].clear();
   }
 
-  ent->deque.head = deque_phys(&ent->deque, (size_t)start); // compute before changing count
-  ent->deque.count = keep;
+  entry_deque(ent).head = deque_phys(&entry_deque(ent), (size_t)start); // compute before changing count
+  entry_deque(ent).count = keep;
 
 
   g_data.g_writes_since_save++;
@@ -1362,7 +1363,7 @@ static void cb_scan(HNode *node, void *arg){
   Entry *ent = container_of(node, Entry, node);
 
   // skip expired keys, read only check
-  if (ent->heap_idx != (size_t)-1 && g_data.heap[ent->heap_idx].val <= get_monotonic_msec()){ return; }
+  if (entry_has_ttl(ent) && g_data.heap[ent->heap_idx].val <= get_monotonic_msec()){ return; }
 
   // MATCH filter (if a pattern was given)
   if (ctx->pattern && !glob_match(ctx->pattern->data(), ctx->pattern->size(), ent->key.data(), ent->key.size())){
@@ -1420,7 +1421,7 @@ static void do_hset(std::vector<std::string> &cmd, Buffer *out){
   }
   int64_t added = 0;
   for (size_t i = 2; i + 1 < cmd.size(); i += 2){
-    if (hash_set(&ent->hash, cmd[i], cmd[i + 1])){ added++; }
+    if (hash_set(&entry_hash(ent), cmd[i], cmd[i + 1])){ added++; }
   }
   g_data.g_writes_since_save++;
   resp_int(out, added); 
@@ -1435,7 +1436,7 @@ static void do_hget(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:  break;
   }
 
-  HashNode *hn = hash_get(&ent->hash, cmd[2]);
+  HashNode *hn = hash_get(&entry_hash(ent), cmd[2]);
   if (!hn){ return resp_nil(out); }
   resp_str(out, hn->value.data(), hn->value.size());
 }
@@ -1450,10 +1451,10 @@ static void do_hdel(std::vector<std::string> &cmd, Buffer *out){
   }
   int64_t removed = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
-    if (hash_del(&ent->hash, cmd[i])){ removed++; }
+    if (hash_del(&entry_hash(ent), cmd[i])){ removed++; }
   }
   // if empty hash we drop the key
-  if (hm_size(&ent->hash) == 0){
+  if (hm_size(&entry_hash(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
@@ -1469,7 +1470,7 @@ static void do_hexists(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  resp_int(out, hash_get(&ent->hash, cmd[2]) ? 1 : 0);
+  resp_int(out, hash_get(&entry_hash(ent), cmd[2]) ? 1 : 0);
 }
 
 // HLEN key field
@@ -1480,7 +1481,7 @@ static void do_hlen(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  resp_int(out, (int64_t)hm_size(&ent->hash));
+  resp_int(out, (int64_t)hm_size(&entry_hash(ent)));
 }
 
 // shared by HGETALL(0), HKEYS(1), HVALS(2)
@@ -1511,7 +1512,7 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out, int mode
   std::vector<std::string> items;
   HCollect c { &items, mode };
 
-  hm_foreach(&ent->hash, cb_hcollect, &c);
+  hm_foreach(&entry_hash(ent), cb_hcollect, &c);
   resp_arr(out,(uint32_t)items.size());
   for (const auto &s : items){ resp_str(out, s.data(), s.size()); }
 }
@@ -1528,7 +1529,7 @@ static void do_hmget(std::vector<std::string> &cmd, Buffer *out){
 
   resp_arr(out, (uint32_t)(cmd.size() - 2));
   for (size_t i = 2; i < cmd.size(); ++i){
-    HashNode *hn = (r == Lookup::OK) ? hash_get(&ent->hash, cmd[i]) : nullptr;
+    HashNode *hn = (r == Lookup::OK) ? hash_get(&entry_hash(ent), cmd[i]) : nullptr;
     if (hn){ resp_str(out, hn->value.data(), hn->value.size()); }
     else { resp_nil(out); }
   }
@@ -1540,9 +1541,9 @@ static void do_hsetnx(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   // already there
-  if (hash_get(&ent->hash, cmd[2])){ return resp_int(out, 0); } 
+  if (hash_get(&entry_hash(ent), cmd[2])){ return resp_int(out, 0); } 
 
-  hash_set(&ent->hash, cmd[2], cmd[3]);
+  hash_set(&entry_hash(ent), cmd[2], cmd[3]);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
@@ -1560,7 +1561,7 @@ static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
   }
 
   int64_t cur = 0;
-  HashNode *hn = hash_get(&ent->hash, cmd[2]);
+  HashNode *hn = hash_get(&entry_hash(ent), cmd[2]);
   if (hn && !str2int(hn->value, cur)){
     return resp_err(out, "ERR hash value is not an integer");
   }
@@ -1568,7 +1569,7 @@ static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR increment or decrement would overflow");
   }
   cur += incr;
-  hash_set(&ent->hash, cmd[2], std::to_string(cur));
+  hash_set(&entry_hash(ent), cmd[2], std::to_string(cur));
   g_data.g_writes_since_save++;
   return resp_int(out, cur);
 }
@@ -1581,7 +1582,7 @@ static void do_hstrlen(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  HashNode *hn = hash_get(&ent->hash, cmd[2]);
+  HashNode *hn = hash_get(&entry_hash(ent), cmd[2]);
   return resp_int(out, hn ? (int64_t)hn->value.size() : 0);
 }
 
@@ -1637,7 +1638,7 @@ static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
   }
   std::vector<std::string> items;
   HScanCtx ctx { &items, pattern };
-  uint64_t next = hm_scan(&ent->hash, (uint64_t)cursor, count ,cb_hscan, &ctx);
+  uint64_t next = hm_scan(&entry_hash(ent), (uint64_t)cursor, count ,cb_hscan, &ctx);
 
   std::string cur = std::to_string(next);
   resp_str(out, cur.data(), cur.size());
@@ -1839,18 +1840,18 @@ static bool sinter_impl(std::vector<std::string> &cmd, size_t start, std::vector
   }
   size_t smallest_idx = 0;
   for (size_t i = 1; i < sets.size(); ++i){
-    if (hm_size(&sets[i]->set) < hm_size(&sets[smallest_idx]->set)){
+    if (hm_size(&entry_set(sets[i])) < hm_size(&entry_set(sets[smallest_idx]))){
       smallest_idx = i;
     }
   }
 
   std::vector<std::string> candidates;
-  hm_foreach(&sets[smallest_idx]->set, cb_collect_members, &candidates);
+  hm_foreach(&entry_set(sets[smallest_idx]), cb_collect_members, &candidates);
   for (auto &m : candidates){
     bool in_all = true;
     for (size_t i = 0; i < sets.size(); ++i){
       if (i == smallest_idx){ continue; }
-      if (!set_is_member(&sets[i]->set, m)){ in_all = false; break; }
+      if (!set_is_member(&entry_set(sets[i]), m)){ in_all = false; break; }
     }
     if (in_all){ result.push_back(m); }
   }
@@ -1863,7 +1864,7 @@ static bool sunion_impl(std::vector<std::string> &cmd, size_t start, std::vector
     Entry *e = lookup_set_ro(cmd[i], &wt);
     if (wt){ return false; }
     if (!e){ continue; } // missing key contributes nothing
-    hm_foreach(&e->set, cb_collect_members, &result);
+    hm_foreach(&entry_set(e), cb_collect_members, &result);
   }
   // deduplicate in O(N log N);
   std::sort(result.begin(), result.end());
@@ -1885,11 +1886,11 @@ static bool sdiff_impl(std::vector<std::string> &cmd, size_t start, std::vector<
   }
 
   std::vector<std::string> candidates;
-  hm_foreach(&base->set, cb_collect_members, &candidates);
+  hm_foreach(&entry_set(base), cb_collect_members, &candidates);
   for (auto &m : candidates){
     bool found = false;
     for (Entry *e : others){
-      if (set_is_member(&e->set, m)){ found = true; break; }
+      if (set_is_member(&entry_set(e), m)){ found = true; break; }
     }
     if (!found){ result.push_back(m); }
   }
@@ -1904,7 +1905,7 @@ static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
   }
   int64_t added = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
-    if (set_add(&ent->set, cmd[i])){ ++added;}
+    if (set_add(&entry_set(ent), cmd[i])){ ++added;}
   }
   g_data.g_writes_since_save++;
   return resp_int(out, added);
@@ -1920,9 +1921,9 @@ static void do_srem(std::vector<std::string> &cmd, Buffer *out){
   }
   int64_t removed = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
-    if (set_remove(&ent->set, cmd[i])){ ++removed; }
+    if (set_remove(&entry_set(ent), cmd[i])){ ++removed; }
   }
-  if (hm_size(&ent->set) == 0){
+  if (hm_size(&entry_set(ent)) == 0){
     hm_delete
     (&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
@@ -1939,7 +1940,7 @@ static void do_sismember(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  return resp_int(out, set_is_member(&ent->set, cmd[2]) ? 1 : 0);
+  return resp_int(out, set_is_member(&entry_set(ent), cmd[2]) ? 1 : 0);
 }
 
 // SMISMEMBER key member [member...] -> array of 0/1
@@ -1949,7 +1950,7 @@ static void do_smismember(std::vector<std::string> &cmd, Buffer *out){
   if (r == Lookup::WRONGTYPE){ return resp_err(out, "WRONGTYPE wrong type"); }
   resp_arr(out, (uint32_t)(cmd.size() - 2));
   for (size_t i = 2; i < cmd.size(); ++i){
-    bool found = (r == Lookup::OK) && set_is_member(&ent->set, cmd[i]);
+    bool found = (r == Lookup::OK) && set_is_member(&entry_set(ent), cmd[i]);
     resp_int(out, found ? 1 : 0);
   }
 }
@@ -1962,7 +1963,7 @@ static void do_scard(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  return resp_int(out, (int64_t)hm_size(&ent->set));
+  return resp_int(out, (int64_t)hm_size(&entry_set(ent)));
 }
 
 // SMEMBERS key
@@ -1974,7 +1975,7 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:  break;
   }
   std::vector<std::string> members;
-  hm_foreach(&ent->set, cb_collect_members, &members);
+  hm_foreach(&entry_set(ent), cb_collect_members, &members);
   resp_arr(out, (uint32_t)members.size());
   for (auto &m : members){ resp_str(out, m.data(), m.size()); }
 }
@@ -1988,7 +1989,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:  break;
   }
   std::vector<std::string> members;
-  hm_foreach(&ent->set, cb_collect_members, &members);
+  hm_foreach(&entry_set(ent), cb_collect_members, &members);
   if (members.empty()){
     return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
   }
@@ -1998,13 +1999,13 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     size_t idx = (size_t)(rand() % members.size());
     const std::string &picked = members[idx];
     resp_str(out, picked.data(), picked.size());
-    set_remove(&ent->set, picked);
+    set_remove(&entry_set(ent), picked);
   } else {
     int64_t count = 0;
     if (!str2int(cmd[2], count) || count < 0){
       return resp_arr(out, 0);
     }
-    if (count == 0){ return resp_err(out, 0); }
+    if (count == 0){ return resp_arr(out, 0); }
     // partial Fisher-Yates: shuffle the first 'n' slots
     size_t n = ((size_t)count < members.size()) ? (size_t)count : members.size();
     for (size_t i =0; i < n; ++i){
@@ -2014,10 +2015,10 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     resp_arr(out, (uint32_t)n);
     for (size_t i = 0; i < n; ++i){
       resp_str(out, members[i].data(), members[i].size());
-      set_remove(&ent->set, members[i]);
+      set_remove(&entry_set(ent), members[i]);
     }
   }
-  if (hm_size(&ent->set) == 0){
+  if (hm_size(&entry_set(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
@@ -2033,7 +2034,7 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::OK:  break;
   }
   std::vector<std::string> members;
-  hm_foreach(&ent->set, cb_collect_members, &members);
+  hm_foreach(&entry_set(ent), cb_collect_members, &members);
   if (members.empty()){
     return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
   }
@@ -2057,7 +2058,7 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
   }
   resp_arr(out, (uint32_t)n);
   for (size_t i = 0; i < n; ++i){
-    resp_str(out, members[i].data(), members.size());
+    resp_str(out, members[i].data(), members[i].size());
   }
  } else {
   // negative count: |count| members with replacement
@@ -2118,7 +2119,7 @@ static void do_sscan(std::vector<std::string> &cmd, Buffer *out){
   }
   std::vector<std::string> items;
   SScanCtx ctx { &items, pattern };
-  uint64_t next = hm_scan(&ent->set, (uint64_t)cursor, count, cb_sscan, &ctx);
+  uint64_t next = hm_scan(&entry_set(ent), (uint64_t)cursor, count, cb_sscan, &ctx);
   std::string cur = std::to_string(next);
   resp_str(out, cur.data(), cur.size());
   resp_arr(out, (uint32_t)items.size());
@@ -2154,9 +2155,9 @@ static void do_sinterstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sinter_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&dest->set, m); }
+  for (auto &m : result){ set_add(&entry_set(dest), m); }
   g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&dest->set));
+  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
 
 // SUNIONSTORE dest key [key...] -- compute first, then store, so dest can be a source
@@ -2164,9 +2165,9 @@ static void do_sunionstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sunion_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&dest->set, m); }
+  for (auto &m : result){ set_add(&entry_set(dest), m); }
   g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&dest->set));
+  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
 
 // SDIFFSTORE dest key [key...] -- compute first, then store, so dest can be a source
@@ -2174,9 +2175,9 @@ static void do_sdiffstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sdiff_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&dest->set, m); }
+  for (auto &m : result){ set_add(&entry_set(dest), m); }
   g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&dest->set));
+  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
 
 // SMOVE src dst member
@@ -2188,7 +2189,7 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_int(out, 0);
     case Lookup::OK:  break;
   }
-  if (!set_is_member(&src_ent->set, cmd[3])){ return resp_int(out, 0); }
+  if (!set_is_member(&entry_set(src_ent), cmd[3])){ return resp_int(out, 0); }
 
   // type check dst before modifying src
   bool wt = false;
@@ -2197,8 +2198,8 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
 
   if (src_name == cmd[2]){ return resp_int(out, 1); } // move to self
 
-  set_remove(&src_ent->set, cmd[3]);
-  if (hm_size(&src_ent->set) == 0){
+  set_remove(&entry_set(src_ent), cmd[3]);
+  if (hm_size(&entry_set(src_ent)) == 0){
     // if move and 0 the set is empty
     hm_delete(&g_data.db, &src_ent->node, &hnode_same);
     entry_del(src_ent);
@@ -2209,7 +2210,7 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     dst_ent->node.hcode = str_hash((const uint8_t *)dst_ent->key.data(), dst_ent->key.size());
     hm_insert(&g_data.db, &dst_ent->node);
   }
-  set_add(&dst_ent->set, cmd[3]);
+  set_add(&entry_set(dst_ent), cmd[3]);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }

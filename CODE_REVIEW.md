@@ -39,7 +39,7 @@ if (set_size > k_large_container_size){ /* never true */ }
 large-container branch is dead. Every delete is synchronous, including
 million-element sets — that stalls the single-threaded event loop. Fix: assign
 the result (`set_size = hm_size(...)`). Also handle `T_HASH` and `T_DLIST`
-(`ent->deque.count`), which are not measured at all. *Why:* the whole point of
+(`entry_deque(ent).count`), which are not measured at all. *Why:* the whole point of
 `entry_del` vs `entry_del_sync` is non-blocking deletion of big containers; right
 now that split does nothing.
 

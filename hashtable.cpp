@@ -45,7 +45,7 @@ static HNode * h_detach(HTab *htab, HNode **from){
 
 //Functions for the newer table when rehashing
 
-const size_t k_rehashing_work = 128;
+static constexpr size_t k_rehashing_work = 128;
 
 static void hm_help_rehashing(HMap *hmap){
     size_t nwork = 0;
@@ -94,7 +94,7 @@ HNode *hm_delete(HMap *hmap, HNode *key, bool(*eq)(HNode *, HNode *)){
     return NULL;
 }
 
-const size_t k_max_load_factor = 8;
+static constexpr size_t k_max_load_factor = 8;
 
 void hm_insert(HMap *hmap, HNode *node){
     if (!hmap->newer.tab){
@@ -119,7 +119,7 @@ void hm_clear(HMap *hmap){
 size_t hm_size(HMap *hmap){
     return hmap->newer.size + hmap->older.size;
 }
-//                                          what is this ?
+// iterates every bucket in the table; returns false early if the callback returns false
 static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *), void *arg){
     for (size_t i = 0; htab->mask != 0 && i <= htab->mask; ++i){
         for (HNode *node = htab->tab[i]; node != NULL; node = node->next){
@@ -131,6 +131,7 @@ static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *), void *arg){
     return true;
 }
 
+// "short-circuit stops scanning older table if callback returns false; early-stop is not visible to the caller — all current callbacks return true unconditionally".
 void hm_foreach(HMap *hmap, bool(*f)(HNode *, void *), void *arg){
     h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
 }
@@ -174,7 +175,7 @@ uint64_t hm_scan(HMap *hmap, uint64_t cursor, size_t count, void(*cb)(HNode *, v
             }
         }
         // picks the next bucket to visit in an order that survives table resizes.
-        cursor |= ~mbig; // <---- magic 
+        cursor |= ~mbig;
         cursor = rev_bits(cursor);
         cursor += 1;
         cursor = rev_bits(cursor);

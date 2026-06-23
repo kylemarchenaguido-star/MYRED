@@ -37,6 +37,20 @@ void deque_push_back(Deque *d, const std::string &val){
     d->count++;
 }
 
+// Helper for a shirnk
+static void deque_maybe_shrink(Deque *d){
+    size_t new_cap = d->cap / 2;
+    std::string *new_buf = new std::string[new_cap];
+    for (size_t i = 0; i < d->count; ++i){
+        new_buf[i] = std::move(d->buf[deque_phys(d,i)]);
+    }
+    delete [] d->buf;
+    d->buf = new_buf;
+    d->cap = new_cap;
+    d->head = 0;
+
+}
+
 // POP operation
 // remove from the head
 bool deque_pop_front(Deque *d, std::string *out){
@@ -47,6 +61,9 @@ bool deque_pop_front(Deque *d, std::string *out){
     d->buf[d->head].clear(); // release memory
     d->head = (d->head + 1) & (d->cap - 1);
     d->count--;
+    if (d->cap > 8 && d->count < d->cap / 4){
+        deque_maybe_shrink(d);
+    }
     return true;
 }
 
@@ -59,13 +76,16 @@ bool deque_pop_back(Deque *d, std::string *out){
     *out = std::move(d->buf[tail]);
     d->buf[tail].clear();
     d->count--;
+    if (d->cap > 8 && d->count < d->cap / 4){
+        deque_maybe_shrink(d);
+    }
     return true;
 }
 
 // Index and range access
 // get element at logical index
 const std::string *deque_get(const Deque *d, size_t idx){
-    if (idx == d->count){
+    if (idx >= d->count){
         return nullptr;
     }
     return &d->buf[deque_phys(d, idx)];

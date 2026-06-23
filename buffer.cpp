@@ -62,11 +62,6 @@ void buf_append(Buffer *buf, uint8_t Byte){
   buf_append(buf, &Byte, 1);
 }
 
-// append 32 bytes
-//void buf_append_u32(Buffer *buf, uint32_t val) {
-//     buf_append(buf, (const uint8_t *)&val, 4);
-// }
-
 // append 64 bytes
 void buf_append_u64(Buffer *buf, uint64_t val) {
     buf_append(buf, (const uint8_t *)&val, 8);
@@ -85,16 +80,21 @@ void buf_consume(Buffer *buf, size_t n){
   if (buf->data_begin == buf->data_end){
     buf->data_begin = buf->buffer_begin;
     buf->data_end = buf->buffer_begin;
+  } else if (buf->data_begin >= buf->buffer_begin + (buf->buffer_end - buf->buffer_begin) / 2){
+    size_t data_size = buf_size(buf);
+    memmove(buf->buffer_begin, buf->data_begin, data_size);
+    buf->data_begin = buf->buffer_begin;
+    buf->data_end = buf->buffer_begin + data_size;
   }
 }
 
 //bytes of the data available 
-size_t buf_size(Buffer *buf){
+size_t buf_size(const Buffer *buf){
   return buf->data_end - buf->data_begin;
 }
 
 //pointer to readble data 
-uint8_t* buf_data(Buffer *buf){
+uint8_t* buf_data(const Buffer *buf){
 return buf->data_begin;
 }
 

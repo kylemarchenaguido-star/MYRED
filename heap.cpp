@@ -1,4 +1,5 @@
 #include "heap.h"
+#include <assert.h>
 
 static size_t heap_parent(size_t i){
     return (i + 1) / 2 - 1;
@@ -40,8 +41,9 @@ static void heap_down(HeapItem *a, size_t pos, size_t len){
             min_val = a[l].val;
         }
         // check right child
-        if (r < len && a[l].val < min_val){
+        if (r < len && a[r].val < min_val){
             min_pos = r;
+            min_val = a[r].val;
         }
         if (min_pos == pos){
             break;
@@ -56,6 +58,7 @@ static void heap_down(HeapItem *a, size_t pos, size_t len){
 }
 
 void heap_update(HeapItem *a, size_t pos, size_t len){
+    assert(pos < len);
     if (pos > 0 && a[heap_parent(pos)].val > a[pos].val){
         heap_up(a, pos);
     } else {

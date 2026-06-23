@@ -51,7 +51,7 @@ INCRBYFLOAT key N → cur + N   (dispatch: cmd.size() == 3, parse N with str2dbl
 ```
 
 Key implementation details:
-- Missing key → `ent->str` is empty → treat as 0. Check: `!ent->str.empty() && !str2int(ent->str, cur)`.
+- Missing key → `entry_str(ent)` is empty → treat as 0. Check: `!entry_str(ent).empty() && !str2int(entry_str(ent), cur)`.
 - Overflow guard BEFORE addition (C++ signed overflow is UB):
   `(delta > 0 && cur > INT64_MAX - delta) || (delta < 0 && cur < INT64_MIN - delta)`
 - `DECRBY`: guard `if (by == INT64_MIN)` before negating — `-INT64_MIN` overflows `int64_t`.
@@ -82,14 +82,14 @@ MSETNX key val [key val...]  → set ALL or NONE. Scan all keys first; if any ex
 ### ✅ Step 5 — Bulk/range: APPEND / STRLEN / GETRANGE / SETRANGE (DONE 2026-06-22)
 
 ```
-APPEND key val             → ent->str += val, return new length. Create if missing.
-STRLEN key                 → ent->str.size(). Missing → 0. WRONGTYPE on wrong type.
+APPEND key val             → entry_str(ent) += val, return new length. Create if missing.
+STRLEN key                 → entry_str(ent).size(). Missing → 0. WRONGTYPE on wrong type.
 GETRANGE key start end     → substring with Redis slice semantics (negative indices, clamp, never error).
 SETRANGE key offset val    → overwrite bytes at offset; zero-pad if offset > len. Return new length.
 ```
 
 `GETRANGE` negative index: `if (idx < 0) idx = max(0, (int64_t)len + idx)`.  
-`SETRANGE` zero-pad: `if (offset > ent->str.size()) ent->str.resize(offset, '\0')`.  
+`SETRANGE` zero-pad: `if (offset > entry_str(ent).size()) entry_str(ent).resize(offset, '\0')`.  
 `SETRANGE` max offset: 512 MB limit — reject `offset >= 512 * 1024 * 1024`.
 
 ---

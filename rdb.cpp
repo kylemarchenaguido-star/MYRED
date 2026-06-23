@@ -144,7 +144,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     // type tag byte
     buf_append(ctx->buf, 0);
     
-    if (ent->heap_idx != (size_t)-1){
+    if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1); // has ttl
       buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val)); // expire at
     } else {
@@ -152,12 +152,12 @@ static bool cb_rdb_write(HNode *node, void *arg){
     }
     //append the key and value
     buf_append_str(ctx->buf, ent->key.data(), (uint32_t)ent->key.size());
-    buf_append_str(ctx->buf, ent->str.data(), (uint32_t)ent->str.size());
+    buf_append_str(ctx->buf, entry_str(ent).data(), (uint32_t)entry_str(ent).size());
   } else if (ent->type == T_ZSET){
     // type tag byte
     buf_append(ctx->buf, 1);
 
-    if (ent->heap_idx != (size_t)-1){
+    if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
       buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
@@ -176,7 +176,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     zctx.buf = ctx->buf;
     zctx.count = 0;
     // iterates over the zset and calls cb over each one
-    hm_foreach(&ent->zset.hmap, cb_zset_member, &zctx);
+    hm_foreach(&entry_zset(ent).hmap, cb_zset_member, &zctx);
 
     // patch real member count
     memcpy(ctx->buf->data_begin + member_count_index, &zctx.count, 4);
@@ -184,7 +184,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
   } else if (ent->type == T_DLIST){
     buf_append(ctx->buf, 2); // type list
     // ttl
-    if (ent->heap_idx != (size_t)-1){
+    if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
       buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
@@ -195,17 +195,17 @@ static bool cb_rdb_write(HNode *node, void *arg){
     buf_append_str(ctx->buf, ent->key.data(), ent->key.size());
 
     // element count
-    uint32_t n = (uint32_t)ent->deque.count;
+    uint32_t n = (uint32_t)entry_deque(ent).count;
     buf_append(ctx->buf, (const uint8_t *)&n, 4);
 
     // element in logical order
-    for (size_t i = 0; i < ent->deque.count; ++i){
-      const std::string *val = deque_get(&ent->deque, i);
+    for (size_t i = 0; i < entry_deque(ent).count; ++i){
+      const std::string *val = deque_get(&entry_deque(ent), i);
       buf_append_str(ctx->buf, val->data(), (uint32_t)val->size());
     }
   } else if (ent->type == T_HASH){
       buf_append(ctx->buf, 3);
-    if (ent->heap_idx != (size_t)-1){
+    if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
       buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
@@ -216,11 +216,11 @@ static bool cb_rdb_write(HNode *node, void *arg){
     size_t cnt_idx = buf_size(ctx->buf);
     buf_append(ctx->buf, (const uint8_t *)"\0\0\0\0", 4);
     HashSaveCtx hctx { ctx->buf, 0 };
-    hm_foreach(&ent->hash, cb_hash_member, &hctx);
+    hm_foreach(&entry_hash(ent), cb_hash_member, &hctx);
     memcpy(ctx->buf->data_begin + cnt_idx, &hctx.count, 4);
   } else if (ent->type == T_SET){
     buf_append(ctx->buf, 4); 
-    if (ent->heap_idx != (size_t)-1){
+    if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
       buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
@@ -230,7 +230,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     size_t cnt_idx = buf_size(ctx->buf);
     buf_append(ctx->buf, (const uint8_t *)"\0\0\0\0", 4);
     SetSaveCtx sctx { ctx->buf, 0 };
-    hm_foreach(&ent->set, cb_set_member, &sctx);
+    hm_foreach(&entry_set(ent), cb_set_member, &sctx);
     memcpy(ctx->buf->data_begin + cnt_idx, &sctx.count, 4);
   }
   ctx->count++;
@@ -442,7 +442,7 @@ static bool rdb_load_string_entry(RDBCursor *c){
   // reconstruct the entry in the database
   Entry *ent = entry_new(T_STR);
   ent->key = key;
-  ent->str = val;
+  entry_str(ent) = val;
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
   hm_insert(&g_data.db, &ent->node);
   if (has_ttl){
@@ -506,7 +506,7 @@ static bool rdb_load_zset_entry(RDBCursor *c){
     }
 
     // insert into the zset
-    zset_insert(&ent->zset, name.data(), name.size(), score); 
+    zset_insert(&entry_zset(ent), name.data(), name.size(), score); 
   }
 
   // insert entry into main hashtable
@@ -549,8 +549,7 @@ static bool rdb_load_deque_entry(RDBCursor *c){
   uint32_t n = 0;
   if (!cursor_read_u32(c, &n)) { return false; }
 
-  Entry  *ent = entry_new(T_DLIST);
-  deque_init(&ent->deque);
+  Entry *ent = entry_new(T_DLIST);
   ent->key = key;
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
 
@@ -560,7 +559,7 @@ static bool rdb_load_deque_entry(RDBCursor *c){
       entry_del_sync(ent);
       return false;
     }
-    deque_push_back(&ent->deque, val);
+    deque_push_back(&entry_deque(ent), val);
   }
 
   hm_insert(&g_data.db, &ent->node);
@@ -608,7 +607,7 @@ static bool rdb_load_hash_entry(RDBCursor *c){
       entry_del(ent);
       return false;
     }
-    hash_set(&ent->hash, f, v);
+    hash_set(&entry_hash(ent), f, v);
   }
 
   hm_insert(&g_data.db, &ent->node);
@@ -645,7 +644,7 @@ static bool rdb_load_set_entry(RDBCursor *c){
   for (uint32_t i = 0; i < n; ++i){
     std::string m;
     if (!cursor_read_str(c, &m)){ return false; }
-    set_add(&ent->set, m);
+    set_add(&entry_set(ent), m);
   }
   hm_insert(&g_data.db, &ent->node);
   if (has_ttl){

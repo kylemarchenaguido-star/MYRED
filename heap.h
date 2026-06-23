@@ -9,3 +9,4 @@ struct HeapItem {
 };
 
 void heap_update(HeapItem *a, size_t pos, size_t len);
+// heap_delete / heap_upsert operate on g_data.heap and live in state.cpp

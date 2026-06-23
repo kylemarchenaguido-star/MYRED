@@ -1,6 +1,6 @@
 #pragma once
- #include <stdint.h>
- #include <stddef.h>
+#include <stdint.h>
+#include <stddef.h>
 
 // Buffer for the tcp protocol
 struct Buffer {
@@ -17,6 +17,6 @@ void buf_append(Buffer *buf, uint8_t Byte);
 void buf_append_u64(Buffer *buf, uint64_t val);
 void buf_append_str(Buffer *buf, const char *str, uint32_t len);
 void buf_consume(Buffer *buf, size_t n);
-size_t buf_size(Buffer *buf);
-uint8_t* buf_data(Buffer *buf);
+size_t buf_size(const Buffer *buf);
+uint8_t* buf_data(const Buffer *buf);
 void buf_destroy(Buffer *buf);

@@ -1,7 +1,7 @@
- #include "state.h"
- #include "common.h"
- #include <time.h>
- #include "hash.h"
+#include "state.h"
+#include "common.h"
+#include <time.h>
+#include "hash.h"
 
 GlobalData g_data;
 Config g_config;
@@ -34,15 +34,22 @@ bool entry_eq(HNode *node, HNode *key){
 Entry *entry_new(uint32_t type) {
   Entry *ent = new Entry();
   ent->type = type;
+  switch (type){
+    case T_STR: ent->val = std::string{}; break;
+    case T_ZSET: ent->val = ZSet{}; break;
+    case T_DLIST: ent->val = Deque{}; break;
+    case T_HASH: ent->val = EntryHash{}; break;
+    case T_SET: ent->val = EntrySet{}; break;
+  }
   return ent;
 }
 
 // set or remove the TTL
 void entry_set_ttl(Entry *ent, int64_t ttl_ms){
-  if (ttl_ms < 0 && ent->heap_idx != (size_t)-1){
+  if (ttl_ms < 0 && entry_has_ttl(ent)){
     // negative ttl -> remove ttl
     heap_delete(g_data.heap, ent->heap_idx);
-    ent->heap_idx = -1;
+    ent->heap_idx = NO_TTL;
   } else if (ttl_ms >= 0){
     // we add or update the data structure
     uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
@@ -57,11 +64,14 @@ void entry_del(Entry *ent){
   entry_set_ttl(ent, -1);
   // decide if use thread pool or synchronous
   size_t set_size = 0;
-  if ((ent->type == T_ZSET)){ hm_size(&ent->zset.hmap);} 
-  else if ((ent->type == T_SET)){ hm_size(&ent->set); } 
-
+  switch(ent->type){
+    case T_ZSET: set_size = hm_size(&entry_zset(ent).hmap); break;
+    case T_SET: set_size = hm_size(&entry_set(ent)); break;
+    case T_HASH: set_size = hm_size(&entry_hash(ent)); break;
+    case T_DLIST: set_size = entry_deque(ent).count; break;
+    default: break;
+  }
   constexpr size_t k_large_container_size = 1000;
-
   if (set_size > k_large_container_size){
     thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
   } else {
@@ -71,10 +81,13 @@ void entry_del(Entry *ent){
 
 // Delete the actual work
 void entry_del_sync(Entry *ent){
-  if (ent->type == T_ZSET)       { zset_clear(&ent->zset); }
-  else if (ent->type == T_DLIST) { deque_free(&ent->deque); }
-  else if (ent->type == T_HASH)  { hash_clear(&ent->hash); }
-  else if (ent->type == T_SET)  { set_clear(&ent->hash); }
+  switch(ent->type){
+    case T_ZSET: zset_clear(&entry_zset(ent)); break;
+    case T_SET: set_clear(&entry_set(ent)); break;
+    case T_HASH: hash_clear(&entry_hash(ent)); break;
+    case T_DLIST: deque_free(&entry_deque(ent)); break;
+    default: break;
+  }
   entry_set_ttl(ent, -1);
   delete ent;
 }
@@ -119,7 +132,7 @@ bool hnode_same(HNode *node, HNode *key){
 // report true so the caller can treat the key as missing. no TTL or not yet
 // expired -> false (entry stays).
 bool expire_if_needed(Entry *ent){
-  if (ent->heap_idx == (size_t)-1) { return false; }              // no TTL
+  if (!entry_has_ttl(ent)) { return false; }             // no TTL
   if (g_data.heap[ent->heap_idx].val > get_monotonic_msec()) {    // not expired yet
     return false;
   }
