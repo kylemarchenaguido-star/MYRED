@@ -30,7 +30,7 @@
 
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
-  fprintf(stderr, "[errno:%s\n]", msg);
+  fprintf(stderr, "[errno:%s]\n", msg);
 }
 
 static void die(const char *msg){
@@ -72,8 +72,9 @@ static int32_t handle_accept(int fd){
 
   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
   if (connfd < 0) {
-  msg_errno("accept() error");
-  return -1;
+    if (errno != EAGAIN){ msg_errno("accept() error"); }
+    msg_errno("accept() error");
+    return -1;
   }
   uint32_t ip = client_addr.sin_addr.s_addr;
   fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
@@ -101,6 +102,7 @@ static int32_t handle_accept(int fd){
   assert(!g_data.fd2conn[conn->fd]);
   // return the conn 
   g_data.g_total_connections++;
+  g_data.connected_clients++;
   g_data.fd2conn[conn->fd] = conn;
 
   return 0;
@@ -111,7 +113,7 @@ static void conn_destroy(Conn *conn){
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
   delete conn;
-  g_data.g_total_connections--;
+  g_data.connected_clients--;
 }
 
 // Timers logic 
@@ -122,12 +124,12 @@ static int32_t next_timer_ms() {
   // check the front of the idle_list 
   if (!dlist_empty(&g_data.idle_list)){
     Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
-    next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    next_ms = std::min(next_ms, conn->last_active_ms + k_idle_timeout_ms);
   }
   // check the front of the io_list 
   if (!dlist_empty(&g_data.io_list)){
     Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
-    next_ms = conn->last_active_ms + k_io_timeout_ms;
+    next_ms = std::min(next_ms, conn->last_active_ms + k_io_timeout_ms);
   }
   // check the heap
   if (!g_data.heap.empty()){
@@ -242,7 +244,8 @@ static bool try_one_request(Conn *conn){
 static void handle_write(Conn *conn){
   assert(buf_size(&conn->outgoing) > 0);
   ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_size(&conn->outgoing));
-  if(rv < 0 && errno == EAGAIN){return;}
+  if(rv < 0 && errno == EAGAIN){ return; }
+  if (rv < 0 && errno == EINTR){ return; }
 
   if (rv < 0) {
     conn->want_close = true;
@@ -261,6 +264,7 @@ static void handle_read(Conn *conn){
   uint8_t buf [64 * 1024];
   ssize_t rv = read(conn->fd, buf, sizeof(buf));
   if (rv < 0 && errno == EAGAIN){return;}
+  if (rv < 0 && errno == EINTR){ return; }
   if(rv <= 0) {
     conn->want_close = true;
     return;
@@ -284,10 +288,6 @@ static void handle_read(Conn *conn){
 }
 
 int main(){
-
-  g_config.password = "kek1234";
-  srand(time(NULL)); 
-
   // control for Ctrl-c
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
@@ -305,17 +305,28 @@ int main(){
     fprintf(stderr, "rdb_load failed, starting with empty database\n");
   }
 
+  const char *pass_env = getenv("MYRED_PASSWORD");
+  g_config.password = pass_env ? pass_env : "kek1234";
+
+  uint16_t port = 1234;
+  const char *port_env = getenv("MYRED_PORT");
+  if (port_env){
+    int p = atoi(port_env);
+    if (p > 0 && p < 65536){ port = (uint16_t)p; }
+  }
+
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
 
   int val = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)); // set the socket option like the time wait for the socket
+  setsockopt(fd, SOL_SOCKET,  SO_REUSEADDR, &val, sizeof(val));  
 
   // the is the parameter bind to 0.0.0.0: 1234
   struct sockaddr_in addr = {};
   addr.sin_family = AF_INET;
-  addr.sin_port = ntohs(1234);
-  addr.sin_addr.s_addr = ntohl(0);
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(0);
 
   int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
   if (rv) {die("bind()");}
@@ -355,7 +366,7 @@ int main(){
 
     // handle the listening socket
     if (poll_args[0].revents) {
-      handle_accept(fd);
+      while (handle_accept(fd) == 0) {}
     }
 
     //This is for to handle the connections of sockets

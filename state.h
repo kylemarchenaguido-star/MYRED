@@ -47,21 +47,20 @@ enum class ConnTimer {
 
 // Connections state and buffers 
 struct Conn {
-  // buffered input, output
-  Buffer incoming; // This two are for the buffers that we are gonna parse // data
-  Buffer outgoing; // the response 
-  int fd = -1; // this is for the event loop
-  bool want_read = false; // The the read and the write, is waiting for the fd api readiness
+  // Hot metadata: checked every event-loop iteration (fits in first cache line)
+  int fd = -1;
+  bool want_read = false;
   bool want_write = false;
   bool want_close = false;
   bool authenticaded = false;
-
+  // int(4) + bool×4(4) = 8 bytes 
   DList idle_node;
-  //Info commands stadistics and functions
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
-
   uint32_t failed_attemps = 0;
+  // 40 bytes total above → Buffer needs align 8, no padding needed
+  Buffer incoming;
+  Buffer outgoing;
 };
 
 // global hashtable

@@ -327,7 +327,7 @@ note for a future ZSET parity pass.
 `commands.cpp:2237-2415`. Every command does up to ~100 `std::string ==`
 comparisons plus a size check. Replace with a `static const
 std::unordered_map<std::string_view, Handler>` (or a perfect-hash/`switch` on a
-small command-id) keyed on `cmd[0]`, with arity validated inside each handler or
+small command-id keyed on `cmd[0]`, with arity validated inside each handler or
 via a table of `{min_args, max_args, fn}`. *Why:* O(1) dispatch, and it removes
 the single largest and most error-prone function in the file (arity bugs like the
 `mset` odd-size check are easy to get wrong when buried in the chain).
@@ -350,7 +350,7 @@ O(N) and avoids sorting. Minor unless unions are large.
 
 ### Clean code
 ⚪ **Inconsistent / typo'd error messages** throughout: `"WRONGTYPE wrong type"`
-vs `"WRONGTYPE Operation against a key holding the wrong kind of value"` vs
+vs `MSG_WRONGTYPE` vs
 `"WRONGTPE..."`; `"Opreation"`, `"excessds"`, `"maximun"`, `"succesfully"`. Define
 the standard messages once as named constants
 (`MSG_WRONGTYPE`, `MSG_NOT_INT`, …) and reuse. *Why:* consistency for clients and

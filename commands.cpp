@@ -12,6 +12,21 @@
 #include "hash.h"
 #include "set.h"
 #include <algorithm>
+#include <random>
+#include <unordered_map>
+#include <string_view>
+
+static constexpr const char *MSG_WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
+static constexpr const char *MSG_NOT_INT   = "ERR value is not an integer or out of range";
+static constexpr const char *MSG_NOT_FLOAT = "ERR value is not a valid float";
+static constexpr const char *MSG_SYNTAX    = "ERR syntax error";
+static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
+
+static std::mt19937_64 g_rng{std::random_device{}()};
+
+static size_t rand_idx(size_t n){
+  return std::uniform_int_distribution<size_t>(0 , n - 1)(g_rng);
+}
 
 enum class Lookup{
   OK,
@@ -19,7 +34,21 @@ enum class Lookup{
   WRONGTYPE
 };
 
-// Find (or optionally create) a key holding a specific type
+static bool str2dbl(const std::string &s, double &out){
+  char *endp = NULL;
+  out = strtod(s.c_str(), &endp); // endp points to the first wrong character
+  return endp == s.c_str() + s.size() && !isnan(out); // NaN = not a number
+}
+
+static bool str2int(const std::string &s, int64_t &out){
+  char *endp = NULL;
+  out = strtoll(s.c_str(), &endp, 10);
+  return endp == s.c_str() + s.size();
+}
+
+
+// WARNING: swaps cmd[i] into the LookupKey, leaving cmd[i] empty after the call.
+// If you need cmd[i] after the call, use a non-destructive hm_lookup copy instead.
 static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create, Entry **out_ent){
   LookupKey key;
   key.key.swap(keystr);
@@ -69,9 +98,6 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
   return resp_ok(out);
 }
 
-static bool str2dbl(const std::string &s, double &out);
-static bool str2int(const std::string &s, int64_t &out);
-
 // mult = 1000 for SETEX (s), mult = 1 for PSETEX (ms)
 static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mult){
   int64_t ttl = 0;
@@ -80,7 +106,7 @@ static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mu
   }
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTYPE Opreation against a key holding the wrong kind of value");
+    return resp_err(out, MSG_WRONGTYPE);
   }
   entry_str(ent).swap(cmd[3]);
   entry_set_ttl(ent, ttl * mult);
@@ -120,7 +146,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
     Entry *ent = container_of(node, Entry, node);
     if (!expire_if_needed(ent)){
       if (ent->type != T_STR){
-        return resp_err(out, "WRONGTYPE Operation against a key holding the wrong type of value");
+        return resp_err(out, MSG_WRONGTYPE);
       }
       std::string old = std::move(entry_str(ent)); // extract the old value
       entry_str(ent).swap(cmd[2]); // set the new value
@@ -169,21 +195,21 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
   for (char &c : opt){ c = (char)tolower((unsigned char)c); }
 
   if (opt == "persist"){
-    if (cmd.size() != 3){ return resp_err(out, "ERR syntax error"); }
+    if (cmd.size() != 3){ return resp_err(out, MSG_SYNTAX); }
     entry_set_ttl(ent, -1);
     return resp_str(out, entry_str(ent).data(), entry_str(ent).size());
   }
 
-  if (cmd.size() != 4){ return resp_err(out, "ERR syntax error"); }
+  if (cmd.size() != 4){ return resp_err(out, MSG_SYNTAX); }
   int64_t v = 0;
-  if (!str2int(cmd[3], v)){ return resp_err(out, "ERR value is not an integer or out of range"); }
+  if (!str2int(cmd[3], v)){ return resp_err(out, MSG_NOT_INT); }
 
   int64_t ttl_ms = 0;
   if (opt == "ex"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v * 1000; }
   else if (opt == "px"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v; }
   else if (opt == "exat"){ ttl_ms = v * 1000 - (int64_t)get_wall_msec(); }
   else if (opt == "pxat"){ ttl_ms = v - (int64_t)get_wall_msec(); }
-  else { return resp_err(out, "ERR syntax error"); }
+  else { return resp_err(out, MSG_SYNTAX); }
 
   if (ttl_ms <= 0){
     // past timestamp so we get the value then delete the key
@@ -214,7 +240,7 @@ static void do_mget(std::vector<std::string> &cmd, Buffer *out){
 static void do_append(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    return resp_err(out, MSG_WRONGTYPE);
   }
   entry_str(ent) += cmd[2];
   g_data.g_writes_since_save++;
@@ -225,7 +251,7 @@ static void do_append(std::vector<std::string> &cmd, Buffer *out){
 static void do_strlen(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   switch (lookup_entry(cmd[1], T_STR, false, &ent)){
-    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    case Lookup::WRONGTYPE: return resp_err(out, MSG_WRONGTYPE);
     case Lookup::MISSING:   return resp_int(out, 0);  // missing -> 0, not nil
     case Lookup::OK:        break;
   }
@@ -236,14 +262,14 @@ static void do_strlen(std::vector<std::string> &cmd, Buffer *out){
 static void do_getrange(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   switch (lookup_entry(cmd[1], T_STR, false, &ent)){
-    case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    case Lookup::WRONGTYPE: return resp_err(out, MSG_WRONGTYPE);
     case Lookup::MISSING:   return resp_str(out, "", 0);
     case Lookup::OK:        break;
   }
 
   int64_t start, end;
   if (!str2int(cmd[2], start) || !str2int(cmd[3], end)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
   }
 
   int64_t len = (int64_t)entry_str(ent).size();
@@ -265,19 +291,19 @@ static void do_getrange(std::vector<std::string> &cmd, Buffer *out){
 static void do_setrange(std::vector<std::string> &cmd, Buffer *out){
   int64_t offset = 0 ;
   if (!str2int(cmd[2], offset)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
   }
   if (offset < 0){
     return resp_err(out, "ERR offset is not an integer or out of range");
   }
   const int64_t MAX_OFFSET = 512LL * 1024 * 1024;
   if (offset >= MAX_OFFSET){
-    return resp_err(out, "ERR string excessds maximun allowed size (512MB)");
+    return resp_err(out, "ERR string exceeds maximun allowed size (512MB)");
   }
 
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong the kind of value");
+    return resp_err(out, MSG_WRONGTYPE);
   }
 
   size_t new_end = (size_t)offset + cmd[3].size();
@@ -293,6 +319,9 @@ static void do_setrange(std::vector<std::string> &cmd, Buffer *out){
 
 // MSET key val [key val ...]
 static void do_mset(std::vector<std::string> &cmd, Buffer *out){
+  if (cmd.size() < 3 || (cmd.size() & 1) == 0) {
+    return resp_err(out, "ERR wrong number of arguments for 'mset' command");
+  }
   // pre-scan: non-destructive check (copy, not swap) so cmd[i] survives for write pass
   for (size_t i = 1; i < cmd.size(); i += 2){
     LookupKey lk;
@@ -302,7 +331,7 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out){
     if (node){
       Entry *e = container_of(node, Entry, node);
       if (!expire_if_needed(e) && e->type != T_STR){
-        return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return resp_err(out, MSG_WRONGTYPE);
       }
     }
   }
@@ -318,6 +347,9 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out){
 
 // MSETNX key val [key val ...]
 static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
+  if (cmd.size() < 3 || (cmd.size() & 1) == 0) {
+    return resp_err(out, "ERR wrong number of arguments for 'mset' command");
+  }
   // existence check: copy, don't swap — cmd[i] must survive for the write pass
   for (size_t i = 1; i < cmd.size(); i += 2){
     LookupKey lk;
@@ -345,11 +377,11 @@ static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
 static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t delta){
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) ==  Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    return resp_err(out, MSG_WRONGTYPE);
   }
   int64_t cur = 0;
   if (!entry_str(ent).empty() && !str2int(entry_str(ent), cur)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
   }
   if ((delta > 0 && cur > INT64_MAX - delta) || (delta < 0 && cur < INT64_MIN - delta)){
     return resp_err(out, "ERR increment or decrement would overflow");
@@ -371,7 +403,7 @@ static void do_decr(std::vector<std::string> &cmd, Buffer *out){
 static void do_incrby(std::vector<std::string> &cmd, Buffer *out){
   int64_t delta = 0;
   if (!str2int(cmd[2], delta)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
   }
   incr_generic(cmd, out, delta);
 } 
@@ -379,7 +411,7 @@ static void do_incrby(std::vector<std::string> &cmd, Buffer *out){
 static void do_decrby(std::vector<std::string> &cmd, Buffer *out){
   int64_t by = 0;
   if (!str2int(cmd[2], by)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
   }
   // -INT64_MIN overflows int64
   if (by == INT64_MIN){
@@ -395,7 +427,7 @@ static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out){
   }
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    return resp_err(out, MSG_WRONGTYPE);
   }
   double cur = 0.0;
   if (!entry_str(ent).empty() && !str2dbl(entry_str(ent), cur)){
@@ -434,17 +466,15 @@ struct KeyStats {
   uint32_t with_ttl;
 };
 
-struct KeysCtx {
-  std::vector<std::string> *keys;
-};
-
-// Returns all the keys from the hashtable
-static bool cb_keys(HNode *node, void *arg){
-  auto *ctx = (KeysCtx *)arg;
-  Entry *ent = container_of(node, Entry, node);
-  ctx->keys->push_back(ent->key);
-  return true;
+// WARNING: O(N) full keyspace scan — blocks the event loop.
+// Never run against a large DB in production; steer clients to SCAN instead.
+static bool cb_keys_emit(HNode *node, void *arg) {
+    Buffer *out = (Buffer *)arg;
+    Entry *ent = container_of(node, Entry, node);
+    resp_str(out, ent->key.data(), ent->key.size());
+    return true;
 }
+
 
 // Gets all the keys for the stats 
 static bool cb_count_keys(HNode *node, void *args){
@@ -457,17 +487,12 @@ static bool cb_count_keys(HNode *node, void *args){
   return true;
 }
 
-static void do_keys(std::vector<std::string> &cmd, Buffer *out){
+static void do_keys(std::vector<std::string> &cmd, Buffer *out) {
   (void)cmd;
-  std::vector<std::string> keys;
-  KeysCtx ctx = {&keys};
-  hm_foreach(&g_data.db, cb_keys, &ctx);
-
-  resp_arr(out, (uint32_t)keys.size());
-  for (const auto &k : keys){
-    resp_str(out, k.data(), k.size());
-  }
+  resp_arr(out, (uint32_t)hm_size(&g_data.db));
+  hm_foreach(&g_data.db, cb_keys_emit, out);
 }
+
 
 static KeyStats get_keys_stats(){
   KeyStats stats = {0,0};
@@ -496,18 +521,6 @@ static size_t get_memory_usage(){
   return mem;
 }
 
-static bool str2dbl(const std::string &s, double &out){
-  char *endp = NULL;
-  out = strtod(s.c_str(), &endp); // endp points to the first wrong character
-  return endp == s.c_str() + s.size() && !isnan(out); // NaN = not a number
-}
-
-static bool str2int(const std::string &s, int64_t &out){
-  char *endp = NULL;
-  out = strtoll(s.c_str(), &endp, 10);
-  return endp == s.c_str() + s.size();
-}
-
 // shared by PEXPIRE (mult=1) and EXPIRE (mult=1000): set a TTL on a key.
 // non-positive TTL deletes the key (Redis semantics). returns 1 if the key
 // existed (ttl set or key deleted), 0 if missing.
@@ -525,6 +538,7 @@ static void expire_generic(std::vector<std::string> &cmd, Buffer *out, int64_t m
   if (!node) { return resp_int(out, 0); }
 
   Entry *ent = container_of(node, Entry, node);
+  if (expire_if_needed(ent)){ return resp_int(out, 0); }
   if (ttl_ms <= 0){
     // non-positive TTL means "already expired" -> delete now
     hm_delete(&g_data.db, &ent->node, &hnode_same);
@@ -828,8 +842,7 @@ static void do_bgsave(std::vector<std::string> &cmd, Buffer *out){
 }
 
 // asyncdel key - delete in background
-static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  (void)conn; // not used; kept for dispatch signature symmetry
+static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out){
   // look the key
   LookupKey key;
   key.key.swap(cmd[1]);
@@ -845,15 +858,7 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   entry_set_ttl(ent, -1);
 
   // check if need offloading
-  size_t set_size = 0;
-  if (ent->type ==  T_ZSET){ set_size = hm_size(&entry_zset(ent).hmap); }
-  else if (ent->type == T_SET){ set_size = hm_size(&entry_set(ent)); }
-
-  if (set_size > 1000){
-    thread_pool_queue(&g_data.thread_pool, entry_del_func, ent);
-  } else {
-    entry_del_sync(ent);
-  }
+  entry_del(ent);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
@@ -971,7 +976,7 @@ void do_lpop(std::vector<std::string> &cmd, Buffer *out){
 
   // if list is now empty, delete the key
   if (entry_deque(ent).count == 0){
-    hm_delete(&g_data.db, &ent->node, &entry_eq);
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
   g_data.g_writes_since_save++;
@@ -991,7 +996,7 @@ void do_rpop(std::vector<std::string> &cmd, Buffer *out){
   if (!deque_pop_back(&entry_deque(ent), &val)){ return resp_nil(out); }
   // if list is now empty, delete the key
   if (entry_deque(ent).count == 0){
-    hm_delete(&g_data.db, &ent->node, &entry_eq);
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
   }
   g_data.g_writes_since_save++;
@@ -1081,7 +1086,7 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
   idx = deque_normalize(&entry_deque(ent), idx);
 
   if (idx < 0 || idx >= (int64_t)entry_deque(ent).count){
-    return resp_err(out, "ERR index out of range");
+    return resp_err(out, MSG_OUT_OF_RANGE);
   }
 
   // direct write
@@ -1150,7 +1155,7 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   bool before = false;
   if (cmd[2] == "before") { before = true; }
   else if (cmd[2] == "after") { before = false; }
-  else { return resp_err(out, "ERR syntax error"); }
+  else { return resp_err(out, MSG_SYNTAX); }
 
   if (!ent){ return resp_int(out, 0); } // key does not exist
 
@@ -1292,69 +1297,83 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
 //   [abc]    one of a set;  [a-z] range;  [^...] negation
 //   \x       escape: match x literally
 // p/plen = pattern, s/slen = string. recursive on '*'.
-static bool glob_match(const char *p, size_t plen, const char *s, size_t slen){
-  while (plen > 0){
-    switch (p[0]){
-      case '*':
-        while (plen > 1 && p[1] == '*'){ p++; plen--; }     // collapse "**"
-        if (plen == 1){ return true; }                       // trailing '*' eats the rest
-        // try matching the rest of the pattern at every split of s
-        for (size_t i = 0; i <= slen; i++){
-          if (glob_match(p + 1, plen - 1, s + i, slen - i)){ return true; }
-        }
-        return false;
-      case '?':
-        if (slen == 0){ return false; }                      // needs one char
-        s++; slen--;
-        break;
-        // this bombed is dark magic how iterate over the string 
-      case '[': {
-        if (slen == 0){ return false; }
-        const char *cp = p + 1; size_t crem = plen - 1;
-        bool negate = false;
-        if (crem > 0 && cp[0] == '^'){ negate = true; cp++; crem--; }
-        bool matched = false;
-        while (crem > 0 && cp[0] != ']'){
-          if (cp[0] == '\\' && crem >= 2){                   // escaped char in class
-            if (cp[1] == s[0]){ matched = true; }
-            cp += 2; crem -= 2;
-          } else if (crem >= 3 && cp[1] == '-' && cp[2] != ']'){  // range a-z // what is this bomboclat ???
-            char lo = cp[0], hi = cp[2];
-            if (lo > hi){ char t = lo; lo = hi; hi = t; }
-            if (s[0] >= lo && s[0] <= hi){ matched = true; }
-            cp += 3; crem -= 3;
-          } else {                                           // single char
-            if (cp[0] == s[0]){ matched = true; }
-            cp++; crem--;
-          }
-        }
-        if (crem > 0 && cp[0] == ']'){ cp++; crem--; }        // step past ']'
-        if (negate){ matched = !matched; }
-        if (!matched){ return false; }
-        s++; slen--;
-        p = cp; plen = crem;                                 // pattern advanced past the class
-        continue;                                            // skip the p++ below
+static bool glob_match(const char *p, size_t plen, const char *s, size_t slen) {
+  const char *bp = nullptr; size_t bplen = 0;
+  const char *bs = nullptr; size_t bslen = 0;
+
+  while (true) {
+      while (plen > 0 && p[0] == '*') {
+          while (plen > 1 && p[1] == '*') { p++; plen--; }
+          if (plen == 1) return true;
+          bp = p + 1; bplen = plen - 1;
+          bs = s;     bslen = slen;
+          p++; plen--;
       }
 
-      case '\\':
-        if (plen >= 2){ p++; plen--; }                       // consume the backslash
-        // fallthrough-style literal compare:
-        if (slen == 0 || p[0] != s[0]){ return false; }
-        s++; slen--;
-        break;
+      if (plen == 0 && slen == 0) return true;
+      if (plen == 0 || slen == 0) {
+          if (!bp) return false;
+          bs++; bslen--;
+          p = bp; plen = bplen;
+          s = bs; slen = bslen;
+          continue;
+      }
 
-      default:
-        if (slen == 0 || p[0] != s[0]){ return false; }
-        s++; slen--;
-        break;
-    }
-    p++; plen--;
+      bool matched = false;
+      size_t pat_step = 1;
+      switch (p[0]) {
+          case '?':
+              matched = true;
+              break;
+          case '[': {
+              const char *cp = p + 1; size_t crem = plen - 1;
+              bool negate = (crem > 0 && cp[0] == '^');
+              if (negate) { cp++; crem--; }
+              bool hit = false;
+              while (crem > 0 && cp[0] != ']') {
+                  if (cp[0] == '\\' && crem >= 2) {
+                      if (cp[1] == s[0]) hit = true;
+                      cp += 2; crem -= 2;
+                  } else if (crem >= 3 && cp[1] == '-' && cp[2] != ']') {
+                      char lo = cp[0], hi = cp[2];
+                      if (lo > hi) { char t = lo; lo = hi; hi = t; }
+                      if (s[0] >= lo && s[0] <= hi) hit = true;
+                      cp += 3; crem -= 3;
+                  } else {
+                      if (cp[0] == s[0]) hit = true;
+                      cp++; crem--;
+                  }
+              }
+              if (crem > 0 && cp[0] == ']') { cp++; crem--; }
+              matched = negate ? !hit : hit;
+              pat_step = plen - crem;
+              break;
+          }
+          case '\\':
+              if (plen < 2) { matched = false; break; }
+              matched = (p[1] == s[0]);
+              pat_step = 2;
+              break;
+          default:
+              matched = (p[0] == s[0]);
+              break;
+      }
+
+      if (matched) {
+          p += pat_step; plen -= pat_step;
+          s++; slen--;
+      } else {
+          if (!bp) return false;
+          bs++; bslen--;
+          p = bp; plen = bplen;
+          s = bs; slen = bslen;
+      }
   }
-  return slen == 0;   // pattern consumed -> match iff string is also consumed
 }
 
+
 struct ScanCtx {
-  std::vector<std::string> *keys;
+  std::vector<std::string> *out;
   const std::string *pattern; // nullptr if no match
 };
 
@@ -1370,7 +1389,7 @@ static void cb_scan(HNode *node, void *arg){
     return;
   }
 
-  ctx->keys->push_back(ent->key);
+  ctx->out->push_back(ent->key);
 }
 
 // SCAN cursor [MATCH PATTERN] [COUNT n]
@@ -1393,7 +1412,7 @@ static void do_scan(std::vector<std::string> &cmd, Buffer *out){
       pat = cmd[i+1];
       pattern = &pat;
     } else {
-      return resp_err(out, "ERR syntax error");
+      return resp_err(out, MSG_SYNTAX);
     }
   }
 
@@ -1485,20 +1504,22 @@ static void do_hlen(std::vector<std::string> &cmd, Buffer *out){
 }
 
 // shared by HGETALL(0), HKEYS(1), HVALS(2)
-struct HCollect { 
-  std::vector<std::string> *out; 
+struct HEmit { 
+  Buffer *out;
   int mode;
 };
-// bull ↑ and shit ↓
-static bool cb_hcollect(HNode *node, void *arg){
-  HCollect *c = (HCollect *)arg;
+
+static bool cb_hemit(HNode *node, void *arg){
+  HEmit *c = (HEmit *)arg;
   HashNode *hn = container_of(node, HashNode, node);
   if (c->mode == 0){ 
-    c->out->push_back(hn->field);
-    c->out->push_back(hn->value);
+    resp_str(c->out, hn->field.data(), hn->field.size());
+    resp_str(c->out, hn->value.data(), hn->value.size());
   } else if (c->mode == 1){
-    c->out->push_back(hn->field);
-  } else { c->out->push_back(hn->value); }
+    resp_str(c->out, hn->field.data(), hn->field.size());
+  } else { 
+    resp_str(c->out, hn->value.data(), hn->value.size());
+  }
   return true;
 }
 
@@ -1509,12 +1530,10 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out, int mode
     case Lookup::MISSING: return resp_arr(out, 0);
     case Lookup::OK:  break;
   }
-  std::vector<std::string> items;
-  HCollect c { &items, mode };
-
-  hm_foreach(&entry_hash(ent), cb_hcollect, &c);
-  resp_arr(out,(uint32_t)items.size());
-  for (const auto &s : items){ resp_str(out, s.data(), s.size()); }
+  size_t n = hm_size(&entry_hash(ent));
+  resp_arr(out, (uint32_t)(mode == 0 ? n * 2 : n));
+  HEmit c { out, mode };
+  hm_foreach(&entry_hash(ent), cb_hemit, &c);
 }
 
 static void do_hgetall(std::vector<std::string> &cmd, Buffer *out){ h_collect_reply(cmd, out, 0); }
@@ -1552,7 +1571,7 @@ static void do_hsetnx(std::vector<std::string> &cmd, Buffer *out){
 static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
   int64_t incr = 0;
   if (!str2int(cmd[3], incr)){ 
-    return resp_err(out, "ERR value is not an integer or out of range"); 
+    return resp_err(out, MSG_NOT_INT); 
   }
 
   Entry *ent;
@@ -1586,14 +1605,8 @@ static void do_hstrlen(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, hn ? (int64_t)hn->value.size() : 0);
 }
 
-// HSCAN support
-struct HScanCtx{
-  std::vector<std::string> *out; // flat (field, value ...)
-  const std::string *pattern; // match applies to the field name
-};
-
 static void cb_hscan(HNode *node, void *arg){
-  HScanCtx *c = (HScanCtx *)arg;
+  ScanCtx *c = (ScanCtx *)arg;
   HashNode *hn = container_of(node, HashNode, node);
   if (c->pattern && !glob_match(c->pattern->data(), c->pattern->size(), hn->field.data(), hn->field.size())){
     return;
@@ -1625,7 +1638,7 @@ static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
       pat = cmd[i + 1];
       pattern = &pat;
     } else {
-      return resp_err(out, "ERR syntax error");
+      return resp_err(out, MSG_SYNTAX);
     }
   }
 
@@ -1637,7 +1650,7 @@ static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
     return;
   }
   std::vector<std::string> items;
-  HScanCtx ctx { &items, pattern };
+  ScanCtx ctx { &items, pattern };
   uint64_t next = hm_scan(&entry_hash(ent), (uint64_t)cursor, count ,cb_hscan, &ctx);
 
   std::string cur = std::to_string(next);
@@ -1671,7 +1684,7 @@ static void do_flushall(std::vector<std::string> &cmd, Buffer *out){
   return resp_ok(out);
 }
 
-// RANDOMKEY -> a random key (crazy this trash (garbage))
+// RANDOMKEY -> a random key 
 struct RandKeyCtx{ 
   std::string key;
   size_t seen;
@@ -1680,7 +1693,7 @@ struct RandKeyCtx{
 static bool cb_randomkey(HNode *node, void *arg){
   RandKeyCtx *ctx = (RandKeyCtx *)arg; 
   ctx->seen++;
-  if ((size_t)(rand() % ctx->seen) == 0){
+  if ((size_t)(rand_idx(ctx->seen)) == 0){
     ctx->key = container_of(node, Entry, node)->key;
   }
   return true;
@@ -1765,13 +1778,15 @@ static void expireat_generic(std::vector<std::string> &cmd, Buffer *out, int64_t
   key.node.hcode = str_hash((const uint8_t *)key.key.data(), key.key.size());
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node){ return resp_int(out, 0); }
+
   Entry *ent = container_of(node, Entry, node);
-  
+  if (expire_if_needed(ent)){ return resp_int(out, 0); }
+
   // absolute -> remamining 
   int64_t remaining = abs_ms - (int64_t)get_wall_msec();
   // already past -> delete
   if (remaining <= 0){
-    hm_delete(&g_data.db, &ent->node, *hnode_same);
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
     g_data.g_writes_since_save++;
     return resp_int(out, 1);
@@ -1796,7 +1811,14 @@ static bool cb_collect_members(HNode *node, void *arg){
   return true;
 }
 
-// Read-only lookup 
+static bool cb_members_emit(HNode *node, void *arg){
+  Buffer *out = (Buffer *)arg;
+  resp_str(out, container_of(node, SetNode, node)->member.data(), container_of(node, SetNode, node)->member.size());
+  return true;
+}
+
+// Non-destructive — takes const ref, makes an internal copy of the key for hashing.
+// Use for all read-only lookups (GET, HGET, EXPIRE, etc.)
 static Entry *lookup_set_ro(const std::string &key, bool *wrongtype){
   LookupKey lk; lk.key = key;
   lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
@@ -1804,7 +1826,7 @@ static Entry *lookup_set_ro(const std::string &key, bool *wrongtype){
 
   if (!node){ return nullptr; }
   Entry *ent= container_of(node, Entry, node);
-  // key is missing ?? i am dumb asfck
+  // key is missing ?? 
   if (expire_if_needed(ent)){ return nullptr; }
   if (ent->type != T_SET){ *wrongtype = true; return nullptr; }
   return ent;
@@ -1901,7 +1923,7 @@ static bool sdiff_impl(std::vector<std::string> &cmd, size_t start, std::vector<
 static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent; 
   if (lookup_entry(cmd[1], T_SET, true, &ent) == Lookup::WRONGTYPE){
-    return resp_err(out, "WRONGTPE wrong type");
+    return resp_err(out, "WRONGTYPE wrong type");
   }
   int64_t added = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
@@ -1974,10 +1996,8 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return resp_arr(out, 0);
     case Lookup::OK:  break;
   }
-  std::vector<std::string> members;
-  hm_foreach(&entry_set(ent), cb_collect_members, &members);
-  resp_arr(out, (uint32_t)members.size());
-  for (auto &m : members){ resp_str(out, m.data(), m.size()); }
+  resp_arr(out, (uint32_t)hm_size(&entry_set(ent)));
+  hm_foreach(&entry_set(ent), cb_members_emit, out);
 }
 
 // SPOP key [count]
@@ -1996,7 +2016,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
 
   if (cmd.size() == 2){
     // single pop - pick one random member
-    size_t idx = (size_t)(rand() % members.size());
+    size_t idx = (size_t)(rand_idx(members.size()));
     const std::string &picked = members[idx];
     resp_str(out, picked.data(), picked.size());
     set_remove(&entry_set(ent), picked);
@@ -2009,7 +2029,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     // partial Fisher-Yates: shuffle the first 'n' slots
     size_t n = ((size_t)count < members.size()) ? (size_t)count : members.size();
     for (size_t i =0; i < n; ++i){
-      size_t j = i + (size_t)(rand() % (members.size() - i));
+      size_t j = i + (size_t)(rand_idx(members.size() - i));
       std::swap(members[i], members[j]);
     }
     resp_arr(out, (uint32_t)n);
@@ -2039,13 +2059,13 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
     return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
   }
  if (cmd.size() == 2){
-    size_t idx = (size_t)(rand() % members.size());
+    size_t idx = (size_t)(rand_idx(members.size()));
     return resp_str(out, members[idx].data(), members[idx].size());
  }
 
  int64_t count = 0;
  if (!str2int(cmd[2], count)){
-    return resp_err(out, "ERR value is not an integer or out of range");
+    return resp_err(out, MSG_NOT_INT);
  }
  if (count == 0){ return resp_arr(out, 0); }
 
@@ -2053,7 +2073,7 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
   // distinct members up to min(count, size)
   size_t n = ((size_t)count < members.size() ? (size_t)count : members.size());
   for (size_t i = 0; i < n; ++i){
-    size_t j = i + (size_t)(rand() % (members.size() - i));
+    size_t j = i + (size_t)(rand_idx(members.size() - i));
     std::swap(members[i], members[j]);
   }
   resp_arr(out, (uint32_t)n);
@@ -2065,20 +2085,14 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
   size_t n = (size_t)(-count);
   resp_arr(out, (uint32_t)n);
   for (size_t i = 0; i < n; ++i){
-    size_t idx = (size_t)(rand() % members.size());
+    size_t idx = (size_t)(rand_idx(members.size()));
     resp_str(out, members[idx].data(), members[idx].size());
   }
  }
 }
 
-// SSCAN key cursor [MATCH pat] [COUNT n]
-struct SScanCtx{
-  std::vector<std::string> *out;
-  const std::string *pattern; // nullptr = no filter
-};
-
 static void cb_sscan(HNode *node, void *arg){
-  SScanCtx *c = (SScanCtx *)arg;
+  ScanCtx *c = (ScanCtx *)arg;
   SetNode *sn = container_of(node, SetNode, node);
   if (c->pattern && !glob_match(c->pattern->data(),c->pattern->size(), sn->member.data(),sn->member.size())){
     return;
@@ -2108,7 +2122,7 @@ static void do_sscan(std::vector<std::string> &cmd, Buffer *out){
       pat = cmd[i + 1];
       pattern = &pat;
     } else {
-      return resp_err(out, "ERR syntax error");
+      return resp_err(out, MSG_SYNTAX);
     }
   }
   resp_arr(out, 2);
@@ -2118,7 +2132,7 @@ static void do_sscan(std::vector<std::string> &cmd, Buffer *out){
     return;
   }
   std::vector<std::string> items;
-  SScanCtx ctx { &items, pattern };
+  ScanCtx ctx { &items, pattern };
   uint64_t next = hm_scan(&entry_set(ent), (uint64_t)cursor, count, cb_sscan, &ctx);
   std::string cur = std::to_string(next);
   resp_str(out, cur.data(), cur.size());
@@ -2215,6 +2229,114 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, 1);
 }
 
+using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
+
+struct CmdSpec {
+  CmdFn fn;
+  int min_args;
+  int max_args;
+};
+
+static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
+  // strings
+  {"get",          {do_get,           2,  2}},
+  {"set",          {do_set,           3,  3}},
+  {"incr",         {do_incr,          2,  2}},
+  {"decr",         {do_decr,          2,  2}},
+  {"incrby",       {do_incrby,        3,  3}},
+  {"decrby",       {do_decrby,        3,  3}},
+  {"incrbyfloat",  {do_incrbyfloat,   3,  3}},
+  {"setex",        {do_setex,         4,  4}},
+  {"psetex",       {do_psetex,        4,  4}},
+  {"setnx",        {do_setnx,         3,  3}},
+  {"getset",       {do_getset,        3,  3}},
+  {"getdel",       {do_getdel,        2,  2}},
+  {"getex",        {do_getex,         2, -1}},
+  {"append",       {do_append,        3,  3}},
+  {"strlen",       {do_strlen,        2,  2}},
+  {"getrange",     {do_getrange,      4,  4}},
+  {"setrange",     {do_setrange,      4,  4}},
+  {"mget",         {do_mget,          2, -1}},
+  {"mset",         {do_mset,          3, -1}},   // odd-argc check is inside handler
+  {"msetnx",       {do_msetnx,        3, -1}},   // odd-argc check is inside handler
+  // generic key
+  {"del",          {do_del,           2, -1}},
+  {"exists",       {do_exists,        2, -1}},
+  {"type",         {do_type,          2,  2}},
+  {"rename",       {do_rename,        3,  3}},
+  {"renamenx",     {do_renamenx,      3,  3}},
+  {"touch",        {do_touch,         2, -1}},
+  {"unlink",       {do_asyncdel,      2,  2}},
+  {"keys",         {do_keys,          1,  1}},
+  {"scan",         {do_scan,          2, -1}},
+  {"randomkey",    {do_randomkey,     1,  1}},
+  {"dbsize",       {do_dbsize,        1,  1}},
+  {"flushall",     {do_flushall,      1,  1}},
+  {"flushdb",      {do_flushall,      1,  1}},
+  // ttl
+  {"expire",       {do_expire,        3,  3}},
+  {"pexpire",      {do_pexpire,       3,  3}},
+  {"expireat",     {do_expireat,      3,  3}},
+  {"pexpireat",    {do_pexpireat,     3,  3}},
+  {"ttl",          {do_ttl_seconds,   2,  2}},
+  {"pttl",         {do_ttl,           2,  2}},
+  {"persist",      {do_persist,       2,  2}},
+  // sorted set
+  {"zadd",         {do_zadd,          4,  4}},
+  {"zrem",         {do_zrem,          3,  3}},
+  {"zscore",       {do_zscore,        3,  3}},
+  {"zrank",        {do_zrank,         3,  3}},
+  {"zquery",       {do_zquery,        6,  6}},
+  {"zrevquery",    {do_zquery_reversed, 6, 6}},
+  // list
+  {"lpush",        {do_lpush,         3, -1}},
+  {"rpush",        {do_rpush,         3, -1}},
+  {"lpop",         {do_lpop,          2,  2}},
+  {"rpop",         {do_rpop,          2,  2}},
+  {"llen",         {do_llen,          2,  2}},
+  {"lindex",       {do_lindex,        3,  3}},
+  {"lrange",       {do_lrange,        4,  4}},
+  {"lset",         {do_lset,          4,  4}},
+  {"linsert",      {do_linsert,       5,  5}},
+  {"lrem",         {do_lrem,          4,  4}},
+  {"ltrim",        {do_ltrim,         4,  4}},
+  // hash
+  {"hset",         {do_hset,          4, -1}},
+  {"hget",         {do_hget,          3,  3}},
+  {"hdel",         {do_hdel,          3, -1}},
+  {"hexists",      {do_hexists,       3,  3}},
+  {"hlen",         {do_hlen,          2,  2}},
+  {"hgetall",      {do_hgetall,       2,  2}},
+  {"hkeys",        {do_hkeys,         2,  2}},
+  {"hvals",        {do_hvals,         2,  2}},
+  {"hmget",        {do_hmget,         3, -1}},
+  {"hsetnx",       {do_hsetnx,        4,  4}},
+  {"hincrby",      {do_hincrby,       4,  4}},
+  {"hstrlen",      {do_hstrlen,       3,  3}},
+  {"hscan",        {do_hscan,         3, -1}},
+  // set
+  {"sadd",         {do_sadd,          3, -1}},
+  {"srem",         {do_srem,          3, -1}},
+  {"sismember",    {do_sismember,     3,  3}},
+  {"smismember",   {do_smismember,    3, -1}},
+  {"scard",        {do_scard,         2,  2}},
+  {"smembers",     {do_smembers,      2,  2}},
+  {"spop",         {do_spop,          2,  3}},
+  {"srandmember",  {do_srandmember,   2,  3}},
+  {"sscan",        {do_sscan,         3, -1}},
+  {"sinter",       {do_sinter,        2, -1}},
+  {"sunion",       {do_sunion,        2, -1}},
+  {"sdiff",        {do_sdiff,         2, -1}},
+  {"sinterstore",  {do_sinterstore,   3, -1}},
+  {"sunionstore",  {do_sunionstore,   3, -1}},
+  {"sdiffstore",   {do_sdiffstore,    3, -1}},
+  {"smove",        {do_smove,         4,  4}},
+  // server
+  {"info",         {do_info,          1,  1}},
+  {"save",         {do_save,          1,  1}},
+  {"bgsave",       {do_bgsave,        1,  1}},
+};
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -2226,7 +2348,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   }
 
   // AUTH always allowed
-  if (cmd.size() == 2 && cmd[0] == "auth") {
+  if (cmd[0] == "auth") {
     return do_auth(cmd, out, conn);
   }
 
@@ -2235,183 +2357,15 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     return resp_err(out, "NOAUTH authentication required");
   }
 
-  if (cmd.size() == 2 && cmd[0] == "get") {
-    do_get(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "set") {
-    do_set(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "incr") {
-      do_incr(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "setex") {
-    do_setex(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "psetex") {
-      do_psetex(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "setnx") {
-      do_setnx(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "getset") {
-      do_getset(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "getdel") {
-      do_getdel(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "getex") {
-    do_getex(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "append") {
-    do_append(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "strlen") {
-    do_strlen(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "getrange") {
-    do_getrange(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "setrange") {
-    do_setrange(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "decr") {
-      do_decr(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "incrby") {
-      do_incrby(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "decrby") {
-      do_decrby(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "incrbyfloat") {
-      do_incrbyfloat(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "mget") {
-      do_mget(cmd, out);
-  } else if (cmd.size() >= 3 && (cmd.size() & 1) == 1 && cmd[0] == "mset") {
-      do_mset(cmd, out);
-  } else if (cmd.size() >= 3 && (cmd.size() & 1) == 1 && cmd[0] == "msetnx") {
-      do_msetnx(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "del") {
-    do_del(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
-    do_pexpire(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "pttl") {
-    do_ttl(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "keys") {
-    do_keys(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "zadd") {
-    do_zadd(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zrem") {
-    do_zrem(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zscore") {
-    do_zscore(cmd, out);
-  } else if (cmd.size() == 6 && cmd[0] == "zquery") {
-    do_zquery(cmd, out);
-  } else if (cmd.size() == 6 && cmd[0] == "zrevquery") {
-    do_zquery_reversed(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "zrank") {
-    do_zrank(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "info") {
-    do_info(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "save") {
-    do_save(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "bgsave") {
-    do_bgsave(cmd,out);
-  } else if (cmd.size() >= 3 && cmd[0] == "lpush") {
-    do_lpush(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "rpush") {
-    do_rpush(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "lpop") {
-    do_lpop(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "rpop") {
-    do_rpop(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "llen") {
-    do_llen(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "lindex") {
-    do_lindex(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "lrange") {
-    do_lrange(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "lset") {
-    do_lset(cmd, out);
-  } else if (cmd.size() == 5 && cmd[0] == "linsert") {
-    do_linsert(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "lrem") {
-    do_lrem(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "ltrim") {
-    do_ltrim(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "exists") {
-    do_exists(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "type") {
-    do_type(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "expire") {
-    do_expire(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "ttl") {
-    do_ttl_seconds(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "persist") {
-    do_persist(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "scan") {
-    do_scan(cmd, out);
-  } else if (cmd.size() >= 4 && cmd[0] == "hset") {
-    do_hset(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "hget") {
-    do_hget(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "hdel") {
-    do_hdel(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "hexists") {
-    do_hexists(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "hlen") {
-    do_hlen(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "hgetall") {
-    do_hgetall(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "hkeys") {
-    do_hkeys(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "hvals") {
-    do_hvals(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "hmget") {
-    do_hmget(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "dbsize") {
-    do_dbsize(cmd, out);
-  } else if (cmd.size() == 1 && (cmd[0] == "flushall" || cmd[0] == "flushdb")) {
-    do_flushall(cmd, out);
-  } else if (cmd.size() == 1 && cmd[0] == "randomkey") {
-    do_randomkey(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "rename") {
-    do_rename(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "renamenx") {
-    do_renamenx(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "touch") {
-    do_touch(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "unlink") {
-    do_asyncdel(cmd, out, conn);
-  } else if (cmd.size() == 3 && cmd[0] == "expireat") {
-    do_expireat(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "pexpireat") {
-    do_pexpireat(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "hsetnx") {
-    do_hsetnx(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "hincrby") {
-    do_hincrby(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "hstrlen") {
-    do_hstrlen(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "hscan") {
-    do_hscan(cmd, out);  
-  } else if (cmd.size() >= 3 && cmd[0] == "sadd") {
-    do_sadd(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "srem") {
-    do_srem(cmd, out);
-  } else if (cmd.size() == 3 && cmd[0] == "sismember") {
-    do_sismember(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "smismember") {
-    do_smismember(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "scard") {
-    do_scard(cmd, out);
-  } else if (cmd.size() == 2 && cmd[0] == "smembers") {
-    do_smembers(cmd, out);
-  } else if (cmd.size() >= 2 && cmd.size() <= 3 && cmd[0] == "spop") {
-    do_spop(cmd, out);
-  } else if (cmd.size() >= 2 && cmd.size() <= 3 && cmd[0] == "srandmember") {
-    do_srandmember(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "sscan") {
-    do_sscan(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "sinter") {
-    do_sinter(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "sunion") {
-    do_sunion(cmd, out);
-  } else if (cmd.size() >= 2 && cmd[0] == "sdiff") {
-    do_sdiff(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "sinterstore") {
-    do_sinterstore(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "sunionstore") {
-    do_sunionstore(cmd, out);
-  } else if (cmd.size() >= 3 && cmd[0] == "sdiffstore") {
-    do_sdiffstore(cmd, out);
-  } else if (cmd.size() == 4 && cmd[0] == "smove") {
-    do_smove(cmd, out);
-  } else {
-    resp_err(out, "ERR unknown command");
+  auto it = k_cmd_table.find(cmd[0]);
+  if (it == k_cmd_table.end()){
+    return resp_err(out, "ERR unknown command");
   }
+
+  const CmdSpec &spec = it->second;
+  int argc = (int)cmd.size();
+  if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
+    return resp_err(out, "ERR wrong number of arguments");
+  }
+  spec.fn(cmd, out);
 }

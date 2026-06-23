@@ -10,6 +10,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 
 pid_t g_rdb_child_pid = -1;
 
@@ -817,6 +820,33 @@ bool rdb_load(const char *filename){
   return true; // start empty 
 }
 
+// Called only in the forked child, Uses only POSIX syscall - no malloc and no stdio.
+static void rdb_write_snapshot(const Buffer *buf, const char *filename){
+  char tmp[256];
+  snprintf(tmp, sizeof(tmp), "%s.tmp.%d", filename, (int)getpid());
+
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0){ _exit(1); }
+
+  const uint8_t *data = buf->data_begin;
+  size_t remaining = buf_size(buf);
+  while (remaining > 0){
+    ssize_t n = write(fd, data, remaining);
+    if (n < 0){
+      // interrupted by signal, retry
+      if (errno == EINTR){ continue; }
+      close(fd); unlink(tmp); _exit(1); 
+    }
+    data += n;
+    remaining -= (size_t)n;
+  }
+
+  if (fsync(fd) != 0){ close(fd); unlink(tmp); _exit(1); }
+  close(fd);
+  if (rename(tmp, filename) != 0){ unlink(tmp); _exit(1); }
+  _exit(0);
+}
+
 //  rdb save with fork 
 void rdb_save_background(){
   // dont start a fork is one is running
@@ -825,21 +855,26 @@ void rdb_save_background(){
     return;
   }
 
-  pid_t pid = fork();
+  // Serialize entirely in the parent - all malloc happens here, before fork
+  Buffer buf = buf_create(64 * 1024);
+  RDBStats stats = {};
+  rdb_serialize(&buf, &stats);
 
+  // Fork. chiled inherits the fully_built buffers as a COW copy
+  pid_t pid = fork();
   if (pid < 0){
     fprintf(stderr, "rdb_save_background: fork failed: %s\n", strerror(errno));
+    buf_destroy(&buf);
     return;
   }
 
   if (pid == 0){
-    // this is the child proccess and cannot touch the event loop......
-    bool ok = rdb_save("dump.rdb");
-
-    // exits with status code
-    _exit(ok ? 0 : 1);
+    // child, only syscalls from here
+    rdb_write_snapshot(&buf, "dump.rdb");
   }
 
+  // Parent release our copy of the buffer 
+  buf_destroy(&buf);
   g_rdb_child_pid = pid;
   fprintf(stderr, "rdb_save_background: started (pid=%d)\n", pid);
 }   
@@ -862,9 +897,13 @@ void rdb_check_background_save(){
     // child finished
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0){
       fprintf(stderr, "rdb_save_background: completed succesfully\n");
+      struct stat st;
+      if (stat("dump.rdb", &st) == 0) {
+        g_data.g_last_save_size_bytes = (size_t)st.st_size;
+      }
+      g_data.g_last_save_ok = true;
       g_data.g_last_save_ms = get_monotonic_msec();
       g_data.g_writes_since_save = 0;
-      g_data.g_last_save_ok = true;
     } else {
       fprintf(stderr, "rdb_save_background: child failed (status=%d\n", status);
       g_data.g_last_save_ok = false;
