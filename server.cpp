@@ -73,7 +73,6 @@ static int32_t handle_accept(int fd){
   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
   if (connfd < 0) {
     if (errno != EAGAIN){ msg_errno("accept() error"); }
-    msg_errno("accept() error");
     return -1;
   }
   uint32_t ip = client_addr.sin_addr.s_addr;

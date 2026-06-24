@@ -823,8 +823,7 @@ static void do_save(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "ERR background save in progress");
   }
   if (rdb_save("dump.rdb")){
-    g_data.g_last_save_ms = get_monotonic_msec();
-    g_data.g_writes_since_save = 0;
+  rdb_on_save_complete(g_config.dump_path.c_str());   
     resp_ok(out);
   } else {
     resp_err(out, "ERR save failed");

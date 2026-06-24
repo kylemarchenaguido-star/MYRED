@@ -88,6 +88,7 @@ struct GlobalData{
 //global config
 struct Config {
   std::string password = "";
+  std::string dump_path = "dump.rdb";
 };
 
 // HMap is not unique

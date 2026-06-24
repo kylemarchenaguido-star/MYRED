@@ -2,7 +2,6 @@
 #include "state.h"      
 #include "buffer.h"
 #include "common.h"
-#include "buffer.h"
 #include "hash.h"
 #include "set.h"
 #include <zlib.h>  
@@ -16,8 +15,10 @@
 
 pid_t g_rdb_child_pid = -1;
 
-// Convert an in memort monotonic expiry into a wall clock expirary for the rdb
-static uint64_t mono_expired_to_wall(uint64_t mono_expire){
+// Converts a monotonic-clock expiry timestamp to wall-clock milliseconds.
+// The cast to int64_t intentionally wraps on underflow (key already expired);
+// the clamp to 0 converts any negative remaining to "expires now".
+static uint64_t mono_expiry_to_wall(uint64_t mono_expire){
   uint64_t mono_now = get_monotonic_msec();
   // ms left until expirary 
   int64_t remaining = (int64_t)(mono_expire - mono_now);
@@ -149,7 +150,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     
     if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1); // has ttl
-      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val)); // expire at
+      buf_append_u64(ctx->buf, mono_expiry_to_wall(g_data.heap[ent->heap_idx].val)); // expire at
     } else {
       buf_append(ctx->buf, 0); // not ttl
     }
@@ -162,7 +163,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
 
     if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
+      buf_append_u64(ctx->buf, mono_expiry_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -189,7 +190,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     // ttl
     if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
+      buf_append_u64(ctx->buf, mono_expiry_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -210,7 +211,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
       buf_append(ctx->buf, 3);
     if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
+      buf_append_u64(ctx->buf, mono_expiry_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -225,7 +226,7 @@ static bool cb_rdb_write(HNode *node, void *arg){
     buf_append(ctx->buf, 4); 
     if (entry_has_ttl(ent)){
       buf_append(ctx->buf, 1);
-      buf_append_u64(ctx->buf, mono_expired_to_wall(g_data.heap[ent->heap_idx].val));
+      buf_append_u64(ctx->buf, mono_expiry_to_wall(g_data.heap[ent->heap_idx].val));
     } else {
       buf_append(ctx->buf, 0);
     }
@@ -322,6 +323,17 @@ static void rdb_serialize(Buffer *buf, RDBStats *stats){
   fprintf(stderr, "rdb_serialize: %zu bytes, %u entries, crc=0x%08x\n", stats->bytes, stats->entries, crc);
 }
 
+void rdb_on_save_complete(const char *filename){
+  struct stat st;
+  if (stat(filename, &st) == 0){
+    g_data.g_last_save_size_bytes = (size_t)st.st_size;
+  }
+  g_data.g_last_save_ok = true;
+  g_data.g_last_save_ms = get_monotonic_msec();
+  g_data.g_writes_since_save++;
+}
+
+
 // we build the rdb function
 bool rdb_save(const char* filename){
   // build the buffer
@@ -357,12 +369,17 @@ bool rdb_save(const char* filename){
   }
   fclose(fp);
 
+  // Rotate old dump -> .bak before replacing
+  char bak[256];
+  snprintf(bak, sizeof(bak), "%s.bak", filename);
+  rename(filename, bak); // ok if it failes that means theres no old file on first save
+
   if (rename(tmp, filename) != 0){
     fprintf(stderr, "rdb_save: rename failed: %s\n", strerror(errno));
     remove(tmp);
     return false;
   }
-  g_data.g_last_save_size_bytes = stats.bytes;
+  rdb_on_save_complete(filename);   
   fprintf(stderr, "rdb_save: done (%zu bytes, %u entries)\n", stats.bytes, stats.entries);
   return true;
 }
@@ -470,7 +487,11 @@ static bool rdb_load_zset_entry(RDBCursor *c){
       std::string key;
       uint32_t n_members = 0;
       cursor_read_str(c, &key); // skip key
-      cursor_read_u32(c, &n_members); // skip member count
+      if (!cursor_read_u32(c, &n_members)){ return false; }; // skip member count
+      if (n_members > (size_t)(c->end - c->pos) / 12){
+        fprintf(stderr, "rdb_load: zset n_numbers %u too large for the remaining bytes\n", n_members);
+        return false;
+      }
       for (uint32_t i = 0; i< n_members; ++i){
         double score = 0;
         std::string name;
@@ -552,6 +573,11 @@ static bool rdb_load_deque_entry(RDBCursor *c){
   uint32_t n = 0;
   if (!cursor_read_u32(c, &n)) { return false; }
 
+  if (n > (size_t)(c->end - c->pos) / 4){
+    fprintf(stderr, "rdb_load: list count %u too large\n", n);
+    return false;
+  }
+
   Entry *ent = entry_new(T_DLIST);
   ent->key = key;
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
@@ -600,6 +626,11 @@ static bool rdb_load_hash_entry(RDBCursor *c){
   uint32_t n = 0;
   if (!cursor_read_u32(c, &n)){ return false; }
 
+  if (n > (size_t)(c->end - c->pos) / 8) {
+    fprintf(stderr, "rdb_load: hash field count %u too large\n", n);
+    return false;
+  }
+
   Entry *ent = entry_new(T_HASH);
   ent->key = key;
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
@@ -641,6 +672,11 @@ static bool rdb_load_set_entry(RDBCursor *c){
   uint32_t n = 0;
   if (!cursor_read_u32(c, &n)) { return false; }
 
+  if (n > (size_t)(c->end - c->pos) / 4) {
+    fprintf(stderr, "rdb_load: set member count %u too large\n", n);
+    return false;
+  }
+
   Entry *ent = entry_new(T_SET);
   ent->key = key;
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
@@ -662,6 +698,11 @@ static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint3
   c.end = payload + payload_size; 
 
   uint32_t loaded = 0;
+  if (n_entries > payload_size){ 
+    fprintf(stderr, "rdb_load: n_entries %u exceeds payload size\n", n_entries);
+    return false;
+  }
+
   for (uint32_t i = 0; i < n_entries; ++i){
     uint8_t type = 0;
     if (!cursor_read_u8(&c, &type)) { return false; }
@@ -870,7 +911,7 @@ void rdb_save_background(){
 
   if (pid == 0){
     // child, only syscalls from here
-    rdb_write_snapshot(&buf, "dump.rdb");
+    rdb_write_snapshot(&buf, g_config.dump_path.c_str());
   }
 
   // Parent release our copy of the buffer 
@@ -897,13 +938,7 @@ void rdb_check_background_save(){
     // child finished
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0){
       fprintf(stderr, "rdb_save_background: completed succesfully\n");
-      struct stat st;
-      if (stat("dump.rdb", &st) == 0) {
-        g_data.g_last_save_size_bytes = (size_t)st.st_size;
-      }
-      g_data.g_last_save_ok = true;
-      g_data.g_last_save_ms = get_monotonic_msec();
-      g_data.g_writes_since_save = 0;
+      rdb_on_save_complete(g_config.dump_path.c_str());   
     } else {
       fprintf(stderr, "rdb_save_background: child failed (status=%d\n", status);
       g_data.g_last_save_ok = false;
