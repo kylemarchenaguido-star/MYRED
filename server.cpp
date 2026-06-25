@@ -404,6 +404,8 @@ int main(){
     process_timers();
     rdb_check_background_save();
   }
+  thread_pool_destroy(&g_data.thread_pool);
+
   fprintf(stderr, "shutting down, saving...\n");
 
   // if a background save is running, wait for it first

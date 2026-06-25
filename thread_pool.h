@@ -15,7 +15,9 @@ struct ThreadPool{
     std::deque<Work> queue;
     pthread_mutex_t mu;
     pthread_cond_t not_empty; 
+    bool stop = false;
 };
 
 void thread_pool_queue(ThreadPool *tp, void(*f)(void *), void *arg);
 void thread_pool_init(ThreadPool *tp, size_t num_threads);
+void thread_pool_destroy(ThreadPool *tp);
