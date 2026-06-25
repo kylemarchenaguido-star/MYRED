@@ -56,7 +56,7 @@ static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
 
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (node){
-    Entry *ent = container_of(node, Entry, node);
+    Entry *ent = container_of(node, &Entry::node);
     if (!expire_if_needed(ent)){                 // alive
       if (ent->type != want_type) return Lookup::WRONGTYPE;
       if (out_ent) *out_ent = ent;
@@ -122,7 +122,7 @@ static void do_setnx(std::vector<std::string> &cmd, Buffer *out){
   lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
   HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
   if (node){
-    Entry *e = container_of(node, Entry, node);
+    Entry *e = container_of(node, &Entry::node);
     if (!expire_if_needed(e)){
       return resp_int(out, 0); // alive so we dont do nothing
     }
@@ -143,7 +143,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
   HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
 
   if (node){
-    Entry *ent = container_of(node, Entry, node);
+    Entry *ent = container_of(node, &Entry::node);
     if (!expire_if_needed(ent)){
       if (ent->type != T_STR){
         return resp_err(out, MSG_WRONGTYPE);
@@ -329,7 +329,7 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out){
     lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
     HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
     if (node){
-      Entry *e = container_of(node, Entry, node);
+      Entry *e = container_of(node, &Entry::node);
       if (!expire_if_needed(e) && e->type != T_STR){
         return resp_err(out, MSG_WRONGTYPE);
       }
@@ -357,7 +357,7 @@ static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
     lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
     HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
     if (node){
-      Entry *e = container_of(node, Entry, node);
+      Entry *e = container_of(node, &Entry::node);
       if (!expire_if_needed(e)){
         return resp_int(out, 0);  // any key exists -> set nothing
       }
@@ -453,7 +453,7 @@ static void do_del(std::vector<std::string> &cmd, Buffer *out){
     lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
     HNode *node = hm_delete(&g_data.db, &lk.node, &entry_eq);
     if (node){
-      entry_del(container_of(node, Entry, node));
+      entry_del(container_of(node, &Entry::node));
       ++deleted;
     }
   }
@@ -470,7 +470,7 @@ struct KeyStats {
 // Never run against a large DB in production; steer clients to SCAN instead.
 static bool cb_keys_emit(HNode *node, void *arg) {
     Buffer *out = (Buffer *)arg;
-    Entry *ent = container_of(node, Entry, node);
+    Entry *ent = container_of(node, &Entry::node);
     resp_str(out, ent->key.data(), ent->key.size());
     return true;
 }
@@ -479,7 +479,7 @@ static bool cb_keys_emit(HNode *node, void *arg) {
 // Gets all the keys for the stats 
 static bool cb_count_keys(HNode *node, void *args){
   KeyStats *stats = (KeyStats *)args;
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
   stats->total++;
   if (entry_has_ttl(ent)){
     stats->with_ttl++;
@@ -537,7 +537,7 @@ static void expire_generic(std::vector<std::string> &cmd, Buffer *out, int64_t m
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node) { return resp_int(out, 0); }
 
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
   if (expire_if_needed(ent)){ return resp_int(out, 0); }
   if (ttl_ms <= 0){
     // non-positive TTL means "already expired" -> delete now
@@ -571,7 +571,7 @@ static void ttl_generic(std::vector<std::string> &cmd, Buffer *out, int64_t div)
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node){ return resp_int(out, -2); } // not found
 
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
   if (expire_if_needed(ent)){ return resp_int(out, -2); } // expired -> gone
 
   if (!entry_has_ttl(ent)){
@@ -605,7 +605,7 @@ static void do_exists(std::vector<std::string> &cmd, Buffer *out){
     lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
     HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
     if (!node){ continue; }
-    Entry *ent = container_of(node, Entry, node);
+    Entry *ent = container_of(node, &Entry::node);
     if (!expire_if_needed(ent)){ ++count; }
   }
   resp_int(out, count);
@@ -620,7 +620,7 @@ static void do_type(std::vector<std::string> &cmd, Buffer *out){
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
   if (!node){ return resp_simple(out, "none"); }
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
 
   if (expire_if_needed(ent)){ return resp_simple(out, "none"); }
   const char *t = "none";
@@ -642,7 +642,7 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out){
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
   if (!node){ return resp_int(out, 0); }
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
 
   if (expire_if_needed(ent)){ return resp_int(out, 0); } // expired -> gone
   if (!entry_has_ttl(ent)){ return resp_int(out, 0); } // no TTL to remove
@@ -851,10 +851,9 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out){
   if (!hnode){
     return resp_int(out, 0); // key does not exit
   }
-  Entry *ent = container_of(hnode, Entry, node);
+  Entry *ent = container_of(hnode, &Entry::node);
   // remove from hashtable and heap
   hm_delete(&g_data.db, &ent->node, &hnode_same);
-  entry_set_ttl(ent, -1);
 
   // check if need offloading
   entry_del(ent);
@@ -1378,7 +1377,7 @@ struct ScanCtx {
 
 static void cb_scan(HNode *node, void *arg){
   ScanCtx *ctx = (ScanCtx *)arg;
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
 
   // skip expired keys, read only check
   if (entry_has_ttl(ent) && g_data.heap[ent->heap_idx].val <= get_monotonic_msec()){ return; }
@@ -1510,7 +1509,7 @@ struct HEmit {
 
 static bool cb_hemit(HNode *node, void *arg){
   HEmit *c = (HEmit *)arg;
-  HashNode *hn = container_of(node, HashNode, node);
+  HashNode *hn = container_of(node, &HashNode::node);
   if (c->mode == 0){ 
     resp_str(c->out, hn->field.data(), hn->field.size());
     resp_str(c->out, hn->value.data(), hn->value.size());
@@ -1606,7 +1605,7 @@ static void do_hstrlen(std::vector<std::string> &cmd, Buffer *out){
 
 static void cb_hscan(HNode *node, void *arg){
   ScanCtx *c = (ScanCtx *)arg;
-  HashNode *hn = container_of(node, HashNode, node);
+  HashNode *hn = container_of(node, &HashNode::node);
   if (c->pattern && !glob_match(c->pattern->data(), c->pattern->size(), hn->field.data(), hn->field.size())){
     return;
   }
@@ -1666,7 +1665,7 @@ static void do_dbsize(std::vector<std::string> &cmd, Buffer *out){
 
 // FLUSHALL / FLUSHDB -> delete every key
 static bool cb_collect_entry(HNode *node, void *arg){
-  ((std::vector<Entry *> *)arg)->push_back(container_of(node, Entry, node));
+  ((std::vector<Entry *> *)arg)->push_back(container_of(node, &Entry::node));
   return true;
 }
 
@@ -1693,7 +1692,7 @@ static bool cb_randomkey(HNode *node, void *arg){
   RandKeyCtx *ctx = (RandKeyCtx *)arg; 
   ctx->seen++;
   if ((size_t)(rand_idx(ctx->seen)) == 0){
-    ctx->key = container_of(node, Entry, node)->key;
+    ctx->key = container_of(node, &Entry::node)->key;
   }
   return true;
 }
@@ -1712,7 +1711,7 @@ static int rename_key(const std::string &src, const std::string &dst, bool nx){
   sk.node.hcode = str_hash((const uint8_t *)src.data(), src.size());
   HNode *snode = hm_lookup(&g_data.db, &sk.node, &entry_eq);
   if (!snode){ return -1; }
-  Entry *sent = container_of(snode, Entry, node);
+  Entry *sent = container_of(snode, &Entry::node);
   if (expire_if_needed(sent)){ return -1; } // source expired
   if (src == dst){ return 1; } // rename to self
 
@@ -1720,7 +1719,7 @@ static int rename_key(const std::string &src, const std::string &dst, bool nx){
   dk.node.hcode = str_hash((const u_int8_t *)dst.data(), dst.size());
   HNode *dnode = hm_lookup(&g_data.db, &dk.node, &entry_eq);
   if (dnode){
-    Entry *dent = container_of(dnode, Entry, node);
+    Entry *dent = container_of(dnode, &Entry::node);
     // if dest exist & alive
     if (!expire_if_needed(dent)){
       // nx refuses
@@ -1760,7 +1759,7 @@ static void do_touch(std::vector<std::string> &cmd, Buffer *out){
     key.node.hcode = str_hash((const uint8_t *)cmd[i].data(), cmd[i].size());
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node){
-      Entry *ent = container_of(node, Entry, node);
+      Entry *ent = container_of(node, &Entry::node);
       if (!expire_if_needed(ent)){ ++n;}
     }
   }
@@ -1778,7 +1777,7 @@ static void expireat_generic(std::vector<std::string> &cmd, Buffer *out, int64_t
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node){ return resp_int(out, 0); }
 
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
   if (expire_if_needed(ent)){ return resp_int(out, 0); }
 
   // absolute -> remamining 
@@ -1806,13 +1805,13 @@ static void do_pexpireat(std::vector<std::string> &cmd, Buffer *out){ expireat_g
 // Collects all member strings from a set's HMap (used by multi-key ops and bulk commands)
 static bool cb_collect_members(HNode *node, void *arg){
   auto *v = (std::vector<std::string> *)arg;
-  v->push_back(container_of(node, SetNode, node)->member);
+  v->push_back(container_of(node, &SetNode::node)->member);
   return true;
 }
 
 static bool cb_members_emit(HNode *node, void *arg){
   Buffer *out = (Buffer *)arg;
-  resp_str(out, container_of(node, SetNode, node)->member.data(), container_of(node, SetNode, node)->member.size());
+  resp_str(out, container_of(node, &SetNode::node)->member.data(), container_of(node, &SetNode::node)->member.size());
   return true;
 }
 
@@ -1824,7 +1823,7 @@ static Entry *lookup_set_ro(const std::string &key, bool *wrongtype){
   HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
 
   if (!node){ return nullptr; }
-  Entry *ent= container_of(node, Entry, node);
+  Entry *ent= container_of(node, &Entry::node);
   // key is missing ?? 
   if (expire_if_needed(ent)){ return nullptr; }
   if (ent->type != T_SET){ *wrongtype = true; return nullptr; }
@@ -1837,7 +1836,7 @@ static Entry *set_make_dest(const std::string &key){
   lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
   HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
   if (node){
-    Entry *old = container_of(node, Entry, node);
+    Entry *old = container_of(node, &Entry::node);
     hm_delete(&g_data.db, &old->node, &hnode_same);
     entry_del(old);
   }
@@ -2092,7 +2091,7 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
 
 static void cb_sscan(HNode *node, void *arg){
   ScanCtx *c = (ScanCtx *)arg;
-  SetNode *sn = container_of(node, SetNode, node);
+  SetNode *sn = container_of(node, &SetNode::node);
   if (c->pattern && !glob_match(c->pattern->data(),c->pattern->size(), sn->member.data(),sn->member.size())){
     return;
   }

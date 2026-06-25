@@ -9,7 +9,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_compile_options(-Wall -Wextra)
+add_compile_options(-Wall -Wextra -Wshadow)
+
 
 # dependencies: zlib (RDB compression) and pthreads (thread pool)
 find_package(ZLIB REQUIRED)

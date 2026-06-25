@@ -30,7 +30,7 @@ bool set_remove(HMap *h, const std::string &member){
     sk_init(&key, member);
     HNode *found = hm_delete(h, &key.node, &str_node_eq<SetNode, &SetNode::member>);
     if (!found){ return false; }
-    delete container_of(found, SetNode, node);
+    delete container_of(found, &SetNode::node);
     return true;
 }
 

@@ -112,7 +112,7 @@ struct SetSaveCtx {
 
 static bool cb_zset_member(HNode *node, void *arg){
   ZSetSaveCtx *ctx = (ZSetSaveCtx *)arg;
-  ZNode *znode = container_of(node, ZNode, hmap);
+  ZNode *znode = container_of(node, &ZNode::hmap);
 
   // score -> 8 bytes
   buf_append(ctx->buf, (const uint8_t *)&znode->score, 8);
@@ -125,7 +125,7 @@ static bool cb_zset_member(HNode *node, void *arg){
 
 static bool cb_hash_member(HNode *node, void *arg){
   HashSaveCtx *ctx = (HashSaveCtx *)arg;
-  HashNode *hn = container_of(node, HashNode, node);
+  HashNode *hn = container_of(node, &HashNode::node);
   buf_append_str(ctx->buf, hn->field.data(), (uint32_t)hn->field.size());
   buf_append_str(ctx->buf, hn->value.data(), (uint32_t)hn->value.size());
   ctx->count++;
@@ -134,7 +134,7 @@ static bool cb_hash_member(HNode *node, void *arg){
 
 static bool cb_set_member(HNode *node, void *arg){
   SetSaveCtx *ctx = (SetSaveCtx *)arg;
-  SetNode *sn = container_of(node, SetNode, node);
+  SetNode *sn = container_of(node, &SetNode::node);
   buf_append_str(ctx->buf, sn->member.data(), (uint32_t)sn->member.size());
   ctx->count++;
   return true;
@@ -142,7 +142,7 @@ static bool cb_set_member(HNode *node, void *arg){
 
 static bool cb_rdb_write(HNode *node, void *arg){
   RDBWriteCtx *ctx = (RDBWriteCtx *)arg;
-  Entry *ent = container_of(node, Entry, node);
+  Entry *ent = container_of(node, &Entry::node);
   // strings
   if (ent->type == T_STR){
     // type tag byte

@@ -26,8 +26,8 @@ uint64_t get_wall_msec(){
 
 //equality comparison for the top level hash table
 bool entry_eq(HNode *node, HNode *key){
-  Entry *ent = container_of(node, Entry, node);
-  LookupKey *keydata = container_of(key, LookupKey, node);
+  Entry *ent = container_of(node, &Entry::node);
+  LookupKey *keydata = container_of(key, &LookupKey::node);
   return ent->key == keydata->key;
 }
 

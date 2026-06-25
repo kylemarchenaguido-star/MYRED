@@ -23,11 +23,13 @@ int32_t parse_resp_request(Buffer *buf, std::vector<std::string> &cmd){
   if (data[pos + 1] != '\n') { return -1; }
 
   int32_t n_args = 0;
-  for (size_t i = n_start; i < pos; ++i){
+for (size_t i = n_start; i < pos; ++i){
     if (data[i] < '0' || data[i] > '9') { return -1; }
+    if (n_args > (int32_t)k_max_args / 10) { return -1; }   
     n_args = n_args * 10 + (data[i] - '0');
     if (n_args > (int32_t)k_max_args){ return -1; }
-  }
+}
+
   if (n_args < 1) { return -1;}
   pos += 2;
 

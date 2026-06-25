@@ -122,12 +122,12 @@ static int32_t next_timer_ms() {
 
   // check the front of the idle_list 
   if (!dlist_empty(&g_data.idle_list)){
-    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    Conn *conn = container_of(g_data.idle_list.next, &Conn::idle_node);
     next_ms = std::min(next_ms, conn->last_active_ms + k_idle_timeout_ms);
   }
   // check the front of the io_list 
   if (!dlist_empty(&g_data.io_list)){
-    Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
+    Conn *conn = container_of(g_data.io_list.next, &Conn::idle_node);
     next_ms = std::min(next_ms, conn->last_active_ms + k_io_timeout_ms);
   }
   // check the heap
@@ -153,7 +153,7 @@ static void process_timers(){
   uint64_t now_ms = get_monotonic_msec();
   // This handles expired idle timers
   while (!dlist_empty(&g_data.idle_list)){
-    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    Conn *conn = container_of(g_data.idle_list.next, &Conn::idle_node);
     uint64_t expired = conn->last_active_ms + k_idle_timeout_ms;
     if (expired > now_ms){
       //expired
@@ -165,7 +165,7 @@ static void process_timers(){
   }
   // This handles expired io timers
   while (!dlist_empty(&g_data.io_list)){
-    Conn *conn = container_of(g_data.io_list.next, Conn, idle_node);
+    Conn *conn = container_of(g_data.io_list.next, &Conn::idle_node);
     uint64_t expired = conn->last_active_ms + k_io_timeout_ms;
     if (expired > now_ms){
       //expired
@@ -181,7 +181,7 @@ static void process_timers(){
   const std::vector<HeapItem> &heap = g_data.heap;
   // This handles TTL timers
   while(!heap.empty() && heap[0].val <= now_ms){
-    Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
+    Entry *ent = container_of(heap[0].ref, &Entry::heap_idx);
     HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
     assert(node == &ent->node);
     (void)node; // assert vanishes in release (NDEBUG)

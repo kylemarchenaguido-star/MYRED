@@ -19,8 +19,8 @@ inline void sk_init(StringKey *k, const std::string &s){
 template<typename Node, std::string Node::*Field>
 
 static bool str_node_eq(HNode *a, HNode *b){
-    Node *n = container_of(a, Node, node);
-    StringKey *k = container_of(b, StringKey, node);
+    Node *n = container_of(a, &Node::node);
+    StringKey *k = container_of(b, &StringKey::node);
     return (n->*Field) == *k->str;
 }
 
@@ -30,7 +30,7 @@ template<typename Node>
 static void hmap_clear_nodes(HMap *h) {
     std::vector<Node *> nodes;
     hm_foreach(h, [](HNode *n, void *arg) -> bool {
-        static_cast<std::vector<Node *> *>(arg)->push_back(container_of(n, Node, node));
+        static_cast<std::vector<Node *> *>(arg)->push_back(container_of(n, &Node::node));
         return true;
     }, &nodes);
     hm_clear(h);

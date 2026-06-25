@@ -24,7 +24,7 @@ static void znode_del(ZNode *node){ free(node);}
 
 // (lhs.score, lhs.name) < (rhs.score, rhs.name)
 static bool zless(AVLNode *lhs, double score, const char *name, size_t len){
-    ZNode *zl = container_of(lhs, ZNode, tree);
+    ZNode *zl = container_of(lhs, &ZNode::tree);
     if (zl->score != score){
         return zl->score < score;
     }
@@ -37,13 +37,13 @@ static bool zless(AVLNode *lhs, double score, const char *name, size_t len){
 
 //overload of zless
 static bool zless(AVLNode *lhs, AVLNode *rhs){
-    ZNode *zr = container_of(rhs, ZNode, tree);
+    ZNode *zr = container_of(rhs, &ZNode::tree);
     return zless(lhs, zr->score, zr->name, zr->len);
 }
 
 // (rhs.score, rhs.name) > raw (score,name,len)
 static bool zless_raw(AVLNode *rhs, double score, const char* name, size_t len){
-    ZNode *zr = container_of(rhs, ZNode, tree);
+    ZNode *zr = container_of(rhs, &ZNode::tree);
     if (zr->score != score){
         return score < zr->score;
     }
@@ -104,9 +104,9 @@ struct HKey {
 
 static bool hcmp(HNode *node, HNode *key){
     // recover the data from znode
-    ZNode *znode = container_of(node, ZNode, hmap);
+    ZNode *znode = container_of(node, &ZNode::hmap);
     // recover the data from heky
-    HKey *hkey = container_of(key, HKey, node);
+    HKey *hkey = container_of(key, &HKey::node);
     // check if the lens for optimization
     if (znode->len != hkey->len) {
         return false;
@@ -124,7 +124,7 @@ ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
     key.name = name;
     key.len = len;
     HNode *found = hm_lookup(&zset->hmap, &key.node, &hcmp);
-    return found ? container_of(found, ZNode, hmap) : NULL;
+    return found ? container_of(found, &ZNode::hmap) : NULL;
 }
 
 //delete a node
@@ -153,7 +153,7 @@ ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len){
             node = node->left;
         }
     }
-    return found ? container_of(found, ZNode, tree) : NULL;
+    return found ? container_of(found, &ZNode::tree) : NULL;
 }
 
 ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len){
@@ -168,13 +168,13 @@ ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len){
             node = node->right;
         }
     }
-    return found ? container_of(found, ZNode, tree) : NULL;
+    return found ? container_of(found, &ZNode::tree) : NULL;
 }
 
 //offsset into the succeding or preceding node
 ZNode *znode_offset(ZNode *node, int64_t offset) {
     AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
-    return tnode ? container_of(tnode, ZNode, tree) : NULL;
+    return tnode ? container_of(tnode, &ZNode::tree) : NULL;
 }
 
 static void tree_dispose(AVLNode *node){
@@ -183,7 +183,7 @@ static void tree_dispose(AVLNode *node){
     }
     tree_dispose(node->left);
     tree_dispose(node->right);
-    znode_del(container_of(node, ZNode, tree));
+    znode_del(container_of(node, &ZNode::tree));
 }
 
 // destroy a zset

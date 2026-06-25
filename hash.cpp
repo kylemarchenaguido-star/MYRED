@@ -9,7 +9,7 @@ bool hash_set(HMap *h, const std::string &field, const std::string value){
 
     HNode *found = hm_lookup(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
     if (found){
-        container_of(found, HashNode, node)->value = value; // update existing
+        container_of(found, &HashNode::node)->value = value; // update existing
         return false;
     }
     // create a new field for the hash 
@@ -26,7 +26,7 @@ HashNode *hash_get(HMap *h, const std::string &field){
     sk_init(&key, field);
 
     HNode *found = hm_lookup(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
-    return found ? container_of(found, HashNode, node) : nullptr;
+    return found ? container_of(found, &HashNode::node) : nullptr;
 }
 
 bool hash_del(HMap *h, const std::string &field){
@@ -36,7 +36,7 @@ bool hash_del(HMap *h, const std::string &field){
     HNode *found = hm_delete(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
     if(!found){ return false; }
 
-    delete container_of(found, HashNode, node);
+    delete container_of(found, &HashNode::node);
     return true;
 }
 
