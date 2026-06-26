@@ -113,6 +113,7 @@ static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mu
   }
   entry_str(ent).swap(cmd[3]);
   entry_set_ttl(ent, ttl * mult);
+  g_data.g_writes_since_save++;
   return resp_ok(out);
 }
 
@@ -2257,7 +2258,7 @@ static void aof_encode(std::string &dst, const std::vector<std::string> &args){
 
 // Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
 static void aof_feed(const std::vector<std::string> &cmd){
-  std::string &buf = g_data.g_aof_buf;
+  std::string frame;
   const std::string &name = cmd[0]; // already lower-case by do request
 
   if (name == "expire" || name == "pexpire" || name == "expireat"){
@@ -2268,21 +2269,29 @@ static void aof_feed(const std::vector<std::string> &cmd){
                      : v * 1000; // expireat
       char ts[32];
       int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
-      aof_encode(buf, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
       return;
-    }
+    } else { aof_encode(frame, cmd); }
   }
-  if (name == "setex" || name == "psetex"){
+  else if (name == "setex" || name == "psetex"){
     int64_t v = 0;
     if (str2int(cmd[2], v)){
       int64_t abs_ms = (name == "setex") ? (int64_t)get_wall_msec() + v * 1000
                                          : (int64_t)get_wall_msec() + v;
-      aof_encode(buf, {"SET", cmd[1], cmd[3]});
+      aof_encode(frame, {"SET", cmd[1], cmd[3]});
       char ts[32];
       int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
-      aof_encode(buf, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
       return;
-    }
+    } else { aof_encode(frame, cmd); }
+  }
+  else { aof_encode(frame, cmd); } 
+  
+  // live aof
+  g_data.g_aof_buf += frame; 
+  // rewrite in progress and we capture the delta
+  if (g_aof_child_pid != 1){
+    g_data.g_aof_rewrite_buf += frame;
   }
 }
 
@@ -2311,7 +2320,7 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"getdel",       {do_getdel,        2,  2, true}},
   {"getex",        {do_getex,         2, -1, true}},
   {"append",       {do_append,        3,  3, true}},
-  {"strlen",       {do_strlen,        2,  2, true}},
+  {"strlen",       {do_strlen,        2,  2}},
   {"getrange",     {do_getrange,      4,  4}},
   {"setrange",     {do_setrange,      4,  4}},
   {"mget",         {do_mget,          2, -1}},
@@ -2426,10 +2435,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     return resp_err(out, "ERR wrong number of arguments");
   }
   uint32_t dirty_before = g_data.g_writes_since_save;
+
+  // Snapshot before running swap() handlers/ consume cmd's
+  bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading;
+  std::vector<std::string> snapshot;
+  if (may_log){ snapshot  = cmd; }
   spec.fn(cmd, out);
 
-  if (g_config.aof_enable && spec.is_write && !g_data.g_loading && 
-      g_data.g_writes_since_save != dirty_before){
-    aof_feed(cmd);
+  if (may_log && g_data.g_writes_since_save != dirty_before){
+    aof_feed(snapshot);
   }
 }

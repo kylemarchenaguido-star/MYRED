@@ -285,6 +285,34 @@ Already have `g_writes_since_save` and `g_last_save_time`. Just need the config 
 | Disk full | Check `write()` return value; log + stop accepting writes rather than silently losing data |
 | AOF size monitoring | Track `aof_current_size` (bytes written since last rewrite); expose in `INFO persistence` |
 
+---
+
+### Alternative write path — log raw RESP bytes (optimization, do after Step 1 works)
+
+Step 1 serializes the AOF entry from the parsed `cmd` vector in `do_request`. That has two costs that bit us during testing:
+
+1. **A defensive copy.** The command handlers `swap()`/consume `cmd`'s strings for speed (`do_set` → `entry_str(ent).swap(cmd[2])`), so by the time `aof_feed` runs after `spec.fn()`, the args are empty. Step 1 works around this by snapshotting `cmd` *before* the handler runs — one `std::vector<std::string>` copy per logged write.
+2. **Re-encoding.** We rebuild the RESP frame (`*N`, `$len`, …) that the client already sent us verbatim.
+
+Both vanish if we log the **raw consumed bytes** instead. In `try_one_request`, the original RESP frame is sitting in `conn->incoming` at `[0, consumed)` *before* `buf_consume()` runs and *before* any handler touches `cmd`. So:
+
+```cpp
+int32_t consumed = parse_resp_request(&conn->incoming, cmd);
+...
+// capture the raw frame BEFORE consuming / dispatching
+const char *raw = (const char *)buf_data(&conn->incoming);
+size_t raw_len = (size_t)consumed;
+
+do_request(cmd, &conn->outgoing, conn, raw, raw_len);   // pass it through
+buf_consume(&conn->incoming, raw_len);
+```
+
+`do_request` then appends `raw[0..raw_len)` to `g_aof_buf` with a single `memcpy` (no vector copy, no re-encode) when the write is logged.
+
+**The one wrinkle:** TTL-relative commands (`EXPIRE`, `SETEX`, `GETEX … EX`) still can't be logged verbatim — a relative TTL replays wrong after a restart. So those keep the translate-to-`PEXPIREAT` path from Step 1. The dispatch is: if the command is in the small "needs TTL rewrite" set → re-encode the rewritten form; otherwise → `memcpy` the raw bytes. The expensive path is the rare one.
+
+**Trade-off:** the raw-bytes path means the AOF stores the command *as the client sent it* (e.g. original casing, inline vs multibulk if you ever accept inline) rather than a normalized form. For a RESP-only server that's fine. Net: removes a per-write heap allocation on the hot path while keeping TTL correctness.
+
 ## v7 — Memory management
 
 - `maxmemory` limit + eviction policies: noeviction, allkeys-lru, allkeys-lfu, volatile-lru, volatile-ttl, random

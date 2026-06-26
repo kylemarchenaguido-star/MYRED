@@ -97,6 +97,7 @@ struct GlobalData{
   uint64_t g_aof_last_fsync_ms = 0;
   bool g_loading = false; // true when replaying
   std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
+  std::string g_aof_rewrite_buf; // delta captured during a rewrite
 };
 
 //global config

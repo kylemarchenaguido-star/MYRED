@@ -82,6 +82,7 @@ class _Tee:
         self._fh.write(_ANSI_RE.sub("", data))
     def flush(self):
         self._stream.flush()
+
         self._fh.flush()
 
 
