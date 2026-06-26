@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
+#include <string.h>
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -149,6 +150,32 @@ static int32_t next_timer_ms() {
   return (int32_t)(next_ms - now_ms);
 }
 
+static bool aof_flush(){
+  std::string &buf = g_data.g_aof_buf;
+  if (g_data.g_aof_fd < 0 || buf.empty()){ return false; }
+  size_t off = 0;
+  while (off < buf.size()){
+    ssize_t rv = write(g_data.g_aof_fd, buf.data() + off, buf.size() - off);
+    if (rv < 0){
+      if (errno == EINTR){ continue; }
+      fprintf(stderr, "aof: write failed: %s\n", strerror(errno));
+      break; // keep remaining bytes buffered, retry the next tick
+    }
+    off += (size_t)rv;
+  }
+  buf.erase(0, off); // drop only what was actually written
+  return off > 0;
+}
+
+static void aof_fsync_job(void *arg){
+  (void)arg;
+  if (g_data.g_aof_fd >= 0){
+    fdatasync(g_data.g_aof_fd);
+  }
+  // This guarantees that the other threads see the fdatasync done
+  g_data.g_aof_fsync_pending.store(false, std::memory_order_release);
+}
+
 static void process_timers(){
   uint64_t now_ms = get_monotonic_msec();
   // This handles expired idle timers
@@ -199,6 +226,17 @@ static void process_timers(){
     g_data.g_last_save_ms =now_ms;
     rdb_save_background();
     fprintf(stderr, "periodic save triggered\n");
+  }
+  // periodic AOF fsync (everysec mode)
+  if (g_config.aof_enable && g_config.aof_fysnc  == Aoffsync::EVERYSEC){
+    if (now_ms - g_data.g_aof_last_fsync_ms >= 1000){
+      g_data.g_aof_last_fsync_ms  = now_ms;
+      bool expected = false;
+      if (g_data.g_aof_fsync_pending.compare_exchange_strong(expected, true)){
+        thread_pool_queue(&g_data.thread_pool, aof_fsync_job, nullptr);
+      }
+      // else previous fdatasync still in  flight, we skip and try again next second
+    }
   }
 }
 
@@ -307,11 +345,31 @@ int main(){
   const char *pass_env = getenv("MYRED_PASSWORD");
   g_config.password = pass_env ? pass_env : "kek1234";
 
+  // Port setup
   uint16_t port = 1234;
   const char *port_env = getenv("MYRED_PORT");
   if (port_env){
     int p = atoi(port_env);
     if (p > 0 && p < 65536){ port = (uint16_t)p; }
+  }
+
+  // AOF setup
+  const char *aof_env = getenv("MYRED_AOF");
+  g_config.aof_enable = aof_env && (aof_env[0] == '1' || aof_env[0] == 'y');
+
+  if (g_config.aof_enable){
+    g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (g_data.g_aof_fd < 0){
+      fprintf(stderr, "fatal: cannot open AOF %s: %s\n", g_config.aof_path.c_str(), strerror(errno));
+      return 1;
+    }
+  }
+
+  const char *fsync_env = getenv("MYRED_AOF_FSYNC");
+  if (fsync_env){
+    if (strcmp(fsync_env, "always") == 0){ g_config.aof_fysnc = Aoffsync::ALWAYS; }
+    else if (strcmp(fsync_env, "no") == 0){ g_config.aof_fysnc = Aoffsync::NO; }
+    else { g_config.aof_fysnc = Aoffsync::EVERYSEC; }
   }
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
@@ -400,13 +458,25 @@ int main(){
 
       }
     } // this if for each connection socket (fd)
+    bool wrote = aof_flush();
+    if (wrote && g_config.aof_fysnc == Aoffsync::ALWAYS){
+      if (fdatasync(g_data.g_aof_fd) < 0){
+        fprintf(stderr, "aof: fdatasync failed: %s\n", strerror(errno));
+      }
+    }
     // handle timers
     process_timers();
     rdb_check_background_save();
   }
   thread_pool_destroy(&g_data.thread_pool);
 
-  fprintf(stderr, "shutting down, saving...\n");
+  if (g_data.g_aof_fd >= 0){
+    aof_flush();
+    fdatasync(g_data.g_aof_fd);
+    close(g_data.g_aof_fd);
+  }
+
+  fprintf(stderr, "Shutting down, saving...\n");
 
   // if a background save is running, wait for it first
   if (g_rdb_child_pid != -1){
@@ -416,6 +486,6 @@ int main(){
   }
 
   rdb_save("dump.rdb");
-  fprintf(stderr, "saved. goodbye.\n");
+  fprintf(stderr, "Saved. Goodbye.\n");
   return 0;
 }

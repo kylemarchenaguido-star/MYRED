@@ -12,6 +12,7 @@
 #include "deque.h"
 #include "set.h"
 #include <variant>
+#include <atomic>
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
@@ -43,6 +44,13 @@ enum {
 enum class ConnTimer {
   IDLE,
   IO,
+};
+
+// Modes for the aof
+enum class Aoffsync{
+  ALWAYS,
+  EVERYSEC,
+  NO
 };
 
 // Connections state and buffers 
@@ -83,12 +91,21 @@ struct GlobalData{
   uint64_t g_total_commands = 0;
   uint64_t g_total_connections =0;
   uint32_t connected_clients = 0;
+  // AOF
+  int g_aof_fd = -1; // -1 when disable
+  std::string g_aof_buf; // pending bytes that aren't write()
+  uint64_t g_aof_last_fsync_ms = 0;
+  bool g_loading = false; // true when replaying
+  std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
 };
 
 //global config
 struct Config {
   std::string password = "";
   std::string dump_path = "dump.rdb";
+  bool aof_enable = false;
+  std::string aof_path = "appendonly.aof";
+  Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
 };
 
 // HMap is not unique

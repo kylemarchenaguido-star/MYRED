@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-25 16:59:00
+# MYRED stress test — 2026-06-26 00:51:06
 
 ```
 (logging output to list_run.md)
@@ -158,17 +158,17 @@
   ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc']
+  ✓ keys returns list → ['kb', 'ka', 'persist_zset', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 4999
+  ✓ pttl returns int → 5000
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 4999ms
+  ℹ  remaining TTL: 5000ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -371,7 +371,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.1ms
+  ℹ  returned in 0.2ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -460,7 +460,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:3\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:2\r\n\r\n# Memory\r\nused_memory_bytes:3801088\r\nused_memory_mb:3.62\r\n\r\n# Stats\r\ntotal_commands:2411\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:2012\r\nrdb_changes_since_save:1971\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:48\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:76\r\nuptime_minutes:1\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:2\r\n\r\n# Memory\r\nused_memory_bytes:3932160\r\nused_memory_mb:3.75\r\n\r\n# Stats\r\ntotal_commands:2411\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:17880\r\nrdb_changes_since_save:1971\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:102\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -477,15 +477,15 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:3
-    uptime_minutes:0
+    uptime_seconds:76
+    uptime_minutes:1
     uptime_hours:0
     # Clients
     connected_clients:1
     total_connections:2
     # Memory
-    used_memory_bytes:3801088
-    used_memory_mb:3.62
+    used_memory_bytes:3932160
+    used_memory_mb:3.75
     # Stats
     total_commands:2411
     # Keyspace
@@ -493,10 +493,10 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:2012
+    rdb_last_save_time:17880
     rdb_changes_since_save:1971
     rdb_last_save_ok:1
-    rdb_last_save_size_bytes:48
+    rdb_last_save_size_bytes:102
     # Replication
     role:master
 
@@ -504,15 +504,15 @@
   ✓ save → OK
   ✓ dump.rdb exists
   ✓ dump.rdb not empty
-  ℹ  dump.rdb size: 19 bytes
+  ℹ  dump.rdb size: 75 bytes
   ✓ magic number correct
 
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 0.6ms: 'Background saving started'
+  ℹ  bgsave returned in 0.7ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 13.1ms
+  ℹ  100 ops during save took 13.2ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -545,17 +545,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    37.39s
-  Throughput: 107 ops/sec
+  Elapsed:    29.92s
+  Throughput: 134 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 65.33ms
-  Latency min: 0.11ms
-  Latency max: 1104.79ms
-  Latency p95: 688.05ms
-  Latency p99: 953.46ms
+  Latency avg: 51.68ms
+  Latency min: 0.08ms
+  Latency max: 976.20ms
+  Latency p95: 516.51ms
+  Latency p99: 886.51ms
   No errors!
-  ℹ  cleaned 140 leftover keys
+  ℹ  cleaned 162 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

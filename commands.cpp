@@ -11,6 +11,8 @@
 #include "ctype.h"
 #include "hash.h"
 #include "set.h"
+#include "fcntl.h"      
+#include <unistd.h> 
 #include <algorithm>
 #include <random>
 #include <unordered_map>
@@ -22,6 +24,7 @@ static constexpr const char *MSG_NOT_FLOAT = "ERR value is not a valid float";
 static constexpr const char *MSG_SYNTAX    = "ERR syntax error";
 static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
 
+// This is for the random generator
 static std::mt19937_64 g_rng{std::random_device{}()};
 
 static size_t rand_idx(size_t n){
@@ -2227,108 +2230,165 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, 1);
 }
 
+// encode an array-of-bulk-strings RESP frame
+static void aof_encode(std::string &dst, std::initializer_list<std::string_view> args){
+  char hdr[32];
+  int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
+  dst.append(hdr, (size_t)n);
+  for (std::string_view a : args){
+    int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
+    dst.append(hdr, (size_t)h);
+    dst.append(a.data(), a.size());
+    dst.append("\r\n", 2);
+  }
+}
+
+static void aof_encode(std::string &dst, const std::vector<std::string> &args){
+  char hdr[32];
+  int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
+  dst.append(hdr, (size_t)n);
+  for (std::string_view a : args){
+    int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
+    dst.append(hdr, (size_t)h);
+    dst.append(a.data(), a.size());
+    dst.append("\r\n", 2);
+  }
+}
+
+// Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
+static void aof_feed(const std::vector<std::string> &cmd){
+  std::string &buf = g_data.g_aof_buf;
+  const std::string &name = cmd[0]; // already lower-case by do request
+
+  if (name == "expire" || name == "pexpire" || name == "expireat"){
+    int64_t v = 0;
+    if (str2int(cmd[2], v)){
+      int64_t abs_ms = (name == "expire") ? (int64_t)get_wall_msec() + v * 1000
+                     : (name == "pexpire") ? (int64_t)get_wall_msec() + v
+                     : v * 1000; // expireat
+      char ts[32];
+      int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
+      aof_encode(buf, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+      return;
+    }
+  }
+  if (name == "setex" || name == "psetex"){
+    int64_t v = 0;
+    if (str2int(cmd[2], v)){
+      int64_t abs_ms = (name == "setex") ? (int64_t)get_wall_msec() + v * 1000
+                                         : (int64_t)get_wall_msec() + v;
+      aof_encode(buf, {"SET", cmd[1], cmd[3]});
+      char ts[32];
+      int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
+      aof_encode(buf, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+      return;
+    }
+  }
+}
+
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
 
 struct CmdSpec {
   CmdFn fn;
   int min_args;
   int max_args;
+  bool is_write = false;
 };
 
 static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   // strings
   {"get",          {do_get,           2,  2}},
-  {"set",          {do_set,           3,  3}},
-  {"incr",         {do_incr,          2,  2}},
-  {"decr",         {do_decr,          2,  2}},
-  {"incrby",       {do_incrby,        3,  3}},
-  {"decrby",       {do_decrby,        3,  3}},
-  {"incrbyfloat",  {do_incrbyfloat,   3,  3}},
-  {"setex",        {do_setex,         4,  4}},
-  {"psetex",       {do_psetex,        4,  4}},
-  {"setnx",        {do_setnx,         3,  3}},
-  {"getset",       {do_getset,        3,  3}},
-  {"getdel",       {do_getdel,        2,  2}},
-  {"getex",        {do_getex,         2, -1}},
-  {"append",       {do_append,        3,  3}},
-  {"strlen",       {do_strlen,        2,  2}},
+  {"set",          {do_set,           3,  3, true}},
+  {"incr",         {do_incr,          2,  2, true}},
+  {"decr",         {do_decr,          2,  2, true}},
+  {"incrby",       {do_incrby,        3,  3, true}},
+  {"decrby",       {do_decrby,        3,  3, true}},
+  {"incrbyfloat",  {do_incrbyfloat,   3,  3, true}},
+  {"setex",        {do_setex,         4,  4, true}},
+  {"psetex",       {do_psetex,        4,  4, true}},
+  {"setnx",        {do_setnx,         3,  3, true}},
+  {"getset",       {do_getset,        3,  3, true}},
+  {"getdel",       {do_getdel,        2,  2, true}},
+  {"getex",        {do_getex,         2, -1, true}},
+  {"append",       {do_append,        3,  3, true}},
+  {"strlen",       {do_strlen,        2,  2, true}},
   {"getrange",     {do_getrange,      4,  4}},
   {"setrange",     {do_setrange,      4,  4}},
   {"mget",         {do_mget,          2, -1}},
-  {"mset",         {do_mset,          3, -1}},   // odd-argc check is inside handler
-  {"msetnx",       {do_msetnx,        3, -1}},   // odd-argc check is inside handler
+  {"mset",         {do_mset,          3, -1, true}},   // odd-argc check is inside handler
+  {"msetnx",       {do_msetnx,        3, -1, true}},   // odd-argc check is inside handler
   // generic key
-  {"del",          {do_del,           2, -1}},
+  {"del",          {do_del,           2, -1, true}},
   {"exists",       {do_exists,        2, -1}},
   {"type",         {do_type,          2,  2}},
-  {"rename",       {do_rename,        3,  3}},
-  {"renamenx",     {do_renamenx,      3,  3}},
+  {"rename",       {do_rename,        3,  3, true}},
+  {"renamenx",     {do_renamenx,      3,  3, true}},
   {"touch",        {do_touch,         2, -1}},
-  {"unlink",       {do_asyncdel,      2,  2}},
+  {"unlink",       {do_asyncdel,      2,  2, true}},
   {"keys",         {do_keys,          1,  1}},
   {"scan",         {do_scan,          2, -1}},
   {"randomkey",    {do_randomkey,     1,  1}},
   {"dbsize",       {do_dbsize,        1,  1}},
-  {"flushall",     {do_flushall,      1,  1}},
-  {"flushdb",      {do_flushall,      1,  1}},
+  {"flushall",     {do_flushall,      1,  1, true}},
+  {"flushdb",      {do_flushall,      1,  1, true}},
   // ttl
-  {"expire",       {do_expire,        3,  3}},
-  {"pexpire",      {do_pexpire,       3,  3}},
-  {"expireat",     {do_expireat,      3,  3}},
-  {"pexpireat",    {do_pexpireat,     3,  3}},
+  {"expire",       {do_expire,        3,  3, true}},
+  {"pexpire",      {do_pexpire,       3,  3, true}},
+  {"expireat",     {do_expireat,      3,  3, true}},
+  {"pexpireat",    {do_pexpireat,     3,  3, true}},
   {"ttl",          {do_ttl_seconds,   2,  2}},
   {"pttl",         {do_ttl,           2,  2}},
-  {"persist",      {do_persist,       2,  2}},
+  {"persist",      {do_persist,       2,  2, true}},
   // sorted set
-  {"zadd",         {do_zadd,          4,  4}},
-  {"zrem",         {do_zrem,          3,  3}},
+  {"zadd",         {do_zadd,          4,  4, true}},
+  {"zrem",         {do_zrem,          3,  3, true}},
   {"zscore",       {do_zscore,        3,  3}},
   {"zrank",        {do_zrank,         3,  3}},
   {"zquery",       {do_zquery,        6,  6}},
   {"zrevquery",    {do_zquery_reversed, 6, 6}},
   // list
-  {"lpush",        {do_lpush,         3, -1}},
-  {"rpush",        {do_rpush,         3, -1}},
-  {"lpop",         {do_lpop,          2,  2}},
-  {"rpop",         {do_rpop,          2,  2}},
+  {"lpush",        {do_lpush,         3, -1, true}},
+  {"rpush",        {do_rpush,         3, -1, true}},
+  {"lpop",         {do_lpop,          2,  2, true}},
+  {"rpop",         {do_rpop,          2,  2, true}},
   {"llen",         {do_llen,          2,  2}},
   {"lindex",       {do_lindex,        3,  3}},
   {"lrange",       {do_lrange,        4,  4}},
-  {"lset",         {do_lset,          4,  4}},
-  {"linsert",      {do_linsert,       5,  5}},
-  {"lrem",         {do_lrem,          4,  4}},
-  {"ltrim",        {do_ltrim,         4,  4}},
+  {"lset",         {do_lset,          4,  4, true}},
+  {"linsert",      {do_linsert,       5,  5, true}},
+  {"lrem",         {do_lrem,          4,  4, true}},
+  {"ltrim",        {do_ltrim,         4,  4, true}},
   // hash
-  {"hset",         {do_hset,          4, -1}},
+  {"hset",         {do_hset,          4, -1, true}},
   {"hget",         {do_hget,          3,  3}},
-  {"hdel",         {do_hdel,          3, -1}},
+  {"hdel",         {do_hdel,          3, -1, true}},
   {"hexists",      {do_hexists,       3,  3}},
   {"hlen",         {do_hlen,          2,  2}},
   {"hgetall",      {do_hgetall,       2,  2}},
   {"hkeys",        {do_hkeys,         2,  2}},
   {"hvals",        {do_hvals,         2,  2}},
   {"hmget",        {do_hmget,         3, -1}},
-  {"hsetnx",       {do_hsetnx,        4,  4}},
-  {"hincrby",      {do_hincrby,       4,  4}},
+  {"hsetnx",       {do_hsetnx,        4,  4, true}},
+  {"hincrby",      {do_hincrby,       4,  4, true}},
   {"hstrlen",      {do_hstrlen,       3,  3}},
   {"hscan",        {do_hscan,         3, -1}},
   // set
-  {"sadd",         {do_sadd,          3, -1}},
-  {"srem",         {do_srem,          3, -1}},
+  {"sadd",         {do_sadd,          3, -1, true}},
+  {"srem",         {do_srem,          3, -1, true}},
   {"sismember",    {do_sismember,     3,  3}},
   {"smismember",   {do_smismember,    3, -1}},
   {"scard",        {do_scard,         2,  2}},
   {"smembers",     {do_smembers,      2,  2}},
-  {"spop",         {do_spop,          2,  3}},
+  {"spop",         {do_spop,          2,  3, true}},
   {"srandmember",  {do_srandmember,   2,  3}},
   {"sscan",        {do_sscan,         3, -1}},
   {"sinter",       {do_sinter,        2, -1}},
   {"sunion",       {do_sunion,        2, -1}},
   {"sdiff",        {do_sdiff,         2, -1}},
-  {"sinterstore",  {do_sinterstore,   3, -1}},
-  {"sunionstore",  {do_sunionstore,   3, -1}},
-  {"sdiffstore",   {do_sdiffstore,    3, -1}},
-  {"smove",        {do_smove,         4,  4}},
+  {"sinterstore",  {do_sinterstore,   3, -1, true}},
+  {"sunionstore",  {do_sunionstore,   3, -1, true}},
+  {"sdiffstore",   {do_sdiffstore,    3, -1, true}},
+  {"smove",        {do_smove,         4,  4, true}},
   // server
   {"info",         {do_info,          1,  1}},
   {"save",         {do_save,          1,  1}},
@@ -2365,5 +2425,11 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
     return resp_err(out, "ERR wrong number of arguments");
   }
+  uint32_t dirty_before = g_data.g_writes_since_save;
   spec.fn(cmd, out);
+
+  if (g_config.aof_enable && spec.is_write && !g_data.g_loading && 
+      g_data.g_writes_since_save != dirty_before){
+    aof_feed(cmd);
+  }
 }

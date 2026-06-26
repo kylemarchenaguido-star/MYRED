@@ -10,15 +10,15 @@ Speaks RESP on port 1234 — real `redis-cli` works against it.
 
 ---
 
-## Current state — 2026-06-21
+## Current state — 2026-06-25
 
-**294/294 tests passing. 0 stress errors. 1823 ops/sec.**
+**328/328 tests passing. 0 stress errors.**
 
-All 5 Redis data types implemented:
+All 5 Redis data types implemented and full project-wide code review (v5.3) complete:
 
 | Type | Commands | Status |
 |---|---|---|
-| String | get, set, del, exists | ✅ (numeric/bulk variants in progress) |
+| String | get, set, del, exists, incr, decr, incrby, decrby, incrbyfloat, setnx, setex, psetex, getset, getex, getdel, mset, mget, msetnx, append, strlen, getrange, setrange | ✅ |
 | Sorted Set | zadd, zrem, zscore, zrank, zquery, zrevquery | ✅ |
 | List | lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim | ✅ |
 | Hash | hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget, hsetnx, hincrby, hstrlen, hscan | ✅ |
@@ -94,23 +94,196 @@ SETRANGE key offset val    → overwrite bytes at offset; zero-pad if offset > l
 
 ---
 
-## v5.3 — Project-wide code review (AFTER all string commands)
+## ✅ v5.3 — Project-wide code review (DONE 2026-06-25)
 
-Full pass over the codebase before adding AOF or replication. Focus areas:
+Full pass over the codebase before adding AOF or replication. 328/328 tests passing.
 
-- **Clean code:** remove duplicate `unlink` dispatch (~line 1468 and ~1558 in `commands.cpp` — second is dead code). Magic numbers → named constants. Comment quality.
-- **Efficiency:** unnecessary `std::string` copies (pass by const ref where possible). `hm_foreach` vs `hm_scan` misuse. `Buffer` realloc patterns.
-- **Optimizations:** `srand(time(NULL))` in `server.cpp main()` — `RANDOMKEY`/`SPOP`/`SRANDMEMBER` are currently deterministic per boot. Consider `SO_REUSEPORT`.
-- **Robustness:** lazy expiry gaps — `expire_if_needed` not called on zset/list reads. `fork()` + thread-pool malloc-lock deadlock (rare, noted). `SETRANGE` 512 MB bound.
-- **Tests:** add `stress_test.py` coverage for all v5.2 commands. Target ~350+ passing tests.
+- **Entry type:** `Entry::val` replaced with `std::variant<monostate, string, ZSet, Deque, EntryHash, EntrySet>` — eliminates a whole class of type-confusion bugs and makes the union explicit.
+- **Dispatch table:** `do_request` replaced 110-branch if/else with `std::unordered_map<string_view, CmdSpec>` — O(1) dispatch, arity checked from table, ~20 lines of routing code.
+- **Error constants:** `MSG_WRONGTYPE`, `MSG_NOT_INT`, `MSG_NOT_FLOAT`, `MSG_SYNTAX`, `MSG_OUT_OF_RANGE` — kills typo class.
+- **RNG:** `srand(time(NULL))` → `std::mt19937_64` seeded from `std::random_device` — fixes modulo bias; `SPOP`/`SRANDMEMBER`/`RANDOMKEY` no longer deterministic per boot.
+- **Uniform lazy expiry:** `expire_if_needed` added to `expire_generic` / `expireat_generic` — every keyspace read now expires first.
+- **Direct-emit:** `do_keys`, `do_smembers`, `h_collect_reply` no longer collect into a `vector` then emit; use `hm_size` for upfront count and write directly into `Buffer*`.
+- **ScanCtx unification:** `HScanCtx` / `SScanCtx` merged into single `ScanCtx`.
+- **`glob_match`:** recursive `*` case replaced with O(n·m) two-pointer iterative algorithm.
+- **`container_of`:** GCC statement-expression macro replaced with portable C++ template; 56 call sites updated; type errors now caught at compile time.
+- **Server hardening:** `SO_REUSEADDR`, `accept()` while-loop, `EINTR` handling in read/write, env vars `MYRED_PORT` / `MYRED_PASSWORD`, `thread_pool_destroy` on shutdown.
+- **RDB hardening:** fork+malloc deadlock fixed (serialize in parent before fork, child uses POSIX only), `.bak` rotation before atomic rename, bounds checks in all loaders, `stat()` for post-save size.
+- **Thread pool:** graceful shutdown (`stop` flag, `thread_pool_destroy`), exception guard in worker, explicit `abort()` on pthread errors.
+- **Build:** `-Wall -Wextra -Wshadow` added; Release build uses `-O3 -DNDEBUG` by default.
 
 ---
 
 ## v6 — Persistence hardening
 
-- AOF append-only log + fsync policies (always / everysec / no)
-- BGREWRITEAOF — compaction (AOF grows unbounded without it)
-- Crash-recovery testing (kill mid-save, reload); RDB+AOF hybrid loading
+Two complementary durability mechanisms: RDB (point-in-time snapshots, already done) and AOF (command log). Redis runs both together — RDB for fast restarts, AOF for durability.
+
+---
+
+### Step 1 — AOF write path
+
+Every write command is serialized in RESP format and appended to `appendonly.aof` after it executes successfully.
+
+**What to append:**
+- Append the command as received, normalized to uppercase name + original args.
+- Expiry-setting commands (`SETEX`, `PSETEX`, `EXPIRE`, `PEXPIRE`) must be rewritten as `PEXPIREAT key <absolute_ms>` when written to AOF so the TTL is correct on replay after a restart. Relative TTLs would be wrong.
+- `GETEX` with EX/PX option → emit `PEXPIREAT` separately.
+- `GETEX PERSIST` → emit `PERSIST key`.
+- `FLUSHALL` → write it; it must replay.
+- Read-only commands (`GET`, `HGET`, `LRANGE`, …) → never written.
+- `DEL` of a missing key → still write it (simpler; the replay `DEL` is a no-op).
+
+**Write path in code (`commands.cpp` / `server.cpp`):**
+```
+after do_request() returns:
+  if (cmd is a write command)
+      aof_append(cmd)   // serialize to RESP, write() into aof_buf
+```
+
+Track which commands are writes via a flag in `CmdSpec` (add `bool is_write` field, or a separate `k_write_cmds` set).
+
+**AOF buffer:** Don't call `write()` per command — buffer in a `std::string aof_buf` in `g_data`. Flush the buffer:
+- On every write if `appendfsync = always`
+- Every 1 second if `appendfsync = everysec` (flush + `fdatasync` posted to thread pool)
+- Never if `appendfsync = no` (OS decides)
+
+**`fdatasync` vs `fsync`:** Prefer `fdatasync` — skips flushing the inode metadata (mtime, size), which is a significant speedup on ext4/xfs.
+
+---
+
+### Step 2 — fsync policies
+
+Three modes, configurable (add `std::string aof_fsync` to `Config`):
+
+| Mode | Durability | Throughput | Notes |
+|---|---|---|---|
+| `always` | 0 data loss | ~1–3k ops/sec | `fdatasync` after every `write()` in event loop |
+| `everysec` | ≤1 sec loss | ~50k ops/sec | post `fdatasync` to thread pool every second |
+| `no` | ~30 sec loss | no overhead | OS controls flush; fastest |
+
+**`everysec` implementation:** add a field `uint64_t g_aof_last_fsync_ms` to `g_data`. In `process_timers()` (already called every event loop tick), if `now - g_aof_last_fsync_ms >= 1000`: flush `aof_buf` to disk and post `fdatasync(aof_fd)` to thread pool. Update `g_aof_last_fsync_ms`.
+
+---
+
+### Step 3 — AOF loading / replay
+
+On startup, if `appendonly.aof` exists: replay it instead of (or after) loading RDB.
+
+```cpp
+void aof_load(const char *path) {
+    // open file, read into a Buffer
+    // loop: parse_resp_request() → do_request() (skip auth, skip AOF write during replay)
+    // on parse error: warn + truncate to last good position (see Step 6)
+}
+```
+
+**Optimization during replay:**
+- Set a `g_data.loading = true` flag; during replay skip `aof_append()` (don't re-log commands being loaded).
+- Disable the save trigger (`g_writes_since_save` doesn't count during load).
+- Don't call `expire_if_needed` during load — keys will expire naturally once the server starts.
+- Open the AOF fd for append at the end of the file after load completes.
+
+---
+
+### Step 4 — BGREWRITEAOF (compaction)
+
+The AOF grows without bound. Compaction rewrites it to the minimum set of commands that reproduce current state. Triggered manually (`BGREWRITEAOF` command) or automatically when `aof_size > aof_rewrite_min_size` and `aof_size > last_rewrite_size * aof_rewrite_growth_factor`.
+
+**Two-phase approach (same fork pattern as BGSAVE):**
+
+**Phase 1 — serialize in parent (before fork), child writes only:**
+- Serialize entire dataset into a buffer (same traversal as RDB but emit RESP commands instead of binary).
+- Fork. Child receives the serialized buffer, writes it to `temp.aof`, calls `fdatasync`, `_exit(0)`.
+- Parent continues serving; new write commands go to both `aof_buf` AND a new `aof_rewrite_buf`.
+
+**Phase 2 — parent finalizes after child exits:**
+- `waitpid` detects child done (via `rdb_check_background_save` pattern already in place).
+- Parent appends `aof_rewrite_buf` (commands that arrived during rewrite) to `temp.aof`.
+- `rename("temp.aof", "appendonly.aof")` — atomic swap.
+- Clear `aof_rewrite_buf`.
+
+**RESP commands to emit per type:**
+```
+String:  SET key value  [+ PEXPIREAT key ms if has TTL]
+ZSet:    ZADD key score1 m1 score2 m2 ...  (batch all members in one command)
+List:    RPUSH key e1 e2 e3 ...  (single command, preserves order)
+Hash:    HSET key f1 v1 f2 v2 ...  (batch)
+Set:     SADD key m1 m2 m3 ...  (batch)
+```
+Batching is critical — one command per element would inflate the AOF and slow replay.
+
+**Cap on batch size:** Redis caps at 64 elements per command to keep individual RESP frames reasonable. Use `k_aof_batch_size = 64`.
+
+---
+
+### Step 5 — RDB + AOF hybrid loading
+
+**Priority on startup:**
+1. If `appendonly = yes` and `appendonly.aof` exists → load AOF only (most complete).
+2. If only `dump.rdb` exists → load RDB.
+3. If both exist and `appendonly = yes` → AOF wins; log a warning that RDB is being ignored.
+4. If neither exists → start empty.
+
+**Hybrid AOF format (optional, Redis 4.0+):** The rewritten AOF begins with an embedded RDB binary block (faster to load than replaying millions of RESP commands), followed by RESP commands for changes since the last rewrite. Header magic: `REDIS` (same as RDB). AOF loader detects the magic and switches to RDB loader for the header, then switches back to RESP replay for the tail. Implement this AFTER basic AOF is working.
+
+---
+
+### Step 6 — Crash recovery & AOF truncation
+
+AOF files can be truncated mid-command if the server crashes during a `write()`. The loader must handle this gracefully.
+
+**Detection:** `parse_resp_request` returns `-1` or `0` (unexpected EOF) partway through a command.
+
+**Recovery:** on a truncation error, log a warning with the file offset, truncate the file to the last successfully parsed position (`ftruncate(fd, good_offset)`), and continue. Don't treat partial writes as fatal — this is expected after a crash.
+
+**`redis-check-aof` equivalent:** add a `--check-aof` CLI flag that opens the AOF, parses it without executing, reports the last good offset, and optionally truncates.
+
+**Test scenarios to run:**
+```bash
+# 1. Kill mid-save (RDB)
+./build/server &; redis-cli -p 1234 -a kek1234 bgsave; kill -9 $!; ./build/server
+# dump.rdb must be intact (old copy); new temp file is orphaned
+
+# 2. Kill mid-AOF-write
+# After recovery, server must load up to last complete command
+
+# 3. Disk full during AOF write
+# Server must log error and switch to read-only or warn loudly — don't silently drop writes
+```
+
+---
+
+### Step 7 — Config-driven save triggers
+
+Redis `save` directive: save RDB if N keys changed in the last M seconds.
+
+```
+save 3600 1      # 1 write in 1 hour
+save 300 100     # 100 writes in 5 minutes
+save 60 10000    # 10000 writes in 1 minute
+```
+
+Add `std::vector<SaveCondition> save_conditions` to `Config`, where `SaveCondition = {uint32_t seconds, uint32_t changes}`.
+
+Check in `process_timers()`: for each condition, if `g_writes_since_save >= changes && now - g_last_save_time >= seconds * 1000` → trigger `BGSAVE` automatically.
+
+Already have `g_writes_since_save` and `g_last_save_time`. Just need the config parsing and the multi-condition loop.
+
+---
+
+
+// Remember to the overload on aof_encode, make it an template at the end
+
+### Optimization summary
+
+| Concern | Approach |
+|---|---|
+| AOF write latency | Buffer writes; use `fdatasync` not `fsync` |
+| BGREWRITEAOF memory | Serialize in parent before fork (no CoW explosion); child does pure I/O |
+| Replay speed | Disable `aof_append` + `expire_if_needed` during load |
+| Rewrite correctness | Dual-buffer: `aof_buf` for live AOF, `aof_rewrite_buf` for delta during child run |
+| Disk full | Check `write()` return value; log + stop accepting writes rather than silently losing data |
+| AOF size monitoring | Track `aof_current_size` (bytes written since last rewrite); expose in `INFO persistence` |
 
 ## v7 — Memory management
 
@@ -140,7 +313,7 @@ Full pass over the codebase before adding AOF or replication. Focus areas:
 - **Thread pool (8 threads)** for background work: large ZSet/Set async deletes.
 - **fork()-based BGSAVE**: child writes snapshot, parent keeps serving. `g_rdb_child_pid` tracked.
 - **Dual HMap** with progressive rehashing. `hm_scan` uses reverse-binary cursor (safe during rehash).
-- **Entry types:** `T_STR=1`, `T_ZSET=2`, `T_DLIST=3`, `T_HASH=4`, `T_SET=5`.
+- **Entry types:** `T_STR=1`, `T_ZSET=2`, `T_DLIST=3`, `T_HASH=4`, `T_SET=5`. Value stored as `std::variant` in `Entry::val`.
 - **RDB tags** (separate from Entry::type): string=0, zset=1, list=2, hash=3, set=4.
 - **TTL:** monotonic clock in memory, wall clock on disk (survives reboots).
 - **Benchmarking:** Python harness is client-bound (~1800 ops/sec). Server min latency ~0.02 ms → ~50k ops/sec single-thread. For real numbers: `redis-benchmark -p 1234 -a kek1234 -t set,get,lpush -n 200000 -c 50 -P 16`
