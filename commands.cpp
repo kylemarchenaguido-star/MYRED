@@ -2,6 +2,7 @@
 #include "state.h"
 #include "resp.h"
 #include "rdb.h"
+#include "aof.h"
 #include "buffer.h"
 #include "common.h"
 #include "string.h"
@@ -832,6 +833,13 @@ static void do_save(std::vector<std::string> &cmd, Buffer *out){
   } else {
     resp_err(out, "ERR save failed");
   }
+}
+
+// BGREWRITEAOF - aof fork save
+static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out){
+  (void)cmd;
+  aof_rewrite_background();
+  resp_simple(out, "Background append only file rewriting started");
 }
 
 // BGSAVE - fork , returns immediately
@@ -2402,6 +2410,7 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"info",         {do_info,          1,  1}},
   {"save",         {do_save,          1,  1}},
   {"bgsave",       {do_bgsave,        1,  1}},
+  {"bgrewriteaof", {do_bgrewriteaof,  1,  1}},
 };
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {

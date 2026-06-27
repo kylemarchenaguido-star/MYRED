@@ -14,8 +14,6 @@
 
 // RDB
 pid_t g_rdb_child_pid = -1;
-// AOF
-pid_t g_aof_child_pid = -1;
 
 // Converts a monotonic-clock expiry timestamp to wall-clock milliseconds.
 // The cast to int64_t intentionally wraps on underflow (key already expired);
@@ -227,72 +225,6 @@ static bool cb_rdb_write(HNode *node, void *arg){
 
 // AOF callbacks and functions
 
-struct AofBatch {
-  Buffer *buf;
-  const char *cmd; // ZADD / HSET / SADD
-  std::string_view key;
-  std::vector<std::string> args; // OWNS the strings (score are formated here)
-  size_t per_elem; // 1 for SADD, 2 for ZADD/HSET
-};
-
-static constexpr size_t k_aof_batch = 64; // max elements per emitted command
-
-// emit one RESP array command into a Buffer
-static void aof_emit_vec(Buffer *buf, const std::vector<std::string_view> &parts){
-  char hdr[32];
-  int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", parts.size());
-  buf_append(buf, hdr, (size_t)n);
-  for (std::string_view a : parts){
-    int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
-    buf_append(buf, hdr, (size_t)h);
-    buf_append(buf, a.data(), a.size());
-    buf_append(buf, "\r\n", (size_t)2);
-  }
-}
-
-static void aof_batch_flush(AofBatch *b){
-  if (b->args.empty()){ return; }
-  std::vector<std::string_view> v;
-  v.reserve(b->args.size() + 2);
-  v.push_back(b->cmd);
-  v.push_back(b->key);
-  for (auto &s : b->args){ v.push_back(s); }
-  aof_emit_vec(b->buf, v);
-  b->args.clear();
-}
-
-static inline void aof_batch_maybe_flush(AofBatch *b){
-  if (b->args.size() >= k_aof_batch * b->per_elem) aof_batch_flush(b);
-}
-
-// member callbacks (Same node types as your RDB callbacks)
-static bool cb_aof_zset(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  ZNode *z = container_of(node, &ZNode::hmap);
-  char sc[64];
-  int n = snprintf(sc, sizeof(sc), "%.17g", z->score);
-  b->args.emplace_back(sc, (size_t)n); // score
-  b->args.emplace_back(z->name, z->len); // member
-  aof_batch_maybe_flush(b);
-  return true;
-}
-
-static bool cb_aof_hash(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  HashNode *h = container_of(node, &HashNode::node);
-  b->args.emplace_back(h->field);
-  b->args.emplace_back(h->value);
-  aof_batch_maybe_flush(b);
-  return true;
-}
-
-static bool cb_aof_set(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  SetNode *s = container_of(node, &SetNode::node);
-  b->args.emplace_back(s->member);
-  aof_batch_maybe_flush(b);
-  return true;
-}
 
 struct RDBStats{
   uint32_t entries;
@@ -385,7 +317,6 @@ void rdb_on_save_complete(const char *filename){
   g_data.g_last_save_ms = get_monotonic_msec();
   g_data.g_writes_since_save++;
 }
-
 
 // we build the rdb function
 bool rdb_save(const char* filename){

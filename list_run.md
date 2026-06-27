@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-26 00:51:06
+# MYRED stress test — 2026-06-27 00:04:27
 
 ```
 (logging output to list_run.md)
@@ -158,7 +158,7 @@
   ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'persist_zset', 'kc']
+  ✓ keys returns list → ['kb', 'ka', 's', 'k', 'kc', 'mylist', 'h', 'foo']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
@@ -460,7 +460,7 @@
   ℹ  100 rapid set/get/del complete
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:76\r\nuptime_minutes:1\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:2\r\n\r\n# Memory\r\nused_memory_bytes:3932160\r\nused_memory_mb:3.75\r\n\r\n# Stats\r\ntotal_commands:2411\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:17880\r\nrdb_changes_since_save:1971\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:102\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:4\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:2\r\n\r\n# Memory\r\nused_memory_bytes:3932160\r\nused_memory_mb:3.75\r\n\r\n# Stats\r\ntotal_commands:2411\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:13206\r\nrdb_changes_since_save:1974\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:192\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -477,8 +477,8 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:76
-    uptime_minutes:1
+    uptime_seconds:4
+    uptime_minutes:0
     uptime_hours:0
     # Clients
     connected_clients:1
@@ -493,10 +493,10 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:17880
-    rdb_changes_since_save:1971
+    rdb_last_save_time:13206
+    rdb_changes_since_save:1974
     rdb_last_save_ok:1
-    rdb_last_save_size_bytes:102
+    rdb_last_save_size_bytes:192
     # Replication
     role:master
 
@@ -512,7 +512,7 @@
   ✓ bgsave returns fast (<50ms)
   ℹ  bgsave returned in 0.7ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 13.2ms
+  ℹ  100 ops during save took 15.1ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -545,17 +545,17 @@ All tests passed!
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    29.92s
-  Throughput: 134 ops/sec
+  Elapsed:    31.36s
+  Throughput: 128 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 51.68ms
-  Latency min: 0.08ms
-  Latency max: 976.20ms
-  Latency p95: 516.51ms
-  Latency p99: 886.51ms
+  Latency avg: 57.87ms
+  Latency min: 0.11ms
+  Latency max: 1038.28ms
+  Latency p95: 623.27ms
+  Latency p99: 913.34ms
   No errors!
-  ℹ  cleaned 162 leftover keys
+  ℹ  cleaned 139 leftover keys
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

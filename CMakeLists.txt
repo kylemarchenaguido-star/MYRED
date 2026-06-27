@@ -32,6 +32,7 @@ add_executable(server
   deque.cpp
   hash.cpp
   set.cpp
+  aof.cpp
 )
 target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
 

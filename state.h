@@ -98,6 +98,9 @@ struct GlobalData{
   bool g_loading = false; // true when replaying
   std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
   std::string g_aof_rewrite_buf; // delta captured during a rewrite
+  size_t g_aof_current_size = 0;
+  size_t g_aof_base_size = 0;
+  uint64_t g_aof_check_ms = 0; // throttles the auto-rewrite check
 };
 
 //global config
@@ -107,6 +110,8 @@ struct Config {
   bool aof_enable = false;
   std::string aof_path = "appendonly.aof";
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
+  size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
+  int aof_rewrite_perc = 100; // ... or until it has doubled
 };
 
 // HMap is not unique

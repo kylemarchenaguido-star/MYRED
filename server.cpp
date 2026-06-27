@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <sys/wait.h>   // for waitpid
+#include <sys/stat.h>  // fstat
 // C++
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "resp.h"
 #include "rdb.h"
 #include "commands.h"
+#include "aof.h"
 
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
@@ -164,6 +166,7 @@ static bool aof_flush(){
     off += (size_t)rv;
   }
   buf.erase(0, off); // drop only what was actually written
+  g_data.g_aof_current_size += off; // we tracked with no syscall
   return off > 0;
 }
 
@@ -236,6 +239,23 @@ static void process_timers(){
         thread_pool_queue(&g_data.thread_pool, aof_fsync_job, nullptr);
       }
       // else previous fdatasync still in  flight, we skip and try again next second
+    }
+  }
+
+  // auto AOF rewrite
+  if (g_config.aof_enable && g_aof_child_pid == -1 && g_rdb_child_pid == -1 && now_ms  - g_data.g_aof_check_ms >= 1000){
+    g_data.g_aof_check_ms = now_ms;
+
+    size_t cur = g_data.g_aof_current_size;
+    size_t base = g_data.g_aof_base_size;
+    if (cur >= g_config.aof_rewrite_min_size){
+      // base == 0 -> no prior rewwrite -> treat as 100% grown so we establish a baseline
+      long long growth = (base != 0) ? (long long)((cur - base) * 100 / base) : 100;
+      if (growth >= g_config.aof_rewrite_perc){
+        fprintf(stderr, "aof_rewrite: auto-trigger (size=%zu base=%zu growth=%lld%%)\n",
+                cur, base, growth);
+        aof_rewrite_background();
+      }
     }
   }
 }
@@ -338,10 +358,6 @@ int main(){
   // Initialiaze the thread pool and result queue 
   thread_pool_init(&g_data.thread_pool, 8);
 
-  if (!rdb_load("dump.rdb")){
-    fprintf(stderr, "rdb_load failed, starting with empty database\n");
-  }
-
   const char *pass_env = getenv("MYRED_PASSWORD");
   g_config.password = pass_env ? pass_env : "kek1234";
 
@@ -357,19 +373,55 @@ int main(){
   const char *aof_env = getenv("MYRED_AOF");
   g_config.aof_enable = aof_env && (aof_env[0] == '1' || aof_env[0] == 'y');
 
+  // AOF takes priority over RDB
+  bool aof_exists = (access(g_config.aof_path.c_str(), F_OK) == 0);
+  bool rdb_exists = (access(g_config.dump_path.c_str(), F_OK) == 0);
+
+  if (g_config.aof_enable && aof_exists){
+    if (rdb_exists){
+      fprintf(stderr, "startup: AOF and RDB both present -> loading AOF, ignording RDB\n");
+    }
+    if (!aof_load(g_config.aof_path.c_str())){
+      fprintf(stderr, "startup: AOF load failed\n");
+    }
+  } else if (rdb_exists){
+    if (!rdb_load(g_config.dump_path.c_str())){
+      fprintf(stderr, "startup: RDB load failed, starting empty\n");
+    }
+  } else {
+    fprintf(stderr, "startup: no persistence file, starting empty\n");
+  }
+
   if (g_config.aof_enable){
     g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_data.g_aof_fd < 0){
       fprintf(stderr, "fatal: cannot open AOF %s: %s\n", g_config.aof_path.c_str(), strerror(errno));
       return 1;
     }
+    struct stat st;
+    if (fstat(g_data.g_aof_fd, &st) == 0){
+      g_data.g_aof_current_size  = (size_t)st.st_size;
+      g_data.g_aof_base_size  = (size_t)st.st_size;
+    }
   }
-
+  
   const char *fsync_env = getenv("MYRED_AOF_FSYNC");
   if (fsync_env){
     if (strcmp(fsync_env, "always") == 0){ g_config.aof_fysnc = Aoffsync::ALWAYS; }
     else if (strcmp(fsync_env, "no") == 0){ g_config.aof_fysnc = Aoffsync::NO; }
     else { g_config.aof_fysnc = Aoffsync::EVERYSEC; }
+  }
+
+  const char *rmin_enve = getenv("MYRED_AOF_REWRITE_MIN");
+  if (rmin_enve){
+    long long v = atoll(rmin_enve);
+    if (v > 0){ g_config.aof_rewrite_min_size = (size_t)v; }
+  }
+
+  const char *rperc_env = getenv("MYRED_AOF_REWRITE_PERC");
+  if (rperc_env){
+    int v = atoi(rperc_env);
+    if (v > 0){ g_config.aof_rewrite_perc = v; }
   }
 
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
@@ -467,6 +519,7 @@ int main(){
     // handle timers
     process_timers();
     rdb_check_background_save();
+    aof_check_background_rewrite();
   }
   thread_pool_destroy(&g_data.thread_pool);
 
