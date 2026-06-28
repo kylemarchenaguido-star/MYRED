@@ -1,5 +1,5 @@
 # MYRED — Full Codebase Review (v5.3)
-
+redis-benchmark -p 1234 -a kek1234 -t set,get,incr,lpush,rpush,sadd,hset -n 200000 -c 50 -P 16 -q
 Project-wide pass over every `.cpp`/`.h` file. Each item has a **location**, a
 **what**, and a **why**. Grouped by severity, then by file.
 
