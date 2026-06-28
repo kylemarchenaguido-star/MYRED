@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-06-23 11:01:45
+# MYRED stress test — 2026-06-25 17:13:00
 
 ```
 (logging output to stress_results.md)
@@ -158,17 +158,17 @@
   ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc']
+  ✓ keys returns list → ['kc', 'ka', 'kb']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 5000
+  ✓ pttl returns int → 4999
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 5000ms
+  ℹ  remaining TTL: 4999ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -371,7 +371,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.3ms
+  ℹ  returned in 0.2ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -386,20 +386,179 @@
   ✓ smismember missing key
   ✓ scard → 4
   ✓ scard missing → 0
+  ✓ smembers returns 4 items
+  ✓ smembers has a
+  ✓ smembers has d
+  ✓ smembers missing → []
+  ✓ srem existing → 1
+  ✓ srem same again → 0
+  ✓ scard after srem → 3
+  ✓ srem multi: b c → 2
+  ✓ scard → 1
+  ✓ srem missing key → 0
+  ✓ srem on string → WRONGTYPE
 
-Unexpected error: Server closed connection
+── Sets: SPOP / SRANDMEMBER ──────────────────────────
+  ✓ spop returns string
+  ✓ spop reduces card by 1
+  ✓ spop missing → nil
+  ✓ spop count=3 list of 3
+  ✓ spop count=3 distinct
+  ✓ scard after spop 3 → 2
+  ✓ srandmember returns string
+  ✓ card unchanged after srandmember
+  ✓ srandmember count=3 list
+  ✓ srandmember count=3 distinct
+  ✓ srandmember -5 returns 5
+  ✓ srandmember count>size → all
+  ✓ srandmember missing → nil
+
+── Sets: SSCAN ───────────────────────────────────────
+  ✓ sscan sees all 4
+  ✓ sscan has apple
+  ✓ sscan has cherry
+  ✓ sscan match a* → 2
+  ✓ sscan excludes banana
+  ✓ sscan missing key cursor → 0
+  ✓ sscan missing key array → []
+  ✓ sscan on string → WRONGTYPE
+
+── Sets: SINTER / SUNION / SDIFF ─────────────────────
+  ✓ sinter s1∩s2∩s3 = {c}
+  ✓ sinter s1∩s2 = {b,c}
+  ✓ sunion = {a,b,c,d,e,f}
+  ✓ sdiff s1-s2 = {a,d}
+  ✓ sdiff s1-s2-s3 = {a,d}
+  ✓ sinter wrong type → WRONGTYPE
+
+── Sets: SINTERSTORE / SUNIONSTORE / SDIFFSTORE ──────
+  ✓ sinterstore tsdest ts1 ts2 → 2
+  ✓ sinterstore result = {b,c}
+  ✓ sunionstore tsdest ts1 ts2 → 5
+  ✓ sunionstore result = {a,b,c,d,e}
+  ✓ sdiffstore tsdest ts1 ts2 → 2
+  ✓ sdiffstore result = {a,d}
+  ✓ sinterstore ts1←ts1∩ts2 → 2
+  ✓ ts1 is now {b,c}
+
+── Sets: SMOVE ───────────────────────────────────────
+  ✓ smove existing → 1
+  ✓ src no longer has x
+  ✓ dst now has x
+  ✓ smove non-existent → 0
+  ✓ smove missing src → 0
+  ✓ smove already-in-dst → 1
+  ✓ src size → 1 (just z)
+
+── Edge Cases ────────────────────────────────────────
+  ✓ zscore negative → -5
+  ✓ zscore zero → 0
+  ✓ same score sorted by name
+  ✓ special chars in value
+  ✓ get on zset → WRONGTYPE error
+  ✓ 100 rapid get correct
+  ℹ  100 rapid set/get/del complete
+
+── INFO Command ──────────────────────────────────────
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:103\r\nuptime_minutes:1\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:28\r\n\r\n# Memory\r\nused_memory_bytes:5050368\r\nused_memory_mb:4.82\r\n\r\n# Stats\r\ntotal_commands:11426\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:560\r\nrdb_changes_since_save:7112\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:115\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ has # Server section
+  ✓ has # Clients section
+  ✓ has # Memory section
+  ✓ has # Stats section
+  ✓ has # Keyspace section
+  ✓ has # Persistence section
+  ✓ has version field
+  ✓ has uptime_seconds field
+  ✓ has connected_clients field
+  ✓ has total_commands field
+  ✓ has keys_total field
+  ✓ has keys_with_ttl field
+
+  INFO output:
+    # Server
+    version:1.0.0
+    uptime_seconds:103
+    uptime_minutes:1
+    uptime_hours:0
+    # Clients
+    connected_clients:1
+    total_connections:28
+    # Memory
+    used_memory_bytes:5050368
+    used_memory_mb:4.82
+    # Stats
+    total_commands:11426
+    # Keyspace
+    keys_total:0
+    keys_with_ttl:0
+    keys_no_ttl:0
+    # Persistence
+    rdb_last_save_time:560
+    rdb_changes_since_save:7112
+    rdb_last_save_ok:1
+    rdb_last_save_size_bytes:115
+    # Replication
+    role:master
+
+── SAVE / RDB Persistence ────────────────────────────
+  ✓ save → OK
+  ✓ dump.rdb exists
+  ✓ dump.rdb not empty
+  ℹ  dump.rdb size: 75 bytes
+  ✓ magic number correct
+
+── BGSAVE (fork-based background save) ───────────────
+  ✓ bgsave returns string → 'Background saving started'
+  ✓ bgsave returns fast (<50ms)
+  ℹ  bgsave returned in 0.8ms: 'Background saving started'
+  ✓ server responsive during save
+  ℹ  100 ops during save took 14.2ms
+  ✓ save did not block event loop (burst <500ms)
+  ✓ dump.rdb exists after bgsave
+  ✓ bgsave file has magic
+  ✓ second bgsave handled gracefully
 
 ── Authentication ────────────────────────────────────
+  ✓ wrong password → error
+  ✓ unauthenticated → NOAUTH error
+  ✓ correct password → OK
+  ✓ authenticated set works
 
-Unexpected error: [Errno 111] Connection refused
+── Persistence Round-trip (in-memory) ────────────────
+  ✓ save → OK
+  ✓ string still readable
+  ✓ zset alice still readable → 10
+  ✓ zset bob still readable → 20
+  ✓ zrank alice → 0
+  ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 328/328 passed
+Results: 421/421 passed
 All tests passed!
 ═══════════════════════════════════════════════════════
 
+── Concurrent Write Safety ─────────────────────────────
+  ✓ 10 threads × 50 ops, no errors
+
+── Stress Test ────────────────────────────────────────
+  Threads:    8
+  Ops/thread: 500
+  Total ops:  4000
+
+  Elapsed:    1.94s
+  Throughput: 2059 ops/sec
+  Total ops:   4000
+  Errors:      0
+  Latency avg: 3.73ms
+  Latency min: 0.03ms
+  Latency max: 64.99ms
+  Latency p95: 39.54ms
+  Latency p99: 57.32ms
+  No errors!
+  ℹ  cleaned 155 leftover keys
+
 ═══════════════════════════════════════════════════════
-  SOME TESTS FAILED
+  ALL TESTS PASSED
 ═══════════════════════════════════════════════════════
 
 
