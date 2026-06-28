@@ -17,8 +17,6 @@
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
 constexpr size_t k_max_args = 65536;
-constexpr uint64_t k_save_interval_ms  = 5 * 60 * 1000; // 5 minutes 5 * 60 * 1000
-constexpr uint32_t k_save_after_writes = 100; // or after 100 writes
 // secondes * miliseconds (5s -> 5000ms)
 constexpr uint64_t k_idle_timeout_ms = 30 * 1000;
 constexpr uint64_t k_io_timeout_ms = 30 * 1000;

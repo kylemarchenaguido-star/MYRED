@@ -18,6 +18,7 @@
 // C++
 #include <string>
 #include <vector>
+#include <sstream>
 // project
 #include "hashtable.h"
 #include "common.h"
@@ -139,8 +140,15 @@ static int32_t next_timer_ms() {
   }
   // check the periodic wake up
   if (g_data.g_writes_since_save > 0){
-    uint64_t next_save = g_data.g_last_save_ms + k_save_interval_ms;
-    next_ms = std::min(next_ms, next_save);
+    uint64_t soonest = (uint8_t)-1;
+    for (const SaveCondition &sc : g_config.save_conditions){
+      if (g_data.g_writes_since_save >= sc.changes){
+        soonest = std::min(soonest, g_data.g_last_save_ms + sc.seconds * 1000);
+      }
+    }
+    if (soonest != (uint64_t)-1){
+      next_ms = std::min(next_ms, soonest);
+    }
   }
   // no timers 
   if (next_ms == (uint64_t)-1){ return -1; }
@@ -234,13 +242,21 @@ static void process_timers(){
     }
   }
   // periodic RDB save
-  bool time_elapsed = (now_ms - g_data.g_last_save_ms) >= k_save_interval_ms;
-  bool dirty_enough = g_data.g_writes_since_save >= k_save_after_writes;
-
-  if (time_elapsed && dirty_enough && g_rdb_child_pid == -1){
-    g_data.g_last_save_ms =now_ms;
-    rdb_save_background();
-    fprintf(stderr, "periodic save triggered\n");
+  
+  if ( g_rdb_child_pid == -1 && g_data.g_writes_since_save > 0){
+    uint64_t elapsed_ms = now_ms - g_data.g_last_save_ms;
+    for (const SaveCondition &sc : g_config.save_conditions){
+      if (g_data.g_writes_since_save >= sc.changes && elapsed_ms >= sc.seconds * 1000){
+        fprintf(stderr, "save: %u changes within %llus -> bgsave\n", 
+                 g_data.g_writes_since_save, (unsigned long long)sc.seconds);
+        // gate against retry-storm if the save fails
+        g_data.g_last_save_ms = now_ms;
+        // snapshots g_dirty_at_save internally already
+        rdb_save_background();
+        // one save per tick
+        break;
+      }
+    }
   }
   // periodic AOF fsync (everysec mode)
   if (g_config.aof_enable && g_config.aof_fysnc  == Aoffsync::EVERYSEC){
@@ -430,6 +446,17 @@ int main(int argc, char **argv){
       g_data.g_aof_base_size  = (size_t)st.st_size;
     }
   }
+
+  const char *save_env = getenv("MYRED_SAVE");
+  if (save_env){
+    g_config.save_conditions.clear();           // "" disables automatic saves entirely
+    std::istringstream iss(save_env);
+    uint64_t sec; uint32_t ch;
+    while (iss >> sec >> ch){
+      g_config.save_conditions.push_back({sec, ch});
+    }
+  }
+
   
   const char *fsync_env = getenv("MYRED_AOF_FSYNC");
   if (fsync_env){

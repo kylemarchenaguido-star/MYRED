@@ -2303,6 +2303,27 @@ static void aof_feed(const std::vector<std::string> &cmd){
   }
 }
 
+static void do_ping(std::vector<std::string> &cmd, Buffer *out){
+  if (cmd.size() >= 2){
+    // PING msg -> bulk echo
+    return resp_str(out, cmd[1].data(), cmd[1].size()); 
+  }
+  return resp_simple(out, "PONG");
+}
+
+static void do_config(std::vector<std::string> &cmd, Buffer *out){
+  std::string sub = cmd[1];
+  for (char &c : sub){ c = (char)tolower((unsigned char)c); }
+
+  if (sub == "get"){
+    return resp_arr(out, 0);
+  }
+  if (sub == "set" || sub == "resetstat" || sub == "rewrite"){
+    return resp_ok(out);
+  }
+  return resp_err(out, "ERR Unknown CONFIG subcommand");
+}
+
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
 
 struct CmdSpec {
@@ -2411,6 +2432,8 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"save",         {do_save,          1,  1}},
   {"bgsave",       {do_bgsave,        1,  1}},
   {"bgrewriteaof", {do_bgrewriteaof,  1,  1}},
+  {"ping",         {do_ping,          1,  2}},
+  {"config",       {do_config,        2, -1}},
 };
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {

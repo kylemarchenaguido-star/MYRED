@@ -327,6 +327,7 @@ void rdb_on_save_complete(const char *filename){
 
 // we build the rdb function
 bool rdb_save(const char* filename){
+  g_data.g_dirty_at_save = g_data.g_writes_since_save;
   // build the buffer
   Buffer buf = buf_create(64 * 1024);
   RDBStats stats = {};
@@ -338,6 +339,7 @@ bool rdb_save(const char* filename){
   if (!fp){
     fprintf(stderr, "rdb_save: cannot open %s: %s\n", tmp, strerror(errno));
     buf_destroy(&buf);
+    g_data.g_dirty_at_save = 0;
     return false;
   }
   size_t data_size = buf_size(&buf);
@@ -348,6 +350,7 @@ bool rdb_save(const char* filename){
     fprintf(stderr, "rdb_save: short write\n");
     fclose(fp);
     remove(tmp);
+    g_data.g_dirty_at_save = 0;
     return false;
   }
 
@@ -356,6 +359,7 @@ bool rdb_save(const char* filename){
     fprintf(stderr, "rdb_save; fsync failed: %s\n", strerror(errno));
     fclose(fp);
     remove(tmp);
+    g_data.g_dirty_at_save = 0;
     return false;
   }
   fclose(fp);
@@ -368,6 +372,7 @@ bool rdb_save(const char* filename){
   if (rename(tmp, filename) != 0){
     fprintf(stderr, "rdb_save: rename failed: %s\n", strerror(errno));
     remove(tmp);
+    g_data.g_dirty_at_save = 0;
     return false;
   }
   rdb_on_save_complete(filename);   
@@ -883,6 +888,7 @@ static void rdb_write_snapshot(const Buffer *buf, const char *filename){
 void rdb_save_background(){
   // dont start a fork is one is running
   if (g_rdb_child_pid != -1){
+    g_data.g_dirty_at_save = g_data.g_writes_since_save;
     fprintf(stderr, "rdb_save_background: save already in progress (pid=%d)\n", g_rdb_child_pid);
     return;
   }

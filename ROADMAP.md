@@ -160,9 +160,13 @@ Startup priority: AOF wins when enabled and present (RDB ignored, warns); else R
 - **Disk-full policy:** `aof_flush` sets `g_aof_write_err` on a real write error; `do_request` then rejects write commands with `MISCONF ...` (reads still served) until a later flush drains the buffer and clears the flag — no silent data loss, no unbounded buffer growth.
 - **Signal hardening:** `SIGXFSZ` and `SIGPIPE` are `SIG_IGN`'d so a file-size limit or a client disconnect mid-write returns a handleable `errno` (`EFBIG`/`EPIPE`) instead of killing the process.
 
-### ❌ Step 7 — Config-driven save triggers (TODO)
+### ✅ Step 7 — Config-driven save triggers (DONE)
 
-Redis `save N M` directive (save RDB if M writes in N seconds). Add `std::vector<SaveCondition>{seconds, changes}` to `Config`; in `process_timers()`, fire `rdb_save_background()` when any condition's `g_writes_since_save >= changes && now - g_last_save_ms >= seconds*1000`. Counters already exist; needs config parsing + the multi-condition loop. (Currently a single hardcoded `k_save_interval_ms` / `k_save_after_writes`.)
+Redis-style `save N M` (save RDB if ≥M writes happened within N seconds), OR-combined across conditions.
+- **Config:** `std::vector<SaveCondition>{seconds, changes}` with defaults `{3600,1} {300,100} {60,10000}`; overridable via `MYRED_SAVE="3600 1 300 100 60 10000"` (empty string disables auto-save).
+- **Trigger:** `process_timers` loops the conditions; first match (`g_writes_since_save >= changes && elapsed >= seconds*1000`) fires `rdb_save_background()`, guarded by `g_rdb_child_pid == -1`.
+- **Dirty-counter fix:** `rdb_on_save_complete` previously did `g_writes_since_save++` (never reset!). Now each save path snapshots `g_dirty_at_save` at start, and completion **subtracts** it — so writes during a background save survive while saved changes clear. This is what makes the "changes since last save" windows meaningful.
+- **Idle wake tightened:** `next_timer_ms` derives the next-save wake from the soonest *armed* condition instead of the old `k_save_interval_ms`, so an idle-but-dirty server saves on time. `k_save_interval_ms` / `k_save_after_writes` retired.
 
 ---
 
@@ -220,6 +224,28 @@ Expose the counters we already track: `aof_enabled`, `aof_current_size`, `aof_ba
 | Rewrite correctness | Dual-buffer: `g_aof_buf` live + `g_aof_rewrite_buf` delta during child run |
 | No-op writes | Mutation-gated via `g_writes_since_save` delta |
 | Auto-rewrite cost | Size tracked in memory (no per-tick `stat`); check gated to 1/s |
+
+---
+
+## v6.1 — redis-benchmark / tooling compatibility
+
+Goal: make standard Redis tooling (`redis-benchmark`, `redis-cli`) run against MYRED so throughput can be measured with the real C client (the Python harness is client-bound at ~1800 ops/sec and measures the client, not the server).
+
+### ✅ `PING`
+`PING` → `+PONG`; `PING msg` → bulk-string echo of `msg`. RESP multibulk form, handled by the existing parser. Required because the default `redis-benchmark` suite leads with ping tests.
+
+### ✅ `CONFIG` (stub)
+`CONFIG GET <param>` → empty array, `CONFIG SET` / `CONFIG RESETSTAT` / `CONFIG REWRITE` → `+OK`. Just enough to satisfy tooling startup probes without implementing a real config system (real config is v9).
+
+### Usage
+```bash
+redis-benchmark -p 1234 -a kek1234 -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset -n 200000 -c 50 -P 16 -q
+```
+
+### Known gaps (use `-t` to avoid)
+- **Inline protocol** — the parser only accepts RESP arrays (`*…`), so `PING_INLINE` (sends bare `PING\r\n`) fails. `PING_MBULK` works. Supporting inline commands is optional.
+- **`ZPOPMIN`** — part of the *default* benchmark suite; not implemented. Select tests with `-t` to skip it.
+- **`COMMAND` / `COMMAND DOCS`** — `redis-cli` interactive probes these; harmless if absent, add a stub if the interactive CLI complains.
 
 ## v7 — Memory management
 
