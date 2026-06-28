@@ -315,7 +315,14 @@ void rdb_on_save_complete(const char *filename){
   }
   g_data.g_last_save_ok = true;
   g_data.g_last_save_ms = get_monotonic_msec();
-  g_data.g_writes_since_save++;
+  
+  // changes since the snapshot taken at save start survive; everything saves is cleared
+  if ( g_data.g_writes_since_save >= g_data.g_dirty_at_save){
+    g_data.g_writes_since_save -= g_data.g_dirty_at_save;
+  } else {
+    g_data.g_writes_since_save = 0;
+  }
+  g_data.g_dirty_at_save = 0;
 }
 
 // we build the rdb function

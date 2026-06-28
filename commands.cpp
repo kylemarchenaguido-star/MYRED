@@ -2443,6 +2443,11 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
     return resp_err(out, "ERR wrong number of arguments");
   }
+
+  if (spec.is_write && g_config.aof_enable && g_data.g_aof_write_err && !g_data.g_loading){
+    return resp_err(out, "MISCONF Errors writing to the AOF file, can't accept writes");
+  }
+
   uint32_t dirty_before = g_data.g_writes_since_save;
 
   // Snapshot before running swap() handlers/ consume cmd's

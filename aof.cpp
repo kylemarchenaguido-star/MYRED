@@ -292,3 +292,59 @@ bool aof_load(const char *path){
     }
     return true;
 }
+
+bool aof_check(const char *path, bool fix){
+  FILE *fp = fopen(path,  "rb");
+  if (!fp){ fprintf(stderr, "check-aof: cannot open %s: %s\n", path, strerror(errno)); }
+
+  fseek(fp, 0, SEEK_END);
+  long sz = ftell(fp);
+  fseek(fp, 0 , SEEK_SET);
+
+  if (sz <= 0){ fclose(fp); fprintf(stderr, "check-aof: %s is empty\n", path); return true; }
+
+  Buffer buf = buf_create((size_t)sz);
+  std::vector<uint8_t> raw((size_t)sz);
+  if (fread(raw.data(), 1, (size_t)sz, fp)){
+    fprintf(stderr, "check-aof: short read\n"); fclose(fp); buf_destroy(&buf); return false;
+  }
+  fclose(fp);
+  buf_append(&buf, raw.data(), (size_t)sz);
+
+  size_t good_offset = 0, n = 0;
+  const char *reason = nullptr;
+  while (buf_size(&buf)){
+    std::vector<std::string> cmd;
+    int32_t consumed = parse_resp_request(&buf, cmd);
+    if (consumed == 0){
+      reason = "truncated trailing command";
+      break;
+    }
+    // corrupt frame
+    if (consumed < 0){
+      reason = "malformed command"; 
+      break;
+    }
+    buf_consume(&buf, (size_t)consumed);
+    good_offset += (size_t)consumed;
+    n++;
+  }  
+  buf_destroy(&buf);
+
+  if (!reason){
+    fprintf(stderr, "check-aof: OK - %zu commands, %ld bytes, no errors\n", n, sz);
+    return true;
+  }
+  fprintf(stderr, "check-aof: %s at offset %zu (%zu of %ld bytes valid, %zu commands)\n",
+         reason, good_offset, good_offset, sz, n);
+  if (!fix){
+    fprintf(stderr, "check-aof: re-rerun with --fix to truncate to the last valid command\n");
+    return false;
+  }
+  if (truncate(path, (off_t)good_offset) == 0){
+    fprintf(stderr, "check-aof: truncated %s to %zu bytes\n", path, good_offset);
+    return true;
+  }
+  fprintf(stderr, "check-aof: truncate failed: %s\n", strerror(errno));
+  return false;
+}

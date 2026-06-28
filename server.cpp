@@ -156,17 +156,29 @@ static bool aof_flush(){
   std::string &buf = g_data.g_aof_buf;
   if (g_data.g_aof_fd < 0 || buf.empty()){ return false; }
   size_t off = 0;
+  bool err = false;
   while (off < buf.size()){
     ssize_t rv = write(g_data.g_aof_fd, buf.data() + off, buf.size() - off);
     if (rv < 0){
       if (errno == EINTR){ continue; }
-      fprintf(stderr, "aof: write failed: %s\n", strerror(errno));
+      if (!g_data.g_aof_write_err){
+        // log only on the transition into the error state
+        fprintf(stderr, "aof: write failed: %s - refusing writes until recovery\n", strerror(errno));
+      }
+      err = true;
       break; // keep remaining bytes buffered, retry the next tick
     }
     off += (size_t)rv;
   }
   buf.erase(0, off); // drop only what was actually written
   g_data.g_aof_current_size += off; // we tracked with no syscall
+
+  if (err){
+    g_data.g_aof_write_err =true;
+  } else if (g_data.g_aof_write_err && buf.empty()){
+    fprintf(stderr, "aof: write recovered, accepting writes again\n");
+    g_data.g_aof_write_err = false;
+  }
   return off > 0;
 }
 
@@ -344,10 +356,24 @@ static void handle_read(Conn *conn){
   } // else wants to keep reading.
 }
 
-int main(){
+int main(int argc, char **argv){
   // control for Ctrl-c
   signal(SIGINT,  signal_handler);
   signal(SIGTERM, signal_handler);
+  signal(SIGXFSZ, SIG_IGN);
+  signal(SIGPIPE, SIG_IGN);
+
+  for (int i = 1; i < argc; ++i){
+    if (strcmp(argv[i], "--check-aof") == 0){
+      bool fix = false;
+      const char *path = "appendonly.aof";
+      for (int j = i + 1; j < argc; ++j){
+        if (strcmp(argv[j], "--fix") == 0){ fix = true; }
+        else { path = argv[j]; }
+      }
+      return aof_check(path, fix) ? 0 : 1;
+    }
+  }
 
   g_data.g_server_start_ms = get_monotonic_msec();
 

@@ -84,6 +84,7 @@ struct GlobalData{
   // Data base globals
   uint64_t g_last_save_ms = 0; // timestamp last succesful save
   uint32_t g_writes_since_save = 0; // how many keys we written
+  uint32_t g_dirty_at_save = 0; // g_writes_since_save captured when a save starts
   size_t g_last_save_size_bytes = 0; // size of last dump
   bool g_last_save_ok = true; // did the last save succeded
   // statdistics// written per command
@@ -92,15 +93,21 @@ struct GlobalData{
   uint64_t g_total_connections =0;
   uint32_t connected_clients = 0;
   // AOF
-  int g_aof_fd = -1; // -1 when disable
-  std::string g_aof_buf; // pending bytes that aren't write()
+  uint64_t g_aof_check_ms = 0; // throttles the auto-rewrite check
   uint64_t g_aof_last_fsync_ms = 0;
-  bool g_loading = false; // true when replaying
-  std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
-  std::string g_aof_rewrite_buf; // delta captured during a rewrite
+  int g_aof_fd = -1; // -1 when disable
   size_t g_aof_current_size = 0;
   size_t g_aof_base_size = 0;
-  uint64_t g_aof_check_ms = 0; // throttles the auto-rewrite check
+  std::string g_aof_buf; // pending bytes that aren't write()
+  std::string g_aof_rewrite_buf; // delta captured during a rewrite
+  std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
+  bool g_loading = false; // true when replaying
+  bool g_aof_write_err = false; // last AOF flush failed -> refuse rewrties until recovery
+};
+
+struct SaveCondition {
+  uint64_t seconds; // window lenght
+  uint32_t changes; // min writes within that window
 };
 
 //global config
@@ -112,6 +119,12 @@ struct Config {
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
+  // Redis defaults
+  std::vector<SaveCondition> save_conditions = {
+    {3600, 1}, // 1 change in 1 hour
+    {300, 100}, // 100 changes in 5 min
+    {60, 10000}, // 10000 changes in 1 min
+  };
 };
 
 // HMap is not unique
