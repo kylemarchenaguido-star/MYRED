@@ -659,19 +659,32 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out){
 
 // zadd and zset (score, name)
 static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
-  double score = 0;
-  if (!str2dbl(cmd[2], score)){
-    return resp_err(out, "ERR invalid score");
+  if (cmd.size() < 4 || (cmd.size() % 2 ) != 0){
+    return resp_err(out, "ERR wrong number of arguments for 'zadd command");
   }
+  // validate all the scores first, ZADD is atomic, a bad score adds nothing
+  for (size_t i = 2; i < cmd.size(); i += 2){
+    double tmp;
+    if (!str2dbl(cmd[i], tmp)){ return resp_err(out, "ERR value is not a valid float"); }
+  }
+  
+
   Entry *ent;
   if (lookup_entry(cmd[1], T_ZSET, true, &ent) == Lookup::WRONGTYPE){
     return resp_err(out, "WRONGTYPE wrong type");
   }
 
   // add or update the tuple
-  bool added = zset_insert(&entry_zset(ent), cmd[3].data(), cmd[3].size(), score);
+  int64_t added = 0;
+  for (size_t i = 2; i + 1 < cmd.size(); i += 2){
+    double score;
+    str2dbl(cmd[i], score);
+    if (zset_insert(&entry_zset(ent), cmd[i + 1].data(), cmd[i + 1].size(), score)){
+      ++added;
+    }
+  }
   g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)added);
+  return resp_int(out, added);
 }
 
 // zrem zset name (search and remove)
@@ -803,6 +816,48 @@ static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out){
   }
   
 }
+
+static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out){
+  int64_t count = 1;
+  if (cmd.size() >= 3){
+    if (!str2int(cmd[2], count)){ return resp_err(out, MSG_NOT_INT); }
+    if (count < 0){ count = 0; }
+  }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)){
+    case Lookup::WRONGTYPE: return resp_err(out, MSG_WRONGTYPE);
+    case Lookup::MISSING: return resp_arr(out, 0);
+    case Lookup::OK: break;
+  }
+  ZSet *zset = &entry_zset(ent);
+
+  // collect the lowest-score members first - RESP needs the array lenght up front
+  std::vector<ZQueryResult> popped;
+  for (int64_t i = 0; i < count && zset->root; ++i){
+    AVLNode *node = zset->root;
+    // leftmost = min 
+    while (node->left){ node = node->left; }
+    ZNode *zn = container_of(node, &ZNode::tree);
+    popped.push_back({ std::string(zn->name, zn->len), zn->score} );
+    zset_delete(zset, zn);
+  }
+  // pairs of (member, score)
+  resp_arr(out, (uint32_t)(popped.size() * 2));
+  for (const auto &p : popped){
+    resp_str(out, p.name.data(), p.name.size());
+    resp_dbl(out, p.score);
+  }
+
+  if (!popped.empty()){
+    g_data.g_writes_since_save++;
+    // emptied -> drop the key
+    if (hm_size(&zset->hmap) == 0){
+      hm_delete(&g_data.db, &ent->node, &hnode_same);
+      entry_del(ent);
+    }
+  }
+}
+
 // Authenticate 
 static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (g_config.password.empty()){
@@ -2378,12 +2433,13 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"pttl",         {do_ttl,           2,  2}},
   {"persist",      {do_persist,       2,  2, true}},
   // sorted set
-  {"zadd",         {do_zadd,          4,  4, true}},
+  {"zadd",         {do_zadd,          4,  -1, true}},
   {"zrem",         {do_zrem,          3,  3, true}},
   {"zscore",       {do_zscore,        3,  3}},
   {"zrank",        {do_zrank,         3,  3}},
   {"zquery",       {do_zquery,        6,  6}},
-  {"zrevquery",    {do_zquery_reversed, 6, 6}},
+  {"zrevquery",    {do_zquery_reversed,6, 6}},
+  {"zpopmin",      {do_zpopmin,       2,  3}},
   // list
   {"lpush",        {do_lpush,         3, -1, true}},
   {"rpush",        {do_rpush,         3, -1, true}},

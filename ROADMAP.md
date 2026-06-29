@@ -19,13 +19,13 @@ All 5 Redis data types implemented and full project-wide code review (v5.3) comp
 | Type | Commands | Status |
 |---|---|---|
 | String | get, set, del, exists, incr, decr, incrby, decrby, incrbyfloat, setnx, setex, psetex, getset, getex, getdel, mset, mget, msetnx, append, strlen, getrange, setrange | ✅ |
-| Sorted Set | zadd, zrem, zscore, zrank, zquery, zrevquery | ✅ |
+| Sorted Set | zadd (variadic), zrem, zscore, zrank, zquery, zrevquery, zpopmin | ✅ |
 | List | lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim | ✅ |
 | Hash | hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget, hsetnx, hincrby, hstrlen, hscan | ✅ |
 | Set | sadd, srem, sismember, smismember, scard, smembers, spop, srandmember, sscan, sinter, sunion, sdiff, sinterstore, sunionstore, sdiffstore, smove | ✅ |
 
 Generic: exists, type, keys, scan, dbsize, randomkey, rename, renamenx, touch, unlink, flushall, expire, pexpire, expireat, pexpireat, ttl, pttl, persist  
-Admin: auth, info, save, bgsave
+Admin: auth, info, save, bgsave, bgrewriteaof, ping, config (stub)
 
 ---
 
@@ -242,10 +242,19 @@ Goal: make standard Redis tooling (`redis-benchmark`, `redis-cli`) run against M
 redis-benchmark -p 1234 -a kek1234 -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset -n 200000 -c 50 -P 16 -q
 ```
 
-### Known gaps (use `-t` to avoid)
-- **Inline protocol** — the parser only accepts RESP arrays (`*…`), so `PING_INLINE` (sends bare `PING\r\n`) fails. `PING_MBULK` works. Supporting inline commands is optional.
-- **`ZPOPMIN`** — part of the *default* benchmark suite; not implemented. Select tests with `-t` to skip it.
-- **`COMMAND` / `COMMAND DOCS`** — `redis-cli` interactive probes these; harmless if absent, add a stub if the interactive CLI complains.
+### ✅ Inline protocol
+`parse_resp_request` now handles requests not starting with `*` as inline commands: read a line (tolerates `\n` and `\r\n`), split on whitespace into args, return bytes consumed. Runaway lines past `k_max_msg` with no terminator are rejected. This makes `PING_INLINE` (bare `PING\r\n`) work alongside `PING_MBULK`.
+
+### ✅ `ZPOPMIN`
+`ZPOPMIN key [count]` — pops the lowest-score member(s) (leftmost AVL node), returns `[member, score, …]`, drops the key when the zset empties. `is_write`, deterministic → logged verbatim to AOF.
+
+### ✅ Variadic `ZADD`
+`ZADD key score member [score member ...]` now accepts multiple pairs (was single-pair, arity `4,4`). Table entry is `4, -1`; the handler enforces an even arg count, validates **all** scores before inserting any (atomicity — a bad score adds nothing), and returns the count of newly-added members.
+
+### Remaining gap (optional)
+- **`COMMAND` / `COMMAND DOCS`** — `redis-cli` interactive probes these; harmless if absent, add a stub if the interactive CLI complains. Not needed for `redis-benchmark`.
+
+With inline + `ZPOPMIN`, the **default** `redis-benchmark` suite (no `-t`) now runs clean.
 
 ## v7 — Memory management
 

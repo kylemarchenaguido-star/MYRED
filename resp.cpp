@@ -5,15 +5,39 @@
 #include "state.h"
 
 //Parse the RESP protocol
-int32_t parse_resp_request(Buffer *buf, std::vector<std::string> &cmd){
+int32_t parse_resp_request( Buffer *buf, std::vector<std::string> &cmd){
   const char *data = (const char *)buf->data_begin;
   size_t size = buf_size(buf);
   size_t pos = 0;
 
   if (size == 0){ return 0; }
 
-  // must start with '*'
-  if  (data[0] != '*') { return -1; }
+  // inline commands 
+  if  (data[0] != '*') { 
+    size_t eol = 0;
+    while (eol < size && data[eol] != '\n'){ eol++; }
+    // no newline yet
+    if (eol == size){
+      //  runway line with no terminator -> bail
+      if (size > k_max_msg){ return -1; }
+      // we needs more data
+      return 0;
+    }
+    size_t line_end = eol;
+    // tolerate \r\n and \n
+    if (line_end > 0 && data[line_end - 1] == '\r'){ line_end--; }
+
+    // split the line on whitespace into args
+    size_t i = 0;
+    while (i < line_end){
+      while (i <  line_end && (data[i] == ' ' || data[i] == '\t')){ i++; }
+      if (i >= line_end){ break; }
+      size_t start = i;
+      while (i < line_end && data[i] != ' ' && data[i] != '\t'){ i++; }
+      cmd.push_back(std::string(data + start, i - start));
+    }
+    return (int32_t)(eol + 1);
+  }
   pos = 1;
 
   // read n_args
