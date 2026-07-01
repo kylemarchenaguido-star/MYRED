@@ -10,5 +10,17 @@ dump.rdb
 dump.rdb.tmp
 dump.rdb.bak
 
+# AOF persistence files
+appendonly.aof
+appendonly.aof.tmp
+appendonly.aof.bak
+
+# stress-test output (stress_test.py --log)
+stress_results.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # editor / IDE
 .vs/
