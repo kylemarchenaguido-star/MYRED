@@ -480,6 +480,7 @@ static bool rdb_load_string_entry(RDBCursor *c){
     int64_t remaining_ms = (int64_t)(expire_at - now_ms);
     entry_set_ttl(ent, remaining_ms);
   }
+  mem_reaccount(ent);
   return true;
 }
 
@@ -552,7 +553,7 @@ static bool rdb_load_zset_entry(RDBCursor *c){
     int64_t remaining_ms = (int64_t)(expire_at - now_ms);
     entry_set_ttl(ent, remaining_ms);
   }
-  
+  mem_reaccount(ent);
   return true;
 }
 
@@ -606,6 +607,7 @@ static bool rdb_load_deque_entry(RDBCursor *c){
     uint64_t now_ms = get_wall_msec();
     entry_set_ttl(ent, (int64_t)(expire_at - now_ms));
   }
+  mem_reaccount(ent);
   return true;
 }
 
@@ -658,6 +660,7 @@ static bool rdb_load_hash_entry(RDBCursor *c){
   if (has_ttl){
     entry_set_ttl(ent, (int64_t)(expire_at - get_wall_msec()));
   }
+  mem_reaccount(ent);
   return true;
 }
 
@@ -699,6 +702,7 @@ static bool rdb_load_set_entry(RDBCursor *c){
   if (has_ttl){
     entry_set_ttl(ent, (int64_t)(expire_at - get_wall_msec()));
   }
+  mem_reaccount(ent);
   return true;
 }
 

@@ -98,6 +98,7 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   entry_str(ent).swap(cmd[2]);
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_ok(out);
 }
@@ -114,6 +115,7 @@ static void setex_generic(std::vector<std::string> &cmd, Buffer *out, int64_t mu
   }
   entry_str(ent).swap(cmd[3]);
   entry_set_ttl(ent, ttl * mult);
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_ok(out);
 }
@@ -137,6 +139,7 @@ static void do_setnx(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   lookup_entry(cmd[1], T_STR, true, &ent);
   entry_str(ent).swap(cmd[2]);
+  mem_reaccount(ent); 
   g_data.g_writes_since_save++;
   resp_int(out, 1);
 }
@@ -166,6 +169,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
   ent->node.hcode = lk.node.hcode;
   entry_str(ent).swap(cmd[2]);
   hm_insert(&g_data.db, &ent->node);
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_nil(out);
 }
@@ -248,6 +252,7 @@ static void do_append(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, MSG_WRONGTYPE);
   }
   entry_str(ent) += cmd[2];
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)entry_str(ent).size());
 }
@@ -318,6 +323,7 @@ static void do_setrange(std::vector<std::string> &cmd, Buffer *out){
   if (!cmd[3].empty()){
     memcpy(&entry_str(ent)[offset], cmd[3].data(), cmd[3].size());
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)entry_str(ent).size());
 }
@@ -345,6 +351,7 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out){
     Entry *ent;
     lookup_entry(cmd[i], T_STR, true, &ent);
     entry_str(ent).swap(cmd[i + 1]);
+    mem_reaccount(ent);
   }
   g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
   resp_ok(out);
@@ -373,6 +380,7 @@ static void do_msetnx(std::vector<std::string> &cmd, Buffer *out){
     Entry *ent;
     lookup_entry(cmd[i], T_STR, true, &ent);  // was cmd[1]
     entry_str(ent).swap(cmd[i + 1]);
+    mem_reaccount(ent);
   }
   g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
   resp_int(out, 1);
@@ -393,6 +401,7 @@ static void incr_generic(std::vector<std::string> &cmd, Buffer *out, int64_t del
   }
   cur += delta;
   entry_str(ent) = std::to_string(cur);
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, cur);
 }
@@ -445,6 +454,7 @@ static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out){
   char buf[64];
   snprintf(buf, sizeof(buf), "%.17g", result);
   entry_str(ent) = buf;
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
@@ -683,6 +693,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
       ++added;
     }
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_int(out, added);
 }
@@ -855,6 +866,8 @@ static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out){
       hm_delete(&g_data.db, &ent->node, &hnode_same);
       entry_del(ent);
     }
+  } else {
+    mem_reaccount(ent);
   }
 }
 
@@ -950,8 +963,12 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "total_connections:%llu\r\n"
     "\r\n"
     "# Memory\r\n"
-    "used_memory_bytes:%zu\r\n"
-    "used_memory_mb:%.2f\r\n"
+    "used_memory:%zu\r\n"
+    "used_memory_human:%.2fM\r\n"
+    "used_memory_rss:%zu\r\n"
+    "mem_fragmentation_ratio:%.2f\r\n"
+    "maxmemory:%zu\r\n"
+    "maxmemory_policy:%s\r\n"
     "\r\n"
     "# Stats\r\n"
     "total_commands:%llu\r\n"
@@ -985,8 +1002,12 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     (unsigned long long)g_data.g_total_connections,
 
     // memory
-    memory,
-    (double)memory / (1024.0 * 1024.0),
+    g_data.used_memory,
+    (double)g_data.used_memory / (1024.0 * 1024.0),
+    memory,                                                   // RSS from get_memory_usage()
+    g_data.used_memory ? (double)memory / (double)g_data.used_memory : 0.0,
+    g_config.maxmemory,
+    maxmemory_policy_name(g_config.maxmemory_policy),
 
     //stats
     (unsigned long long)g_data.g_total_commands,
@@ -1025,6 +1046,7 @@ void do_lpush(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 2; i < cmd.size(); ++i){
     deque_push_front(&entry_deque(ent), cmd[i]);
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)entry_deque(ent).count); 
 }
@@ -1038,6 +1060,7 @@ void do_rpush(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 2; i < cmd.size(); ++i){
     deque_push_back(&entry_deque(ent), cmd[i]);
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)entry_deque(ent).count);
 }
@@ -1058,6 +1081,8 @@ void do_lpop(std::vector<std::string> &cmd, Buffer *out){
   if (entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else {
+    mem_reaccount(ent);
   }
   g_data.g_writes_since_save++;
   resp_str(out, val.data(), val.size());
@@ -1078,6 +1103,8 @@ void do_rpop(std::vector<std::string> &cmd, Buffer *out){
   if (entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else {
+    mem_reaccount(ent);
   }
   g_data.g_writes_since_save++;
   resp_str(out, val.data(), val.size());
@@ -1171,6 +1198,7 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
 
   // direct write
   entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)idx)] = cmd[3];
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_ok(out);
 }
@@ -1260,6 +1288,7 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
   deque_open_gap(&entry_deque(ent), insert_idx);
   entry_deque(ent).buf[deque_phys(&entry_deque(ent), insert_idx)] = value;
 
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)entry_deque(ent).count); // new length
 }
@@ -1311,6 +1340,8 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
   if (ent && entry_deque(ent).count == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else if (removed > 0){
+    mem_reaccount(ent);
   }
 
   if (removed > 0){ g_data.g_writes_since_save++; }
@@ -1366,7 +1397,7 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   entry_deque(ent).head = deque_phys(&entry_deque(ent), (size_t)start); // compute before changing count
   entry_deque(ent).count = keep;
 
-
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_ok(out);
 }
@@ -1522,6 +1553,7 @@ static void do_hset(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 2; i + 1 < cmd.size(); i += 2){
     if (hash_set(&entry_hash(ent), cmd[i], cmd[i + 1])){ added++; }
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_int(out, added); 
 }
@@ -1556,6 +1588,8 @@ static void do_hdel(std::vector<std::string> &cmd, Buffer *out){
   if (hm_size(&entry_hash(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else if (removed){
+    mem_reaccount(ent);
   }
   if (removed) { g_data.g_writes_since_save++; }
   resp_int(out, removed);
@@ -1643,6 +1677,7 @@ static void do_hsetnx(std::vector<std::string> &cmd, Buffer *out){
   if (hash_get(&entry_hash(ent), cmd[2])){ return resp_int(out, 0); } 
 
   hash_set(&entry_hash(ent), cmd[2], cmd[3]);
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
@@ -1669,6 +1704,7 @@ static void do_hincrby(std::vector<std::string> &cmd, Buffer *out){
   }
   cur += incr;
   hash_set(&entry_hash(ent), cmd[2], std::to_string(cur));
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_int(out, cur);
 }
@@ -1816,6 +1852,7 @@ static int rename_key(const std::string &src, const std::string &dst, bool nx){
   sent->key = dst;
   sent->node.hcode = dk.node.hcode;
   hm_insert(&g_data.db, &sent->node);
+  mem_reaccount(sent);
   return 1;
 }
 
@@ -2009,6 +2046,7 @@ static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 2; i < cmd.size(); ++i){
     if (set_add(&entry_set(ent), cmd[i])){ ++added;}
   }
+  mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_int(out, added);
 }
@@ -2029,6 +2067,8 @@ static void do_srem(std::vector<std::string> &cmd, Buffer *out){
     hm_delete
     (&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else if (removed){
+    mem_reaccount(ent);
   }
   if (removed){ g_data.g_writes_since_save++; }
   return resp_int(out, removed);
@@ -2121,6 +2161,8 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
   if (hm_size(&entry_set(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
+  } else {
+    mem_reaccount(ent);
   }
   g_data.g_writes_since_save++;
 }
@@ -2250,6 +2292,7 @@ static void do_sinterstore(std::vector<std::string> &cmd, Buffer *out){
   if (!sinter_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
   for (auto &m : result){ set_add(&entry_set(dest), m); }
+  mem_reaccount(dest);
   g_data.g_writes_since_save++;
   return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
@@ -2260,6 +2303,7 @@ static void do_sunionstore(std::vector<std::string> &cmd, Buffer *out){
   if (!sunion_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
   for (auto &m : result){ set_add(&entry_set(dest), m); }
+  mem_reaccount(dest);
   g_data.g_writes_since_save++;
   return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
@@ -2270,6 +2314,7 @@ static void do_sdiffstore(std::vector<std::string> &cmd, Buffer *out){
   if (!sdiff_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
   Entry *dest = set_make_dest(cmd[1]);
   for (auto &m : result){ set_add(&entry_set(dest), m); }
+  mem_reaccount(dest);
   g_data.g_writes_since_save++;
   return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
 }
@@ -2297,6 +2342,8 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     // if move and 0 the set is empty
     hm_delete(&g_data.db, &src_ent->node, &hnode_same);
     entry_del(src_ent);
+  } else {
+    mem_reaccount(dst_ent);
   }
   if (!dst_ent){
     dst_ent = entry_new(T_SET);
@@ -2305,6 +2352,7 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     hm_insert(&g_data.db, &dst_ent->node);
   }
   set_add(&entry_set(dst_ent), cmd[3]);
+  mem_reaccount(dst_ent);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
 }
@@ -2322,30 +2370,58 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
   for (char &c : sub){ c = (char)tolower((unsigned char)c); }
 
   if (sub == "get"){
-    return resp_arr(out, 0);
+    if (cmd.size() < 3){ return resp_err(out, "ERR wrong number of arguments for 'config|get'"); }
+    std::string param = cmd[2];
+    for (char &c : param){ c = (char)tolower((unsigned char)c); }
+
+    // collect (name, value) for the params we actually support; '*' = all
+    std::vector<std::pair<std::string , std::string>> kv;
+    if (param == "maxmemory" || param == "*"){
+      kv.emplace_back("maxmemory", std::to_string(g_config.maxmemory));
+    }
+    if (param == "maxmemory-policy" || param == "*"){
+      kv.emplace_back("maxmemory-policy", maxmemory_policy_name(g_config.maxmemory_policy));
+    }
+    // empty array for unknown params
+    resp_arr(out, (uint32_t)(kv.size() * 2));
+    for (auto &p : kv){
+      resp_str(out, p.first.data(), p.first.size());
+      resp_str(out, p.second.data(), p.second.size());
+    }
+    return;
   }
-  if (sub == "set" || sub == "resetstat" || sub == "rewrite"){
+
+  if (sub == "set"){
+    if (cmd.size() < 4){ return resp_err(out, "ERR wrong number of arguments for 'config|set'"); }
+    std::string param = cmd[2];
+    for (char &c : param){ c = (char)tolower((unsigned char)c); }
+    const std::string &val = cmd[3];
+
+    if (param == "maxmemory"){
+      size_t bytes = 0;
+      if (!parse_memory_size(val, &bytes)){
+        return resp_err(out, "ERR invalid argument for CONFIG SET 'maxmemory'");
+      }
+      g_config.maxmemory = bytes;
+      return resp_ok(out);
+    }
+    if (param == "maxmemory-policy"){
+      MaxmemoryPolicy p;
+      if(!parse_maxmemory_policy(val, &p)){
+        return resp_err(out, "ERR invalid argument for CONFIG SET 'maxmemory-policy'");
+      }
+      g_config.maxmemory_policy = p;
+      return resp_ok(out);
+    }
+    // accpet and ignore unknown params
+    return resp_ok(out);
+  }
+
+  if (sub == "resetstat" || sub == "rewrite"){
     return resp_ok(out);
   }
   return resp_err(out, "ERR Unknown CONFIG subcommand");
 }
-
-// // encode an array-of-bulk-strings RESP frame
-// static void aof_encode(std::string &dst, std::initializer_list<std::string_view> args){
-
-// }
-
-// static void aof_encode(std::string &dst, const std::vector<std::string> &args){
-//   char hdr[32];
-//   int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
-//   dst.append(hdr, (size_t)n);
-//   for (std::string_view a : args){
-//     int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
-//     dst.append(hdr, (size_t)h);
-//     dst.append(a.data(), a.size());
-//     dst.append("\r\n", 2);
-//   }
-// }
 
 // Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
 static void aof_feed(const std::vector<std::string> &cmd){
@@ -2437,7 +2513,7 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"append",       {do_append,        3,  3, true}},
   {"strlen",       {do_strlen,        2,  2}},
   {"getrange",     {do_getrange,      4,  4}},
-  {"setrange",     {do_setrange,      4,  4}},
+  {"setrange",     {do_setrange,      4,  4, true}},
   {"mget",         {do_mget,          2, -1}},
   {"mset",         {do_mset,          3, -1, true}},   // odd-argc check is inside handler
   {"msetnx",       {do_msetnx,        3, -1, true}},   // odd-argc check is inside handler
@@ -2553,6 +2629,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
     return resp_err(out, "ERR wrong number of arguments");
   }
+
+  #ifndef NDEBUG
+  mem_selfcheck(cmd[0].c_str());   // prints "[mem] drift..." if any handler mis-accounted
+  #endif
 
   if (spec.is_write && g_config.aof_enable && g_data.g_aof_write_err && !g_data.g_loading){
     return resp_err(out, "MISCONF Errors writing to the AOF file, can't accept writes");

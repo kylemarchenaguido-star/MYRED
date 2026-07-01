@@ -489,6 +489,20 @@ int main(int argc, char **argv){
     if (v > 0){ g_config.aof_rewrite_perc = v; }
   }
 
+  const char *maxmen_env = getenv("MYRED_MAXMEMORY");
+  if (maxmen_env){
+    size_t bytes = 0;
+    if (parse_memory_size(maxmen_env, &bytes)){ g_config.maxmemory = bytes; }
+    else { fprintf(stderr, "warning: bad MYRED_MAXMEMORY '%s'\n", maxmen_env); }
+  }
+  const char *policy_env = getenv("MYRED_MAXMEMORY_POLICY");
+  if (policy_env){
+    MaxmemoryPolicy p;
+    if (parse_maxmemory_policy(policy_env, &p)){ g_config.maxmemory_policy = p; }
+    else { fprintf(stderr, "warning: bad MYRED_MAXMEMORY_POLICY '%s'\n", policy_env); }
+  }
+
+
   int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
   if (fd < 0) {die("socket()");}
 

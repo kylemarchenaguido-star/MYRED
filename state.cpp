@@ -1,7 +1,9 @@
 #include "state.h"
 #include "common.h"
-#include <time.h>
 #include "hash.h"
+#include <time.h>
+#include <cctype>
+#include <cstdlib>
 
 GlobalData g_data;
 Config g_config;
@@ -9,6 +11,133 @@ Config g_config;
 // forward declarations: defined lower in this file, used by entry_set_ttl
 static void heap_delete(std::vector<HeapItem> &a, size_t pos);
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t);
+
+bool parse_memory_size(const std::string &s, size_t *out){
+  if (s.empty()){ return false; }
+  size_t i = 0;
+  while (i < s.size() && isdigit((unsigned char)s[i])) { ++i; }
+  // must start with digits
+  if (i== 0) { return false; }
+  unsigned long long num = strtoull(s.c_str(), nullptr, 10);
+
+  std::string unit = s.substr(i);
+  for (char &c : unit){ c = (char)tolower((unsigned char)c); }
+
+  unsigned long long mult = 0;
+  if      (unit == ""  || unit == "b") { mult = 1ULL; }
+  else if (unit == "k")  { mult = 1000ULL; }
+  else if (unit == "kb") { mult = 1024ULL; }
+  else if (unit == "m")  { mult = 1000ULL * 1000; }
+  else if (unit == "mb") { mult = 1024ULL * 1024; }
+  else if (unit == "g")  { mult = 1000ULL * 1000 * 1000; }
+  else if (unit == "gb") { mult = 1024ULL * 1024 * 1024; }
+  else { return false; }
+  if (mult != 0 && num > ULLONG_MAX / mult){ return false; }
+  *out = (size_t)(num * mult);
+  return true;
+}
+
+bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out){
+  std::string p = s;
+  for (char &c : p){ c = (char)tolower((unsigned char)c); }
+  if      (p == "noeviction")      { *out = MaxmemoryPolicy::NOEVICTION; }
+  else if (p == "allkeys-lru")     { *out = MaxmemoryPolicy::ALLKEYS_LRU; }
+  else if (p == "allkeys-lfu")     { *out = MaxmemoryPolicy::ALLKEYS_LFU; }
+  else if (p == "allkeys-random")  { *out = MaxmemoryPolicy::ALLKEYS_RANDOM; }
+  else if (p == "volatile-lru")    { *out = MaxmemoryPolicy::VOLATILE_LRU; }
+  else if (p == "volatile-lfu")    { *out = MaxmemoryPolicy::VOLATILE_LFU; }
+  else if (p == "volatile-random") { *out = MaxmemoryPolicy::VOLATILE_RANDOM; }
+  else if (p == "volatile-ttl")    { *out = MaxmemoryPolicy::VOLATILE_TTL; }
+  else { return false; }
+  return true;
+}
+
+const char *maxmemory_policy_name(MaxmemoryPolicy p){
+    switch (p){
+    case MaxmemoryPolicy::NOEVICTION:      return "noeviction";
+    case MaxmemoryPolicy::ALLKEYS_LRU:     return "allkeys-lru";
+    case MaxmemoryPolicy::ALLKEYS_LFU:     return "allkeys-lfu";
+    case MaxmemoryPolicy::ALLKEYS_RANDOM:  return "allkeys-random";
+    case MaxmemoryPolicy::VOLATILE_LRU:    return "volatile-lru";
+    case MaxmemoryPolicy::VOLATILE_LFU:    return "volatile-lfu";
+    case MaxmemoryPolicy::VOLATILE_RANDOM: return "volatile-random";
+    case MaxmemoryPolicy::VOLATILE_TTL:    return "volatile-ttl";
+  }
+  return "noeviction";
+}
+
+// Per-type element accumalators
+static bool cb_mem_hash(HNode *node, void *arg){
+  HashNode *hn = container_of(node, &HashNode::node);
+  // node + 1 bucket slot
+  *(size_t *)arg += sizeof(HashNode) + sizeof(HNode *) + hn->field.capacity() + hn->value.capacity();
+  return true;
+}
+
+static bool cb_mem_set(HNode *node, void *arg){
+  SetNode *sn = container_of(node, &SetNode::node);
+  *(size_t *)arg += sizeof(SetNode) + sizeof(HNode *) + sn->member.capacity();
+  return true;
+}
+
+static bool cb_mem_zset(HNode *node, void *arg){
+  ZNode *zn = container_of(node, &ZNode::hmap);
+  // ZNode is malloc'd as sizeof(ZNode)+len (name[0] flexible array); + 1 bucket slot
+  *(size_t *)arg += sizeof(ZNode) + zn->len + sizeof(HNode *);
+  return true;
+}
+
+// Approximate byte cost of one entry (key + value). Kinda cheap, walks aggregates once
+size_t entry_mem_usage(Entry *ent){
+  size_t n = sizeof(Entry) + ent->key.capacity();
+  switch (ent->type){
+    case T_STR:
+      n += entry_str(ent).capacity();
+      break;
+    case T_DLIST: {
+      Deque &d = entry_deque(ent);
+      // the ring buffer itself 
+      n += d.cap * sizeof(std::string);
+      for (size_t i = 0; i < d.count; ++i){
+        // live element bytes
+        n += deque_get(&d, i)->capacity();
+      }
+      break;
+    }
+    case T_HASH: hm_foreach(&entry_hash(ent), cb_mem_hash, &n); break;
+    case T_SET: hm_foreach(&entry_set(ent), cb_mem_set, &n); break;
+    case T_ZSET: hm_foreach(&entry_zset(ent).hmap, cb_mem_zset, &n); break;
+    default: break;
+  }
+  return n;
+}
+
+// Recompute this entry size and fold the delta into the global counter.
+// Add-new-before-subtract-old keeps used_memory from the ever underflowing,
+// because the invariant guarantees used_memory >= ent->mem.
+void mem_reaccount(Entry *ent){
+  size_t now = entry_mem_usage(ent);
+  g_data.used_memory += now;
+  g_data.used_memory -= ent->mem;
+  ent->mem = now; 
+}
+
+#ifndef NDEBUG
+static bool cb_mem_sum(HNode *node, void *arg){
+  Entry *e = container_of(node, &Entry::node);
+  *(size_t *)arg += entry_mem_usage(e);
+  return true;
+}
+void mem_selfcheck(const char *where){
+  size_t sweep = 0;
+  hm_foreach(&g_data.db, cb_mem_sum, &sweep);
+  if (sweep != g_data.used_memory){
+    fprintf(stderr, "[mem] drift at %s: counter=%zu sweep=%zu delta=%zd)\n",
+            where, g_data.used_memory, sweep,
+            (ssize_t)sweep - (ssize_t)g_data.used_memory);
+  }
+}
+#endif
 
 // because CLOCK_MONOTONIC resets on reboot. in-memory timers stay monotonic.
 uint64_t get_monotonic_msec(){
@@ -60,6 +189,8 @@ void entry_set_ttl(Entry *ent, int64_t ttl_ms){
 
 // When and where to delete
 void entry_del(Entry *ent){ 
+  // discharge on the main thread (before async free)
+  g_data.used_memory -= ent->mem;
   // remove from the heap first
   entry_set_ttl(ent, -1);
   // decide if use thread pool or synchronous

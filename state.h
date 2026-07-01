@@ -51,6 +51,20 @@ enum class Aoffsync{
   NO
 };
 
+// Eviction policies
+enum class MaxmemoryPolicy {
+  NOEVICTION,
+  ALLKEYS_LRU,
+  ALLKEYS_LFU,
+  ALLKEYS_RANDOM,
+  VOLATILE_LRU,
+  VOLATILE_LFU,
+  VOLATILE_RANDOM,
+  VOLATILE_TTL
+};
+
+
+
 // Connections state and buffers 
 struct Conn {
   // Hot metadata: checked every event-loop iteration (fits in first cache line)
@@ -84,6 +98,7 @@ struct GlobalData{
   uint32_t g_writes_since_save = 0; // how many keys we written
   uint32_t g_dirty_at_save = 0; // g_writes_since_save captured when a save starts
   size_t g_last_save_size_bytes = 0; // size of last dump
+  size_t used_memory = 0;
   bool g_last_save_ok = true; // did the last save succeded
   // statdistics// written per command
   uint64_t g_server_start_ms = 0;
@@ -118,6 +133,9 @@ struct Config {
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
+  // Memory managment 
+  size_t maxmemory = 0;
+  MaxmemoryPolicy maxmemory_policy = MaxmemoryPolicy::NOEVICTION;
   // Redis defaults
   std::vector<SaveCondition> save_conditions = {
     {3600, 1}, // 1 change in 1 hour
@@ -145,6 +163,7 @@ struct Entry {
   struct HNode node; // hashtable node
   std::string key;
   size_t heap_idx = NO_TTL;
+  size_t mem = 0;
   EntryValue val;
   uint32_t type; 
 };
@@ -159,20 +178,34 @@ struct LookupKey {
 extern GlobalData g_data;
 extern Config g_config;
 
-// Functions
+// Functions declarations
+
+#ifndef NDEBUG
+void mem_selfcheck(const char *where);
+#endif
+
 uint64_t get_monotonic_msec();
 uint64_t get_wall_msec();
+bool expire_if_needed(Entry *ent);
+inline bool entry_has_ttl(const Entry *e){ return e->heap_idx != NO_TTL; }
+
 bool entry_eq(HNode *node, HNode *key);
 Entry *entry_new(uint32_t type);
 void entry_del(Entry *ent);
 void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 void entry_del_sync(Entry *ent);
 void entry_del_func(void *arg);
+size_t entry_mem_usage(Entry *ent);
+
+void mem_reaccount(Entry *ent);
 bool hnode_same(HNode *node, HNode *key);
-bool expire_if_needed(Entry *ent);
-inline bool entry_has_ttl(const Entry *e){ return e->heap_idx != NO_TTL; }
+
 inline std::string &entry_str(Entry *e){ return std::get<std::string>(e->val); }
 inline ZSet &entry_zset(Entry *e){ return std::get<ZSet>(e->val); }
 inline Deque &entry_deque(Entry *e){ return std::get<Deque>(e->val); }
 inline HMap &entry_hash(Entry *e){ return std::get<EntryHash>(e->val).hmap; }
 inline HMap &entry_set(Entry *e){ return std::get<EntrySet>(e->val).hmap; }
+
+bool parse_memory_size(const std::string &s, size_t *out);
+bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
+const char *maxmemory_policy_name(MaxmemoryPolicy p);

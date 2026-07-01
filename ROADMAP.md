@@ -245,8 +245,172 @@ With inline + `ZPOPMIN`, the **default** `redis-benchmark` suite (no `-t`) now r
 
 ## v7 — Memory management
 
-- `maxmemory` limit + eviction policies: noeviction, allkeys-lru, allkeys-lfu, volatile-lru, volatile-ttl, random
-- `MEMORY USAGE` / `OBJECT ENCODING` introspection
+Goal: bound the server's footprint with a `maxmemory` limit and evict keys under
+pressure, plus the introspection commands (`MEMORY USAGE`, `OBJECT ENCODING`) that
+tooling and humans use to reason about it. Everything here builds on the existing
+single-threaded loop, the `std::variant` `Entry`, the TTL min-heap, and the thread
+pool for async free. Do the steps in order — accounting first, because nothing else
+can be enforced or reported without it.
+
+### ✅ Step 1 — Memory accounting (foundation) (DONE 2026-07-01)
+
+Implemented via a drift-free incremental counter: `Entry::mem` holds the bytes last
+charged to each entry, the invariant `g_data.used_memory == Σ Entry::mem` is kept by
+`mem_reaccount(ent)` (add-new-before-subtract-old), and `entry_del` discharges on the
+main thread (safe with the async-delete pool). `entry_mem_usage(Entry*)` estimates
+per-type cost; write handlers reaccount after mutating (once per distinct entry — so
+MSET reaccounts inside its loop, HSET/SADD once after theirs); RDB loaders reaccount
+each entry on the success path. `INFO memory` now reports `used_memory` +
+`used_memory_rss` + `mem_fragmentation_ratio`. Verified by `test_memory.py` (per-type
+create→drain→baseline, overwrite-stability, `FLUSHALL`→0) and a `mem_selfcheck`
+counter-vs-sweep pass under the full `stress_test.py` suite. Bugs caught along the
+way: `lpop`/`rpop` use-after-free (reaccount after `entry_del`), `mset`/`msetnx`
+single-reaccount-outside-loop. Follow-ups noted: `setrange` missing `is_write`,
+`zrem` doesn't drop an emptied zset.
+
+Before any limit can be enforced we need a live `used_memory` number. Two layers:
+
+- **Global counter** `g_data.used_memory` (`size_t`, atomic not required — single loop
+  thread). Bump it in the allocation choke points, not by walking the keyspace:
+  - `entry_new` / `entry_del_sync` — add/subtract the entry's accounted size.
+  - Every value mutation that grows/shrinks a value (`APPEND`, `SETRANGE`, `RPUSH`,
+    `HSET`, `SADD`, `ZADD`, `LREM`, …) must adjust the delta. Centralize this: a small
+    `mem_account(Entry*, ssize_t delta)` helper so handlers don't each reinvent it.
+- **Per-entry size estimator** `entry_mem_usage(const Entry*)` — walks the value by
+  type and returns an approximate byte cost (used by both the counter's initial
+  charge and by `MEMORY USAGE`):
+
+  | Type | Cost model |
+  |---|---|
+  | key | `sizeof(Entry)` + key string len + HMap slot overhead |
+  | string | `capacity()` of the `std::string` |
+  | list (deque) | ring-buffer `cap * sizeof(slot)` + sum of element lens |
+  | hash | nested HMap buckets + Σ(field+value) |
+  | set | nested HMap buckets + Σ(member) |
+  | zset | AVL nodes (`sizeof(AVLNode)` each) + HMap + Σ(member) |
+
+  Keep it *approximate and cheap* — Redis's own `MEMORY USAGE` samples large
+  aggregates rather than walking every element (see `SAMPLES` option, Step 6).
+- **`INFO memory`** section: `used_memory`, `used_memory_human`, `maxmemory`,
+  `maxmemory_policy`, `mem_fragmentation_ratio` (report RSS via `getrusage`/`statm`
+  ÷ `used_memory`), `evicted_keys`, `expired_keys`. Read straight from `g_data`.
+
+**Robustness:** the counter must never underflow — clamp at 0 and assert in debug.
+A drift between the counter and a full re-walk is the classic accounting bug; add a
+debug-only `MEMORY DOCTOR`-style self-check that compares the counter to a full
+`entry_mem_usage` sweep and warns on divergence.
+
+### Step 2 — `maxmemory` config
+
+- `Config::maxmemory` (bytes, `0` = unlimited). Env knob `MYRED_MAXMEMORY`, parsed
+  with a human-size reader (`100mb`, `1gb`, `512kb` → bytes) reused by `CONFIG SET`.
+- `Config::maxmemory_policy` enum (see Step 3), default `noeviction`.
+- Wire both into the `CONFIG GET/SET` stub so they're runtime-tunable (this turns the
+  v6.1 stub into its first real parameters).
+
+### Step 3 — Eviction policies
+
+Eight policies, matching Redis. Store as an enum parsed once at boot / on `CONFIG SET`:
+
+| Policy | Candidate set | Victim chosen by |
+|---|---|---|
+| `noeviction` | — | none — reject writes with `-OOM` |
+| `allkeys-random` | all keys | random |
+| `volatile-random` | keys with a TTL | random |
+| `allkeys-lru` | all keys | oldest idle time |
+| `volatile-lru` | keys with a TTL | oldest idle time |
+| `allkeys-lfu` | all keys | lowest access frequency |
+| `volatile-lfu` | keys with a TTL | lowest access frequency |
+| `volatile-ttl` | keys with a TTL | nearest expiry |
+
+**Volatile fallback:** when a `volatile-*` policy has no keys with a TTL to evict and
+we're still over the limit, behave like `noeviction` (return `-OOM`) — do *not* touch
+non-volatile keys.
+
+### Step 4 — LRU / LFU metadata + approximated eviction
+
+Redis does **not** keep a true global LRU list (too much memory + pointer churn). It
+stores a small per-object field and evicts by *sampling*. Mirror that:
+
+- **Entry field:** add a `uint32_t lru` to `Entry` (24 bits used). Under an LRU policy
+  it holds a coarse access timestamp; under LFU it packs a 16-bit last-decay-time +
+  8-bit logarithmic counter. Costs 4 bytes/key.
+- **LRU clock:** a global `g_lru_clock` updated once per event-loop tick from the
+  cached monotonic time (no per-access syscall). On every keyspace *read/write* stamp
+  `ent->lru = g_lru_clock`. Idle time = `g_lru_clock - ent->lru` (handle wraparound).
+- **LFU counter:** probabilistic log increment (`p = 1/(counter*factor+1)`) on access,
+  with time-based decay so cold-but-once-hot keys age out. `lfu_log_factor` /
+  `lfu_decay_time` configs.
+- **Eviction pool:** keep a fixed 16-slot pool of best candidates across calls. Each
+  eviction round samples `maxmemory_samples` keys (default 5) via a cheap random
+  sampler over the HMap, merges them into the pool sorted by idle-time / inverse-freq
+  / nearest-TTL, and evicts from the good end. Amortizes sampling cost.
+- **Random sampler:** needs an O(1)-ish "give me a random live entry" over the dual
+  HMap. Generalize the `RANDOMKEY` reservoir path into `hm_random_entry()` that both
+  tables can serve; for `volatile-*` iterate the TTL min-heap instead (it already
+  holds exactly the keys with a TTL, and for `volatile-ttl` it's *sorted by expiry* —
+  the victim is near the heap root, nearly free).
+
+### Step 5 — Eviction trigger + write path integration
+
+- **Where:** a `free_memory_if_needed()` called at the top of `do_request` for any
+  command flagged `is_write` in `k_cmd_table` (reads never trigger eviction) — before
+  the handler runs, while over `maxmemory`.
+- **Loop:** while `used_memory > maxmemory`: pick a victim per policy, delete it,
+  subtract its size, `evicted_keys++`. Give up after a bounded number of attempts to
+  avoid stalling the loop on a pathological keyspace; if still over and policy is
+  `noeviction` (or volatile-with-no-volatiles), the triggering write returns
+  `-OOM command not allowed when used memory > 'maxmemory'`.
+- **Async free:** route large-value evictions through the existing `asyncdel`/thread
+  pool path so freeing a huge hash/zset doesn't stall the loop (same mechanism as
+  `UNLINK`).
+- **AOF / persistence correctness (critical):** an eviction is a data change. It must
+  be **propagated as an explicit `DEL key` to the AOF** (and later to replicas in v10)
+  so the log doesn't replay the evicted key back into existence. Feed it through the
+  same `aof_feed`/`aof_append_raw` path used by real `DEL`, gated by `g_loading` so
+  replay itself never evicts-and-logs.
+- **Don't evict when:** `g_loading` is true (startup replay), inside the BGSAVE/AOF
+  fork child, or `maxmemory == 0`.
+
+### Step 6 — Introspection commands
+
+- `MEMORY USAGE key [SAMPLES count]` → `entry_mem_usage(ent)`; for big aggregates,
+  sample `count` elements (default 5, `0` = exact) and extrapolate, matching Redis.
+- `MEMORY STATS` → array of internal figures (used, overhead, keys count, …).
+- `MEMORY DOCTOR` → human string; reuse the Step 1 counter-vs-sweep self-check.
+- `OBJECT ENCODING key` → report our encoding names. We don't have Redis's listpack/
+  intset/skiplist duality, so map honestly: string→`raw`/`int` (if `str2int` fits),
+  list→`deque`, hash→`hashtable`, set→`hashtable` (or `intset` if all-integer, if we
+  ever add that), zset→`skiplist`. Document that these are MYRED encodings.
+- `OBJECT IDLETIME key` → `(g_lru_clock - ent->lru)` in seconds (LRU policies).
+- `OBJECT FREQ key` → the LFU counter (LFU policies only; error otherwise, like Redis).
+- `OBJECT REFCOUNT key` → we don't share objects, so always `1` (stub for compat).
+
+### Optimization / robustness summary
+
+| Concern | Approach |
+|---|---|
+| Accounting cost | Incremental global counter at alloc choke points — never walk the keyspace to answer `maxmemory` |
+| `MEMORY USAGE` cost | Sample large aggregates (`SAMPLES`), don't sum every element |
+| LRU memory overhead | 4 bytes/key, sampled eviction — no global linked list |
+| LRU clock cost | One cached clock per loop tick, not a syscall per access |
+| Eviction sampling cost | 16-slot eviction pool amortized across rounds; TTL heap serves `volatile-ttl` near-free |
+| Large-value eviction stall | Async free via the existing thread pool (`asyncdel`) |
+| AOF divergence | Evictions propagate an explicit `DEL` to the AOF; suppressed during `g_loading` |
+| Counter drift | Debug self-check (`MEMORY DOCTOR`) compares counter to a full sweep |
+| Fork safety | No eviction inside the BGSAVE/rewrite child |
+| Volatile starvation | `volatile-*` with no TTL keys falls back to `-OOM`, never evicts persistent keys |
+| Loop starvation | Bounded eviction attempts per write; give up → `-OOM` rather than spin |
+
+### Suggested testing
+
+- `test_maxmemory.sh`: set a low `MYRED_MAXMEMORY`, flood keys, assert `used_memory`
+  stays bounded and `evicted_keys` climbs; assert `noeviction` returns `-OOM`.
+- Per-policy victim-selection unit checks (fill with known idle/freq/TTL spreads).
+- AOF-eviction regression: evict under load, restart, assert evicted keys stay gone
+  (the `DEL` propagation actually took).
+- Accounting regression: build a mixed dataset, compare the counter to a full
+  `entry_mem_usage` sweep (drift == bug).
 
 ## v8 — Pub/Sub & Transactions
 
