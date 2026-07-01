@@ -101,6 +101,7 @@ struct GlobalData{
   std::atomic<bool> g_aof_fsync_pending{false}; // true while a pool fdatasync is running
   bool g_loading = false; // true when replaying
   bool g_aof_write_err = false; // last AOF flush failed -> refuse rewrties until recovery
+  bool g_aof_last_rewrite_ok = true; // For do_info
 };
 
 struct SaveCondition {

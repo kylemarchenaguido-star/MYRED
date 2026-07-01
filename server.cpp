@@ -316,11 +316,15 @@ static bool try_one_request(Conn *conn){
     return false;
   }
 
-  buf_consume(&conn->incoming, (size_t)consumed);
+  // capture the raw frame BEFORe consuming/dispatching. logged berbatim for aof
+  const char *raw = (const char *)buf_data(&conn->incoming);
+  size_t raw_len = (size_t)consumed;
+
   g_data.g_total_commands++;
+  do_request(cmd, &conn->outgoing, conn, raw, raw_len);
 
-  do_request(cmd, &conn->outgoing, conn);
-
+  // moved after do_request, raw must stay valid
+  buf_consume(&conn->incoming, raw_len);
   conn->want_read = false;
   conn->want_write = true;
   return true;
@@ -391,7 +395,13 @@ int main(int argc, char **argv){
     }
   }
 
+  // Timers start
   g_data.g_server_start_ms = get_monotonic_msec();
+  g_data.g_last_save_ms = g_data.g_server_start_ms;
+
+  g_data.g_aof_last_fsync_ms = g_data.g_server_start_ms;
+  g_data.g_aof_check_ms      = g_data.g_server_start_ms;
+
 
   // initialiaze idle connection list and io waiting list
   dlist_init(&g_data.idle_list);
@@ -433,6 +443,8 @@ int main(int argc, char **argv){
   } else {
     fprintf(stderr, "startup: no persistence file, starting empty\n");
   }
+  
+  g_data.g_aof_buf.reserve(64 * 1024);
 
   if (g_config.aof_enable){
     g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);

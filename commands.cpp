@@ -937,7 +937,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
   size_t memory = get_memory_usage();
 
   // build the info string 
-  char buf[2048];
+  char buf[4096];
   int len = snprintf(buf, sizeof(buf),
     "# Server\r\n"
     "version:1.0.0\r\n"
@@ -966,6 +966,12 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "rdb_changes_since_save:%u\r\n"
     "rdb_last_save_ok:%d\r\n"
     "rdb_last_save_size_bytes:%zu\r\n"
+    "aof_enabled:%d\r\n"
+    "aof_current_size:%zu\r\n"
+    "aof_base_size:%zu\r\n"
+    "aof_pending_rewrite:%d\r\n"
+    "aof_last_write_status:%s\r\n"
+    "aof_last_bgrewrite_status:%s\r\n"
     "\r\n"
     "# Replication\r\n"
     "role:master\r\n",
@@ -990,14 +996,23 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     keystats.with_ttl,
     keystats.total - keystats.with_ttl,
 
-    // persistence
+    // persistence (rdb)
     (unsigned long long)(g_data.g_last_save_ms / 1000),
     g_data.g_writes_since_save,
     (int)g_data.g_last_save_ok,
-    g_data.g_last_save_size_bytes
+    g_data.g_last_save_size_bytes,
+    // persistence (aof)
+    (int)g_config.aof_enable,
+    g_data.g_aof_current_size,
+    g_data.g_aof_base_size,
+    (int)(g_aof_child_pid != -1),
+    g_data.g_aof_write_err ? "err" : "ok",
+    g_data.g_aof_last_rewrite_ok ? "ok" : "err"
   );
+  if (len < 0){ return resp_err(out, "ERR info formatting"); }
+  // clamp, never over read
+  if (len >= (int)sizeof(buf)){ len = sizeof(buf) - 1; }
   resp_str(out, buf, (size_t)len);         
-
 }
 
 // LPUSH key
@@ -2294,70 +2309,6 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, 1);
 }
 
-// encode an array-of-bulk-strings RESP frame
-static void aof_encode(std::string &dst, std::initializer_list<std::string_view> args){
-  char hdr[32];
-  int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
-  dst.append(hdr, (size_t)n);
-  for (std::string_view a : args){
-    int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
-    dst.append(hdr, (size_t)h);
-    dst.append(a.data(), a.size());
-    dst.append("\r\n", 2);
-  }
-}
-
-static void aof_encode(std::string &dst, const std::vector<std::string> &args){
-  char hdr[32];
-  int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
-  dst.append(hdr, (size_t)n);
-  for (std::string_view a : args){
-    int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
-    dst.append(hdr, (size_t)h);
-    dst.append(a.data(), a.size());
-    dst.append("\r\n", 2);
-  }
-}
-
-// Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
-static void aof_feed(const std::vector<std::string> &cmd){
-  std::string frame;
-  const std::string &name = cmd[0]; // already lower-case by do request
-
-  if (name == "expire" || name == "pexpire" || name == "expireat"){
-    int64_t v = 0;
-    if (str2int(cmd[2], v)){
-      int64_t abs_ms = (name == "expire") ? (int64_t)get_wall_msec() + v * 1000
-                     : (name == "pexpire") ? (int64_t)get_wall_msec() + v
-                     : v * 1000; // expireat
-      char ts[32];
-      int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
-      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
-      return;
-    } else { aof_encode(frame, cmd); }
-  }
-  else if (name == "setex" || name == "psetex"){
-    int64_t v = 0;
-    if (str2int(cmd[2], v)){
-      int64_t abs_ms = (name == "setex") ? (int64_t)get_wall_msec() + v * 1000
-                                         : (int64_t)get_wall_msec() + v;
-      aof_encode(frame, {"SET", cmd[1], cmd[3]});
-      char ts[32];
-      int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
-      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
-      return;
-    } else { aof_encode(frame, cmd); }
-  }
-  else { aof_encode(frame, cmd); } 
-  
-  // live aof
-  g_data.g_aof_buf += frame; 
-  // rewrite in progress and we capture the delta
-  if (g_aof_child_pid != 1){
-    g_data.g_aof_rewrite_buf += frame;
-  }
-}
-
 static void do_ping(std::vector<std::string> &cmd, Buffer *out){
   if (cmd.size() >= 2){
     // PING msg -> bulk echo
@@ -2379,6 +2330,85 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
   return resp_err(out, "ERR Unknown CONFIG subcommand");
 }
 
+// // encode an array-of-bulk-strings RESP frame
+// static void aof_encode(std::string &dst, std::initializer_list<std::string_view> args){
+
+// }
+
+// static void aof_encode(std::string &dst, const std::vector<std::string> &args){
+//   char hdr[32];
+//   int n = snprintf(hdr, sizeof(hdr), "*%zu\r\n", args.size());
+//   dst.append(hdr, (size_t)n);
+//   for (std::string_view a : args){
+//     int h = snprintf(hdr, sizeof(hdr), "$%zu\r\n", a.size());
+//     dst.append(hdr, (size_t)h);
+//     dst.append(a.data(), a.size());
+//     dst.append("\r\n", 2);
+//   }
+// }
+
+// Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
+static void aof_feed(const std::vector<std::string> &cmd){
+  std::string frame;
+  const std::string &name = cmd[0];              // already lower-cased
+  int64_t now = (int64_t)get_wall_msec();
+
+  if (name == "expire" || name == "pexpire" || name == "expireat"){
+    int64_t v = 0;
+    if (str2int(cmd[2], v)){
+      int64_t abs_ms = (name == "expire")  ? now + v * 1000
+                     : (name == "pexpire") ? now + v
+                     :                        v * 1000;      // expireat (abs seconds)
+      char ts[32]; int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
+      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+    } else { aof_encode(frame, cmd); }
+  }
+  else if (name == "setex" || name == "psetex"){
+    int64_t v = 0;
+    if (str2int(cmd[2], v)){
+      int64_t abs_ms = (name == "setex") ? now + v * 1000 : now + v;
+      aof_encode(frame, { "SET", cmd[1], cmd[3] });
+      char ts[32]; int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
+      aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+    } else { aof_encode(frame, cmd); }
+  }
+  else if (name == "getex" && cmd.size() >= 3){
+    std::string opt = cmd[2];
+    for (char &c : opt){ c = (char)tolower((unsigned char)c); }
+    if (opt == "persist"){
+      aof_encode(frame, { "PERSIST", cmd[1] });
+    } else if (cmd.size() >= 4){
+      int64_t v = 0;
+      if (str2int(cmd[3], v)){
+        int64_t abs_ms = (opt == "ex")   ? now + v * 1000
+                       : (opt == "px")   ? now + v
+                       : (opt == "exat") ? v * 1000
+                       :                    v;               // pxat (abs ms)
+        if (abs_ms <= now){
+          aof_encode(frame, { "DEL", cmd[1] });             // past → key was deleted
+        } else {
+          char ts[32]; int n = snprintf(ts, sizeof(ts), "%lld", (long long)abs_ms);
+          aof_encode(frame, { "PEXPIREAT", cmd[1], std::string_view(ts, (size_t)n) });
+        }
+      } else { aof_encode(frame, cmd); }
+    } else { aof_encode(frame, cmd); }
+  }
+  else { aof_encode(frame, cmd); }               // verbatim fallback
+
+  g_data.g_aof_buf += frame;
+  if (g_aof_child_pid != -1){                    // FIXED
+    g_data.g_aof_rewrite_buf += frame;
+  }
+}
+
+static void aof_append_raw(const char *raw, size_t len){
+  g_data.g_aof_buf.append(raw, len);
+  // Dual write during a rewrite
+  if (g_aof_child_pid != -1){
+    g_data.g_aof_rewrite_buf.append(raw, len);
+  }
+}
+
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
 
 struct CmdSpec {
@@ -2386,6 +2416,7 @@ struct CmdSpec {
   int min_args;
   int max_args;
   bool is_write = false;
+  bool aof_rewrite = false; // can't be logged verbati- needs TTL translation
 };
 
 static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
@@ -2397,12 +2428,12 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"incrby",       {do_incrby,        3,  3, true}},
   {"decrby",       {do_decrby,        3,  3, true}},
   {"incrbyfloat",  {do_incrbyfloat,   3,  3, true}},
-  {"setex",        {do_setex,         4,  4, true}},
-  {"psetex",       {do_psetex,        4,  4, true}},
+  {"setex",        {do_setex,         4, 4, true, true}},
+  {"psetex",       {do_psetex,        4, 4, true, true}},
   {"setnx",        {do_setnx,         3,  3, true}},
   {"getset",       {do_getset,        3,  3, true}},
   {"getdel",       {do_getdel,        2,  2, true}},
-  {"getex",        {do_getex,         2, -1, true}},
+  {"getex",        {do_getex,         2, -1, true, true}},
   {"append",       {do_append,        3,  3, true}},
   {"strlen",       {do_strlen,        2,  2}},
   {"getrange",     {do_getrange,      4,  4}},
@@ -2425,10 +2456,10 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"flushall",     {do_flushall,      1,  1, true}},
   {"flushdb",      {do_flushall,      1,  1, true}},
   // ttl
-  {"expire",       {do_expire,        3,  3, true}},
-  {"pexpire",      {do_pexpire,       3,  3, true}},
-  {"expireat",     {do_expireat,      3,  3, true}},
-  {"pexpireat",    {do_pexpireat,     3,  3, true}},
+  {"expire",       {do_expire,        3, 3, true, true}},
+  {"pexpire",      {do_pexpire,       3, 3, true, true}},
+  {"expireat",     {do_expireat,      3, 3, true, true}},
+  {"pexpireat",    {do_pexpireat,     3, 3, true}},
   {"ttl",          {do_ttl_seconds,   2,  2}},
   {"pttl",         {do_ttl,           2,  2}},
   {"persist",      {do_persist,       2,  2, true}},
@@ -2492,7 +2523,7 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"config",       {do_config,        2, -1}},
 };
 
-void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const char *raw, size_t raw_len) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
   }
@@ -2532,10 +2563,16 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
   // Snapshot before running swap() handlers/ consume cmd's
   bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading;
   std::vector<std::string> snapshot;
-  if (may_log){ snapshot  = cmd; }
+  if (may_log && spec.aof_rewrite){ snapshot  = cmd; }
   spec.fn(cmd, out);
 
   if (may_log && g_data.g_writes_since_save != dirty_before){
-    aof_feed(snapshot);
+    if (spec.aof_rewrite){
+      // rare: re-encode with absolute PEXPIREAT
+      aof_feed(snapshot);
+    } else {
+      // common: verbatim memcpy, no copy/re-encode
+      aof_append_raw(raw, raw_len);
+    }
   }
 }

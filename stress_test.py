@@ -1939,6 +1939,88 @@ def cleanup_stress_keys(host: str, port: int):
         pass
 
 
+def test_zset_extended(r: TestRunner, sock: socket.socket):
+    r.section("Sorted Set: variadic ZADD / ZPOPMIN")
+
+    zset = "zext"
+    cmd(sock, "del", zset)
+
+    # variadic ZADD: 3 score/member pairs in one command → 3 new members
+    r.check("zadd variadic 3 pairs → 3",
+            cmd(sock, "zadd", zset, "1", "a", "2", "b", "3", "c"), 3)
+    # mix: 'a' exists (update → 0), 'd' new (→ 1) ⇒ returns 1 (only new counted)
+    r.check("zadd variadic new+update → 1",
+            cmd(sock, "zadd", zset, "1.5", "a", "4", "d"), 1)
+    r.check_approx("zscore a updated → 1.5", cmd(sock, "zscore", zset, "a"), 1.5)
+
+    # odd arg count (dangling score) → error
+    r.expect_error("zadd odd args → error", sock, "zadd", zset, "9", "x", "8")
+    # atomicity: a bad score must add nothing
+    r.expect_error("zadd bad score → error", sock, "zadd", zset, "notnum", "z")
+    r.check_none("zadd atomic: z not added", cmd(sock, "zscore", zset, "z"))
+
+    # scores now: a=1.5, b=2, c=3, d=4
+    res = cmd(sock, "zpopmin", zset)
+    r.check_type("zpopmin → list", res, list)
+    r.check("zpopmin min member → a", res[0] if isinstance(res, list) and res else None, "a")
+    r.check_approx("zpopmin min score → 1.5",
+                   res[1] if isinstance(res, list) and len(res) > 1 else None, 1.5)
+
+    # zpopmin count=2 → b, c (4 items: member,score,member,score)
+    res2 = cmd(sock, "zpopmin", zset, "2")
+    r.check("zpopmin 2 → 4 items", len(res2) if isinstance(res2, list) else -1, 4)
+    r.check("zpopmin 2 members → b,c",
+            res2[0::2] if isinstance(res2, list) else None, ["b", "c"])
+
+    # only 'd' left — popping it should drop the now-empty key
+    cmd(sock, "zpopmin", zset)
+    r.check("zset emptied → key dropped", cmd(sock, "exists", zset), 0)
+
+    # zpopmin on a missing key → empty array
+    r.check("zpopmin missing → []", cmd(sock, "zpopmin", "ghost_zset"), [])
+
+    # wrong type
+    cmd(sock, "del", "ztype")
+    cmd(sock, "set", "ztype", "x")
+    r.expect_error("zpopmin wrong type → error", sock, "zpopmin", "ztype")
+    cmd(sock, "del", "ztype")
+
+
+def test_ping_command(r: TestRunner, sock: socket.socket):
+    r.section("PING (multibulk + inline)")
+
+    r.check("ping → PONG", cmd(sock, "ping"), "PONG")
+    r.check("ping msg → echo", cmd(sock, "ping", "hello"), "hello")
+
+    # inline protocol: a bare "PING\r\n" (not a RESP array)
+    sock.sendall(b"PING\r\n")
+    r.check("inline PING → PONG", recv_response(sock), "PONG")
+
+    # inline with argument
+    sock.sendall(b"PING inlinemsg\r\n")
+    r.check("inline PING msg → echo", recv_response(sock), "inlinemsg")
+
+
+def test_config_command(r: TestRunner, sock: socket.socket):
+    r.section("CONFIG (stub)")
+
+    res = cmd(sock, "config", "get", "maxmemory")
+    r.check_type("config get → array", res, list)
+    r.check("config set → OK", cmd(sock, "config", "set", "maxmemory", "0"), "OK")
+    r.check("config resetstat → OK", cmd(sock, "config", "resetstat"), "OK")
+    r.expect_error("config bad subcommand → error", sock, "config", "frobnicate")
+
+
+def test_bgrewriteaof_command(r: TestRunner, sock: socket.socket):
+    r.section("BGREWRITEAOF")
+
+    # returns a status string whether or not AOF is enabled; must not crash
+    res = cmd(sock, "bgrewriteaof")
+    r.check_type("bgrewriteaof → string", res, str)
+    # server must stay responsive afterward
+    r.check("server responsive after bgrewriteaof", cmd(sock, "ping"), "PONG")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2003,6 +2085,7 @@ def main():
             test_ttl_commands(r,          sock)
             test_zset_commands(r,         sock)
             test_zquery_commands(r,       sock)
+            test_zset_extended(r,         sock)
             test_list_commands(r,         sock)
             test_hash_commands(r,                  sock)
             test_extended_hash_commands(r,         sock)
@@ -2012,9 +2095,12 @@ def main():
             test_unlink_command(r,                 sock)
             test_set_commands(r,                   sock)
             test_edge_cases(r,            sock)
+            test_ping_command(r,          sock)
+            test_config_command(r,        sock)
             test_info_command(r,          sock)
             test_save_command(r,          sock)
             test_bgsave_command(r,        sock)
+            test_bgrewriteaof_command(r,  sock)
         except Exception as e:
             print(f"\n{RED}Unexpected error: {e}{RESET}")
             all_ok = False

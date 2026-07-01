@@ -170,60 +170,47 @@ Redis-style `save N M` (save RDB if ≥M writes happened within N seconds), OR-c
 
 ---
 
-## v6 — Optimizations & future work
+## ✅ v6 — Optimizations (DONE 2026-06-28)
 
-Forward-looking improvements to the persistence layer. None are required for correctness — the core AOF (Steps 1-5) is functional. Ordered roughly by value.
+All five optimizations applied. Several latent bugs surfaced and were fixed along the way.
 
-### A. `aof_encode` → one template
+### ✅ A. `aof_encode` → one template
+Collapsed the two overloads into `template <typename Range> aof_encode(std::string&, const Range&)` plus a thin `initializer_list<string_view>` forwarder (braced `{...}` calls can't deduce a generic `Range`, so the forwarder keeps those call sites working). Body lives in one place. Moved to `aof.h` (templates are implicitly inline) to dedupe across TUs.
 
-There are currently two `aof_encode` overloads (`initializer_list<string_view>` and `vector<string>`). Collapse into a single template over any iterable of `string_view`-convertible elements:
-```cpp
-template <typename Range>
-void aof_encode(std::string &dst, const Range &args);   // works for both call sites
-```
-Removes the duplicate body and the maintenance hazard of fixing one and forgetting the other.
+### ✅ B. Alternative write path — raw RESP bytes
+`try_one_request` captures the raw frame from `conn->incoming` (`buf_consume` moved *after* dispatch) and threads `(raw, raw_len)` into `do_request`. Common writes are logged with one `memcpy` (`aof_append_raw`) — no snapshot copy, no re-encode. Only the five TTL-rewrite commands (flagged `aof_rewrite` in `CmdSpec`) still snapshot + translate. Dropped a per-write heap allocation on the hot path.
 
-### B. Alternative write path — log raw RESP bytes
+### ✅ C. Hybrid AOF format (embedded RDB preamble)
+Rewrite now emits `["MYAOFRDB"][rdb_len:u64][RDB image][RESP delta]`. `rdb_build_aof_preamble` wraps a standalone `rdb_serialize` image; `rdb_load_buffer` loads an RDB from memory. `aof_load` detects the marker → fast binary load of the snapshot → RESP-replay only the tail; markerless files still load as plain RESP (backward-compatible). Load for large datasets drops from "replay N commands" to "one RDB pass + small delta". Verified by `test_aof_hybrid.sh`.
 
-Step 1 snapshots `cmd` (a `std::vector<std::string>` copy) and re-encodes the RESP frame. Both costs vanish if we log the **raw consumed bytes**: in `try_one_request` the original frame sits in `conn->incoming` at `[0, consumed)` before `buf_consume()` and before any handler mutates `cmd`.
+### ✅ D. `INFO persistence` observability
+Added `aof_enabled`, `aof_current_size`, `aof_base_size`, `aof_pending_rewrite`, `aof_last_write_status` (from `g_aof_write_err`) to the `# Persistence` section — all read straight from `g_data`/`g_config`. Also bumped the `INFO` buffer to 4096 + clamped `len` (it trusted `snprintf`'s return as a length → latent OOB read).
 
-```cpp
-int32_t consumed = parse_resp_request(&conn->incoming, cmd);
-const char *raw = (const char *)buf_data(&conn->incoming);   // capture BEFORE consume/dispatch
-size_t raw_len = (size_t)consumed;
-do_request(cmd, &conn->outgoing, conn, raw, raw_len);
-buf_consume(&conn->incoming, raw_len);
-```
-`do_request` then `memcpy`s `raw` into `g_aof_buf` (no vector copy, no re-encode) when logging.
+### ✅ E. Smaller wins
+- **Precise `GETEX` translation** (correctness): `aof_feed` now emits `PEXPIREAT`/`PERSIST`/`DEL` for every mutating `GETEX` form instead of logging it verbatim (relative `EX`/`PX` would replay wrong). `GETDEL` stays verbatim (deterministic, correct). `getex` tagged `aof_rewrite`.
+- **`reserve()`** `g_aof_buf` (startup) and `g_aof_rewrite_buf` (per rewrite) to 64 KB — avoids reallocation churn.
+- `writev()` scatter-gather flush: **skipped** (marginal, not worth it without profiling).
 
-**Wrinkle:** TTL-relative commands (`EXPIRE`, `SETEX`, `GETEX … EX`) still need the translate-to-`PEXPIREAT` path — they can't be logged verbatim. So: command in the small "needs TTL rewrite" set → re-encode rewritten form; else → `memcpy` raw. The expensive path is the rare one. **Trade-off:** stores the command as the client sent it (original casing) rather than normalized — fine for a RESP-only server. Removes a per-write heap allocation on the hot path.
-
-### C. Hybrid AOF format (embedded RDB header)
-
-A rewritten AOF that begins with an RDB binary block (fast to load) followed by RESP commands for changes since the rewrite — much faster to load than replaying millions of RESP commands for a large dataset. Header magic `MYRED` (same as RDB): `aof_load` detects it, runs the RDB loader for the header, then switches to RESP replay for the tail. Reuses the existing `rdb_serialize` in `cb_aof_rewrite`'s parent phase. Do this only once datasets are large enough that RESP replay is the bottleneck.
-
-### D. `INFO persistence` section / observability
-
-Expose the counters we already track: `aof_enabled`, `aof_current_size`, `aof_base_size`, `aof_pending_rewrite` (`g_aof_child_pid != -1`), `aof_last_bgrewrite_status`, `rdb_last_save_time`, `rdb_changes_since_save`. Cheap (data already in `g_data`) and makes the AOF debuggable in production without log-diving.
-
-### E. Smaller wins
-
-- **`g_aof_rewrite_buf` as a `Buffer`** (or `reserve()` it) — during a long rewrite under heavy write load the delta `std::string` reallocates repeatedly.
-- **Precise `GETEX`/`GETDEL` translation** — `GETEX` is currently logged verbatim; `GETEX key EX 100` should emit `PEXPIREAT`, `GETEX key PERSIST` → `PERSIST`, `GETDEL` → `DEL`. (Correctness gap, not just speed.)
-- **`writev()` for flush** — write the AOF buffer without first concatenating frames, scatter-gather from per-frame chunks. Marginal; only if profiling shows the `+=` copies matter.
-- **Reserve `g_aof_buf` capacity** at startup to avoid early reallocations under burst load.
+### Bugs fixed during the optimization pass
+- **`g_last_save_ms` uninitialized** (Step 7): defaulted to 0, so `now - 0` satisfied every `save N M` window → spurious `BGSAVE` on the *first write*, which then blocked `BGREWRITEAOF` via the fork guard. Now seeded to boot time (with `g_aof_last_fsync_ms` / `g_aof_check_ms`).
+- **`aof_feed` `return` bug**: leftover `return`s in the `EXPIRE`/`SETEX` branches skipped `g_aof_buf += frame` → relative-TTL commands were never logged live (masked by the RDB preamble on rewrite). Restructured so all branches fall through to the append.
+- **`aof_feed` `g_aof_child_pid != 1`** (should be `!= -1`): mirrored every write into `g_aof_rewrite_buf` outside a rewrite → unbounded growth. Fixed.
 
 ### Optimization summary (implemented)
 
 | Concern | Approach (done) |
 |---|---|
 | AOF write latency | Buffer in memory; one `write()` per tick; `fdatasync` not `fsync` |
+| Per-write allocation | Raw-bytes `memcpy` path — no snapshot copy / re-encode except TTL commands |
 | fsync never blocks loop | `everysec` offloads `fdatasync` to thread pool with CAS in-flight guard |
 | BGREWRITEAOF memory | Serialize in parent before fork (no CoW explosion); child does pure I/O |
+| Large-dataset load | Hybrid AOF: binary RDB preamble + RESP delta, not full RESP replay |
 | Replay correctness | `g_loading` suppresses re-logging; counter reset after load |
 | Rewrite correctness | Dual-buffer: `g_aof_buf` live + `g_aof_rewrite_buf` delta during child run |
+| TTL correctness | All relative-TTL cmds (incl. `GETEX`) logged as absolute `PEXPIREAT` |
 | No-op writes | Mutation-gated via `g_writes_since_save` delta |
 | Auto-rewrite cost | Size tracked in memory (no per-tick `stat`); check gated to 1/s |
+| Observability | `INFO persistence` exposes AOF size/state/write-status |
 
 ---
 

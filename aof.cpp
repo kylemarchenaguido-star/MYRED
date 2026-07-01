@@ -93,53 +93,6 @@ static bool cb_aof_set(HNode *node, void *arg){
   return true;
 }
 
-static bool cb_aof_rewrite(HNode *node, void *arg){
-  Buffer *buf = (Buffer *)arg;
-  Entry *ent = container_of(node, &Entry::node);
-  std::string_view key(ent->key.data(), ent->key.size());
-
-  switch (ent->type){
-    case T_STR: 
-      aof_emit_vec(buf, { "SET", key, std::string_view(entry_str(ent).data(), entry_str(ent).size()) });
-      break;
-    case T_ZSET: {
-      AofBatch b {buf, "ZADD", key, {}, 2 };
-      hm_foreach(&entry_zset(ent).hmap, cb_aof_zset, &b);
-      aof_batch_flush(&b);
-      break;
-    }
-    case T_DLIST: {
-      AofBatch b {buf, "RPUSH", key, {}, 1 };
-      for (size_t i = 0; i < entry_deque(ent).count; ++i){
-        b.args.emplace_back(*deque_get(&entry_deque(ent), i));
-        aof_batch_maybe_flush(&b);
-      }
-      aof_batch_flush(&b);
-      break;
-    }
-    case T_HASH: {
-      AofBatch b {buf, "HSET", key, {}, 2 };
-      hm_foreach(&entry_hash(ent), cb_aof_hash, &b);
-      aof_batch_flush(&b);
-      break;
-    }
-    case T_SET: {
-      AofBatch b {buf, "SADD", key, {}, 1 };
-      hm_foreach(&entry_set(ent), cb_aof_set, &b);
-      aof_batch_flush(&b);
-      break;
-    }
-  }
-  // TTL -> absolute PEXPIREAT
-  if (entry_has_ttl(ent)){
-    uint64_t abs = mono_expiry_to_wall(g_data.heap[ent->heap_idx].val);
-    char ts[32];
-    int n = snprintf(ts, sizeof(ts), "%llu", (unsigned long long)abs);
-    aof_emit_vec(buf, { "PEXPIREAT", key, std::string_view(ts, (size_t)n) });
-  }
-  return true;
-}
-
 // child only - write the snapshot buffer, fsync, exit. No rename (parent finalizes)
 static void aof_write_snapshot(const Buffer *buf, const char *tmp){
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -167,9 +120,10 @@ void aof_rewrite_background(){
 
   // serialize the WHOLE dataset to resp in the parent, before fork (all malloc here)
   Buffer buf = buf_create(64 * 1024);
-  hm_foreach(&g_data.db, cb_aof_rewrite, &buf);
+  rdb_build_aof_preamble(&buf);
 
   g_data.g_aof_rewrite_buf.clear(); // start the delta clean
+  g_data.g_aof_rewrite_buf.reserve(64 * 1024);
 
   pid_t pid = fork();
   if (pid < 0){
@@ -217,9 +171,11 @@ void aof_check_background_rewrite(){
         g_data.g_aof_current_size  = (size_t)st.st_size;
         g_data.g_aof_base_size  = (size_t)st.st_size;
       }
+      g_data.g_aof_last_rewrite_ok = true;
       fprintf(stderr, "aof_rewrite: completed, %zu delta bytes\n", d.size());
     }
   } else {
+    g_data.g_aof_last_rewrite_ok = false;
     fprintf(stderr, "aof_rewrite: child failed (status=%d), keeping old AOF\n", status);
     unlink("appendonly.aof.tmp");
   }
@@ -237,14 +193,34 @@ bool aof_load(const char *path){
     // empty aof file, nothing to replay
     if (sz <= 0){ fclose(fp); return true; }
 
-    Buffer buf = buf_create((size_t)sz);
     std::vector<uint8_t> raw((size_t)sz); 
     if (fread(raw.data(), 1, (size_t)sz, fp) != (size_t)sz){
         fprintf(stderr, "aof_load: short read\n");
-        fclose(fp); buf_destroy(&buf); return false;
+        fclose(fp); 
+        return false;
     }
     fclose(fp);
-    buf_append(&buf, raw.data(), (size_t)sz);
+
+    size_t resp_offset = 0;
+    if (sz >= 16 && memcmp(raw.data(), "MYAOFRDB", 8) == 0){
+      uint64_t rdb_len = 0;
+      memcpy(&rdb_len, raw.data() + 8, 8);
+      if (rdb_len > (uint64_t)sz - 16){
+        fprintf(stderr, "aof_load: truncated RDB preamble\n");
+        return false;
+      }
+      if (!rdb_load_buffer(raw.data() + 16, (size_t)rdb_len)){
+        fprintf(stderr, "aof_load; RDB preamble failed\n");
+        return false;
+      }
+      resp_offset = 16 + (size_t)rdb_len;
+      fprintf(stderr, "aof_load: RDB preamble %llu bytes, replaying RESP tail\n", (unsigned long long)rdb_len);
+    }
+
+    // build the resp vuffer from the tail only
+    Buffer buf = buf_create(sz - resp_offset + 1);
+    buf_append(&buf, raw.data() + resp_offset, sz - resp_offset);
+
 
     // reply setup -> suppress re-logging, bypass auth, discard replies
     g_data.g_loading = true;
@@ -271,7 +247,7 @@ bool aof_load(const char *path){
         buf_consume(&buf, (size_t)consumed);
         good_offset += (size_t)consumed;
 
-        do_request(cmd, &sink, &fake);
+        do_request(cmd, &sink, &fake, nullptr, 0);
         // we drain the replay so sink do not grow
         buf_consume(&sink, buf_size(&sink));
         replayed++;
@@ -285,9 +261,10 @@ bool aof_load(const char *path){
     fprintf(stderr, "aof_load: replayed %zu commands (%zu bytes)\n", replayed, good_offset);
 
     // crash-recovery: if there was a bad/partial tail, trim the file to the last good command
-    if (good_offset < (size_t)sz){
-        if (truncate(path, (off_t)good_offset) == 0){
-            fprintf(stderr, "aof_load: truncated AOF to %zu good bytes\n", good_offset);
+    size_t good_total = resp_offset + good_offset;
+    if (good_total < (size_t)sz){
+        if (truncate(path, (off_t)good_total) == 0){
+            fprintf(stderr, "aof_load: truncated AOF to %zu good bytes\n", good_total);
         }
     }
     return true;

@@ -308,6 +308,20 @@ static void rdb_serialize(Buffer *buf, RDBStats *stats){
   fprintf(stderr, "rdb_serialize: %zu bytes, %u entries, crc=0x%08x\n", stats->bytes, stats->entries, crc);
 }
 
+// BUild [marker][len][RDB image] into 'out'
+void rdb_build_aof_preamble(Buffer *out){
+  Buffer rdb = buf_create(64 * 1024);
+  RDBStats stats = {};
+  // Self contained image, CRC over itself
+  rdb_serialize(&rdb, &stats);
+
+  buf_append(out, (const uint8_t *)"MYAOFRDB", 8);
+  uint64_t rdb_len = (uint64_t)buf_size(&rdb);
+  buf_append(out, (const uint8_t *)&rdb_len, 8);
+  buf_append(out, rdb.data_begin, buf_size(&rdb));
+  buf_destroy(&rdb);
+} 
+
 void rdb_on_save_complete(const char *filename){
   struct stat st;
   if (stat(filename, &st) == 0){
@@ -733,6 +747,42 @@ static bool rdb_parse_entries(const uint8_t *payload, size_t payload_size, uint3
 
 }
 
+// Load an RDB image from memory, 'size' = exact lenght of the RDB blob
+bool rdb_load_buffer(const uint8_t *data, size_t size){
+  // read header files
+  // cursor starts after magic(5)+version(4)+flags(1)+count(4) = 14
+  // cursor ends before eof(1) + crc(4)
+  if (size < 19){ fprintf(stderr, "rdb_load: image too small\n"); return false; }
+  if (memcmp(data, "MYRED", 5) != 0){ fprintf(stderr, "rdb_load: bad magic\n"); return false; }
+  uint32_t version = 0;
+  memcpy(&version, data + 5, 4);
+  if (version != 3){ fprintf(stderr, "rdb_load: unsupported version %u\n", version); return false; }
+
+  size_t content_size = size - 4;
+  uint32_t stored_crc = 0, computed_crc = crc32_compute(data, content_size);
+  memcpy(&stored_crc, data + content_size, 4);
+  if (stored_crc != computed_crc){ fprintf(stderr, "rdb_load: CRC mismatch\n"); return false; }
+
+  uint8_t flags = data[9];
+  bool compressed = (flags & 0x01) != 0;
+  uint32_t n_entries = 0;
+  memcpy(&n_entries, data + 10, 4);
+  const uint8_t *payload = data + 14;
+  size_t payload_size = content_size - 14;
+
+  if (compressed){
+    // read uncompressed size
+    uint32_t usize = 0;
+    memcpy(&usize, payload, 4);
+    uint8_t *dec = rdb_decompress(payload + 4, payload_size - 4, usize);
+    if (!dec){ return false; }
+    bool ok = rdb_parse_entries(dec, usize, n_entries);
+    delete [] dec;
+    return ok;
+  }
+  return rdb_parse_entries(payload, payload_size, n_entries);
+}
+
 static bool rdb_load_file(const char *filename){
   // open and read entire file into memory
   FILE *fp = fopen(filename, "rb");
@@ -792,44 +842,7 @@ static bool rdb_load_file(const char *filename){
   }
   fprintf(stderr, "rdb_load: CRC OK\n");
 
-  // read header files
-  // cursor starts after magic(5)+version(4)+flags(1)+count(4) = 14
-  // cursor ends before eof(1) + crc(4)
-  uint8_t flags = data[9];
-  bool compressed = (flags & 0x01) != 0;
-  uint32_t n_entries = 0;
-  memcpy(&n_entries, data + 10, 4);
-
-  const uint8_t *payload = data + 14;
-  size_t payload_size = content_size - 14;
-
-  // decompress if needed
-  bool ok = false;
-  uint8_t *decompressed = NULL;
-
-  if (compressed){
-    // read uncompressed size
-    uint32_t uncompressed_size = 0;
-    memcpy(&uncompressed_size, payload, 4);
-
-    // compressed data starts after the 4 byte size field
-    const uint8_t *compressed_data = payload + 4;
-    size_t compressed_size = payload_size - 4;
-
-    decompressed = rdb_decompress(compressed_data, compressed_size, uncompressed_size);
-
-    if (!decompressed){
-      delete [] data;
-      return false;
-    }
-    fprintf(stderr, "rdb_load: decompressed %zu -> %u bytes\n", compressed_size, uncompressed_size);
-    ok = rdb_parse_entries(decompressed, (size_t)uncompressed_size, n_entries);
-
-    delete [] decompressed;
-  } else {
-    ok = rdb_parse_entries(payload, payload_size, n_entries);
-  }
- 
+  bool ok = rdb_load_buffer(data, file_size);
   delete [] data;
   return ok;
 }
