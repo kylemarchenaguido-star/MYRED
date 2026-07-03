@@ -201,6 +201,7 @@ static void aof_fsync_job(void *arg){
 
 static void process_timers(){
   uint64_t now_ms = get_monotonic_msec();
+  g_data.g_lru_clock = (uint32_t)((now_ms / 1000) & LRU_CLOCK_MAX);
   // This handles expired idle timers
   while (!dlist_empty(&g_data.idle_list)){
     Conn *conn = container_of(g_data.idle_list.next, &Conn::idle_node);

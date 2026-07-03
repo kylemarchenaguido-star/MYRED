@@ -26,6 +26,10 @@ constexpr size_t k_compress_threshold = 1024;
 constexpr uint32_t k_max_failed_auth = 3;
 // NO_TTL 
 static constexpr size_t NO_TTL = (size_t)-1;
+// 24-bit clock, wraps -194
+static constexpr uint32_t LRU_CLOCK_MAX = (1u << 24) - 1; // maximun of a 24 bit number 
+// New keys start here
+static constexpr uint8_t LFU_INIT_VAL = 5;
 
 
 //value types 
@@ -95,8 +99,10 @@ struct GlobalData{
   ThreadPool thread_pool;
   // Data base globals
   uint64_t g_last_save_ms = 0; // timestamp last succesful save
+  uint64_t evicted_keys = 0; // total keys removed by the maxmemory eviction policy
   uint32_t g_writes_since_save = 0; // how many keys we written
   uint32_t g_dirty_at_save = 0; // g_writes_since_save captured when a save starts
+  uint32_t g_lru_clock = 0; // coarse seconds, 24-bit; bumped each event-loop tick
   size_t g_last_save_size_bytes = 0; // size of last dump
   size_t used_memory = 0;
   bool g_last_save_ok = true; // did the last save succeded
@@ -133,6 +139,9 @@ struct Config {
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
+  int maxmemory_samples = 5; // eviction sample size (best-of-n)
+  int lfu_log_factor = 10; // LFU: higher = counter saturates slower
+  int lfu_decay_time = 1; // LFU: minutes of idleness per counter decrement
   // Memory managment 
   size_t maxmemory = 0;
   MaxmemoryPolicy maxmemory_policy = MaxmemoryPolicy::NOEVICTION;
@@ -164,6 +173,7 @@ struct Entry {
   std::string key;
   size_t heap_idx = NO_TTL;
   size_t mem = 0;
+  uint32_t lru = 0; // 
   EntryValue val;
   uint32_t type; 
 };
@@ -190,12 +200,16 @@ bool expire_if_needed(Entry *ent);
 inline bool entry_has_ttl(const Entry *e){ return e->heap_idx != NO_TTL; }
 
 bool entry_eq(HNode *node, HNode *key);
-Entry *entry_new(uint32_t type);
 void entry_del(Entry *ent);
 void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 void entry_del_sync(Entry *ent);
 void entry_del_func(void *arg);
+Entry *entry_new(uint32_t type);
 size_t entry_mem_usage(Entry *ent);
+
+void entry_init_access(Entry *ent);
+void entry_touch_access(Entry *ent);
+Entry *evict_pick_victim();
 
 void mem_reaccount(Entry *ent);
 bool hnode_same(HNode *node, HNode *key);

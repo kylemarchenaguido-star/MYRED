@@ -18,6 +18,7 @@
 #include <random>
 #include <unordered_map>
 #include <string_view>
+#include <unordered_set> 
 
 static constexpr const char *MSG_WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
 static constexpr const char *MSG_NOT_INT   = "ERR value is not an integer or out of range";
@@ -50,6 +51,59 @@ static bool str2int(const std::string &s, int64_t &out){
   return endp == s.c_str() + s.size();
 }
 
+// LFU and LRU helpers for lookup_entry
+
+// LRU and LFU access accounting
+static uint16_t lfu_now_minutes(){
+  // we reuse the cached clock
+  return (uint16_t)((g_data.g_lru_clock / 60) & 0xFFFF);
+}
+
+// halve-ish decay: drop the counter by one per lfu_decay_time minutes of idleness
+static uint8_t lfu_decay(uint32_t lru){
+  uint16_t last = (uint16_t)(lru >> 8);
+  uint8_t counter = (uint8_t)(lru & 0xFF);
+  if (g_config.lfu_decay_time <= 0){ return counter; }
+  // wraparound is fine
+  uint16_t elapsed = (uint16_t)(lfu_now_minutes() - last);
+  uint16_t periods = elapsed / (uint16_t)g_config.lfu_decay_time;
+  if (periods){ counter = (periods > counter) ? 0 : (uint8_t)(counter - periods); }
+  return counter;
+}
+
+// Probalistic log increment: harder to advance as the counter grows
+static uint8_t lfu_log_incr(uint8_t counter){
+  if (counter == 255){ return 255; }
+  double baseval = (double)counter - LFU_INIT_VAL;
+  if (baseval < 0){ baseval = 0; }
+  double p = 1.0 / (baseval * g_config.lfu_log_factor + 1); 
+  double r = (double)rand_idx(1000000) / 1000000.0;
+  if (r < p){ counter++;}
+  return counter;
+}
+
+static bool policy_is_lfu(){
+  return g_config.maxmemory_policy == MaxmemoryPolicy::ALLKEYS_LFU ||
+         g_config.maxmemory_policy == MaxmemoryPolicy::VOLATILE_LFU;
+}
+
+void entry_init_access(Entry *ent){
+  if (policy_is_lfu()){
+    ent->lru = ((uint32_t)lfu_now_minutes() << 8 | LFU_INIT_VAL);
+  } else {
+    ent->lru = g_data.g_lru_clock;
+  }
+}
+
+void entry_touch_access(Entry *ent){
+  if (policy_is_lfu()){
+    uint8_t c = lfu_decay(ent->lru);
+    c = lfu_log_incr(c);
+    ent->lru = ((uint32_t)lfu_now_minutes() << 8) | c;
+  } else {
+    ent->lru = g_data.g_lru_clock;
+  }
+}
 
 // WARNING: swaps cmd[i] into the LookupKey, leaving cmd[i] empty after the call.
 // If you need cmd[i] after the call, use a non-destructive hm_lookup copy instead.
@@ -63,6 +117,8 @@ static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
     Entry *ent = container_of(node, &Entry::node);
     if (!expire_if_needed(ent)){                 // alive
       if (ent->type != want_type) return Lookup::WRONGTYPE;
+      // we stamp on every hit
+      entry_touch_access(ent);
       if (out_ent) *out_ent = ent;
       return Lookup::OK;
     }
@@ -74,9 +130,85 @@ static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
   Entry *ent = entry_new(want_type);
   ent->key.swap(key.key);                        // key.key holds the real key
   ent->node.hcode = key.node.hcode;
+  entry_init_access(ent);
   hm_insert(&g_data.db, &ent->node);
   if (out_ent) *out_ent = ent;
   return Lookup::OK;                             // create never returns MISSING
+}
+
+// Random samplers
+
+// A unifromly-ish random live entry from the ehole keyspace (both rehash tables).
+static Entry *db_random_entry(){
+  HMap *m = &g_data.db;
+  size_t total = m->newer.size + m->older.size;
+  if (total == 0){ return nullptr; }
+  HTab *t = (rand_idx(total) < m->newer.size) ? &m->newer : &m->older;
+  if (!t->tab || t->size == 0){ t = (t == &m->newer) ? &m->older : &m->newer; }
+  if (!t->tab || t->size == 0){ return nullptr; }
+
+  size_t start = rand_idx(t->mask + 1);
+  // scan forward to a non-empty bucket
+  for (size_t probe = 0; probe <= t->mask; ++probe){
+    HNode *h = t->tab[(start + probe) & t->mask];
+    if (h){
+      size_t len = 0;
+      for (HNode *c = h; c; c = c->next){ ++len; }
+      size_t pick = rand_idx(len);
+      for (size_t i = 0; i < pick; ++i){ h = h->next; }
+      return container_of(h, &Entry::node);
+    }
+  }
+  return nullptr; 
+}
+
+// A random key that has a TTL - the ttl heap holds exactly those.
+static Entry *volatile_random_entry(){
+  if (g_data.heap.empty()){ return nullptr; }
+  size_t i = rand_idx(g_data.heap.size());
+  // ref == &ent.heap_idx
+  return container_of(g_data.heap[i].ref, &Entry::heap_idx);
+}
+
+// Eviction score: Higher = better victim
+static uint64_t evict_score(const Entry *ent){
+  if (policy_is_lfu()){
+    // lowest frecuency wins
+    return 255 - (ent->lru & 0xFF);
+  } 
+  // largest idle wins
+  return (uint64_t)((g_data.g_lru_clock - ent->lru) & LRU_CLOCK_MAX);
+}
+
+// Pick a key to evict for the active policy, or nullptr if there's nothing to take
+// (noeviction, or volatile-* policy with no TTL keys -> caller must return -OOM)
+Entry *evict_pick_victim(){
+  using P = MaxmemoryPolicy;
+  P pol = g_config.maxmemory_policy;
+
+  switch (pol){
+    case P::NOEVICTION:
+      return nullptr;
+    case P::ALLKEYS_RANDOM:
+      // nullptr if no volatile keys -> OOM
+      return volatile_random_entry();
+    case P::VOLATILE_TTL:
+      // nearest expiry == heap root, nearly free
+      return g_data.heap.empty() ? nullptr : container_of(g_data.heap[0].ref, &Entry::heap_idx);
+    default: break; // LRU / LFU: best of N sampling below
+  }
+
+  bool volatile_only = (pol == P::VOLATILE_LRU || pol == P::VOLATILE_LFU);
+  Entry *best = nullptr;
+  uint64_t best_score = 0;
+  for (int i = 0; i < g_config.maxmemory_samples; ++i){
+    Entry *e = volatile_only ? volatile_random_entry() : db_random_entry();
+    if (!e){ break; }
+    uint64_t s = evict_score(e);
+    if (!best || s > best_score){ best = e; best_score = s; }
+  }
+  // nullptr -> caller OOMs (volatile feedback)
+  return best;
 }
 
 
@@ -969,6 +1101,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "mem_fragmentation_ratio:%.2f\r\n"
     "maxmemory:%zu\r\n"
     "maxmemory_policy:%s\r\n"
+    "evicted_keys:%llu\r\n"
     "\r\n"
     "# Stats\r\n"
     "total_commands:%llu\r\n"
@@ -1008,6 +1141,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     g_data.used_memory ? (double)memory / (double)g_data.used_memory : 0.0,
     g_config.maxmemory,
     maxmemory_policy_name(g_config.maxmemory_policy),
+    (unsigned long long)g_data.evicted_keys,
 
     //stats
     (unsigned long long)g_data.g_total_commands,
@@ -2485,6 +2619,41 @@ static void aof_append_raw(const char *raw, size_t len){
   }
 }
 
+// Evict keys unitl we're back under maxmemory. Returns false if we can't get under
+// (noeviction, or a volatile-* policy with nothing evictable) -> caller return -OOM.
+static bool free_memory_if_needed(){
+  // unlimited
+  if (g_config.maxmemory == 0){ return true; }
+  // never during replay
+  if (g_data.g_loading){ return true; }
+  // already under
+  if (g_data.used_memory <= g_config.maxmemory){ return true; }
+  if (g_config.maxmemory_policy == MaxmemoryPolicy::NOEVICTION){ return false;}
+
+  // bounded, we don't stall the loop
+  int attempts = 100;
+  while (g_data.used_memory > g_config.maxmemory && --attempts > 0){
+    Entry *victim = evict_pick_victim();
+    // volatile-* with no TTL keys -> OOM
+    if (!victim){ return false; }
+
+    // CRITICAL: log an explicit DEL so AOF replay / replicas don't resurrect the key.
+    // aof_feed already handles the rewrite dual-buffer; gate on aof_eanble + not loading.
+    if (g_config.aof_enable && !g_data.g_loading){
+      // copy key before we free the entry
+      aof_feed({ "del", victim->key });
+    }
+
+    hm_delete(&g_data.db, &victim->node, &hnode_same);
+    // discharges used_memory; async-frees big values
+    entry_del(victim);
+    g_data.evicted_keys++;
+    // eviction is a change woth persisting
+    g_data.g_writes_since_save++;
+  }
+  return g_data.used_memory <= g_config.maxmemory;
+}
+
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
 
 struct CmdSpec {
@@ -2599,6 +2768,20 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"config",       {do_config,        2, -1}},
 };
 
+// Commands that can only free or leave memory unchanged are never denied under
+static bool cmd_can_grow_memory(const std::string &name){
+  // name is already lower-cased
+  static const std::unordered_set<std::string_view> no_grow {
+    "del", "unlink", "flushall", "flushdb",
+    "expire", "pexpire", "expireat", "pexpireat", "persist",
+    "getdel", "getex",
+    "lpop", "rpop", "lrem", "ltrim",
+    "spop", "srem", "hdel", "zrem", "zpopmin",
+    "rename", "renamenx",
+  };
+  return no_grow.count(name) == 0;
+}
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const char *raw, size_t raw_len) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -2636,6 +2819,11 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 
   if (spec.is_write && g_config.aof_enable && g_data.g_aof_write_err && !g_data.g_loading){
     return resp_err(out, "MISCONF Errors writing to the AOF file, can't accept writes");
+  }
+
+  // maxmemory enforcement: make room before a write, or refuse it
+  if (spec.is_write && cmd_can_grow_memory(cmd[0]) && !free_memory_if_needed()){
+    return resp_err(out, "OOM commands not allowed when used memory > 'maxmemory'");
   }
 
   uint32_t dirty_before = g_data.g_writes_since_save;

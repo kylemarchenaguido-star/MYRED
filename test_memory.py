@@ -85,16 +85,34 @@ def connect():
     return s
 
 
+def info_field(sock, name: str) -> Optional[str]:
+    for ln in cmd(sock, "info").splitlines():
+        if ln.startswith(name + ":"):
+            return ln.split(":", 1)[1]
+    return None
+
+
 def used_memory(sock) -> int:
-    info = cmd(sock, "info")
-    for ln in info.splitlines():
-        if ln.startswith("used_memory:"):
-            return int(ln.split(":", 1)[1])
-    # fall back to the older field name if used_memory isn't present
-    for ln in info.splitlines():
-        if ln.startswith("used_memory_bytes:"):
-            return int(ln.split(":", 1)[1])
-    raise RuntimeError("no used_memory field in INFO")
+    v = info_field(sock, "used_memory") or info_field(sock, "used_memory_bytes")
+    if v is None:
+        raise RuntimeError("no used_memory field in INFO")
+    return int(v)
+
+
+def evicted_keys(sock) -> int:
+    v = info_field(sock, "evicted_keys")
+    return int(v) if v is not None else 0
+
+
+def set_result(sock, key, val) -> str:
+    """SET a key; return 'OK' or 'OOM'. Re-raise any other error."""
+    try:
+        cmd(sock, "set", key, val)
+        return "OK"
+    except RuntimeError as e:
+        if "OOM" in str(e):
+            return "OOM"
+        raise
 
 
 # ─── test harness ──────────────────────────────────────────────────────────────
@@ -202,6 +220,53 @@ def main():
     check("mixed load grows used_memory", loaded > 0, f"loaded={loaded}")
     check("FLUSHALL returns used_memory to 0", residual == 0,
           f"residual={residual} (leak/double-count)")
+
+    # ── maxmemory: OOM (noeviction) vs eviction (allkeys-lru) ─────────────────
+    # Both floods push ~6 MB of data into a 1 MB cap, so anything that stays
+    # bounded near the cap proves the limit is enforced; anything that grows to
+    # multiples of the cap means the -OOM return value is being ignored.
+    CAP = 1024 * 1024                       # 1 MB
+    VAL = "y" * 1000                        # ~1 KB values
+    BOUND = CAP + CAP // 2                   # tolerate ~1 write of overshoot; reject unbounded growth
+    cmd(s, "config", "set", "maxmemory", str(CAP))
+
+    # noeviction: writes succeed until full, then every write returns OOM
+    cmd(s, "flushall")
+    cmd(s, "config", "set", "maxmemory-policy", "noeviction")
+    ev_before = evicted_keys(s)
+    oks = ooms = 0
+    for i in range(6000):
+        r = set_result(s, f"ne:{i}", VAL)
+        oks += (r == "OK"); ooms += (r == "OOM")
+        if ooms >= 50:                       # seen enough rejections
+            break
+    check("noeviction: writes succeed then start OOMing", oks > 0 and ooms > 0,
+          f"ok={oks} oom={ooms}")
+    check("noeviction: used_memory stays bounded near cap", used_memory(s) <= BOUND,
+          f"used={used_memory(s)} bound={BOUND}")
+    check("noeviction: nothing was evicted", evicted_keys(s) == ev_before,
+          f"evicted_delta={evicted_keys(s) - ev_before}")
+    # over the cap now -> a fresh write must be refused
+    check("noeviction: write over cap returns OOM", set_result(s, "over", VAL) == "OOM")
+
+    # allkeys-lru: writes never fail, memory holds near cap, evictions climb
+    cmd(s, "flushall")
+    cmd(s, "config", "set", "maxmemory-policy", "allkeys-lru")
+    ev0 = evicted_keys(s)
+    oks = ooms = 0
+    for i in range(6000):
+        r = set_result(s, f"lru:{i}", VAL)
+        oks += (r == "OK"); ooms += (r == "OOM")
+    check("allkeys-lru: no write ever OOMs", ooms == 0, f"oom={ooms}")
+    check("allkeys-lru: used_memory held near cap", used_memory(s) <= BOUND,
+          f"used={used_memory(s)} bound={BOUND}")
+    check("allkeys-lru: evicted_keys climbed", evicted_keys(s) - ev0 > 0,
+          f"evicted={evicted_keys(s) - ev0}")
+
+    # restore the server to unlimited so we leave it as we found it
+    cmd(s, "config", "set", "maxmemory", "0")
+    cmd(s, "config", "set", "maxmemory-policy", "noeviction")
+    cmd(s, "flushall")
 
     print(f"\n{'PASS' if FAIL == 0 else 'FAIL'}: {PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

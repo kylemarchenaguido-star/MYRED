@@ -64,34 +64,34 @@ static inline void aof_batch_maybe_flush(AofBatch *b){
   if (b->args.size() >= k_aof_batch * b->per_elem) aof_batch_flush(b);
 }
 
-// member callbacks (Same node types as your RDB callbacks)
-static bool cb_aof_zset(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  ZNode *z = container_of(node, &ZNode::hmap);
-  char sc[64];
-  int n = snprintf(sc, sizeof(sc), "%.17g", z->score);
-  b->args.emplace_back(sc, (size_t)n); // score
-  b->args.emplace_back(z->name, z->len); // member
-  aof_batch_maybe_flush(b);
-  return true;
-}
+// // member callbacks (Same node types as your RDB callbacks)
+// static bool cb_aof_zset(HNode *node, void *arg){
+//   AofBatch *b = (AofBatch *)arg;
+//   ZNode *z = container_of(node, &ZNode::hmap);
+//   char sc[64];
+//   int n = snprintf(sc, sizeof(sc), "%.17g", z->score);
+//   b->args.emplace_back(sc, (size_t)n); // score
+//   b->args.emplace_back(z->name, z->len); // member
+//   aof_batch_maybe_flush(b);
+//   return true;
+// }
 
-static bool cb_aof_hash(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  HashNode *h = container_of(node, &HashNode::node);
-  b->args.emplace_back(h->field);
-  b->args.emplace_back(h->value);
-  aof_batch_maybe_flush(b);
-  return true;
-}
+// static bool cb_aof_hash(HNode *node, void *arg){
+//   AofBatch *b = (AofBatch *)arg;
+//   HashNode *h = container_of(node, &HashNode::node);
+//   b->args.emplace_back(h->field);
+//   b->args.emplace_back(h->value);
+//   aof_batch_maybe_flush(b);
+//   return true;
+// }
 
-static bool cb_aof_set(HNode *node, void *arg){
-  AofBatch *b = (AofBatch *)arg;
-  SetNode *s = container_of(node, &SetNode::node);
-  b->args.emplace_back(s->member);
-  aof_batch_maybe_flush(b);
-  return true;
-}
+// static bool cb_aof_set(HNode *node, void *arg){
+//   AofBatch *b = (AofBatch *)arg;
+//   SetNode *s = container_of(node, &SetNode::node);
+//   b->args.emplace_back(s->member);
+//   aof_batch_maybe_flush(b);
+//   return true;
+// }
 
 // child only - write the snapshot buffer, fsync, exit. No rename (parent finalizes)
 static void aof_write_snapshot(const Buffer *buf, const char *tmp){
