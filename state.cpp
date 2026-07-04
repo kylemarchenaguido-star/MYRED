@@ -4,6 +4,8 @@
 #include <time.h>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 GlobalData g_data;
 Config g_config;
@@ -50,6 +52,183 @@ bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out){
   else if (p == "volatile-ttl")    { *out = MaxmemoryPolicy::VOLATILE_TTL; }
   else { return false; }
   return true;
+}
+// Tokenizer for the config file
+static std::vector<std::string> config_tokenize(const char *line){
+  std::vector<std::string> out;
+  for (size_t i = 0; line[i]; ){
+    while (line[i] && isspace((unsigned char)line[i])){ ++i; }
+    // a comment -> #
+    if (!line[i] || line[i] == '#'){ break; } 
+    std::string tok;
+    // quoted
+    if (line[i] == '"'){
+      for (i++; line[i] && line[i+1] != '"'; ){
+        if (line[i] == '\\' && line[i+1]){ tok += line[i+1]; i += 2; }
+        else { tok += line[++i]; }
+      }
+      if (line[i] == '"'){ ++i; }
+    } else {
+      while (line[i] && !isspace((unsigned char)line[i])){ tok += line[++i]; }
+    }
+    out.push_back(std::move(tok));
+  }
+  return out;
+}
+
+CfgResult config_apply(const std::string &name_in, const std::vector<std::string> &args, std::string &err){
+  std::string name = name_in;
+  for (char &c : name){ c = (char)tolower((unsigned char)c); }
+
+  // Lambda function for checking number of args
+  auto need1 = [&](void) -> bool { if (args.size() != 1){ 
+      err = "wrong number of args for '" + name + "'";
+      return false; 
+    } 
+    return true; 
+  };
+
+  // auth - network
+  if (name == "requirepass"){ 
+    if (!need1()){ return CfgResult::BADVALUE; }
+    g_config.password = args[0];
+    return CfgResult::OK;
+  }
+
+  if (name == "port"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    int p = atoi(args[0].c_str());
+    if (p < 1 || p > 65535){
+      err = "invalid port";
+      return CfgResult::BADVALUE;
+    }
+    g_config.port = p;
+    return CfgResult::OK;
+  }
+
+  // memory / eviction
+  if (name == "maxmemory"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    size_t b = 0;
+    if (!parse_memory_size(args[0], &b)){
+      err = "invalid maxmemory";
+      return CfgResult::BADVALUE;
+    }
+    g_config.maxmemory = b;
+    return CfgResult::OK;
+  }
+
+  if (name == "maxmemory-policy"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    MaxmemoryPolicy pol;
+    if (!parse_maxmemory_policy(args[0], &pol)){
+      err = "invalid policy";
+      return CfgResult::BADVALUE;
+    }
+    g_config.maxmemory_policy = pol;
+    return CfgResult::OK;
+  }
+
+  if (name == "maxmemory-samples"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    int n = atoi(args[0].c_str());
+    if (n < 1){
+      err = "invalid samples";
+      return CfgResult::BADVALUE;
+    }
+    g_config.maxmemory_samples = n;
+    return CfgResult::OK;
+  }
+
+  // AOF persistence
+  if (name == "appendonly"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    g_config.aof_enable = (args[0] == "yes");
+    return CfgResult::OK;
+  }
+
+  if (name == "appendfsync"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    if (args[0] == "always"){
+      g_config.aof_fysnc = Aoffsync::ALWAYS;
+    } else if (args[0] == "no"){
+      g_config.aof_fysnc = Aoffsync::NO;
+    } else if (args[0] == "everysec"){
+      g_config.aof_fysnc == Aoffsync::EVERYSEC;
+    } else {
+      err = "invalid appendfsync";
+      return CfgResult::BADVALUE;
+    }
+    return CfgResult::OK;
+  }
+
+  if (name == "appendfilename"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    g_config.aof_path = args[0];
+    return CfgResult::OK;
+  }
+
+  if (name == "auto_aof_rewrite-percentage"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    int n = atoi(args[0].c_str());
+    if (n < 0){
+      err = "invalid";
+      return CfgResult::BADVALUE;
+    }
+    g_config.aof_rewrite_perc = n;
+    return CfgResult::OK;
+  }
+
+  if (name == "auto_aof_rewrite-min-size"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    size_t b = 0;
+    if (!parse_memory_size(args[0], &b)){
+      err = "invalid";
+      return CfgResult::BADVALUE;
+    }
+    g_config.aof_rewrite_min_size = b;
+    return CfgResult::OK;
+  }
+
+  // RDB persistence
+  if (name == "dbfilename"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    g_config.dump_path = args[0];
+    return CfgResult::OK;
+  }
+
+  if (name == "save"){
+    // save '' -> disable all save conditions 
+    if (args.size() == 1 && args[0].empty()){
+      g_config.save_conditions.clear();
+      return CfgResult::OK;
+    }
+    if (args.size() != 2){
+      err = "save needs <seconds> <changes>";
+      return CfgResult::BADVALUE;
+    }
+    g_config.save_conditions.push_back({
+      strtoull(args[0].c_str(), nullptr, 10),
+      (uint32_t)strtoul(args[1].c_str(), nullptr, 10)
+    });
+    return CfgResult::OK;
+  }
+
+  // Unknown directive
+  err = "unknown directive '" + name + "'";
+  return CfgResult::UNKNOWN;
+
+}
+
+bool config_load_file(const char *path){
+  FILE *fp = fopen(path, "r");
+  if (!fp){ fprintf(stderr, "fatal: cannot open config %s: %s\n", path, strerror(errno)); return false; }
+  char line[1024];
+  int lineno = 0; bool ok = true, cleared_save = false;
+  while (fgets(line, sizeof(line), fp)){
+    lineno++;
+    std::vector<std::string> t = config_tokenize(line);
+  }
 }
 
 const char *maxmemory_policy_name(MaxmemoryPolicy p){

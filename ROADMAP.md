@@ -469,8 +469,121 @@ encodings + real object sharing deferred — see **General upgrades**.
 
 ## v9 — Security & auth
 
-- Config file for password → full `redis.conf`-style config
-- ACL system, password hashing (bcrypt/argon2), IP allowlist, TLS
+> **Note: doing v9 before v8.** Hardening the server (real config, hashed auth, ACLs,
+> network exposure control, TLS) is higher-value than Pub/Sub right now.
+
+Goal: take MYRED from "one plaintext password, binds to `0.0.0.0`, everyone who
+authenticates is root" to a real security model — a config file, hashed credentials,
+multi-user ACLs with per-command/per-key permissions, network exposure control, and
+TLS. Today's baseline: `do_auth` compares `cmd[1] == g_config.password` (plaintext,
+non-constant-time), `conn->authenticaded` is a single bool, the listener is hardcoded
+to `INADDR_ANY`, and there's no notion of users or per-command permissions. Do the
+steps in order — the config file is the foundation everything else is declared in.
+
+### Step 1 — `redis.conf`-style config file (foundation)
+
+Turn the scattered `MYRED_*` env knobs + the v6.1/v7 `CONFIG` stub into a real config layer.
+
+- **Parser:** `--config <path>` (or `MYRED_CONFIG`); line-based `directive arg [arg…]`,
+  `#` comments, quoted values. Map to `Config` fields: `requirepass`, `port`, `bind`,
+  `maxmemory`/`maxmemory-policy`, `save`, `appendonly`/`appendfsync`, `dir`, `logfile`,
+  `loglevel`, plus the v9 ones below.
+- **Precedence:** defaults → config file → env → runtime `CONFIG SET`. Load the file in
+  `main()` *before* opening sockets; keep env as overrides for backward compat.
+- **`CONFIG REWRITE`** (currently a stub `+OK`): serialize live `Config` back to the file,
+  preserving comments where practical. Extend `CONFIG GET/SET` from the v7 two-parameter
+  set to the full table.
+- **Robustness:** validate on load (port range, enum values, sizes via `parse_memory_size`);
+  reject unknown directives with `file:line` context rather than silently ignoring.
+
+### Step 2 — Password hashing + constant-time compare
+
+- Replace the plaintext `==` with a **hash compare**. Store `requirepass` as a **SHA-256**
+  digest (hand-rolled or small vendored impl, matching the from-scratch ethos); config
+  accepts a plaintext password (hashed at load) or a pre-hashed value.
+- **Constant-time comparison** (XOR-accumulate over the full digest, no early return) —
+  the current `==` leaks match length via timing. This is the single most important
+  robustness fix in v9.
+- **Upgrade path:** note `argon2`/`bcrypt` (salted, memory-hard) as the real answer for
+  credentials at rest — needs a library; SHA-256 is the baseline.
+- **Hygiene:** `explicit_bzero` the plaintext buffer after hashing; never log passwords;
+  keep the existing max-3-attempts disconnect and add a small fixed backoff on failure.
+
+### Step 3 — Protected mode + `bind` + IP allowlist
+
+All checked at `handle_accept` (before auth), so unauthorized peers never reach the loop.
+
+- **Protected mode** (Redis default): if no `requirepass` *and* bound to a non-loopback
+  address, refuse non-loopback peers with an explanatory error. Check the peer `sockaddr`.
+- **`bind`:** listen on specific interfaces instead of the hardcoded `INADDR_ANY`; support
+  multiple bind addresses (a listen fd per address, all in the `poll` set).
+- **IP allowlist:** optional CIDR list matched against the peer IP at accept; reject + log
+  others. Cheap — a handful of prefix compares.
+
+### Step 4 — ACL system (multi-user, command + key permissions)
+
+The big one. A `User` = name, enabled flag, password hash(es), allowed **command
+categories/commands**, allowed **key glob patterns**, allowed pub/sub channels.
+
+- **Command categories:** add a `uint64_t acl_cats` bitflag to `CmdSpec` (`@read`,
+  `@write`, `@admin`, `@keyspace`, `@dangerous`, `@fast`/`@slow`, …), set once in
+  `k_cmd_table`. ACL rules like `+@read -@write +get -flushall` compile to an
+  allow/deny bitset **per user** at `ACL SETUSER` time.
+- **Enforcement in `do_request`** (after resolving `spec`, before running): (a) command
+  permitted for `conn->user`? (b) every key arg matches a user key pattern? — reuse the
+  existing `glob_match`. (c) pub/sub channels. Reject with `NOPERM`.
+- **Backward compatible:** a `default` user carries today's behavior; `requirepass`
+  becomes the default user's password.
+- **Commands:** `AUTH <user> <pass>` (2-arg form; 1-arg = default user), `ACL
+  SETUSER/GETUSER/DELUSER/LIST/USERS/WHOAMI/CAT/GENPASS`.
+- **Per-`Conn`:** replace the `authenticaded` bool with a `User *user` set at AUTH; the
+  per-command check is then an O(1) bitset test — no re-hash, no re-parse.
+- **Persistence:** `user` directives in the config file, or a separate `aclfile`.
+
+### Step 5 — Command hardening + audit log
+
+- **`rename-command`** (config): rename or disable dangerous commands (`rename-command
+  FLUSHALL ""` disables; renaming `CONFIG` to a secret name). Requires building
+  `k_cmd_table` at boot (it's `const` today) so keys can be mutated/removed.
+- **Audit log:** timestamp + peer IP for AUTH failures, ACL changes, and
+  `@admin`/`@dangerous` command use → a file (ties into the Continuous "logging
+  framework" item). A disabled command must also drop out of the AOF/replication path.
+
+### Step 6 — TLS (heaviest; could be its own milestone)
+
+- Link **OpenSSL**. `tls-port`, `tls-cert-file`/`tls-key-file`/`tls-ca-cert-file`;
+  optional **mutual TLS** (require + verify client certs).
+- **Event-loop integration (the hard part):** wrap per-`Conn` I/O in an `SSL*`; the
+  non-blocking handshake and `SSL_read`/`SSL_write` return `SSL_ERROR_WANT_READ/WRITE`,
+  which must drive the `poll` interest flags (`want_read`/`want_write`). Abstract `Conn`
+  read/write behind a plain-vs-TLS function pointer so the loop stays protocol-agnostic.
+- **Robustness:** handshake timeouts, `SSL_shutdown` on close, cert reload without restart.
+
+### Optimization / robustness summary
+
+| Concern | Approach |
+|---|---|
+| Timing side-channel on password | Constant-time XOR-accumulate compare — never `==` / early return |
+| Password at rest | SHA-256 baseline (→ argon2/bcrypt), salted; `explicit_bzero` plaintext; never logged |
+| Per-command auth cost | User resolved once at AUTH; command check is an O(1) bitset test; key patterns via existing `glob_match` |
+| Command category lookup | Precomputed `acl_cats` bitflags in `CmdSpec`, not recomputed per request |
+| Unauthorized peers | Rejected at `accept()` (protected mode / bind / allowlist) before the command loop |
+| Config precedence | defaults < file < env < `CONFIG SET`; `CONFIG REWRITE` persists live state |
+| TLS without blocking | `SSL_ERROR_WANT_*` drives poll interest; `Conn` I/O behind a plain/TLS abstraction |
+| Dangerous commands | `rename-command` disables/renames at boot; audit log for `@admin`/`@dangerous` |
+| Fail-safe defaults | Protected mode when no password; ability to disable the `default` user |
+
+### Suggested testing
+
+- **Auth:** `AUTH` right/wrong/2-arg-user; wrong password still disconnects after 3 tries.
+- **ACL:** `SETUSER`/`GETUSER` round-trip; `NOPERM` on a denied command and on a key
+  outside the user's pattern; `default` user preserves legacy behavior.
+- **Config:** bad directive → `file:line` error; `CONFIG REWRITE` → restart → values survive.
+- **Protected mode:** no-password + remote connect refused; loopback allowed; allowlist hit/miss.
+- **Password hashing:** stored value is a digest, not plaintext; (optional) statistical
+  timing test that compare time is independent of how many leading chars match.
+- **TLS:** `openssl s_client` / `redis-cli --tls` handshake; mutual TLS with and without a
+  client cert.
 
 ## v10 — Replication & HA
 

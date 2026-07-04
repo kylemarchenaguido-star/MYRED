@@ -415,12 +415,12 @@ int main(int argc, char **argv){
   g_config.password = pass_env ? pass_env : "kek1234";
 
   // Port setup
-  uint16_t port = 1234;
-  const char *port_env = getenv("MYRED_PORT");
-  if (port_env){
-    int p = atoi(port_env);
-    if (p > 0 && p < 65536){ port = (uint16_t)p; }
-  }
+  // uint16_t port = 1234;
+  // const char *port_env = getenv("MYRED_PORT");
+  // if (port_env){
+  //   int p = atoi(port_env);
+  //   if (p > 0 && p < 65536){ port = (uint16_t)p; }
+  // }
 
   // AOF setup
   const char *aof_env = getenv("MYRED_AOF");
@@ -514,7 +514,7 @@ int main(int argc, char **argv){
   // the is the parameter bind to 0.0.0.0: 1234
   struct sockaddr_in addr = {};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
+  addr.sin_port = htons(g_config.port);
   addr.sin_addr.s_addr = htonl(0);
 
   int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));

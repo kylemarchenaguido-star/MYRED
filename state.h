@@ -67,7 +67,11 @@ enum class MaxmemoryPolicy {
   VOLATILE_TTL
 };
 
-
+enum class CfgResult {
+  OK,
+  UNKNOWN,
+  BADVALUE
+};
 
 // Connections state and buffers 
 struct Conn {
@@ -132,10 +136,12 @@ struct SaveCondition {
 
 //global config
 struct Config {
+  int port = 1234;
+  std::string config_path;
   std::string password = "";
   std::string dump_path = "dump.rdb";
-  bool aof_enable = false;
   std::string aof_path = "appendonly.aof";
+  bool aof_enable = false;
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
@@ -220,6 +226,11 @@ inline ZSet &entry_zset(Entry *e){ return std::get<ZSet>(e->val); }
 inline Deque &entry_deque(Entry *e){ return std::get<Deque>(e->val); }
 inline HMap &entry_hash(Entry *e){ return std::get<EntryHash>(e->val).hmap; }
 inline HMap &entry_set(Entry *e){ return std::get<EntrySet>(e->val).hmap; }
+
+// Apply one directive to g_config. Shared by the file parser and 'CONFIG SET'
+CfgResult config_apply(const std::string &name, const std::vector<std::string> &args, std::string &err);
+bool config_load_file(const char *path);
+bool config_rewrite(const char *path);
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
