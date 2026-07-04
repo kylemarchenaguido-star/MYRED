@@ -2528,32 +2528,23 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
   }
 
   if (sub == "set"){
-    if (cmd.size() < 4){ return resp_err(out, "ERR wrong number of arguments for 'config|set'"); }
-    std::string param = cmd[2];
-    for (char &c : param){ c = (char)tolower((unsigned char)c); }
-    const std::string &val = cmd[3];
-
-    if (param == "maxmemory"){
-      size_t bytes = 0;
-      if (!parse_memory_size(val, &bytes)){
-        return resp_err(out, "ERR invalid argument for CONFIG SET 'maxmemory'");
-      }
-      g_config.maxmemory = bytes;
-      return resp_ok(out);
-    }
-    if (param == "maxmemory-policy"){
-      MaxmemoryPolicy p;
-      if(!parse_maxmemory_policy(val, &p)){
-        return resp_err(out, "ERR invalid argument for CONFIG SET 'maxmemory-policy'");
-      }
-      g_config.maxmemory_policy = p;
-      return resp_ok(out);
-    }
-    // accpet and ignore unknown params
+    if (cmd.size() < 4){ return resp_err(out, "ERR wrong number of arguments of 'config|set'"); }
+    std::string err;
+    CfgResult res = config_apply(cmd[2], { cmd[3] }, err);
+    if (res == CfgResult::BADVALUE){ return resp_err(out, ("ERR "+ err).c_str()); }
+    // ok / unknown both
     return resp_ok(out);
   }
+  
+  if (sub == "rewrite"){
+    if (g_config.config_path.empty()){
+      return resp_err(out, "ERR the server is running without a config file");
+    }
+    return config_rewrite(g_config.config_path.c_str()) ? resp_ok(out)
+                                                        : resp_err(out, "ERR rewriting config failed");
+  }
 
-  if (sub == "resetstat" || sub == "rewrite"){
+  if (sub == "resetstat"){
     return resp_ok(out);
   }
   return resp_err(out, "ERR Unknown CONFIG subcommand");

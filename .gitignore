@@ -24,3 +24,4 @@ __pycache__/
 
 # editor / IDE
 .vs/
+.vscode/c_cpp_properties.json

@@ -63,13 +63,13 @@ static std::vector<std::string> config_tokenize(const char *line){
     std::string tok;
     // quoted
     if (line[i] == '"'){
-      for (i++; line[i] && line[i+1] != '"'; ){
+      for (i++; line[i] && line[i] != '"'; ){
         if (line[i] == '\\' && line[i+1]){ tok += line[i+1]; i += 2; }
-        else { tok += line[++i]; }
+        else { tok += line[i++]; }
       }
       if (line[i] == '"'){ ++i; }
     } else {
-      while (line[i] && !isspace((unsigned char)line[i])){ tok += line[++i]; }
+      while (line[i] && !isspace((unsigned char)line[i])){ tok += line[i++]; }
     }
     out.push_back(std::move(tok));
   }
@@ -228,7 +228,43 @@ bool config_load_file(const char *path){
   while (fgets(line, sizeof(line), fp)){
     lineno++;
     std::vector<std::string> t = config_tokenize(line);
+    // detected a blank or comment
+    if (t.empty()){ continue; } 
+    std::string name = t[0];
+    std::vector<std::string> args(t.begin() + 1, t.end());
+    std::string ln = name; 
+    for (char &c : ln){ c = (char)tolower((unsigned char)c); }
+    if (ln == "save" && !cleared_save){ g_config.save_conditions.clear(); cleared_save = true; }
+    std::string err;
+    if (config_apply(name, args, err) != CfgResult::OK){
+      fprintf(stderr, "config %s:%d: %s\n", path, lineno, err.c_str());
+      ok = false;
+    }
   }
+  fclose(fp);
+  g_config.config_path = path;
+  return ok;
+}
+
+// serialize live config back
+bool config_rewrite(const char * path){
+  FILE *fp = fopen(path ,"w");
+  if (!fp){ return false; }
+  fprintf(fp, "port %d\n", g_config.port);
+  if (!g_config.password.empty()){ fprintf(fp, "requirepass %s\n", g_config.password.c_str()); }
+  fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
+  fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");
+  fprintf(fp, "appendfilename %s\n", g_config.aof_path.c_str());
+  fprintf(fp, "appendsync %s\n",  g_config.aof_fysnc == Aoffsync::ALWAYS ? "always" 
+                                : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec");
+  fprintf(fp, "maxmemory %zu\n", g_config.maxmemory);
+  fprintf(fp, "maxmemory-policy %s\n", maxmemory_policy_name(g_config.maxmemory_policy));
+  fprintf(fp, "maxmemory-samples %d\n", g_config.maxmemory_samples);
+  for (const SaveCondition &s : g_config.save_conditions){
+    fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
+  }
+  fclose(fp);
+  return true;
 }
 
 const char *maxmemory_policy_name(MaxmemoryPolicy p){

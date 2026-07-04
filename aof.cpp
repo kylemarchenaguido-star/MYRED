@@ -17,14 +17,14 @@
 // AOF
 pid_t g_aof_child_pid = -1;
 
-static uint64_t mono_expiry_to_wall(uint64_t mono_expire){
-  uint64_t mono_now = get_monotonic_msec();
-  // ms left until expirary 
-  int64_t remaining = (int64_t)(mono_expire - mono_now);
-  // already expired
-  if (remaining < 0) { remaining = 0; }
-  return get_wall_msec() + (uint64_t)remaining;
-}
+// static uint64_t mono_expiry_to_wall(uint64_t mono_expire){
+//   uint64_t mono_now = get_monotonic_msec();
+//   // ms left until expirary 
+//   int64_t remaining = (int64_t)(mono_expire - mono_now);
+//   // already expired
+//   if (remaining < 0) { remaining = 0; }
+//   return get_wall_msec() + (uint64_t)remaining;
+// }
 
 struct AofBatch {
   Buffer *buf;
