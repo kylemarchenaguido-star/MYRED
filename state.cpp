@@ -112,6 +112,59 @@ size_t entry_mem_usage(Entry *ent){
   return n;
 }
 
+struct MemSampleCtx { 
+  size_t left;
+  size_t sum;
+  size_t counted;
+  uint32_t type;
+};
+
+static bool cb_mem_sample(HNode *node, void *arg){
+  MemSampleCtx *c = (MemSampleCtx *)arg;
+  switch (c->type){
+    case T_HASH: { HashNode *hn = container_of(node, &HashNode::node);
+      c->sum += sizeof(HashNode) + sizeof(HNode *) + hn->field.capacity() + hn->value.capacity(); break; }
+    case T_SET: { SetNode *sn = container_of(node, &SetNode::node);
+      c->sum += sizeof(SetNode) + sizeof(HNode *) + sn->member.capacity(); break; }
+    case T_ZSET: { ZNode *zn = container_of(node, &ZNode::hmap); 
+      c->sum += sizeof(ZNode) + zn->len + sizeof(HNode *); break; }
+  }
+  c->counted++;
+  // stop once we've sampled 'samples' nodes
+  return --c->left > 0;
+}
+
+size_t entry_mem_usage_sampled(Entry *ent, size_t samples){
+  if (samples == 0){ return entry_mem_usage(ent); }
+  size_t base = sizeof(Entry) + ent->key.capacity();
+  switch (ent->type){
+    case T_STR:
+      // single value, no sampling
+      return base + entry_str(ent).capacity();
+    case T_DLIST: {
+      Deque &d = entry_deque(ent);
+      size_t n = base + d.cap * sizeof(std::string);
+      if (d.count == 0){ return n; }
+      size_t k = samples < d.count ? samples : d.count, sum = 0;
+      for (size_t i = 0; i < k; ++i){ sum += deque_get(&d, i)->capacity(); }
+      // extrapolate
+      return n + (size_t)((double)sum / (double)k * (double)d.count);
+    }
+    case T_HASH: case T_SET: case T_ZSET: {
+      HMap *m = ent->type == T_HASH ? &entry_hash(ent)
+              : ent->type == T_SET ?  &entry_set(ent)
+              :                       &entry_zset(ent).hmap;
+      size_t total = hm_size(m);
+      if (total == 0){ return base; }
+      MemSampleCtx c{ samples, 0, 0, ent->type };
+      hm_foreach(m, cb_mem_sample, &c);
+      if (c.counted == 0){ return base; }
+      return base + (size_t)((double)c.sum / (double)c.counted * (double)total);
+    }
+  }
+  return base;
+}
+
 // Recompute this entry size and fold the delta into the global counter.
 // Add-new-before-subtract-old keeps used_memory from the ever underflowing,
 // because the invariant guarantees used_memory >= ent->mem.

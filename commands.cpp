@@ -191,6 +191,8 @@ Entry *evict_pick_victim(){
       return nullptr;
     case P::ALLKEYS_RANDOM:
       // nullptr if no volatile keys -> OOM
+      return db_random_entry();
+    case P::VOLATILE_RANDOM:
       return volatile_random_entry();
     case P::VOLATILE_TTL:
       // nearest expiry == heap root, nearly free
@@ -2557,6 +2559,119 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
   return resp_err(out, "ERR Unknown CONFIG subcommand");
 }
 
+// Non creating, type-agnostic lookup with lazy expiry. Does not stamp LRU access
+// (object idletime must report idle time, not reset it)
+// same as lookup_entry but wwithout the stamp, just a helper 
+static Entry *lookup_any(const std::string &key){
+  LookupKey lk; lk.key = key;
+  lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
+  HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
+  if (!node){ return nullptr; }
+  Entry *ent = container_of(node, &Entry::node);
+  if (expire_if_needed(ent)){ return nullptr; }
+  return ent;
+}
+
+// MYRED encodings (we dont gave redis listpack/intset/quicklist duality)
+static const char *object_encoding(Entry *ent){
+  switch (ent->type){
+    case T_STR: { int64_t tmp; return str2int(entry_str(ent), tmp) ? "int" : "raw"; }
+    case T_DLIST: return "deque";
+    case T_HASH: return "hashtable";
+    case T_SET: return "hashtable";
+    case T_ZSET: return "skiplist";
+  }
+  return "unknown";
+}
+// Full sweep sum for memory doctor (callback)
+static bool cb_mem_sweep(HNode *node, void *arg){
+  *(size_t *)arg += entry_mem_usage(container_of(node, &Entry::node));
+  return true;
+}
+
+static void do_memory(std::vector<std::string> &cmd, Buffer *out){
+  std::string sub = cmd[1];
+  for (char &c : sub){ c = (char)tolower((unsigned char)c); }
+
+  if (sub == "usage"){
+    size_t samples = 5; 
+    if (cmd.size() >= 4){
+      std::string opt = cmd[3];
+      for (char &c : opt){ c = (char)tolower((unsigned char)c); } 
+      if (opt != "samples" || cmd.size() < 5){ return resp_err(out, MSG_SYNTAX); }
+      int64_t n = 0;
+      if (!str2int(cmd[4], n) || n < 0){ return resp_err(out, MSG_SYNTAX); }
+      samples = (size_t)n;
+    }
+    Entry *ent = lookup_any(cmd[2]);
+    if (!ent){ return resp_nil(out); }
+    return resp_int(out, (int64_t)entry_mem_usage_sampled(ent, samples));
+  }
+  if (sub == "doctor"){
+    size_t sweep = 0;
+    hm_foreach(&g_data.db, &cb_mem_sweep, &sweep);
+    char buf [192];
+    int n;
+    if (sweep == g_data.used_memory){
+      n = snprintf(buf, sizeof(buf),
+      "Can't find any memory problem. used_memory=%zu matches a full sweep.",
+      g_data.used_memory);
+    } else {
+      n = snprintf(buf, sizeof(buf),
+      "Accounting drift detected: counter=%zu sweep=%zu (delta=%zd) - a write handler "  
+      "is likely a missing a mem_reaccount.", g_data.used_memory, sweep,
+      (ssize_t)sweep - ((ssize_t)g_data.used_memory));
+    }
+    if (n < 0){ n = 0; }
+    return resp_str(out, buf, (size_t)n);
+  }
+
+  if (sub == "stats"){
+    resp_arr(out, 10);
+    resp_str(out, "used_memory", 11); resp_int(out, (int64_t)g_data.used_memory);
+    resp_str(out, "keys.count", 10); resp_int(out, (int64_t)hm_size(&g_data.db));
+    resp_str(out, "maxmemory", 9); resp_int(out, (int64_t)g_config.maxmemory);
+    resp_str(out, "maxmemory.policy", 16);
+    { const char *p = maxmemory_policy_name(g_config.maxmemory_policy); resp_str(out, p, strlen(p)); }
+    resp_str(out, "evicted.keys", 12); resp_int(out, (int64_t)g_data.evicted_keys);
+    return;
+  }
+  return resp_err(out, "ERR unknown MEMORY subcommand");
+}
+
+static void do_object(std::vector<std::string> &cmd, Buffer *out){
+  if (cmd.size() < 3){ return resp_err(out, "ERR wrong nubmer of arguments"); }
+  std::string sub = cmd[1];
+  for (char &c : sub){ c = (char)tolower((unsigned char)c); }
+
+  Entry *ent = lookup_any(cmd[2]);
+  if (!ent){ return resp_err(out, "ERR no such key"); }
+
+  if (sub == "encoding"){
+    const char *enc = object_encoding(ent);
+    return resp_str(out, enc, strlen(enc));
+  }
+  if (sub == "idletime"){
+    if (policy_is_lfu()){
+      return resp_err(out, "ERR an LFU maxmemory policy is selected, idle time not tracked");
+    }
+    uint32_t idle = (g_data.g_lru_clock - ent->lru) & LRU_CLOCK_MAX; // seconds
+    return resp_int(out, (int64_t)idle);
+  }
+  if (sub == "freq"){
+    if (!policy_is_lfu()){
+      return resp_err(out, "ERR An LFU maxmemory policy is not selected, access frequency not tracked.");
+    }
+    return resp_int(out, (int64_t)(ent->lru & 0xFF));
+  }
+
+  if (sub == "refcount"){
+    return resp_int(out, 1);
+  }
+  return resp_err(out, "ERR unknown object subcommand");
+
+}
+
 // Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
 static void aof_feed(const std::vector<std::string> &cmd){
   std::string frame;
@@ -2766,6 +2881,8 @@ static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"bgrewriteaof", {do_bgrewriteaof,  1,  1}},
   {"ping",         {do_ping,          1,  2}},
   {"config",       {do_config,        2, -1}},
+  {"memory",       {do_memory,        2, -1}},
+  {"object",       {do_object,        2, -1}},
 };
 
 // Commands that can only free or leave memory unchanged are never denied under

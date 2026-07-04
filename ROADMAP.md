@@ -252,6 +252,13 @@ single-threaded loop, the `std::variant` `Entry`, the TTL min-heap, and the thre
 pool for async free. Do the steps in order — accounting first, because nothing else
 can be enforced or reported without it.
 
+**Status (2026-07-03): Steps 1–6 DONE — v7 feature-complete.** Accounting, `maxmemory`
+config, all 8 eviction policies, LRU/LFU metadata + sampling, the eviction/OOM trigger,
+and introspection (`MEMORY`/`OBJECT`) are implemented and verified by `test_memory.py`.
+Deferred to the **General upgrades** backlog (below v10): compact encodings
+(listpack/intset/quicklist), object sharing / real `OBJECT REFCOUNT`, and the 16-slot
+eviction pool.
+
 ### ✅ Step 1 — Memory accounting (foundation) (DONE 2026-07-01)
 
 Implemented via a drift-free incremental counter: `Entry::mem` holds the bytes last
@@ -300,7 +307,15 @@ A drift between the counter and a full re-walk is the classic accounting bug; ad
 debug-only `MEMORY DOCTOR`-style self-check that compares the counter to a full
 `entry_mem_usage` sweep and warns on divergence.
 
-### Step 2 — `maxmemory` config
+### ✅ Step 2 — `maxmemory` config (DONE 2026-07-03)
+
+`Config::maxmemory` (bytes) + `MaxmemoryPolicy` enum (all 8 values, default
+`noeviction`); `MYRED_MAXMEMORY` / `MYRED_MAXMEMORY_POLICY` env knobs; one shared
+`parse_memory_size` (`k/m/g` = ×1000, `kb/mb/gb` = ×1024) reused by env + `CONFIG SET`.
+`CONFIG GET/SET` upgraded from stub to real for `maxmemory` + `maxmemory-policy`
+(validates policy names; unknown params still return empty array / `+OK`, so tooling
+probes don't break). `INFO memory` reports `maxmemory` + `maxmemory_policy`. Note:
+config is runtime-only (not persisted) — a restart resets `maxmemory` to `0`.
 
 - `Config::maxmemory` (bytes, `0` = unlimited). Env knob `MYRED_MAXMEMORY`, parsed
   with a human-size reader (`100mb`, `1gb`, `512kb` → bytes) reused by `CONFIG SET`.
@@ -308,7 +323,12 @@ debug-only `MEMORY DOCTOR`-style self-check that compares the counter to a full
 - Wire both into the `CONFIG GET/SET` stub so they're runtime-tunable (this turns the
   v6.1 stub into its first real parameters).
 
-### Step 3 — Eviction policies
+### ✅ Step 3 — Eviction policies (DONE 2026-07-03)
+
+Encoded in `evict_pick_victim()`: random policies do one pick, `volatile-ttl` reads the
+TTL heap root (nearest expiry, nearly free), LRU/LFU use best-of-N sampling. A `nullptr`
+return means `noeviction` **or** a `volatile-*` policy with no TTL keys to take — both
+resolve to `-OOM` in Step 5 (the volatile-fallback rule, in one place).
 
 Eight policies, matching Redis. Store as an enum parsed once at boot / on `CONFIG SET`:
 
@@ -327,7 +347,17 @@ Eight policies, matching Redis. Store as an enum parsed once at boot / on `CONFI
 we're still over the limit, behave like `noeviction` (return `-OOM`) — do *not* touch
 non-volatile keys.
 
-### Step 4 — LRU / LFU metadata + approximated eviction
+### ✅ Step 4 — LRU / LFU metadata + approximated eviction (DONE 2026-07-03)
+
+`Entry::lru` (24-bit: coarse clock for LRU / `[16b minute | 8b counter]` for LFU),
+stamped at the single `lookup_entry` choke point (`entry_touch_access` on hit,
+`entry_init_access` on create). `g_lru_clock` bumped once per event-loop tick from the
+cached `now_ms` — no per-access syscall. LFU uses logarithmic probabilistic increment
+(`p = 1/(base·factor+1)`) + minute-based decay. Samplers: `db_random_entry` (random
+bucket across both rehash tables) and `volatile_random_entry` (off the TTL heap);
+`evict_pick_victim` keeps best-of-`maxmemory_samples` (default 5). Configs
+`maxmemory_samples` / `lfu_log_factor` / `lfu_decay_time`. **Deferred:** the persistent
+16-slot eviction pool (best-of-N is correct; pool is a sampling-quality optimization).
 
 Redis does **not** keep a true global LRU list (too much memory + pointer churn). It
 stores a small per-object field and evicts by *sampling*. Mirror that:
@@ -351,7 +381,19 @@ stores a small per-object field and evicts by *sampling*. Mirror that:
   holds exactly the keys with a TTL, and for `volatile-ttl` it's *sorted by expiry* —
   the victim is near the heap root, nearly free).
 
-### Step 5 — Eviction trigger + write path integration
+### ✅ Step 5 — Eviction trigger + write path integration (DONE 2026-07-03)
+
+`free_memory_if_needed()` runs at the top of the write path (gated on `spec.is_write`),
+evicts via `evict_pick_victim` → `entry_del` (async-frees big values + discharges
+`used_memory` on the main thread), bumps `evicted_keys`, and **propagates a synthetic
+`DEL` to the AOF via `aof_feed`** (critical: otherwise replay resurrects evicted keys).
+Bounded attempts; `nullptr` victim → `-OOM command not allowed…`. `INFO` exposes
+`evicted_keys`. **Bug fixed:** the OOM gate must exempt memory-freeing commands
+(`cmd_can_grow_memory` — `DEL`/`UNLINK`/`FLUSHALL`/`EXPIRE`/pop/rem/…), otherwise you
+deadlock over the cap with no way to recover. Verified end-to-end by `test_memory.py`'s
+maxmemory section: `noeviction` OOMs + stays bounded + evicts nothing; `allkeys-lru`
+never OOMs + holds near cap + `evicted_keys` climbs; freeing commands still work over
+the cap.
 
 - **Where:** a `free_memory_if_needed()` called at the top of `do_request` for any
   command flagged `is_write` in `k_cmd_table` (reads never trigger eviction) — before
@@ -372,7 +414,15 @@ stores a small per-object field and evicts by *sampling*. Mirror that:
 - **Don't evict when:** `g_loading` is true (startup replay), inside the BGSAVE/AOF
   fork child, or `maxmemory == 0`.
 
-### Step 6 — Introspection commands
+### ✅ Step 6 — Introspection commands (DONE 2026-07-03)
+
+`MEMORY USAGE` (→ `entry_mem_usage`; accepts `[SAMPLES n]` but computes exact — the
+estimator is already a cheap single pass), `MEMORY DOCTOR` (release-safe counter-vs-sweep
+drift check), `MEMORY STATS` (flat array). `OBJECT ENCODING` (honest MYRED names
+`raw`/`int`/`deque`/`hashtable`/`skiplist`), `IDLETIME` (non-LFU only), `FREQ` (LFU only),
+`REFCOUNT` (stub `1`). `lookup_any` = non-touching, type-agnostic lookup so `IDLETIME`
+doesn't reset the value it reports. Missing key: `USAGE`→nil, `OBJECT`→error. Compact
+encodings + real object sharing deferred — see **General upgrades**.
 
 - `MEMORY USAGE key [SAMPLES count]` → `entry_mem_usage(ent)`; for big aggregates,
   sample `count` elements (default 5, `0` = exact) and extrapolate, matching Redis.
@@ -426,6 +476,77 @@ stores a small per-object field and evicts by *sampling*. Mirror that:
 
 - Master-replica: `PSYNC`, replication backlog, partial resync
 - Sentinel-style failover; cluster mode / hash-slot sharding
+
+---
+
+## General upgrades & unsupported features (backlog)
+
+Cross-cutting improvements and known gaps surfaced while building v1–v7. Not tied to a
+single version — pull each into a milestone when it becomes worthwhile. Nothing here is
+required for correctness; it's the difference between "works" and "Redis-grade".
+
+### Compact encodings (memory optimization)
+
+The single biggest memory win we don't have. Redis stores *small* collections in flat,
+cache-friendly layouts and only converts to the heavyweight structure past a size/element
+threshold. MYRED always uses the heavyweight structure — `OBJECT ENCODING` reflects this
+honestly today (`raw`, `deque`, `hashtable`, `skiplist`).
+
+- **`embstr` / `int` for strings** — small strings allocated inline with the object;
+  integer values stored as `int64`, not text. (We *detect* `int` in `OBJECT ENCODING`
+  but still store the digits as a `std::string`.)
+- **`listpack`** — small hashes / zsets / lists as one contiguous byte blob instead of
+  HMap (+AVL) / deque. Thresholds: `hash-max-listpack-entries/value`,
+  `zset-max-listpack-entries/value`, `list-max-listpack-size`.
+- **`intset`** — all-integer sets as a sorted packed integer array (no HMap).
+- **`quicklist`** — lists as a linked list of listpacks (we use one ring-buffer deque).
+- Requires: an encoding tag per `Entry`, conversion on threshold crossing, and
+  encode/decode paths in RDB **and** AOF. Also unlocks accurate small-object accounting.
+
+### Object sharing / real refcount
+
+- Shared-integer pool (Redis shares small ints 0–9999) so `OBJECT REFCOUNT` returns real
+  counts — we stub `1`. Saves memory on integer-heavy datasets. Needs a refcount field, a
+  shared-object table, and copy-on-mutate.
+
+### Command coverage gaps (all unimplemented; * = commonly requested)
+
+- **Sorted set (biggest gap — we only have zadd/zrem/zscore/zrank/zquery/zpopmin):**
+  `ZINCRBY`*, `ZCARD`*, `ZCOUNT`, `ZMSCORE`, `ZPOPMAX`, `ZRANGEBYSCORE`*/`ZRANGEBYLEX`,
+  `ZREVRANGE`*, `ZREMRANGEBYRANK/SCORE/LEX`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`,
+  `ZRANDMEMBER`, `ZSCAN`, `ZLEXCOUNT`, `ZRANGESTORE`, `ZMPOP`.
+- **String / bitmap:** `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP`/`BITFIELD`, `SUBSTR`, `LCS`.
+- **Generic:** `COPY`, `SORT`/`SORT_RO`, `DUMP`/`RESTORE`, `EXPIRETIME`/`PEXPIRETIME`,
+  `OBJECT HELP`, `SCAN ... TYPE`, `WAIT`.
+- **Hash:** `HRANDFIELD`, `HINCRBYFLOAT`.
+- **List:** `LPOS`, `LMOVE`/`RPOPLPUSH`, `LMPOP`, and blocking `BLPOP`/`BRPOP`/`BLMOVE`
+  (needs blocking-client machinery — a substantial addition to the event loop).
+- **Set:** `SINTERCARD`.
+- **New data types (each a large effort):** HyperLogLog (`PF*`), Streams (`X*`),
+  Geo (`GEO*`), Bitmaps (as above).
+
+### Server / observability & tooling
+
+- `COMMAND` / `COMMAND DOCS` / `COMMAND COUNT` (redis-cli interactive probes these).
+- `CLIENT LIST`/`KILL`/`SETNAME`/`GETNAME`/`ID`, `HELLO` (RESP3 handshake), `RESET`.
+- `SLOWLOG`, `LATENCY`, `MONITOR`, `DEBUG`, graceful `SHUTDOWN`, `LASTSAVE`, `TIME`, `LOLWUT`.
+- Full `CONFIG GET/SET` coverage (today only `maxmemory` + `maxmemory-policy` are real) +
+  `CONFIG REWRITE` to a `redis.conf`.
+- **RESP3** (`HELLO 3`) — maps, push frames, attributes; our parser/writers are RESP2 only.
+
+### Correctness follow-ups (small, known)
+
+- `zrem` doesn't drop an emptied zset (Redis removes the key; `zpopmin` already does).
+
+### Design decisions (deliberate, not gaps)
+
+- **Eviction: best-of-N, not the 16-slot pool.** We keep `evict_pick_victim`'s
+  best-of-`maxmemory_samples` sampling (tunable; default raised to 10) rather than
+  Redis's persistent 16-slot eviction pool. Best-of-N is correct and was Redis's own
+  approach pre-3.0; the pool only sharpens victim quality at cache scale, and a
+  persistent pool would force key-based storage + stale-entry validation (a pooled
+  candidate can be async-freed between rounds) — real complexity for marginal gain at
+  this project's scale. Revisit only if a real cache workload shows poor hit rates.
 
 ---
 

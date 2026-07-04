@@ -139,7 +139,7 @@ struct Config {
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
-  int maxmemory_samples = 5; // eviction sample size (best-of-n)
+  int maxmemory_samples = 10; // eviction sample size (best-of-n)
   int lfu_log_factor = 10; // LFU: higher = counter saturates slower
   int lfu_decay_time = 1; // LFU: minutes of idleness per counter decrement
   // Memory managment 
@@ -206,6 +206,7 @@ void entry_del_sync(Entry *ent);
 void entry_del_func(void *arg);
 Entry *entry_new(uint32_t type);
 size_t entry_mem_usage(Entry *ent);
+size_t entry_mem_usage_sampled(Entry *ent, size_t samples);
 
 void entry_init_access(Entry *ent);
 void entry_touch_access(Entry *ent);

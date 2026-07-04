@@ -2022,6 +2022,161 @@ def test_bgrewriteaof_command(r: TestRunner, sock: socket.socket):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  MEMORY MANAGEMENT (v7): accounting, introspection, maxmemory eviction / OOM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def info_field(sock: socket.socket, name: str) -> Optional[str]:
+    for ln in cmd(sock, "info").splitlines():
+        if ln.startswith(name + ":"):
+            return ln.split(":", 1)[1]
+    return None
+
+
+def used_memory(sock: socket.socket) -> int:
+    v = info_field(sock, "used_memory") or info_field(sock, "used_memory_bytes")
+    return int(v) if v is not None else -1
+
+
+def evicted_keys(sock: socket.socket) -> int:
+    v = info_field(sock, "evicted_keys")
+    return int(v) if v is not None else 0
+
+
+def set_result(sock: socket.socket, key: str, val: str) -> str:
+    """SET returning 'OK' or 'OOM'; any other error propagates."""
+    try:
+        cmd(sock, "set", key, val)
+        return "OK"
+    except RespError as e:
+        if "OOM" in str(e):
+            return "OOM"
+        raise
+
+
+def test_memory_accounting(r: TestRunner, sock: socket.socket):
+    r.section("Memory: accounting (used_memory)")
+    cmd(sock, "flushall")
+    r.check("empty DB → used_memory 0", used_memory(sock), 0)
+
+    base = used_memory(sock)
+    cmd(sock, "set", "mem:s", "x" * 5000)
+    r.check_true("used_memory grows after SET", used_memory(sock) > base)
+    cmd(sock, "del", "mem:s")
+    r.check("used_memory back to baseline after DEL", used_memory(sock), base)
+
+    # aggregate grow + drain (exercises the shrink-path reaccount)
+    for i in range(200):
+        cmd(sock, "rpush", "mem:L", f"e{i}")
+    r.check_true("used_memory grows after RPUSH x200", used_memory(sock) > base)
+    cmd(sock, "del", "mem:L")
+    r.check("used_memory back to baseline after list DEL", used_memory(sock), base)
+
+    # mixed load then FLUSHALL must return to EXACTLY 0 (leak / double-count detector)
+    for i in range(100):
+        cmd(sock, "set",  f"m:s:{i}", "v" * (i + 1))
+        cmd(sock, "hset", f"m:h:{i}", "a", "1", "b", str(i))
+        cmd(sock, "sadd", f"m:t:{i}", "x", "y", str(i))
+        cmd(sock, "zadd", f"m:z:{i}", "1", "a", "2", "b")
+    r.check_true("mixed load grew used_memory", used_memory(sock) > 0)
+    cmd(sock, "flushall")
+    r.check("FLUSHALL returns used_memory to 0", used_memory(sock), 0)
+
+
+def test_memory_introspection(r: TestRunner, sock: socket.socket):
+    r.section("Memory: MEMORY / OBJECT introspection")
+    cmd(sock, "flushall")
+    cmd(sock, "set",   "o:str",  "hello")
+    cmd(sock, "set",   "o:int",  "12345")
+    cmd(sock, "rpush", "o:list", "a", "b", "c")
+    cmd(sock, "hset",  "o:hash", "f", "v")
+    cmd(sock, "sadd",  "o:set",  "m1", "m2")
+    cmd(sock, "zadd",  "o:zset", "1", "a")
+
+    r.check_type("memory usage o:str → int", cmd(sock, "memory", "usage", "o:str"), int)
+    r.check_none("memory usage missing → nil", cmd(sock, "memory", "usage", "nope"))
+    r.check_type("memory usage ... samples 3 → int",
+                 cmd(sock, "memory", "usage", "o:hash", "samples", "3"), int)
+    # uppercase subcommand must work (regression for the tolower no-op bug)
+    r.check_type("MEMORY USAGE (uppercase) → int", cmd(sock, "MEMORY", "USAGE", "o:str"), int)
+
+    doctor = cmd(sock, "memory", "doctor")
+    r.check_type("memory doctor → string", doctor, str)
+    r.check_true("memory doctor reports no drift", "drift" not in doctor.lower())
+    r.check_type("memory stats → array", cmd(sock, "memory", "stats"), list)
+
+    r.check("object encoding o:str → raw",       cmd(sock, "object", "encoding", "o:str"),  "raw")
+    r.check("object encoding o:int → int",       cmd(sock, "object", "encoding", "o:int"),  "int")
+    r.check("object encoding o:list → deque",    cmd(sock, "object", "encoding", "o:list"), "deque")
+    r.check("object encoding o:hash → hashtable",cmd(sock, "object", "encoding", "o:hash"), "hashtable")
+    r.check("object encoding o:set → hashtable", cmd(sock, "object", "encoding", "o:set"),  "hashtable")
+    r.check("object encoding o:zset → skiplist", cmd(sock, "object", "encoding", "o:zset"), "skiplist")
+    r.check("OBJECT ENCODING (uppercase) works", cmd(sock, "OBJECT", "ENCODING", "o:str"), "raw")
+
+    r.check("object refcount → 1", cmd(sock, "object", "refcount", "o:str"), 1)
+    r.check_type("object idletime → int", cmd(sock, "object", "idletime", "o:str"), int)
+    r.expect_error("object on missing key → error", sock, "object", "encoding", "nope")
+    r.expect_error("object bad subcommand → error", sock, "object", "frobnicate", "o:str")
+    cmd(sock, "flushall")
+
+
+def test_maxmemory_eviction(r: TestRunner, sock: socket.socket):
+    r.section("Memory: maxmemory eviction + OOM")
+    CAP   = 512 * 1024          # 512 KB
+    VAL   = "y" * 400
+    BOUND = CAP * 2             # bounded vs runaway growth (a leaked OOM would blow past this)
+    N     = 1500               # ~825 KB attempted -> well over the cap
+    cmd(sock, "config", "set", "maxmemory", str(CAP))
+
+    # noeviction: writes succeed until full, then OOM; memory bounded; nothing evicted
+    cmd(sock, "flushall")
+    cmd(sock, "config", "set", "maxmemory-policy", "noeviction")
+    ev0 = evicted_keys(sock)
+    oks = ooms = 0
+    for i in range(N):
+        rr = set_result(sock, f"ne:{i}", VAL)
+        oks += (rr == "OK"); ooms += (rr == "OOM")
+        if ooms >= 50:
+            break
+    r.check_true("noeviction: writes succeed then OOM", oks > 0 and ooms > 0)
+    r.check_true("noeviction: used_memory bounded", used_memory(sock) <= BOUND)
+    r.check("noeviction: nothing evicted", evicted_keys(sock), ev0)
+    # a memory-FREEING command must still work while over the cap (no deadlock)
+    r.check("FLUSHALL allowed over cap", cmd(sock, "flushall"), "OK")
+
+    # allkeys-lru: never OOMs, memory bounded, evictions climb
+    cmd(sock, "config", "set", "maxmemory-policy", "allkeys-lru")
+    ev1 = evicted_keys(sock)
+    oks = ooms = 0
+    for i in range(N):
+        rr = set_result(sock, f"lru:{i}", VAL)
+        oks += (rr == "OK"); ooms += (rr == "OOM")
+    r.check("allkeys-lru: no OOM", ooms, 0)
+    r.check_true("allkeys-lru: used_memory bounded", used_memory(sock) <= BOUND)
+    r.check_true("allkeys-lru: evicted_keys climbed", evicted_keys(sock) - ev1 > 0)
+
+    # allkeys-random on keys with NO TTL (regression: it used to call the volatile sampler)
+    cmd(sock, "flushall")
+    cmd(sock, "config", "set", "maxmemory-policy", "allkeys-random")
+    ev2 = evicted_keys(sock)
+    ooms = 0
+    for i in range(N):
+        ooms += (set_result(sock, f"rnd:{i}", VAL) == "OOM")
+    r.check("allkeys-random: no OOM on non-TTL keys", ooms, 0)
+    r.check_true("allkeys-random: evicted_keys climbed", evicted_keys(sock) - ev2 > 0)
+
+    # restore unlimited so later tests aren't capped
+    cmd(sock, "config", "set", "maxmemory", "0")
+    cmd(sock, "config", "set", "maxmemory-policy", "noeviction")
+    cmd(sock, "flushall")
+
+
+def test_memory_commands(r: TestRunner, sock: socket.socket):
+    test_memory_accounting(r, sock)
+    test_memory_introspection(r, sock)
+    test_maxmemory_eviction(r, sock)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2101,6 +2256,7 @@ def main():
             test_save_command(r,          sock)
             test_bgsave_command(r,        sock)
             test_bgrewriteaof_command(r,  sock)
+            test_memory_commands(r,       sock)
         except Exception as e:
             print(f"\n{RED}Unexpected error: {e}{RESET}")
             all_ok = False
