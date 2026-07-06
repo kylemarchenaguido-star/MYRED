@@ -16,6 +16,21 @@ Config g_config;
 static void heap_delete(std::vector<HeapItem> &a, size_t pos);
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t);
 
+// Build/refresh the built in default user from the current requirepass digest
+void acl_bootstrap_default(){
+  User &u = g_config.users["default"]; // operator [] insearts if absent; address stays stable
+  u.name ="default";
+  u.enable = true;
+  u.allow_cats = CAT_ALL;
+  u.all_keys = true;
+  u.key_patterns.clear();
+  u.cmd_overrides.clear();
+  u.pw_hashes.clear();
+  if (!g_config.password.empty()){
+    u.pw_hashes.push_back(g_config.password);
+  }
+}
+
 bool parse_memory_size(const std::string &s, size_t *out){
   if (s.empty()){ return false; }
   size_t i = 0;

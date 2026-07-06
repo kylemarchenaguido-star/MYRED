@@ -1,8 +1,4 @@
 #pragma once
-#include <stdint.h>
-#include <stddef.h>
-#include <string>
-#include <vector>
 #include "buffer.h"
 #include "hashtable.h"
 #include "zset.h"
@@ -13,6 +9,11 @@
 #include "set.h"
 #include <variant>
 #include <atomic>
+#include <stdint.h>
+#include <stddef.h>
+#include <string>
+#include <vector>
+#include <unordered_map>
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
@@ -145,6 +146,16 @@ struct SaveCondition {
   uint32_t changes; // min writes within that window
 };
 
+struct User {
+  std::string name;
+  bool enable = true;
+  std::vector<std::string> pw_hashes; // SHA-256 digets; AUTH matches any (rotation)
+  uint64_t allow_cats = 0; // granted category bits
+  std::unordered_map<std::string, bool> cmd_overrides; // explicit +cmd / -cmd
+  std::vector<std::string> key_patterns; // glob patterns for reacheable keys
+  bool all_keys = false; // ~* : any key
+ };
+
 //global config
 struct Config {
   int port = 1234;
@@ -162,6 +173,7 @@ struct Config {
   // Memory managment 
   size_t maxmemory = 0;
   MaxmemoryPolicy maxmemory_policy = MaxmemoryPolicy::NOEVICTION;
+
   // Redis defaults
   std::vector<SaveCondition> save_conditions = {
     {3600, 1}, // 1 change in 1 hour
@@ -170,6 +182,9 @@ struct Config {
   };
   // (network, maks), host byte order
   std::vector<std::pair<uint32_t, uint32_t>> allowlist;
+  // ACL registry - stable addresses for Conn::User
+  std::unordered_map<std::string, User> users;
+
   // Enable modes
   bool aof_enable = false;
   bool protected_mode = true; // refuse remote peer when no password
@@ -255,3 +270,5 @@ const char *maxmemory_policy_name(MaxmemoryPolicy p);
 bool parse_cidr(const std::string &S, uint32_t *net, uint32_t *mask); // "10.0.0.0/8" , net/mask
 bool ip_is_loopback(uint32_t peer_host); // 127.0.0.0/8
 bool ip_allowed(uint32_t peer_host); // allowlist check 
+
+void acl_bootstrap_default(); // (re)build the built in default user from require pass

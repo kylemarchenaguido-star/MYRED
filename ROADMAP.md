@@ -555,7 +555,13 @@ Builds directly on Step 2 (`sha256_hex`/`ct_equal`/`secure_zero` in `shah256.h`)
 Step 1's config parser (`config_apply`/`config_tokenize` in `state.cpp`). Do the
 sub-steps in this order — data model first, since enforcement and parsing both need it.
 
-#### 4a — `User` struct + registry
+#### ✅ 4a — `User` struct + registry (DONE 2026-07-06)
+
+`User` struct + `CAT_*` bitflags + `Config::users` (`unordered_map`, stable addresses)
+in state.h; `acl_bootstrap_default()` (state.cpp) seeds the `default` user
+(`allow_cats=CAT_ALL`, `all_keys=true`, `pw_hashes={requirepass digest}`) — called in
+`main()` after the password is finalized. Data model only; no `Conn`/enforcement yet.
+Backward-compatible: no `user` directives → one all-powerful `default` = today's behavior.
 
 - New `struct User { std::string name; bool enabled = true; std::vector<std::string> pw_hashes; uint64_t allow_cats = 0; std::unordered_map<std::string,bool> cmd_overrides; std::vector<std::string> key_patterns; bool all_keys = false; }`
   (multiple `pw_hashes` so a password can be rotated without a moment of lockout —
@@ -777,6 +783,43 @@ honestly today (`raw`, `deque`, `hashtable`, `skiplist`).
   persistent pool would force key-based storage + stale-entry validation (a pooled
   candidate can be async-freed between rounds) — real complexity for marginal gain at
   this project's scale. Revisit only if a real cache workload shows poor hit rates.
+
+- **ACL rules: compiled bitset + override map, not Redis's ordered last-match-wins
+  list.** v9 Step 4 resolves `User` permissions to `allow_cats` (bitset) +
+  `cmd_overrides` (flat map, override always beats category regardless of when either
+  was set) instead of storing the raw rule token sequence and replaying Redis's
+  left-to-right resolution algorithm. Enforcement cost is identical either way (Redis
+  also compiles down to a flat per-command check at `ACL SETUSER` time, not a per-
+  request re-walk) — the simplification is purely in rule *composition* semantics.
+  Known gap: re-granting a whole category after an explicit per-command deny does
+  **not** clear that deny here (it would in Redis, if the regrant came later in the
+  token sequence); `ACL GETUSER`/`ACL LIST` can report the resolved state but can't
+  round-trip the literal rule string a user typed, since only the compiled form is
+  kept, not the history. **Post-implementation follow-up** (once Step 4 is done and
+  ACLs are in normal use — not a blocker for landing the feature): if the gap actually
+  bites, store the raw ordered rule tokens per user *alongside* the compiled form,
+  replay them into `allow_cats`/`cmd_overrides` at `SETUSER` time (enforcement stays
+  O(1)), and use the raw tokens only for `GETUSER`/`LIST` output. Bolt-on, not a
+  rewrite — don't build it preemptively.
+
+- **`k_cmd_table` lost its `const`** to let `acl_init_categories()`
+  (`commands.cpp:2962`) derive each command's `@read`/`@write` bit from the existing
+  `is_write` flag via a mutating pass (`for (auto &kv : k_cmd_table){ kv.second.acl_cats
+  = ...; }`), instead of hand-typing `CAT_READ`/`CAT_WRITE` per row in the initializer.
+  Deriving is the right call — hand-typing would duplicate the same fact `is_write`
+  already encodes, in a second, independently-editable place (same class of bug as the
+  `config_rewrite` `appendsync`/`appendfsync` drift). The `const` loss is the genuine
+  cost of that choice: the table was `static const` since the v5.3 review specifically
+  for the compile-time guarantee that no command's handler/arity could be corrupted at
+  runtime; it's now mutable for the process's whole lifetime, not just during the boot-
+  time pass, even though only `acl_init_categories()` ever touches it in practice.
+  **Upgrade path if this is ever worth doing:** replace the inline initializer with a
+  `build_cmd_table()` function that constructs the base rows *and* runs the derive
+  pass internally before returning, then bind it once to a `static const`
+  (`static const auto k_cmd_table = build_cmd_table();`) — same derivation guarantee,
+  `const` restored, no more separate `acl_init_categories()` boot call. Not worth the
+  churn for an 82-row table right now; revisit only if something else already needs to
+  touch this function.
 
 ---
 

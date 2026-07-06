@@ -477,6 +477,7 @@ int main(int argc, char **argv){
 
   if (g_config.password.empty()){ g_config.password = sha256_hex("kek1234"); }   // historical default
 
+  acl_bootstrap_default();
 
   // AOF takes priority over RDB
   bool aof_exists = (access(g_config.aof_path.c_str(), F_OK) == 0);

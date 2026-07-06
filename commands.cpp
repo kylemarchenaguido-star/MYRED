@@ -2770,10 +2770,11 @@ struct CmdSpec {
   int min_args;
   int max_args;
   bool is_write = false;
-  bool aof_rewrite = false; // can't be logged verbati- needs TTL translation
+  bool aof_rewrite = false; // can't be logged verbatim- needs TTL translation
+  uint64_t acl_cats = 0; // filled by acl_init_categories() at boot
 };
 
-static const std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
+static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   // strings
   {"get",          {do_get,           2,  2}},
   {"set",          {do_set,           3,  3, true}},
@@ -2954,4 +2955,41 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
       aof_append_raw(raw, raw_len);
     }
   }
+}
+
+// Populate CmdSpec::Acl_cats once at boot, the @read/@write base is derived from the
+// existing is_write flag, simplified taxonomy vs redis
+void acl_init_categories(){
+  static const std::unordered_map<std::string_view, uint64_t> extra = {
+    // connection
+    {"auth", CAT_CONNECTION},          {"ping", CAT_CONNECTION | CAT_FAST},
+    // admin / dangerous server ops
+    {"config", CAT_ADMIN | CAT_DANGEROUS},   {"info",   CAT_ADMIN | CAT_DANGEROUS},
+    {"save",   CAT_ADMIN | CAT_DANGEROUS},   {"bgsave", CAT_ADMIN},
+    {"bgrewriteaof", CAT_ADMIN},             {"memory", CAT_ADMIN | CAT_SLOW},
+    // keyspace-wide / dangerous
+    {"flushall", CAT_KEYSPACE | CAT_DANGEROUS}, {"flushdb", CAT_KEYSPACE | CAT_DANGEROUS},
+    {"keys",     CAT_KEYSPACE | CAT_DANGEROUS | CAT_SLOW},
+    // generic keyspace management
+    {"del", CAT_KEYSPACE},      {"unlink", CAT_KEYSPACE},    {"exists", CAT_KEYSPACE},
+    {"type", CAT_KEYSPACE},     {"rename", CAT_KEYSPACE},    {"renamenx", CAT_KEYSPACE},
+    {"touch", CAT_KEYSPACE},    {"scan", CAT_KEYSPACE},      {"dbsize", CAT_KEYSPACE},
+    {"randomkey", CAT_KEYSPACE},{"object", CAT_KEYSPACE | CAT_SLOW},
+    {"expire", CAT_KEYSPACE},   {"pexpire", CAT_KEYSPACE},   {"expireat", CAT_KEYSPACE},
+    {"pexpireat", CAT_KEYSPACE},{"ttl", CAT_KEYSPACE},       {"pttl", CAT_KEYSPACE},
+    {"persist", CAT_KEYSPACE},
+  };
+
+  for (auto &kv : k_cmd_table){
+    CmdSpec &s = kv.second;
+    s.acl_cats = s.is_write ? CAT_WRITE : CAT_READ;
+    auto it = extra.find(kv.first);
+    if (it != extra.end()){ s.acl_cats |= it->second; }
+  }
+  // fprintf(stderr, "acl: set=%#llx keys=%#llx config=%#llx\n",
+  //   (unsigned long long)k_cmd_table["set"].acl_cats,
+  //   (unsigned long long)k_cmd_table["keys"].acl_cats,
+  //   (unsigned long long)k_cmd_table["config"].acl_cats);
+// expect: set has WRITE bit; keys has READ|KEYSPACE|DANGEROUS|SLOW; config has READ|ADMIN|DANGEROUS
+
 }
