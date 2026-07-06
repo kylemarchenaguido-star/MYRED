@@ -32,6 +32,17 @@ static constexpr uint32_t LRU_CLOCK_MAX = (1u << 24) - 1; // maximun of a 24 bit
 static constexpr uint8_t LFU_INIT_VAL = 5;
 
 
+// ACL command categories. BItflags shared by User::allow_cats
+constexpr uint64_t CAT_READ       = 1ull << 0;
+constexpr uint64_t CAT_WRITE      = 1ull << 1;
+constexpr uint64_t CAT_KEYSPACE   = 1ull << 2;
+constexpr uint64_t CAT_ADMIN      = 1ull << 3;
+constexpr uint64_t CAT_DANGEROUS  = 1ull << 4;
+constexpr uint64_t CAT_FAST       = 1ull << 5;
+constexpr uint64_t CAT_SLOW       = 1ull << 6;
+constexpr uint64_t CAT_CONNECTION = 1ull << 7;
+constexpr uint64_t CAT_ALL        = ~0ull;
+
 //value types 
 enum {
   T_INIT = 0,
@@ -139,9 +150,9 @@ struct Config {
   int port = 1234;
   std::string config_path;
   std::string password = "";
+  std::vector<std::string> binds = {"0.0.0.0"}; // one listen fd per address
   std::string dump_path = "dump.rdb";
   std::string aof_path = "appendonly.aof";
-  bool aof_enable = false;
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
@@ -157,6 +168,11 @@ struct Config {
     {300, 100}, // 100 changes in 5 min
     {60, 10000}, // 10000 changes in 1 min
   };
+  // (network, maks), host byte order
+  std::vector<std::pair<uint32_t, uint32_t>> allowlist;
+  // Enable modes
+  bool aof_enable = false;
+  bool protected_mode = true; // refuse remote peer when no password
 };
 
 // HMap is not unique
@@ -235,3 +251,7 @@ bool config_rewrite(const char *path);
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
 const char *maxmemory_policy_name(MaxmemoryPolicy p);
+
+bool parse_cidr(const std::string &S, uint32_t *net, uint32_t *mask); // "10.0.0.0/8" , net/mask
+bool ip_is_loopback(uint32_t peer_host); // 127.0.0.0/8
+bool ip_allowed(uint32_t peer_host); // allowlist check 

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -160,6 +161,16 @@ inline bool ct_equal(const std::string &a, const std::string &b){
 
 // best-effort to wipe that the compiler don't optimize away
 inline void secure_zero(void *p, size_t n){
-    volatile unsigned char *v = (volatile unsigned char *)p;
-    while (n--) *v++ = 0;
+    if (!p || n == 0){ return; }
+    #if defined(__STDC_LIB_EXT1__)
+        // c11 Aneex K
+        memset_s(p, n, 0, n);
+    #elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
+        explicit_bzero(p, n);
+    #elif defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__APPLE__)
+        explicit_bzero(p, n);
+    #else
+        volatile unsigned char *v = (volatile unsigned char *)p; // portable fallback
+        while (n--) *v++ = 0;
+    #endif
 }

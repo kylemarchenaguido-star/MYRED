@@ -2,6 +2,7 @@
 #include "common.h"
 #include "hash.h"
 #include "sha256.h"
+#include <arpa/inet.h>  
 #include <time.h>
 #include <cctype>
 #include <cstdlib>
@@ -112,6 +113,29 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
       return CfgResult::BADVALUE;
     }
     g_config.port = p;
+    return CfgResult::OK;
+  }
+
+  if (name == "bind"){
+    if (args.empty()){ err = "bind needs at least one address"; return CfgResult::BADVALUE; }
+    g_config.binds = args;
+    return CfgResult::OK;
+  }
+
+  if (name == "protected-mode"){
+    if(!need1()){ return CfgResult::BADVALUE; }
+    g_config.protected_mode = (args[0] == "yes");
+    return CfgResult::OK;
+  }
+
+  if (name == "allow-ip"){ 
+    if (!need1()){ return CfgResult::BADVALUE; }
+    uint32_t net, mask;
+    if (!parse_cidr(args[0], &net, &mask)){
+      err = "invalid CIDR '" + args[0] + "'";
+      return CfgResult::BADVALUE;
+    }
+    g_config.allowlist.push_back({ net, mask });
     return CfgResult::OK;
   }
 
@@ -415,6 +439,42 @@ void mem_selfcheck(const char *where){
   }
 }
 #endif
+
+bool parse_cidr(const std::string &s, uint32_t *net, uint32_t *mask){
+  std::string ip = s;
+  int bits = 32;
+  size_t slash = s.find('/');
+  if (slash != std::string::npos){
+    ip = s.substr(0, slash);
+    const char *bits_str = s.c_str() + slash + 1;
+    char *end = nullptr;
+    long parsed = strtol(bits_str, &end, 10);
+    // no digits, or trailing garbage
+    if (end == bits_str || *end != '\0'){ return false; }
+    if (bits < 0 || bits > 32){ return false; }
+    bits = (int)parsed;
+  }
+  struct in_addr a;
+  if (inet_pton(AF_INET, ip.c_str(), &a) != 1){ return false; }
+  uint32_t m = (bits == 0) ? 0u : (0xFFFFFFFFu << (32 - bits));
+  // store netwwork + mask, host byte order
+  *net = ntohl(a.s_addr) & m;
+  *mask = m;
+  return true;
+}
+
+bool ip_is_loopback(uint32_t peer_host){
+  return (peer_host & 0xFF000000u) == 0x7F000000u; // 127.0.0.0/8
+}
+
+bool ip_allowed(uint32_t peer_host){
+  if (ip_is_loopback(peer_host)){ return true; }
+  if (g_config.allowlist.empty()){ return true; }
+  for (const auto &e : g_config.allowlist){
+    if ((peer_host & e.second) == e.first){ return true; }
+  }
+  return false;
+}
 
 // because CLOCK_MONOTONIC resets on reboot. in-memory timers stay monotonic.
 uint64_t get_monotonic_msec(){

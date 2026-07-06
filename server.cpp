@@ -55,9 +55,7 @@ static void fd_set_nb(int fd){
 
   errno = 0;
   (void) fcntl(fd, F_SETFL, flags);
-  if(errno) {
-    die("fcntl error");
-  }
+  if (errno){ die("fcntl error"); }
 }
 
 // global flag — set to true when Ctrl+C is pressed
@@ -80,6 +78,27 @@ static int32_t handle_accept(int fd){
     if (errno != EAGAIN){ msg_errno("accept() error"); }
     return -1;
   }
+
+  uint32_t peer_host = ntohl(client_addr.sin_addr.s_addr);
+
+  // IP allowlist (loopback always allowed; empty list = allowed all)
+  if (!ip_allowed(peer_host)){
+    fprintf(stderr, "rejected %s: not in allowlist\n", inet_ntoa(client_addr.sin_addr));
+    close(connfd);
+    // keep acepting other pending conections
+    return 0;
+  }
+
+  // protected mode: no password + remote peer -> refuse witn an explanation
+  if (g_config.protected_mode && g_config.password.empty() && !ip_is_loopback(peer_host)){
+    static const char deny[] = 
+      "-DENIED MYRED is in protected mode with no password set. "
+      "Connect from localhost, set 'requirepass', or 'protected-mode no'.\r\n";
+    (void)!write(connfd, deny, sizeof(deny) - 1);
+    close(connfd);
+    return 0;
+  }
+
   uint32_t ip = client_addr.sin_addr.s_addr;
   fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
     ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
@@ -110,6 +129,34 @@ static int32_t handle_accept(int fd){
   g_data.fd2conn[conn->fd] = conn;
 
   return 0;
+}
+
+static int listen_on(const std::string &addr, int port){
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0){ fprintf(stderr, "socket(): %s\n", strerror(errno)); return -1; }
+
+  int val = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+
+  struct sockaddr_in a = {};
+  a.sin_family = AF_INET;
+  a.sin_port   = htons((uint16_t)port);
+  if (inet_pton(AF_INET, addr.c_str(), &a.sin_addr) != 1){
+    fprintf(stderr, "invalid bind address '%s'\n", addr.c_str()); close(fd); return -1;
+  }
+  if (bind(fd, (const struct sockaddr *)&a, sizeof(a)) != 0){
+    fprintf(stderr, "bind %s:%d %s\n", addr.c_str(), port, strerror(errno)); 
+    close(fd);
+    return -1;
+  }
+  fd_set_nb(fd);
+  if (listen(fd, SOMAXCONN)){
+    fprintf(stderr, "listen %s:%d: %s\n", addr.c_str(), port, strerror(errno));
+    close(fd);
+    return -1;
+  }
+  return fd;
 }
 
 static void conn_destroy(Conn *conn){
@@ -508,63 +555,51 @@ int main(int argc, char **argv){
     else { fprintf(stderr, "warning: bad MYRED_MAXMEMORY_POLICY '%s'\n", policy_env); }
   }
 
+  std::vector<int> listen_fds;
+  for (const std::string &addr : g_config.binds){
+    int lfd = listen_on(addr, g_config.port);
+    // fail fast if any addrees can't bind 
+    if (lfd < 0){ die("listener setup"); }
+    listen_fds.push_back(lfd);
+    fprintf(stderr,"listening on %s:%d\n", addr.c_str(), g_config.port);
+  }
 
-  int fd = socket(AF_INET,SOCK_STREAM,0); // obtain a socket handle
-  if (fd < 0) {die("socket()");}
-
-  int val = 1;
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)); // set the socket option like the time wait for the socket
-  setsockopt(fd, SOL_SOCKET,  SO_REUSEADDR, &val, sizeof(val));  
-
-  // the is the parameter bind to 0.0.0.0: 1234
-  struct sockaddr_in addr = {};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((uint16_t)g_config.port);
-  addr.sin_addr.s_addr = htonl(0);
-
-  int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
-  if (rv) {die("bind()");}
-
-  fd_set_nb(fd);
-
-  // listen for connections on the socket
-  rv = listen(fd, SOMAXCONN);
-  if (rv) {die("listen()");}
-
+  const size_t nlisten = listen_fds.size();
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
 
   while(!g_stop){
     
     poll_args.clear(); //This just clean the arguments for poll.
-    struct pollfd pfd = {fd, POLLIN, 0};
-    poll_args.push_back(pfd);
-    //So everething else are just connected sockets 
+    // listen fds occupy [0, nlisten]
+    for (int lfd : listen_fds){
+      struct pollfd pfd = {lfd, POLLIN, 0};
+      poll_args.push_back(pfd);
+    }
 
     for (Conn *conn : g_data.fd2conn){
       if(!conn){continue;}
-
       struct pollfd pfd = {conn->fd, POLLERR, 0}; // This is for the flags of the aplication
-      if (conn->want_read){
-        pfd.events |= POLLIN;
-      }
-      if (conn->want_write){
-        pfd.events |= POLLOUT;
-      }
+      if (conn->want_read){ pfd.events |= POLLIN; }
+      if (conn->want_write){ pfd.events |= POLLOUT; }
       poll_args.push_back(pfd);
     }
+
     int32_t timeout_ms = next_timer_ms();
     int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
 
     if(rv < 0 && errno == EINTR){continue;}
     if(rv < 0){die("poll");}
 
-    // handle the listening socket
-    if (poll_args[0].revents) {
-      while (handle_accept(fd) == 0) {}
+    // any listening socket ready -> drain its backlog
+    for (size_t i = 0; i < nlisten; i++){
+      if (poll_args[i].revents) {
+        // we accept on that fd
+        while (handle_accept(poll_args[i].fd) == 0) {}
+      }
     }
 
     //This is for to handle the connections of sockets
-    for(size_t i = 1;i < poll_args.size(); i++){ // we skip the 1st
+    for(size_t i = nlisten; i < poll_args.size(); i++){ // we skip the 1st
       uint32_t ready = poll_args[i].revents;
       if (ready == 0){ // no events fired up
         continue;

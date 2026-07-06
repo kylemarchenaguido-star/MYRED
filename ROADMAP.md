@@ -529,7 +529,14 @@ hardening step below (before TLS).
 - **Hygiene:** `explicit_bzero` the plaintext buffer after hashing; never log passwords;
   keep the existing max-3-attempts disconnect and add a small fixed backoff on failure.
 
-### Step 3 — Protected mode + `bind` + IP allowlist
+### ✅ Step 3 — Protected mode + `bind` + IP allowlist (DONE 2026-07-04)
+
+All enforced in `handle_accept` **before** a `Conn` is allocated. `ip_allowed`
+(CIDRs pre-parsed to `(net,mask)` at config load; loopback always allowed to prevent
+lockout) + protected mode (no password + non-loopback peer → `-DENIED` + close).
+Rejections `return 0` so the accept loop keeps draining other pending peers. `bind`
+now honors `Config::binds` (multiple listen fds — see below); `protected-mode` and the
+MYRED `allow-ip <cidr>` directives added to `config_apply`.
 
 All checked at `handle_accept` (before auth), so unauthorized peers never reach the loop.
 
@@ -544,21 +551,96 @@ All checked at `handle_accept` (before auth), so unauthorized peers never reach 
 
 The big one. A `User` = name, enabled flag, password hash(es), allowed **command
 categories/commands**, allowed **key glob patterns**, allowed pub/sub channels.
+Builds directly on Step 2 (`sha256_hex`/`ct_equal`/`secure_zero` in `shah256.h`) and
+Step 1's config parser (`config_apply`/`config_tokenize` in `state.cpp`). Do the
+sub-steps in this order — data model first, since enforcement and parsing both need it.
 
-- **Command categories:** add a `uint64_t acl_cats` bitflag to `CmdSpec` (`@read`,
-  `@write`, `@admin`, `@keyspace`, `@dangerous`, `@fast`/`@slow`, …), set once in
-  `k_cmd_table`. ACL rules like `+@read -@write +get -flushall` compile to an
-  allow/deny bitset **per user** at `ACL SETUSER` time.
-- **Enforcement in `do_request`** (after resolving `spec`, before running): (a) command
-  permitted for `conn->user`? (b) every key arg matches a user key pattern? — reuse the
-  existing `glob_match`. (c) pub/sub channels. Reject with `NOPERM`.
-- **Backward compatible:** a `default` user carries today's behavior; `requirepass`
-  becomes the default user's password.
-- **Commands:** `AUTH <user> <pass>` (2-arg form; 1-arg = default user), `ACL
-  SETUSER/GETUSER/DELUSER/LIST/USERS/WHOAMI/CAT/GENPASS`.
-- **Per-`Conn`:** replace the `authenticaded` bool with a `User *user` set at AUTH; the
-  per-command check is then an O(1) bitset test — no re-hash, no re-parse.
-- **Persistence:** `user` directives in the config file, or a separate `aclfile`.
+#### 4a — `User` struct + registry
+
+- New `struct User { std::string name; bool enabled = true; std::vector<std::string> pw_hashes; uint64_t allow_cats = 0; std::unordered_map<std::string,bool> cmd_overrides; std::vector<std::string> key_patterns; bool all_keys = false; }`
+  (multiple `pw_hashes` so a password can be rotated without a moment of lockout —
+  `AUTH` matches against any of them via `ct_equal`).
+- **Registry gotcha:** store users in `std::unordered_map<std::string, User>`, not
+  `std::vector<User>`. `Conn` will hold a raw `User *` (below); a `vector` reallocates
+  and invalidates every live `Conn::user` pointer the moment `ACL SETUSER` adds a user
+  while other clients are connected — a dangling-pointer bug that won't show up until
+  a second client connects mid-session. A `Config`-owned `unordered_map` gives stable
+  element addresses across inserts (erase is the only thing to still be careful about —
+  `ACL DELUSER` on a currently-connected user needs to null out or kick that `Conn`).
+- Pre-populate a `default` user at boot: `allow_cats = CAT_ALL`, `all_keys = true`,
+  `pw_hashes = {g_config.password}` (today's `requirepass`, already a SHA-256 digest
+  after Step 2) — this is what makes the feature backward compatible; a config with no
+  `user` directives behaves exactly like today.
+
+#### 4b — Command categories on `CmdSpec`
+
+- `CmdSpec` (`commands.cpp:2768`) currently has `fn, min_args, max_args, is_write,
+  aof_rewrite`. Add `uint64_t acl_cats = 0`. Define category bits as an enum/constexpr
+  set: `CAT_READ, CAT_WRITE, CAT_ADMIN, CAT_KEYSPACE, CAT_DANGEROUS, CAT_FAST, CAT_SLOW, …`.
+- **Don't hand-retype `@read`/`@write` for all 82 entries in `k_cmd_table`**
+  (`commands.cpp:2776-2880`) — derive it: `spec.is_write ? CAT_WRITE : CAT_READ` is
+  already known per-command via the existing `is_write` flag, computed once at table-
+  build time (or a small init pass over the table). Only the extra categories
+  (`@admin`, `@dangerous`, `@keyspace`) need manual per-entry tagging, and
+  `cmd_can_grow_memory`'s `no_grow` set (`commands.cpp:2883-2894`) is a ready-made
+  starting list for what counts as `@dangerous`-adjacent — same shape of "special
+  commands" set, don't invent a second taxonomy from scratch.
+- **Rule compilation semantics:** Redis ACL rules apply left-to-right, last match wins
+  (`+@read -@write +get -flushall` → category grants, then a specific command name can
+  override its own category). For this project's scope, a reasonable simplification
+  (not full Redis fidelity, worth stating as a deliberate choice): keep `allow_cats` as
+  one bitset plus a small `unordered_map<string, bool> cmd_overrides` for explicit
+  `+cmd`/`-cmd` rules, checked *before* falling back to the category bitset. `ACL
+  SETUSER` parses the rule tokens once and populates both.
+
+#### 4c — Enforcement in `do_request`
+
+Insert the check in the existing flow (`commands.cpp:2896-2925`) right after the arity
+check and before `spec.fn(...)` — auth itself stays exempt exactly like the current
+`if (cmd[0] == "auth")` bypass at line 2907:
+- (a) **Command permitted?** `cmd_overrides` lookup first, else `spec.acl_cats & conn->user->allow_cats`. Reject `NOPERM` otherwise.
+- (b) **Key patterns?** Every key argument must match one of `conn->user->key_patterns`
+  via the existing `glob_match` (`commands.cpp:1550`) unless `all_keys`. This needs a
+  **key-position descriptor** per command, since key args aren't uniformly at `cmd[1]`
+  (`GET`/`SET`: just `cmd[1]`; `DEL`/`EXISTS`/`MGET`: every arg from 1; `MSET`: every
+  *other* arg from 1). Add a small `KeySpec` enum to `CmdSpec` (`NONE, FIRST,
+  ALL_FROM_1, STRIDE2_FROM_1`) alongside `acl_cats` so this is an O(1) table lookup
+  per command, not per-command special-casing in `do_request`.
+- (c) Pub/sub channel patterns — no-op stub until v8 exists; keep the field on `User`
+  now so the config/parsing format doesn't need to change again later.
+
+#### 4d — `AUTH` 2-arg form + `ACL` commands
+
+- `do_auth` (`commands.cpp` ~1010) currently only handles `AUTH <pass>` against
+  `g_config.password`. Extend to `AUTH <user> <pass>` (2-arg) vs `AUTH <pass>` (1-arg =
+  implicit `default` user) — look up the `User` by name in the registry, `ct_equal`
+  against each of its `pw_hashes`, reusing the exact same hash/compare/wipe path
+  already written for Step 2.
+- New commands: `ACL SETUSER/GETUSER/DELUSER/LIST/USERS/WHOAMI/CAT/GENPASS` — dispatch
+  style matches the existing `CONFIG GET/SET` sub-dispatch (`do_config`), i.e. one
+  `do_acl(cmd, out, conn)` entry in `k_cmd_table` that switches on `cmd[1]`. `WHOAMI` →
+  `conn->user->name`; `GENPASS` → random hex via the project's existing `mt19937_64` RNG
+  (from the v5.3 review), not `rand()`.
+
+#### 4e — Per-`Conn` auth state
+
+- Replace `Conn::authenticaded` (`state.h:83`) with `User *user = nullptr;` — `nullptr`
+  means unauthenticated. `do_request`'s `if (!conn->authenticaded)` (line 2912) becomes
+  `if (!conn->user)`. The per-command permission check is then an O(1) bitset test, no
+  re-hash/re-parse per request.
+
+#### 4f — Config file persistence
+
+- `user` directives in `myred.conf`, parsed via a new helper alongside `config_apply`
+  (`state.cpp:81`) — this needs its own mini-parser, not a reuse of the generic
+  `name/args` shape every other directive uses, because the rule grammar is rich:
+  `user alice on >5f4dcc... ~cache:* +@read +@write -flushall`. Tokenize with the
+  existing `config_tokenize` (handles quoting already), then walk tokens applying
+  `on`/`off`, `>hash`/`<hash` (add/remove password), `~pattern` (key pattern, `~*` =
+  `all_keys`), `+@cat`/`-@cat`/`+cmd`/`-cmd` in order. Same multi-token-per-line shape
+  you just fixed for `bind` (`state.cpp:119-123`) — look at that fix before writing
+  this parser, since the "collect all args, don't assume exactly one" pattern applies
+  here too, just with a richer per-token grammar than a flat address list.
 
 ### Step 5 — Command hardening + audit log
 
