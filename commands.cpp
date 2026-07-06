@@ -12,7 +12,8 @@
 #include "ctype.h"
 #include "hash.h"
 #include "set.h"
-#include "fcntl.h"      
+#include "fcntl.h"     
+#include "sha256.h" 
 #include <unistd.h> 
 #include <algorithm>
 #include <random>
@@ -1010,15 +1011,17 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (g_config.password.empty()){
     return resp_err(out, "ERR no password configured");
   }
-  if (cmd[1] == g_config.password){
+  // hash input, constant time compare
+  bool ok = ct_equal(sha256_hex(cmd[1]), g_config.password);
+  // wipe plain text from the request
+  secure_zero(&cmd[1][0], cmd[1].size());
+  if (ok){
     conn->authenticaded = true;
     conn->failed_attemps = 0;
     return resp_ok(out);
   }
   conn->failed_attemps++;
-  if (conn->failed_attemps >= k_max_failed_auth){
-    conn->want_close =true;
-  }
+  if (conn->failed_attemps >= k_max_failed_auth){ conn->want_close =true; }
   return resp_err(out, "ERR invalid password");
 }
 

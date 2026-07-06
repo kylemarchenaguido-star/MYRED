@@ -1,6 +1,7 @@
 #include "state.h"
 #include "common.h"
 #include "hash.h"
+#include "sha256.h"
 #include <time.h>
 #include <cctype>
 #include <cstdlib>
@@ -91,7 +92,15 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
   // auth - network
   if (name == "requirepass"){ 
     if (!need1()){ return CfgResult::BADVALUE; }
-    g_config.password = args[0];
+    // no auth 
+    if (args[0].empty()){ g_config.password.clear(); return CfgResult::OK;}
+    // pre-hashed
+    if (args[0].size() == 65 && args[0][0] == '#'){
+      g_config.password = args[0].substr(1);
+    } else {
+      // hash plaintext
+      g_config.password = sha256_hex(args[0]);
+    }
     return CfgResult::OK;
   }
 
@@ -154,7 +163,7 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     } else if (args[0] == "no"){
       g_config.aof_fysnc = Aoffsync::NO;
     } else if (args[0] == "everysec"){
-      g_config.aof_fysnc == Aoffsync::EVERYSEC;
+      g_config.aof_fysnc = Aoffsync::EVERYSEC;
     } else {
       err = "invalid appendfsync";
       return CfgResult::BADVALUE;
@@ -251,11 +260,11 @@ bool config_rewrite(const char * path){
   FILE *fp = fopen(path ,"w");
   if (!fp){ return false; }
   fprintf(fp, "port %d\n", g_config.port);
-  if (!g_config.password.empty()){ fprintf(fp, "requirepass %s\n", g_config.password.c_str()); }
+  if (!g_config.password.empty()){ fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str()); }
   fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
   fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");
   fprintf(fp, "appendfilename %s\n", g_config.aof_path.c_str());
-  fprintf(fp, "appendsync %s\n",  g_config.aof_fysnc == Aoffsync::ALWAYS ? "always" 
+  fprintf(fp, "appendfsync %s\n",  g_config.aof_fysnc == Aoffsync::ALWAYS ? "always" 
                                 : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec");
   fprintf(fp, "maxmemory %zu\n", g_config.maxmemory);
   fprintf(fp, "maxmemory-policy %s\n", maxmemory_policy_name(g_config.maxmemory_policy));

@@ -1,0 +1,4 @@
+/home/kyled/projects/testfiles/build-debug/CMakeFiles/server.dir
+/home/kyled/projects/testfiles/build-debug/CMakeFiles/client.dir
+/home/kyled/projects/testfiles/build-debug/CMakeFiles/edit_cache.dir
+/home/kyled/projects/testfiles/build-debug/CMakeFiles/rebuild_cache.dir

@@ -480,7 +480,18 @@ non-constant-time), `conn->authenticaded` is a single bool, the listener is hard
 to `INADDR_ANY`, and there's no notion of users or per-command permissions. Do the
 steps in order — the config file is the foundation everything else is declared in.
 
-### Step 1 — `redis.conf`-style config file (foundation)
+### ✅ Step 1 — `redis.conf`-style config file (foundation) (DONE 2026-07-04)
+
+Shared `config_apply()` (state.cpp) is the single directive→`Config` mapper, reused by
+both `config_load_file` and `CONFIG SET` so they can't drift; `config_tokenize` handles
+`#` comments + quoted values; `config_load_file` fails with `file:line` on bad/unknown
+directives (file `save` lines replace defaults); `config_rewrite` serializes back for
+`CONFIG REWRITE`. `main()` loads the file first (argv first-non-flag or `MYRED_CONFIG`),
+then env overrides, then the `CONFIG SET` runtime layer → precedence
+`defaults < file < env < CONFIG SET`. Added `Config::port` + `Config::config_path`.
+Bugs found in transcription: leftover hardcoded `password = kek1234` line (clobbered the
+file), and a `line[++i]` pre-increment in the tokenizer that dropped each token's first
+char. `CONFIG GET` full-table extension left as a mechanical follow-up.
 
 Turn the scattered `MYRED_*` env knobs + the v6.1/v7 `CONFIG` stub into a real config layer.
 
@@ -496,7 +507,16 @@ Turn the scattered `MYRED_*` env knobs + the v6.1/v7 `CONFIG` stub into a real c
 - **Robustness:** validate on load (port range, enum values, sizes via `parse_memory_size`);
   reject unknown directives with `file:line` context rather than silently ignoring.
 
-### Step 2 — Password hashing + constant-time compare
+### ✅ Step 2 — Password hashing + constant-time compare (DONE 2026-07-04)
+
+Header-only `sha256.h` (`sha256_hex`, `ct_equal`, `secure_zero`). `g_config.password`
+now holds the **SHA-256 digest** (or empty for no-auth), never plaintext: `config_apply`
+hashes `requirepass` (also accepts an empty value and a pre-hashed `#<hex>` form),
+`config_rewrite` emits the digest as a quoted `"#<hex>"`, and the `MYRED_PASSWORD` env +
+`kek1234` default are hashed too. `do_auth` hashes the supplied password and
+**constant-time compares** (`ct_equal`, no early return), then `secure_zero`s the
+plaintext out of the request buffer. The argon2/bcrypt upgrade is tracked as its own
+hardening step below (before TLS).
 
 - Replace the plaintext `==` with a **hash compare**. Store `requirepass` as a **SHA-256**
   digest (hand-rolled or small vendored impl, matching the from-scratch ethos); config
@@ -549,7 +569,22 @@ categories/commands**, allowed **key glob patterns**, allowed pub/sub channels.
   `@admin`/`@dangerous` command use → a file (ties into the Continuous "logging
   framework" item). A disabled command must also drop out of the AOF/replication path.
 
-### Step 6 — TLS (heaviest; could be its own milestone)
+### Step 6 — Password hashing upgrade: argon2/bcrypt (do before TLS)
+
+Optimization/hardening of Step 2. SHA-256 is fast and unsalted → weak against offline
+brute-force if the config/ACL file leaks. Upgrade credential-at-rest to a **salted,
+memory-hard** KDF.
+
+- **argon2id** (preferred) or **bcrypt** — needs a library (`libargon2` / `libbcrypt`),
+  the first external dependency in v9 (hence *before* TLS/OpenSSL, so the build gains one
+  dep at a time).
+- Store `$argon2id$…` / `$2b$…` PHC-format strings (they embed salt + params) in place of
+  the bare SHA-256 hex; `secure_zero`/`ct_equal` and the `do_auth` flow are unchanged —
+  only the hash/verify calls swap. Per-user params (cost/memory) live in the ACL entry.
+- Keep SHA-256 verification for backward compat so existing `#<hex>` configs still load;
+  re-hash to argon2 on next `CONFIG SET requirepass` / `ACL SETUSER`.
+
+### Step 7 — TLS (heaviest; could be its own milestone)
 
 - Link **OpenSSL**. `tls-port`, `tls-cert-file`/`tls-key-file`/`tls-ca-cert-file`;
   optional **mutual TLS** (require + verify client certs).

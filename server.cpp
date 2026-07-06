@@ -31,6 +31,7 @@
 #include "rdb.h"
 #include "commands.h"
 #include "aof.h"
+#include "sha256.h"
 
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
@@ -422,12 +423,12 @@ int main(int argc, char **argv){
   if (cfg_path && !config_load_file(cfg_path)){ die("invalid config file"); }
 
 
-  if (const char *e = getenv("MYRED_PASSWORD")){ g_config.password = e; }
+  if (const char *e = getenv("MYRED_PASSWORD")){ g_config.password = sha256_hex(e); }
   if (const char *e = getenv("MYRED_PORT")){ int p = atoi(e); if (p > 0 && p < 65536){ g_config.port = p; } }
   if (const char *e = getenv("MYRED_AOF")){ g_config.aof_enable = (e[0] == '1' || e[0] == 'y'); }
 
 
-  if (g_config.password.empty()){ g_config.password = "kek1234"; }
+  if (g_config.password.empty()){ g_config.password = sha256_hex("kek1234"); }   // historical default
 
 
   // AOF takes priority over RDB
