@@ -110,6 +110,7 @@ static int32_t handle_accept(int fd){
   Conn *conn = new Conn();
   conn->fd = connfd;
   conn->authenticaded = g_config.password.empty();
+  conn->user = &g_config.users["default"]; 
   conn->want_read = true;
   conn->incoming = buf_create(64 * 1024);
   conn->outgoing = buf_create(64 * 1024);
@@ -478,6 +479,7 @@ int main(int argc, char **argv){
   if (g_config.password.empty()){ g_config.password = sha256_hex("kek1234"); }   // historical default
 
   acl_bootstrap_default();
+  acl_init_categories();      
 
   // AOF takes priority over RDB
   bool aof_exists = (access(g_config.aof_path.c_str(), F_OK) == 0);

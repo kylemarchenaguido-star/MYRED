@@ -551,7 +551,7 @@ All checked at `handle_accept` (before auth), so unauthorized peers never reach 
 
 The big one. A `User` = name, enabled flag, password hash(es), allowed **command
 categories/commands**, allowed **key glob patterns**, allowed pub/sub channels.
-Builds directly on Step 2 (`sha256_hex`/`ct_equal`/`secure_zero` in `shah256.h`) and
+Builds directly on Step 2 (`sha256_hex`/`ct_equal`/`secure_zero` in `sha256.h`) and
 Step 1's config parser (`config_apply`/`config_tokenize` in `state.cpp`). Do the
 sub-steps in this order — data model first, since enforcement and parsing both need it.
 
@@ -578,7 +578,15 @@ Backward-compatible: no `user` directives → one all-powerful `default` = today
   after Step 2) — this is what makes the feature backward compatible; a config with no
   `user` directives behaves exactly like today.
 
-#### 4b — Command categories on `CmdSpec`
+#### ✅ 4b — Command categories on `CmdSpec` (DONE 2026-07-06)
+
+`CmdSpec::acl_cats` + `CAT_*` bitflags (`state.h`); `acl_init_categories()`
+(`commands.cpp`) derives `@read`/`@write` from the existing `is_write` flag for all
+table entries in one pass, then merges a small `extra` map of hand-tagged
+`@admin`/`@dangerous`/`@keyspace`/`@connection`/`@fast`/`@slow` bits for the ~30
+commands that need them. Cost of the mutating pass: `k_cmd_table` lost its `const`
+(see **Design decisions** below for the trade and the `build_cmd_table()` upgrade path
+if it's ever worth restoring).
 
 - `CmdSpec` (`commands.cpp:2768`) currently has `fn, min_args, max_args, is_write,
   aof_rewrite`. Add `uint64_t acl_cats = 0`. Define category bits as an enum/constexpr
@@ -599,7 +607,15 @@ Backward-compatible: no `user` directives → one all-powerful `default` = today
   `+cmd`/`-cmd` rules, checked *before* falling back to the category bitset. `ACL
   SETUSER` parses the rule tokens once and populates both.
 
-#### 4c — Enforcement in `do_request`
+#### ✅ 4c — Enforcement in `do_request` (DONE 2026-07-06)
+
+`Conn::user` (raw `User*`, forward-declared, set to `default` at accept). `KeySpec`
+enum + `CmdSpec::keys` filled in the init pass (default `FIRST`, ~30 exceptions).
+`acl_check(user, name, spec, cmd)` — override-then-category command gate + per-`KeySpec`
+key-pattern match via `glob_match`; called after the arity check in `do_request`. No
+behavior change (default user = `CAT_ALL`+`all_keys`) until 4d assigns restricted users.
+Fail-closed. Known simplifications (see Future ACL upgrades): `SMOVE` member over-checked,
+`OBJECT`/`MEMORY` key (at index 2) not key-gated.
 
 Insert the check in the existing flow (`commands.cpp:2896-2925`) right after the arity
 check and before `spec.fn(...)` — auth itself stays exempt exactly like the current
@@ -615,7 +631,34 @@ check and before `spec.fn(...)` — auth itself stays exempt exactly like the cu
 - (c) Pub/sub channel patterns — no-op stub until v8 exists; keep the field on `User`
   now so the config/parsing format doesn't need to change again later.
 
-#### 4d — `AUTH` 2-arg form + `ACL` commands
+#### 🔶 4d — `AUTH` 2-arg form + `ACL` commands (IN PROGRESS 2026-07-06)
+
+`do_auth` (`commands.cpp` ~1010) now handles both `AUTH <pass>` (implicit `default`
+user) and `AUTH <user> <pass>`, hashes once, wipes `cmd`'s copy of the plaintext via
+`secure_zero`, matches against any of the target user's `pw_hashes` via `ct_equal`, and
+runs a dummy `ct_equal` against a fixed-length placeholder on a missing/disabled user
+so username validity doesn't leak via timing. **Bug found + fixed this session:** a
+copy of the password (`std::string pass`) made during arg parsing was never wiped —
+only `cmd`'s copy was — leaving one un-scrubbed plaintext copy alive until the
+function returned; needs a `secure_zero(&pass[0], pass.size())` added after hashing.
+
+`do_acl` is written (`commands.cpp:2893`) with `WHOAMI`/`USERS`/`CAT`/`GENPASS`/
+`SETUSER`/`DELUSER` sub-commands, `DELUSER` carefully redirecting any connected
+`Conn::user` pointers to `default` before erasing (same dangling-pointer hazard as
+4a's registry note) — but **`do_acl` is not yet registered in `k_cmd_table`**, so no
+`ACL` subcommand is actually reachable from a client yet; that one-line wiring is the
+next thing needed before any of this is testable end-to-end. `GETUSER`/`LIST` aren't
+implemented. Two bugs found + fixed this session in the rule parser
+(`acl_apply_rule`): a copy-paste pair of duplicated conditions (`-@cat` and `-cmd`
+deny rules both checked their `+`-prefixed sibling's condition instead of their own,
+making every deny-shaped rule silently unparseable) and a missing final `return
+false;` (undefined behavior on an unrecognized token). Also found + fixed: `GENPASS`
+had its `bits` assignment placed unreachably after a `return`, and the whole generator
+was nested under the optional-arg check so bare `ACL GENPASS` sent no reply at all.
+Still open, not yet fixed: `"allcomands"` typo in `acl_apply_rule` (missing an `m`,
+so the correctly-spelled Redis keyword never matches — only `+@all` works), and
+`resetkeys` doesn't clear `all_keys`, so a user with `allkeys` set retains full key
+access through a `resetkeys` call.
 
 - `do_auth` (`commands.cpp` ~1010) currently only handles `AUTH <pass>` against
   `g_config.password`. Extend to `AUTH <user> <pass>` (2-arg) vs `AUTH <pass>` (1-arg =
@@ -628,7 +671,17 @@ check and before `spec.fn(...)` — auth itself stays exempt exactly like the cu
   `conn->user->name`; `GENPASS` → random hex via the project's existing `mt19937_64` RNG
   (from the v5.3 review), not `rand()`.
 
-#### 4e — Per-`Conn` auth state
+#### 🔶 4e — Per-`Conn` auth state (IN PROGRESS 2026-07-06)
+
+`Conn::user` (`User *`) exists and is assigned at accept-time (points at `default`)
+and on successful `AUTH`. **Not yet done:** `Conn::authenticaded` was supposed to be
+*replaced* by the `nullptr`-means-unauthenticated convention, but both fields still
+coexist — `do_request`'s auth gate still checks `!conn->authenticaded`, not
+`!conn->user`. Side effect worth fixing alongside the removal: `server.cpp`'s
+accept-time setup unconditionally points every new connection's `conn->user` at
+`default` *before* any `AUTH`, regardless of whether a password is required — harmless
+today only because the separate `authenticaded` bool still gates dispatch, but it
+defeats the `nullptr` invariant the moment `authenticaded` is actually retired.
 
 - Replace `Conn::authenticaded` (`state.h:83`) with `User *user = nullptr;` — `nullptr`
   means unauthenticated. `do_request`'s `if (!conn->authenticaded)` (line 2912) becomes
@@ -708,6 +761,23 @@ memory-hard** KDF.
 - **TLS:** `openssl s_client` / `redis-cli --tls` handshake; mutual TLS with and without a
   client cert.
 
+### Future ACL upgrades (things we can do later)
+
+Deliberate simplifications taken during Step 4, safe to revisit once the core ACL works:
+
+- **Full Redis rule fidelity:** left-to-right, last-match-wins rule application instead
+  of our `allow_cats` bitset + `cmd_overrides` map. Enables `+@all -@dangerous +get`
+  ordering nuances we currently flatten.
+- **`KeySpec::SECOND`** (and general key-position lists) so `OBJECT`/`MEMORY` key args
+  (at `cmd[2]`) and `SMOVE`'s exact key set (`cmd[1..2]`, not the member) are key-gated
+  precisely instead of `NONE`/over-checked.
+- **Per-key read vs write patterns** (`%R~`, `%W~`) — Redis lets a user read some keys
+  and write others; we have one `key_patterns` list for all access.
+- **Pub/sub channel ACL** (`&pattern`) — the `User` field exists but is a no-op until v8.
+- **`nopass` users** + `ACL SETUSER` `sanitize-payload`, selectors (`(...)`), and
+  `ACL LOAD`/`ACL SAVE` from a dedicated `aclfile`.
+- **argon2/bcrypt** password hashing — already tracked as Step 6 (before TLS).
+
 ## v10 — Replication & HA
 
 - Master-replica: `PSYNC`, replication backlog, partial resync
@@ -769,6 +839,31 @@ honestly today (`raw`, `deque`, `hashtable`, `skiplist`).
 - Full `CONFIG GET/SET` coverage (today only `maxmemory` + `maxmemory-policy` are real) +
   `CONFIG REWRITE` to a `redis.conf`.
 - **RESP3** (`HELLO 3`) — maps, push frames, attributes; our parser/writers are RESP2 only.
+
+### Windows port
+
+Not a simple `#ifdef _WIN32` sprinkle over sockets/paths — the real work is that
+`fork()`-based BGSAVE/BGREWRITEAOF (v6) is the architectural centerpiece of
+persistence (copy-on-write snapshot while the parent keeps serving), and Windows has
+no `fork()` equivalent at all. A real port needs the background-snapshot mechanism
+redesigned to be portable *first* — e.g. a thread that takes an explicit copy of the
+dataset instead of relying on CoW, or a respawned child process with explicitly shared
+state — before anything else about a Windows build is worth doing.
+
+Once that's solved, the rest is comparatively mechanical:
+- `poll()` → `WSAPoll` (close analog, not identical semantics — re-check `EINTR`-
+  equivalent handling and non-blocking-connect edge cases).
+- Winsock2 needs explicit `WSAStartup`/`WSACleanup`; socket options
+  (`SO_REUSEADDR`/`TCP_NODELAY`) mostly map over but double-check semantics.
+- Thread pool: already `std::thread`-based if it isn't raw pthreads — check.
+- `SIGXFSZ`/`SIGPIPE` ignoring (v9 crash hardening) has no Windows equivalent; the
+  conditions they guard against (file-size limits, write-to-closed-socket) surface
+  differently there.
+- `fdatasync` → `FlushFileBuffers`; path separators, `dump.rdb`-relative-to-CWD
+  behavior, and the config file parser's path handling all need a look.
+
+Low priority, end-of-roadmap material — flagged here so it isn't forgotten, not
+because it's imminent.
 
 ### Correctness follow-ups (small, known)
 

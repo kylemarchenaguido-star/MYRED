@@ -186,7 +186,7 @@ list.h             intrusive list (connection timers)
 common.h           container_of, FNV hash
 client.cpp         a small RESP client (single-shot + REPL)
 stress_test.py     RESP test + benchmark harness
-ROADMAP.md         milestone roadmap and next steps
+docs/ROADMAP.md    milestone roadmap and next steps
 ```
 
 ## Acknowledgements

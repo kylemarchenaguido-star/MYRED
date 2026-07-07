@@ -2190,7 +2190,7 @@ def main():
                     help="server password (if auth is enabled)")
     ap.add_argument("--correctness-only", action="store_true")
     ap.add_argument("--stress-only",      action="store_true")
-    ap.add_argument("--log",              default="stress_results.md",
+    ap.add_argument("--log",              default="docs/stress_results.md",
                     help="write a copy of all output here (ANSI stripped); "
                          "pass --log '' to disable")
     args = ap.parse_args()

@@ -1008,21 +1008,45 @@ static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out){
 
 // Authenticate 
 static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (g_config.password.empty()){
-    return resp_err(out, "ERR no password configured");
+  std::string uname, pass;
+  // AUTH <pass>
+  if (cmd.size() == 2){ uname = "default"; pass = cmd[1]; }
+  //AUTH <user> <pass>
+  else if (cmd.size() == 3){ 
+    uname = cmd[1];
+    pass = cmd[2];
+  } else { return resp_err(out, "ERR wwrong number of arguments for 'auth' command"); }
+
+  // we hash once
+  std::string h = sha256_hex(pass);
+  // wipe plaintext
+  secure_zero(&cmd[cmd.size() - 1][0], cmd[cmd.size() - 1].size());
+
+  // timing equalizer
+  static const std::string k_dummy(64, '0');
+  auto it = g_config.users.find(uname);
+  bool ok = false;
+
+  if (it != g_config.users.end() && it->second.enable){
+    for (const std::string &stored : it->second.pw_hashes){
+      // match any rotation
+      if (ct_equal(h, stored)){ ok = true; break; }
+    }
+  } else {
+    // don't leak "user exists" via timing
+    (void)ct_equal(h, k_dummy);
   }
-  // hash input, constant time compare
-  bool ok = ct_equal(sha256_hex(cmd[1]), g_config.password);
-  // wipe plain text from the request
-  secure_zero(&cmd[1][0], cmd[1].size());
+
   if (ok){
+    // assign the acl identity
+    conn->user = &it->second;
     conn->authenticaded = true;
     conn->failed_attemps = 0;
     return resp_ok(out);
   }
   conn->failed_attemps++;
   if (conn->failed_attemps >= k_max_failed_auth){ conn->want_close =true; }
-  return resp_err(out, "ERR invalid password");
+  return resp_err(out, "WRONGPASS invalid username-password pair or user is disabled");
 }
 
 // SAVE - Do save - stays blocking
@@ -2763,6 +2787,13 @@ static bool free_memory_if_needed(){
   return g_data.used_memory <= g_config.maxmemory;
 }
 
+enum class KeySpec : uint8_t {
+  NONE,
+  FIRST,
+  ALL_FROM_1,
+  STRIDE2_FROM_1
+};
+
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
 
 struct CmdSpec {
@@ -2772,7 +2803,198 @@ struct CmdSpec {
   bool is_write = false;
   bool aof_rewrite = false; // can't be logged verbatim- needs TTL translation
   uint64_t acl_cats = 0; // filled by acl_init_categories() at boot
+  KeySpec keys = KeySpec::FIRST;
 };
+
+
+static bool acl_key_allowed(const User *u, const std::string &key){
+  for (const std::string &pat : u->key_patterns){
+    if (glob_match(pat.data(), pat.size(), key.data(), key.size())){ return true; }
+  }
+  return false;
+}
+
+// nullptr = allowed, otherwise a NOPERM message
+static const char *acl_check(const User *u, const std::string &name, 
+                             const CmdSpec &spec, const std::vector<std::string> &cmd){
+  if (!u || !u->enable){ return "NOPERM this user is disable"; }
+
+  // (a) command permission: explicit +cmd/-cmd override wins, else category grant
+  auto ov = u->cmd_overrides.find(name);
+  bool ok = (ov != u->cmd_overrides.end()) ? ov->second 
+                                           : ((spec.acl_cats & u->allow_cats) != 0);
+  if (!ok){ return "NOPERM this user has no permissions to run this command"; }
+
+  // (b) key patterns (skipped for all_keys users and no key commands)
+  if (!u->all_keys){
+    const char *kdeny = "NOPERM no permissions to access one of the keys used as arguments";
+    switch (spec.keys){
+      case KeySpec::NONE: break;
+      case KeySpec::FIRST: 
+        if (cmd.size() > 1 && !acl_key_allowed(u, cmd[1])){ return kdeny; }
+        break;
+      case KeySpec::ALL_FROM_1:
+        for (size_t i = 1; i < cmd.size(); ++i){
+          if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
+        }
+        break;
+      case KeySpec::STRIDE2_FROM_1:
+        for (size_t i = 1; i < cmd.size(); i += 2){
+          if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
+        }
+        break;
+    }
+  }
+  return nullptr; 
+}
+
+static uint64_t acl_cat_bit(const std::string &n){
+  if (n == "read"){ return CAT_READ;}             if (n == "write"){ return CAT_WRITE; }
+  if (n == "keyspace"){ return CAT_KEYSPACE; }    if (n == "admin"){ return CAT_ADMIN; } 
+  if (n == "dangerous"){ return CAT_DANGEROUS; }  if (n == "fast"){ return CAT_FAST; }
+  if (n == "slow"){ return CAT_SLOW; }            if(n == "connection"){ return CAT_CONNECTION; }
+  if (n == "all"){ return CAT_ALL; }              return 0;
+}
+
+// apply one SETUSER modifier; false on parse error
+static bool acl_apply_rule(User &u, const std::string &t){
+
+  if (t == "on"){ u.enable = true; return true; }
+  if (t == "off"){ u.enable = false; return true; }
+  // clears everything (name reset by caller)
+  if (t == "reset"){ u = User(); u.name.clear(); return true; }
+  if (t == "resetpass"){ u.pw_hashes.clear(); return true; }
+  if (t == "resetkeys"){ u.key_patterns.clear(); return true; }
+
+  if (t == "allkeys" || t == "~*"){ u.all_keys = true; u.key_patterns.clear(); return true; }
+
+  if (t == "allcommands" || t == "+@all"){ u.allow_cats = CAT_ALL; u.cmd_overrides.clear(); return true; }
+  if (t == "nocommands" || t == "-@all"){ u.allow_cats = 0; u.cmd_overrides.clear(); return true; }
+
+  if (t.size() > 1 && t[0] == '>'){ u.pw_hashes.push_back(sha256_hex(t.substr(1))); return true; }
+  if (t.size() > 1 && t[0] == '<'){ std::string h = sha256_hex(t.substr(1));
+  u.pw_hashes.erase(std::remove(u.pw_hashes.begin(), u.pw_hashes.end(), h), u.pw_hashes.end()); return true; }
+
+  if (t.size() > 1 && t[0] == '~'){ u.key_patterns.push_back(t.substr(1)); return true; }
+
+  if (t.rfind("+@", 0) == 0){ uint64_t b = acl_cat_bit(t.substr(2)); if (!b){ return false; } 
+  u.allow_cats |= b; return true; }
+  if (t.rfind("-@", 0) == 0){ uint64_t b = acl_cat_bit(t.substr(2)); if (!b){ return false; } 
+  u.allow_cats &= ~b; return true; }
+
+  if (t.size() > 1 && t[0] == '+'){ std::string c = t.substr(1); for (char & ch : c){ ch = (char)tolower((unsigned char)ch); }
+  u.cmd_overrides[c] = true; return true; }
+  if (t.size() > 1 && t[0] == '-'){ std::string c = t.substr(1); for (char & ch : c){ ch = (char)tolower((unsigned char)ch); }
+  u.cmd_overrides[c] = false; return true; }
+
+  return false;
+}
+
+static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  std::string sub = cmd[1];
+  for (char &c : sub){ c = (char)tolower((unsigned char)c); }
+
+  if (sub == "whoami"){
+    return resp_str(out, conn->user->name.data(), conn->user->name.size());
+  }
+
+  if (sub == "users"){
+    resp_arr(out, (uint32_t)g_config.users.size());
+    for (auto &kv : g_config.users){ resp_str(out, kv.first.data(), kv.first.size()); }
+    return; 
+  }
+
+  if (sub == "cat"){
+    static const char *cats[] = {"read", "write", "keyspace", "admin", "dangerous", "fast", "slow", "connection" };
+    for (const char *c : cats){ resp_str(out, c, strlen(c)); }
+    return; 
+  }
+
+  if (sub == "genpass"){
+    int bits = 256;
+    if (cmd.size() >= 3){ 
+      int64_t b = 0;
+      if (!str2int(cmd[2], b) || b < 1 || b > 4096){ 
+        return resp_err(out, MSG_SYNTAX); 
+      }
+      bits = (int)b;
+    }
+    int nhex = (bits + 3) / 4;
+    static const char *hx = "0123456789abcdef";
+    std::string s; s.reserve(nhex);
+    for (int i = 0; i < nhex; ++i){ s += hx[rand_idx(16)]; }
+    return resp_str(out, s.data(), s.size());
+  }
+
+
+  if (sub == "setuser"){
+    if (cmd.size() < 3){ return resp_err(out, "ERR wrong number of arguments for 'acl|setuser'"); }
+    // create if absent, stable address
+    User &u = g_config.users[cmd[2]];
+    // new user. disable, no perms, no keys
+    if (u.name.empty()){ u.name = cmd[2]; }
+    for (size_t i = 3; i < cmd.size(); ++i){
+      if (!acl_apply_rule(u, cmd[i])){
+        return resp_err(out, ("ERR Error in ACL SETUSER modificer '" + cmd[i] + "'").c_str());
+      }
+    }
+    if (u.name.empty()){ u.name = cmd[2]; }
+    return resp_ok(out);
+  }
+
+  if (sub == "deluser"){
+    if (cmd.size() < 3){ return resp_err(out, "ERR wrong number of arguments for 'acl|deluser'"); }
+    if (cmd[2] == "default"){ return resp_err(out, "ERR the 'default' user cannot be removed"); }
+    auto it = g_config.users.find(cmd[2]);
+    if (it == g_config.users.end()){ return resp_int(out, 0); }
+    User *victim = &it->second;
+    User *fallback = &g_config.users["default"];
+    // critical: no dangling Conn::user
+    for (Conn *c : g_data.fd2conn){
+      if (c && c->user == victim){ 
+        c->user = fallback;
+        c->authenticaded = false;
+        c->want_close = true;
+      }
+    }
+    g_config.users.erase(it);
+    return resp_int(out, 1);
+  }
+
+  if (sub == "getuser"){
+    if (cmd.size() < 3){ return resp_err(out, "ERR wrong number og arguments for 'acl|getuser'"); }
+    auto it = g_config.users.find(cmd[2]);
+    if (it == g_config.users.end()){ return resp_nil(out); }
+    const User &u = it->second;
+    resp_arr(out, 6);
+    resp_str(out, "flags", 5);
+    resp_str(out, u.enable ? "on" : "off", u.enable ? 2 : 3);
+    resp_str(out, "commands", 8);
+    { std::string c = (u.allow_cats == CAT_ALL ?  "+@all" : (u.allow_cats ? "+<cats>" : "-@all")); 
+      resp_str(out, c.data(), c.size()); }
+    resp_str(out, "keys", 4);
+    { std::string k = u.all_keys ? "~*" : ""; 
+      for (auto &p : u.key_patterns){ k += (k.empty() ? "" : " ") + ("~" + p); }
+      resp_str(out, k.data(), k.size()); }
+    return;
+  }
+
+  if (sub == "list"){
+    resp_arr(out, (uint32_t)g_config.users.size());
+    for (auto &kv : g_config.users){
+      const User &u = kv.second;
+      std::string line = "user " + kv.first + (u.enable ? " on" : " off")
+                       + (u.pw_hashes.empty() ? " nopass" : " #<hash>")
+                       + (u.all_keys ? " ~*" : "")
+                       + (u.allow_cats == CAT_ALL ? " +@all" : "");
+      resp_str(out, line.data(), line.size());                
+    }
+    return;
+  }
+  return resp_err(out, "ERR Unknown ACL subcommand or wrong number of arguments");
+}
+
+static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware
 
 static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   // strings
@@ -2878,6 +3100,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"config",       {do_config,        2, -1}},
   {"memory",       {do_memory,        2, -1}},
   {"object",       {do_object,        2, -1}},
+  {"acl",          {do_acl_placeholder, 2, -1}},
 };
 
 // Commands that can only free or leave memory unchanged are never denied under
@@ -2925,6 +3148,12 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return resp_err(out, "ERR wrong number of arguments");
   }
 
+  if (const char *deny = acl_check(conn->user, cmd[0], spec, cmd)){
+    return resp_err(out, deny);
+  }
+
+  if (cmd[0] == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
+
   #ifndef NDEBUG
   mem_selfcheck(cmd[0].c_str());   // prints "[mem] drift..." if any handler mis-accounted
   #endif
@@ -2960,36 +3189,47 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 // Populate CmdSpec::Acl_cats once at boot, the @read/@write base is derived from the
 // existing is_write flag, simplified taxonomy vs redis
 void acl_init_categories(){
+  static const std::unordered_map<std::string_view, KeySpec> ks = {
+    // no key argument at all -> skip key checks (category-gated only)
+    {"ping",KeySpec::NONE}, {"info",KeySpec::NONE}, {"config",KeySpec::NONE},
+    {"dbsize",KeySpec::NONE}, {"randomkey",KeySpec::NONE},{"flushall",KeySpec::NONE},
+    {"flushdb",KeySpec::NONE}, {"save",KeySpec::NONE}, {"bgsave",KeySpec::NONE},
+    {"bgrewriteaof",KeySpec::NONE}, {"auth",KeySpec::NONE}, {"keys",KeySpec::NONE},
+    {"scan",KeySpec::NONE}, {"memory",KeySpec::NONE}, {"object",KeySpec::NONE},
+    {"acl", KeySpec::NONE},
+    // every arg from index 1 is a key
+    {"del",KeySpec::ALL_FROM_1}, {"unlink",KeySpec::ALL_FROM_1}, {"exists",KeySpec::ALL_FROM_1},
+    {"touch",KeySpec::ALL_FROM_1}, {"mget",KeySpec::ALL_FROM_1},
+    {"rename",KeySpec::ALL_FROM_1}, {"renamenx",KeySpec::ALL_FROM_1},
+    {"sinter",KeySpec::ALL_FROM_1}, {"sunion",KeySpec::ALL_FROM_1}, {"sdiff",KeySpec::ALL_FROM_1},
+    {"sinterstore",KeySpec::ALL_FROM_1}, {"sunionstore",KeySpec::ALL_FROM_1},
+    {"sdiffstore",KeySpec::ALL_FROM_1}, {"smove",KeySpec::ALL_FROM_1},
+    // key value key value ...
+    {"mset",KeySpec::STRIDE2_FROM_1},{"msetnx",KeySpec::STRIDE2_FROM_1},
+  };
+
+    // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
   static const std::unordered_map<std::string_view, uint64_t> extra = {
-    // connection
-    {"auth", CAT_CONNECTION},          {"ping", CAT_CONNECTION | CAT_FAST},
-    // admin / dangerous server ops
-    {"config", CAT_ADMIN | CAT_DANGEROUS},   {"info",   CAT_ADMIN | CAT_DANGEROUS},
-    {"save",   CAT_ADMIN | CAT_DANGEROUS},   {"bgsave", CAT_ADMIN},
-    {"bgrewriteaof", CAT_ADMIN},             {"memory", CAT_ADMIN | CAT_SLOW},
-    // keyspace-wide / dangerous
-    {"flushall", CAT_KEYSPACE | CAT_DANGEROUS}, {"flushdb", CAT_KEYSPACE | CAT_DANGEROUS},
-    {"keys",     CAT_KEYSPACE | CAT_DANGEROUS | CAT_SLOW},
-    // generic keyspace management
-    {"del", CAT_KEYSPACE},      {"unlink", CAT_KEYSPACE},    {"exists", CAT_KEYSPACE},
-    {"type", CAT_KEYSPACE},     {"rename", CAT_KEYSPACE},    {"renamenx", CAT_KEYSPACE},
-    {"touch", CAT_KEYSPACE},    {"scan", CAT_KEYSPACE},      {"dbsize", CAT_KEYSPACE},
-    {"randomkey", CAT_KEYSPACE},{"object", CAT_KEYSPACE | CAT_SLOW},
-    {"expire", CAT_KEYSPACE},   {"pexpire", CAT_KEYSPACE},   {"expireat", CAT_KEYSPACE},
-    {"pexpireat", CAT_KEYSPACE},{"ttl", CAT_KEYSPACE},       {"pttl", CAT_KEYSPACE},
-    {"persist", CAT_KEYSPACE},
+    {"acl",     CAT_ADMIN | CAT_DANGEROUS},
+    {"config",  CAT_ADMIN | CAT_DANGEROUS},
+    {"save",    CAT_ADMIN | CAT_DANGEROUS}, {"bgsave", CAT_ADMIN | CAT_DANGEROUS},
+    {"bgrewriteaof", CAT_ADMIN | CAT_DANGEROUS},
+    {"flushall",CAT_KEYSPACE | CAT_DANGEROUS}, {"flushdb", CAT_KEYSPACE | CAT_DANGEROUS},
+    {"keys",    CAT_KEYSPACE | CAT_DANGEROUS | CAT_SLOW},
+    {"scan",    CAT_KEYSPACE | CAT_SLOW},
+    {"dbsize",  CAT_KEYSPACE}, {"randomkey", CAT_KEYSPACE},
+    {"del",     CAT_KEYSPACE}, {"unlink", CAT_KEYSPACE}, {"exists", CAT_KEYSPACE},
+    {"touch",   CAT_KEYSPACE}, {"rename", CAT_KEYSPACE}, {"renamenx", CAT_KEYSPACE},
+    {"ping",    CAT_CONNECTION}, {"auth", CAT_CONNECTION},
+    {"info",    CAT_ADMIN},     {"memory", CAT_ADMIN}, {"object", CAT_ADMIN},
   };
 
   for (auto &kv : k_cmd_table){
     CmdSpec &s = kv.second;
-    s.acl_cats = s.is_write ? CAT_WRITE : CAT_READ;
-    auto it = extra.find(kv.first);
-    if (it != extra.end()){ s.acl_cats |= it->second; }
+    s.acl_cats = s.is_write ? CAT_WRITE : CAT_READ; // base axis
+    auto eit = extra.find(kv.first);
+    if (eit != extra.end()){ s.acl_cats |= eit->second; } // OR the extra bits
+    auto kit = ks.find(kv.first);
+    s.keys = (kit != ks.end()) ? kit->second : KeySpec::FIRST;
   }
-  // fprintf(stderr, "acl: set=%#llx keys=%#llx config=%#llx\n",
-  //   (unsigned long long)k_cmd_table["set"].acl_cats,
-  //   (unsigned long long)k_cmd_table["keys"].acl_cats,
-  //   (unsigned long long)k_cmd_table["config"].acl_cats);
-// expect: set has WRITE bit; keys has READ|KEYSPACE|DANGEROUS|SLOW; config has READ|ADMIN|DANGEROUS
-
 }

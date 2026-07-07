@@ -85,6 +85,16 @@ enum class CfgResult {
   BADVALUE
 };
 
+struct User {
+  uint64_t allow_cats = 0; // granted category bits
+  std::unordered_map<std::string, bool> cmd_overrides; // explicit +cmd / -cmd
+  std::vector<std::string> pw_hashes; // SHA-256 digets; AUTH matches any (rotation)
+  std::vector<std::string> key_patterns; // glob patterns for reacheable keys
+  std::string name;
+  bool enable = true;
+  bool all_keys = false; // ~* : any key
+ };
+
 // Connections state and buffers 
 struct Conn {
   // Hot metadata: checked every event-loop iteration (fits in first cache line)
@@ -101,6 +111,7 @@ struct Conn {
   // 40 bytes total above → Buffer needs align 8, no padding needed
   Buffer incoming;
   Buffer outgoing;
+  User *user = nullptr; 
 };
 
 // global hashtable
@@ -145,16 +156,6 @@ struct SaveCondition {
   uint64_t seconds; // window lenght
   uint32_t changes; // min writes within that window
 };
-
-struct User {
-  std::string name;
-  bool enable = true;
-  std::vector<std::string> pw_hashes; // SHA-256 digets; AUTH matches any (rotation)
-  uint64_t allow_cats = 0; // granted category bits
-  std::unordered_map<std::string, bool> cmd_overrides; // explicit +cmd / -cmd
-  std::vector<std::string> key_patterns; // glob patterns for reacheable keys
-  bool all_keys = false; // ~* : any key
- };
 
 //global config
 struct Config {
@@ -272,3 +273,4 @@ bool ip_is_loopback(uint32_t peer_host); // 127.0.0.0/8
 bool ip_allowed(uint32_t peer_host); // allowlist check 
 
 void acl_bootstrap_default(); // (re)build the built in default user from require pass
+void acl_init_categories();

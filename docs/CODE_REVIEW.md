@@ -12,563 +12,80 @@ Severity legend:
 
 ---
 
-## 0. Critical bugs (fix first)
-
-| # | Location | Problem |
-|---|----------|---------|
-| C1 | `heap.cpp:43` | `heap_down` right-child check reads `a[l].val` instead of `a[r].val`, and never updates `min_val` when it picks the right child. The min-heap invariant breaks → TTL keys expire in the wrong order (some early, some never until a later op reshuffles the heap). |
-| C2 | `commands.cpp:2060` | `do_srandmember` positive-count path: `resp_str(out, members[i].data(), members.size())` passes the **vector length** as the string length instead of `members[i].size()`. Out-of-bounds read → sends garbage / can crash. |
-| C3 | `commands.cpp:2007` | `do_spop` with `count == 0`: `resp_err(out, 0)` passes `NULL` as the message → `strlen(NULL)` inside `resp_err` → crash. Redis returns an empty array here. Should be `resp_arr(out, 0)`. |
-| C4 | `state.cpp:77` | `entry_del_sync` for `T_SET` calls `set_clear(&ent->hash)` — wrong field. Must be `set_clear(&ent->set)`. It clears the (empty) hash HMap and **leaks every set member**, while the real set table is freed only by `hm_clear` inside `set_clear` that never runs on it. Memory corruption/leak on every set deletion. |
-
-These four should be the first commit of the refactor; they are outright defects, not style.
-
----
-
-## 1. `state.cpp` / `state.h`
-
-🟠 **`entry_del` never offloads to the thread pool** — `state.cpp:59-65`
-```cpp
-size_t set_size = 0;
-if ((ent->type == T_ZSET)){ hm_size(&ent->zset.hmap);}   // return value discarded
-else if ((ent->type == T_SET)){ hm_size(&ent->set); }    // return value discarded
-...
-if (set_size > k_large_container_size){ /* never true */ }
-```
-`set_size` is computed but the result is thrown away, so it stays `0` and the
-large-container branch is dead. Every delete is synchronous, including
-million-element sets — that stalls the single-threaded event loop. Fix: assign
-the result (`set_size = hm_size(...)`). Also handle `T_HASH` and `T_DLIST`
-(`entry_deque(ent).count`), which are not measured at all. *Why:* the whole point of
-`entry_del` vs `entry_del_sync` is non-blocking deletion of big containers; right
-now that split does nothing.
-
-🔵 **`Entry` carries every type's storage at once** — `state.h:88-101`
-```cpp
-struct Entry {
-  ...
-  std::string str;   // T_STR
-  ZSet zset;         // T_ZSET
-  Deque deque;       // T_DLIST
-  HMap hash;         // T_HASH
-  HMap set;          // T_SET
-};
-```
-Every key — even a tiny string — allocates and default-constructs a `ZSet`, a
-`Deque`, and **two** `HMap`s. That is a large per-key memory and
-construction-time overhead across the whole keyspace. *Why / how:* make the value
-a tagged `union` (or `std::variant`) constructed per type, or hold a `void*`/
-`std::unique_ptr` to a type-specific payload. This is the single biggest memory
-win available and also removes the "which field is valid for this type" footguns
-that produced C4.
-
-🟡 **`expire_if_needed` reads the heap before checking emptiness is fine, but the magic `-1` is repeated everywhere** — `state.cpp:121-129`. The sentinel
-`(size_t)-1` for "no TTL" appears in ~20 call sites as a raw literal. Introduce
-`static constexpr size_t NO_TTL = (size_t)-1;` and a helper
-`bool entry_has_ttl(const Entry*)`. *Why:* one definition, no chance of a
-`-1` vs `(size_t)-1` signedness slip.
-
-⚪ **`heap_idx` is `size_t` initialized to `-1`** — `state.h:92`. `size_t heap_idx = -1;`
-relies on implicit wrap to `SIZE_MAX`. Works, but name the constant (above) and
-assign it explicitly.
-
-⚪ **Leading-space indentation / mixed style** — `state.cpp:1-4` lines begin with a
-stray space. Cosmetic but it signals the file was hand-patched; run
-clang-format across the project.
-
----
-
-## 2. `heap.cpp` / `heap.h`
-
-🔴 See **C1**. The corrected `heap_down` inner block:
-```cpp
-if (r < len && a[r].val < min_val){   // a[r], not a[l]
-    min_pos = r;
-    min_val = a[r].val;               // must update so a later swap is correct
-}
-```
-
-🟡 **No bounds/representation invariants are asserted** — a malformed
-`pos >= len` passed to `heap_update` indexes out of range. Add
-`assert(pos < len)` at the top of `heap_update`. *Why:* cheap guard for a data
-structure that backs expiry correctness.
-
-⚪ **`heap.h` exposes only `heap_update`** but `heap_delete`/`heap_upsert` live as
-`static` in `state.cpp`. That's fine, but a one-line comment in `heap.h` saying
-"insert/delete are implemented in state.cpp against `g_data.heap`" avoids the
-"where's the rest of the API" hunt.
-
----
-
-## 3. `hashtable.cpp` / `hashtable.h`
-
-🔵 **`h_foreach` rescans from bucket 0 every call; fine — but `hm_foreach` ignores the callback's `false` return across tables** — `hashtable.cpp:134-136`
-```cpp
-void hm_foreach(HMap *hmap, bool(*f)(HNode*,void*), void *arg){
-    h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
-}
-```
-The short-circuit works, but the function returns `void`, so callers that want
-early termination (none today) can't observe it. Either return `bool` or
-document that early-stop only happens within a single table. *Why:* every
-`cb_collect`-style callback returns `true` unconditionally today, so the
-early-exit capability is unused dead semantics — make it intentional.
-
-🟡 **`hm_help_rehashing` runs on every lookup/insert/delete** — `hashtable.cpp:78,87,110`.
-Correct, but each `hm_lookup` does up to `k_rehashing_work = 128` node moves.
-Under a read-heavy load during a resize this adds latency to reads. Consider
-amortizing rehash work only on writes, or lowering the per-call quota. *Why:*
-reads shouldn't pay write-side maintenance cost.
-
-⚪ **Comment noise** — `hashtable.cpp:122` `// what is this ?`, `:177` `// <---- magic`.
-The reverse-bit scan cursor is subtle and deserves a real one-paragraph
-explanation, not a "magic" tag. Keep the explanation, drop the self-deprecation.
-
-⚪ **`k_rehashing_work` / `k_max_load_factor` are file-scope non-`static` `const`** —
-`hashtable.cpp:48,97`. Give them internal linkage (`static constexpr`) or move to
-a named-constants header. *Why:* avoids ODR surprises if another TU ever defines
-the same name.
-
-⚪ **`str_hash` is named "FNV" but only mixes 32 bits** — `common.h:13-19`. `h` is
-`uint32_t`, returned widened to `uint64_t`. Buckets only need low bits so it's
-acceptable, but either compute a true 64-bit FNV-1a or rename to make the 32-bit
-nature explicit. *Why:* a reader expecting 64-bit dispersion (e.g. for future
-larger tables) would be misled.
-
----
-
-## 4. `resp.cpp` / `resp.h`
-
-🟠 **Partial bulk-string headers are rejected as malformed** — `resp.cpp:42`
-```cpp
-while (pos < size && data[pos] != '\r') { pos++; }
-if (pos + 1 >= size) { return -1; }   // <-- should be 'return 0' (need more)
-```
-When a `$<len>\r\n` header is split across two TCP segments, the parser returns
-`-1` ("bad RESP, close connection") instead of `0` ("need more data"). The
-array-header path (`:22`) and the body path (`:53`) correctly return `0`. *Why:*
-under real network fragmentation or pipelining, a client can be disconnected
-mid-command. This is a correctness bug masked by tests that send whole commands
-in one `write`.
-
-🟡 **`n_args` accumulation has no overflow guard** — `resp.cpp:25-31`. The
-per-bulk length loop checks `str_len > k_max_msg` *inside* the loop (`:49`), but
-the `n_args` loop has no equivalent bound, so `*999999999999\r\n` overflows
-`int32_t` (UB) before the `n_args > k_max_msg` check at `:31`. Bound it inside
-the digit loop like `str_len` is. *Why:* a hostile or buggy client can trigger
-signed-overflow UB in the parser — the #1 place you don't want UB.
-
-🟡 **No cap on total argument count vs. memory** — even with `k_max_msg` (32 MB)
-per element, an attacker can request `n_args` near 32M small strings and force a
-huge `cmd` vector. Consider a separate, smaller `k_max_args`. *Why:* request
-amplification / memory exhaustion.
-
-⚪ **Magic `sizeof("literal") - 1`** repeated — `resp.cpp:67,72,79,...`. Fine, but a
-tiny `buf_append_lit(out, "+OK\r\n")` macro/inline removes the `-1` boilerplate
-and the chance of an off-by-one.
-
----
-
-## 5. `buffer.cpp` / `buffer.h`
-
-🟡 **`buf_size` / `buf_data` take non-`const Buffer*`** — `buffer.h:20-21`. They only
-read. Make them `const`. *Why:* lets const-correct callers (and future read-only
-paths) use them, and documents intent.
-
-🟡 **`buf_consume` only reclaims space when the buffer fully drains** — `buffer.cpp:82-89`.
-For a long-lived connection that always has a little residual data, `data_begin`
-creeps forward and the next `buf_append` does a `memmove` to slide it back. That's
-the intended design, but on a pipelined stream it can mean repeated large
-`memmove`s. Consider compacting when `data_begin` passes the halfway mark. *Why:*
-avoids O(n) slides on steady pipelined traffic.
-
-⚪ **Dead code** — `buffer.cpp:66-68` commented-out `buf_append_u32`. Remove it.
-
-⚪ **`buf_append(Buffer*, uint8_t)` single-byte overload** allocates the same
-growth path for 1 byte. Fine, but the RDB writer calls it in tight loops
-(`buf_append(ctx->buf, 0)` etc.); a small-write fast path would help the
-serializer. 🔵
-
----
-
-## 6. `deque.cpp` / `deque.h`
-
-🟡 **`deque_get` bounds check is `==`, not `>=`** — `deque.cpp:67-69`
-```cpp
-const std::string *deque_get(const Deque *d, size_t idx){
-    if (idx == d->count){ return nullptr; }   // idx > count reads OOB
-    return &d->buf[deque_phys(d, idx)];
-}
-```
-Only the exact `idx == count` case is rejected; any `idx > count` indexes the
-ring buffer out of logical range. Today every caller pre-clamps, so it's latent,
-but it's a trap for the next caller. Use `if (idx >= d->count) return nullptr;`.
-*Why:* defense in depth for a primitive that returns a raw pointer.
-
-🔵 **`deque_grow` doubles but never shrinks** — after a list grows to 1M then
-pops down to 2 elements, the 1M-slot buffer is retained until the key is deleted.
-Consider halving when `count < cap/4`. *Why:* unbounded memory retention on
-churning lists.
-
-⚪ `deque.h:29` `deque_phys` is `inline` in the header (good) while
-`deque_grow`/push/pop are out-of-line; consistent, fine.
-
----
-
-## 7. `avl.cpp` / `avl.h` / `zset.cpp` / `zset.h`
-
-🟡 **`avl_offset` can walk off the tree on a bad offset** — `avl.cpp:141-168`. The
-loop trusts that `offset` is reachable; `znode_offset` callers pass arbitrary
-user offsets (ZQUERY). It does return `NULL` via the parentless branch, so it
-terminates — but the logic is dense and untested at the boundaries. Add a unit
-test for offset past both ends. *Why:* AVL rank math is the easiest place to get
-an off-by-one that only shows on specific tree shapes.
-
-🔵 **`do_zquery` materializes results into a `std::vector<ZQueryResult>` then
-emits** — `commands.cpp:731-749`. Necessary because RESP needs the count first.
-Fine, but for large `limit` you copy every name into a `std::string` twice (into
-the vector, then into the buffer). You can count first (`avl_cnt`/walk) then emit
-directly. *Why:* halves allocations on big range queries.
-
-⚪ **`min` redefined locally** — `zset.cpp:19-21` defines a `static size_t min(...)`
-shadowing `std::min`. Harmless but use `std::min`.
-
-⚪ **`zset_clear` order** — `zset.cpp:190-194` calls `hm_clear` then `tree_dispose`.
-Correct (nodes are freed via the tree, the HMap only holds intrusive nodes), but
-add a comment saying the HMap must be cleared first precisely because it does
-**not** own the nodes. *Why:* prevents a future "double free" edit.
-
----
-
-## 8. `hash.cpp` / `hash.h` / `set.cpp` / `set.h`
-
-These two pairs are near-duplicates (`HashNode{field,value}` vs `SetNode{member}`,
-plus `HKey`/`SKey`, `hnode_field_eq`/`snode_eq`, `cb_collect`/`cb_set_collect`,
-`hash_clear`/`set_clear`).
-
-🔵 / ⚪ **Deduplicate the intrusive-HMap-of-strings pattern.** A small templated
-helper (or a shared `kv_node`/`member_node` base with a comparator) would remove
-~60 lines of copy-paste and guarantee both stay in sync. *Why:* C4 (`set_clear`
-vs `hash` field mix-up) is exactly the class of bug that duplicated, almost-
-identical code invites.
-
-🟡 **`hash_set` / `set_add` recompute the hash twice on the create path** — they
-`str_hash` into the `HKey`, look up, miss, then build a node reusing
-`key.node.hcode` (good) — actually fine. But `hash_set`'s update path copies the
-value via `=`; for large values consider taking the value by value and moving.
-🔵 *Why:* avoids a copy on `HSET bigfield bigvalue`.
-
----
-
-## 9. `commands.cpp`
-
-### Correctness / bugs
-🔴 C2 (`:2060`), C3 (`:2007`) — see top table.
-
-🟠 **Misspelled error code breaks the RESP error contract** — `commands.cpp:1903`
-`resp_err(out, "WRONGTPE wrong type")`. Clients (and `redis-cli`) treat the first
-token as the machine-readable error code. `WRONGTPE` ≠ `WRONGTYPE`, so any client
-branching on the code mishandles it. *Why:* this is a protocol bug, not a typo —
-it changes observable behavior.
-
-🟡 **`do_lpop` / `do_rpop` delete with the wrong comparator** — `commands.cpp:973,993`
-```cpp
-hm_delete(&g_data.db, &ent->node, &entry_eq);   // everywhere else uses &hnode_same
-```
-`entry_eq` does `container_of(key, LookupKey, node)` on what is actually an
-`Entry*`. It only works because `Entry` and `LookupKey` share the same
-`{HNode node; std::string key;}` prefix layout, so the aliased `->key` read lands
-on the right bytes. This is fragile UB-adjacent aliasing. Use `&hnode_same`
-(pointer identity), as `do_srem`/`do_hdel`/`do_spop`/expiry all do. *Why:* a
-future field reorder in either struct silently corrupts deletes.
-
-🟡 **`expire_generic` / `expireat_generic` don't lazily expire first** —
-`commands.cpp:514-538`, `1758-1782`. They `hm_lookup` and then set a TTL without
-calling `expire_if_needed`. Setting a new TTL on a key that is already past its
-old TTL (but not yet reaped) effectively resurrects it. *Why:* `EXPIRE` on a
-logically-dead key should report `0`, not revive it.
-
-🟡 **`do_asyncdel` (UNLINK) only measures `T_ZSET`/`T_SET` for offload** —
-`commands.cpp:847-851`. Large `T_HASH` and `T_DLIST` always delete synchronously.
-Same root cause as the `entry_del` bug; unify the "is this container big?"
-decision into one helper used by both. *Why:* UNLINK on a huge hash/list blocks
-the loop, defeating its purpose.
-
-🟡 **`glob_match` has catastrophic backtracking** — `commands.cpp:1294-1353`. Each
-`*` recurses over every suffix split; a pattern like `a*a*a*a*a*b` against a long
-non-matching key is exponential. `KEYS`/`SCAN MATCH` with attacker-chosen
-patterns can hang the server. *Why:* a single `SCAN 0 MATCH '*a*a*a*...'` is a
-DoS. Use the classic two-pointer linear glob (track last-`*` backtrack point)
-instead of recursion.
-
-🟡 **`rand() % n` modulo bias + shared global RNG** — `do_randomkey:1682`,
-`do_spop:1998,2011`, `do_srandmember:2041,2055,2067`. `rand()` is low-quality and
-`% n` skews toward small values; also `rand()` is not thread-safe (the pool
-threads don't call it, so OK for now). *Why:* SPOP/SRANDMEMBER distribution is
-visibly nonuniform for large sets. Use `<random>` (`std::mt19937_64` +
-`uniform_int_distribution`) seeded once.
-
-### Correctness — smaller
-🟡 `do_spop` count-path: after `count == 0` is fixed, note `str2int` failure
-returns `resp_arr(out, 0)` (`:2005`) where Redis returns an error for a
-non-integer count. Minor parity gap.
-
-⚪ **`do_set` supports no options** — `commands.cpp:62-70`. Real `SET` has
-`EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET`. Now that `SETEX`/`SETNX`/`GETSET` exist
-separately, folding them into `SET` options would match Redis and remove
-duplicate handlers. Feature/clean-code.
-
-⚪ **`do_zadd` is single-member, no flags** — `commands.cpp:642-656`. Redis ZADD
-takes `[NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]`. Feature gap;
-note for a future ZSET parity pass.
-
-### Optimization
-🔵 **Dispatch is a ~110-branch `if/else if` string-compare chain** —
-`commands.cpp:2237-2415`. Every command does up to ~100 `std::string ==`
-comparisons plus a size check. Replace with a `static const
-std::unordered_map<std::string_view, Handler>` (or a perfect-hash/`switch` on a
-small command-id keyed on `cmd[0]`, with arity validated inside each handler or
-via a table of `{min_args, max_args, fn}`. *Why:* O(1) dispatch, and it removes
-the single largest and most error-prone function in the file (arity bugs like the
-`mset` odd-size check are easy to get wrong when buried in the chain).
-
-🔵 **`do_keys` uses `hm_foreach` (full O(N) scan, materializes all keys)** —
-`commands.cpp:460-470`. On a large keyspace this blocks the event loop and
-buffers every key. Document it as debug-only and steer clients to `SCAN`
-(already implemented). *Why:* one `KEYS` on a big DB freezes all clients.
-
-🔵 **Collect-then-emit allocates a `std::vector<std::string>` of copies** in
-`do_smembers`, `h_collect_reply`, `do_sscan`, `sunion_impl`, etc. The members are
-copied out of the nodes purely to count them, then copied again into the buffer.
-Where the count is known up front (`hm_size`), emit straight from the nodes via a
-callback that writes to the buffer. *Why:* halves allocations and copies on every
-bulk read.
-
-🔵 **`sunion_impl` dedups with sort+unique (O(N log N) + full copy)** —
-`commands.cpp:1860-1872`. A temporary `HMap`/`unordered_set` membership check is
-O(N) and avoids sorting. Minor unless unions are large.
-
-### Clean code
-⚪ **Inconsistent / typo'd error messages** throughout: `"WRONGTYPE wrong type"`
-vs `MSG_WRONGTYPE` vs
-`"WRONGTPE..."`; `"Opreation"`, `"excessds"`, `"maximun"`, `"succesfully"`. Define
-the standard messages once as named constants
-(`MSG_WRONGTYPE`, `MSG_NOT_INT`, …) and reuse. *Why:* consistency for clients and
-no more code-token typos (see the `WRONGTPE` bug).
-
-⚪ **Profanity / placeholder comments** — e.g. `:1491` `// bull ↑ and shit ↓`,
-`:1673` `(crazy this trash (garbage))`, `:1806` `// i am dumb asfck`, `:1320`
-`// what is this bomboclat ???`. Replace with real explanations or delete. *Why:*
-this is going public (README + ROADMAP committed); the comments undercut an
-otherwise serious project and obscure genuinely subtle code (the scan cursor, the
-glob char-class parser) that *does* need explaining.
-
-⚪ **`str2int` / `str2dbl` are defined at `:499`/`505` but forward-declared at
-`:72`** to be used by the new string handlers above them. Move the definitions up
-near the top (just after `lookup_entry`) so the forward decls can go away. *Why:*
-removes a declaration that has to be kept in sync.
-
-⚪ **`lookup_entry` destructively `swap`s the key out of `cmd[i]`** —
-`commands.cpp:23-47`. Several handlers had to learn this the hard way (SETNX,
-GETSET, MSET use a non-destructive `hm_lookup` copy specifically to avoid it).
-Document this contract in a comment on the function, or split into
-`lookup_entry` (non-destructive, takes `const std::string&`) and
-`lookup_or_create` (consumes the key). *Why:* the swap-then-empty behavior caused
-real bugs during the string-command work; make it impossible to misuse.
-
-⚪ **`KeyStats`/`KeysCtx`/`ScanCtx`/`HCollect`/`RandKeyCtx`/… callback-context
-structs** are declared inline next to each command. They're fine, but several are
-identical shapes (`{vector<string>*, const string* pattern}`); a single
-`CollectCtx` would serve SCAN/HSCAN/SSCAN.
-
----
-
-## 10. `server.cpp`
-
-🟡 **`next_timer_ms` clobbers the idle deadline with the IO deadline** —
-`server.cpp:128-131`
-```cpp
-if (!dlist_empty(&g_data.idle_list)){ next_ms = conn->last_active_ms + k_idle_timeout_ms; }
-if (!dlist_empty(&g_data.io_list )){ next_ms = conn->last_active_ms + k_io_timeout_ms; }  // overwrite
-```
-The second assignment overwrites rather than `std::min`-ing, so the idle timer is
-ignored whenever the IO list is non-empty. The heap/save checks below *do* use
-`std::min`. *Why:* poll can sleep too long and idle connections time out late.
-(Both timeouts are 30 s today so the symptom is hidden; it breaks the moment they
-differ.)
-
-🟠 **Connection counters are swapped** — `server.cpp:103,114` and `state.h:77-78`.
-`handle_accept` does `g_total_connections++`; `conn_destroy` does
-`g_total_connections--`. That makes `g_total_connections` a *current* gauge, not a
-lifetime total, and `INFO` reports it as `total_connections` (`commands.cpp:908`).
-Meanwhile `connected_clients` (the field meant for the live count) is **never
-updated** and `INFO` always prints 0 for it (`:907`). Fix: `total_connections`
-only ever increments; `connected_clients` is the one that ++/-- on
-accept/destroy. *Why:* both INFO numbers are currently wrong.
-
-🟡 **No `SO_REUSEADDR` on the listen socket** — `server.cpp:308-326`. Only
-`TCP_NODELAY` is set. After a restart the port sits in `TIME_WAIT` and `bind()`
-fails with "Address already in use". *Why:* every quick restart during
-development/ops fails to bind. Add `setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, …)`
-before `bind`.
-
-🟡 **`handle_accept` accepts exactly one connection per wakeup** —
-`server.cpp:357-359`. With many simultaneous connects, the backlog drains one per
-poll cycle. Loop `accept()` until `EAGAIN`. *Why:* connection-storm latency.
-
-🟡 **No `EINTR` retry on `read`/`write`** — `server.cpp:244,262`. Only `EAGAIN` is
-handled; an `EINTR` (signal) is treated as a fatal error and closes the
-connection. Retry on `EINTR`. *Why:* a `SIGCHLD` from the BGSAVE child (or
-`SIGINT`) landing mid-syscall can drop a client.
-
-🟡 **`fork()` + thread pool deadlock hazard** — `server.cpp:302` starts 8 pool
-threads; `rdb.cpp:829` forks for BGSAVE. If a pool thread holds the libc
-`malloc`/`stdio` lock at the instant of `fork()`, the child (which then calls
-`rdb_save` → `malloc`/`fprintf`) can deadlock, since only the forking thread
-survives in the child. *Why:* rare but real and very hard to debug. Mitigations:
-prepare the entire serialized snapshot buffer in the parent **before** forking and
-have the child only `write()` it (no malloc/stdio in the child), or quiesce the
-pool around the fork. This also makes BGSAVE point-in-time-consistent without COW
-surprises.
-
-⚪ **`addr.sin_port = ntohs(1234)`** — `server.cpp:317`. Should be `htons`. Works
-only because both are byte-swaps on this host. Same for
-`s_addr = ntohl(0)` (0 either way). *Why:* misleading; breaks if copied to a
-context with a non-zero address.
-
-⚪ **Port and password are hardcoded** — `server.cpp:288,317`. Move to a config
-file / CLI args / env (`redis.conf`-style is already on the roadmap). At minimum
-read `MYRED_PASSWORD`/`MYRED_PORT` env vars. *Why:* can't run two instances or
-change the secret without recompiling.
-
-⚪ **`g_data.fd2conn` grows to the largest fd and never shrinks**, and a linear
-scan over it builds `poll_args` each loop — `server.cpp:338-349`. Fine at small
-scale; for many connections, maintain a compact list. 🔵
-
-⚪ `msg_errno` format string `"[errno:%s\n]"` has the `\n` inside the brackets —
-cosmetic log oddity (`server.cpp:33`).
-
----
-
-## 11. `rdb.cpp` / `rdb.h`
-
-🟡 **The `.bak` recovery path is dead — backups are never written** —
-`rdb.cpp:357-361` (`rdb_save` just `rename(tmp, filename)`), but `rdb_load`
-(`:806-815`) tries `filename + ".bak"` on failure. Since nothing ever creates the
-`.bak`, the "recover from backup" logic can never fire. *Why:* the code advertises
-a safety net that doesn't exist. Either rename the old file to `.bak` before the
-final rename, or delete the dead recovery branch.
-
-🟡 **BGSAVE child always writes `"dump.rdb"`** — `rdb.cpp:838`. The hardcoded name
-ignores any future configurable path and diverges from `do_save`/`rdb_save`'s
-`filename` parameter. *Why:* a configurable dump path (roadmap) will silently not
-apply to BGSAVE.
-
-🟡 **`g_writes_since_save` reset only on success paths, set in two places** —
-`do_save` (`commands.cpp:812`) resets it directly; the periodic/BGSAVE path resets
-it in `rdb_check_background_save` (`rdb.cpp:867`). If a synchronous `SAVE` races a
-periodic trigger the bookkeeping can double-count. Centralize "a save just
-completed" into one function. *Why:* INFO `rdb_changes_since_save` accuracy and
-correct auto-save triggering.
-
-🟡 **Loader trusts `n_entries` and member counts from the file** — e.g.
-`rdb_load_zset_entry:495` loops `n_members` reading score+name. A corrupted (but
-CRC-valid, e.g. truncated-then-rewritten) count drives large allocations / long
-loops. The CRC check mitigates accidental corruption but not a crafted file.
-Bound counts against remaining bytes. *Why:* hardening for untrusted dump files.
-
-🔵 **Whole file is read into memory, then fully decompressed into another
-buffer, then parsed** — `rdb.cpp:716-792`. For large dumps this is 2–3× the file
-size resident at once. Streaming decompression would cap memory. Low priority.
-
-⚪ **Duplicate include** — `rdb.cpp:3` and `:5` both `#include "buffer.h"`.
-
-⚪ **`mono_expired_to_wall` name typo** ("expired" → "expiry") and the
-`int64_t remaining = (int64_t)(mono_expire - mono_now)` underflow-then-clamp is
-correct but worth a comment (`rdb.cpp:17-24`).
-
----
-
-## 12. `thread_pool.cpp` / `thread_pool.h`
-
-🟡 **No shutdown / join / destroy** — threads spin forever, `mu`/`not_empty` are
-never `pthread_*_destroy`'d, and there's no way to drain on exit. On `SIGINT` the
-process just exits with work possibly queued. *Why:* a queued large-container
-delete can be lost (acceptable on shutdown) but the missing shutdown also means
-you can't cleanly quiesce the pool around `fork()` (see the BGSAVE deadlock
-item). Add a `stop` flag + `pthread_cond_broadcast` + `join`.
-
-🟡 **`worker` has no exception guard** — if a `Work` function throws (some handlers
-allocate), the exception propagates out of `worker` → `std::terminate`. *Why:*
-one bad task kills a pool thread silently. Wrap `w.f(w.arg)` in try/catch or
-guarantee tasks are `noexcept`.
-
-⚪ **`assert(rv == 0)` for pthread init** disappears under `NDEBUG` (Release), so
-init failures are unchecked in the build you actually ship — `thread_pool.cpp:26-36`.
-Handle the error or `abort()` explicitly. *Why:* Release silently ignores a failed
-mutex init.
-
----
-
-## 13. `client.cpp`
-
-(Reviewed; it's a test/dev client, lower stakes.)
-
-⚪ Mirrors the server's RESP writing/parsing by hand — if `resp.*` were factored
-into a tiny shared library, the client could reuse the parser instead of a second
-implementation that can drift. 🔵/⚪
-
-🟡 Same partial-read consideration as the server parser applies if the client ever
-reads large multi-bulk replies in pieces — verify it loops on short reads.
-
----
-
-## 14. `common.h` / `list.h`
-
-⚪ **`container_of` uses the GCC statement-expression extension** —
-`common.h:8-10`. Works on gcc/clang (the project targets gnu++17), but it's
-non-standard. A `reinterpret_cast`-based `container_of` template is portable and
-type-checks the member. *Why:* portability + the template form catches
-wrong-type mismatches at compile time.
-
-⚪ `list.h` comments `// ? i gotta be dumb` / `// ?` — replace with what
-`dlist_init` (self-linking sentinel) actually does. The DList is correct; just
-document the circular-sentinel invariant.
-
----
-
-## 15. Cross-cutting / architecture
-
-1. 🔵 **Tagged-union value in `Entry`** (see §1) — biggest memory + safety win.
-2. 🔵 **Hash-map command dispatch** (see §9) — biggest per-command CPU win and
-   removes the most bug-prone function.
-3. 🟡 **One "is container large?" helper** shared by `entry_del`, `do_asyncdel`
-   (and any future eviction) — removes the duplicated, currently-broken size
-   logic.
-4. ⚪ **Named message/constant headers** — error strings, `NO_TTL` sentinel,
-   load-factor/rehash constants. Kills a whole class of typo/мagic-number bugs.
-5. 🟡 **Lazy expiry is not uniform** — `lookup_entry` applies it, but several
-   type-agnostic generic commands (`EXPIRE`, `EXPIREAT`) skip it. Route every
-   keyspace read through a single lookup that always expires first.
-6. 🟡 **RNG** — replace global `rand()` with a seeded `<random>` engine; fixes
-   modulo bias and is a prerequisite for ever moving randomized ops off-thread.
-7. ⚪ **Tooling** — the volume of typos, mixed indentation, and dead code says
-   there's no formatter/linter in the loop. Add `clang-format` + `clang-tidy` and
-   build with `-Wall -Wextra -Wshadow` (a shadowed `min`, discarded `hm_size`
-   results, and the `a[l]`/`a[r]` heap bug would likely have been flagged by
-   `-Wunused-result` / static analysis).
-8. 🟡 **Fuzz the RESP parser** — it's hand-written and is the single most exposed
-   attack surface; the two parser bugs above (partial-read, `n_args` overflow)
-   are exactly what a fuzzer finds in minutes.
-
----
-
-## Suggested order of work
-
-1. **C1–C4** (heap, srandmember OOB, spop NULL-deref, set_clear field) — pure defects.
-2. `entry_del` size bug + unify the large-container helper; fix `lpop/rpop`
-   comparator; fix `next_timer_ms`; fix connection counters; add `SO_REUSEADDR`.
-3. RESP parser hardening (partial reads, `n_args` overflow) + fuzz harness.
-4. `glob_match` linear rewrite (DoS) + `<random>` RNG.
-5. Architecture: tagged-union `Entry`, hash-map dispatch, named constants/messages.
-6. Cleanup pass: clang-format, comment cleanup, dead code, `.bak` path decision.
+## Post-v9 Backlog Audit — 2026-07-07
+
+This pass is a new audit addendum for work to do after the v9 security milestone.
+It focuses on robustness, persistence correctness, memory accounting, optimization,
+and code-shape issues that are worth tracking before the next large feature push.
+
+### 0. Highest-priority correctness items
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🔴 | `aof.cpp:225-250`, `commands.cpp:3151` | AOF replay builds a fake authenticated `Conn`, but never assigns `fake.user`. `do_request()` now runs `acl_check()` after the auth gate, so replayed commands can be rejected with `NOPERM` and silently not rebuild the dataset. | During `g_loading`, either set `fake.user = &g_config.users["default"]` or explicitly bypass ACL checks for trusted local replay. Add an AOF restart test after ACL is enabled. |
+| 🔴 | `aof.cpp:273-286` | `aof_check()` continues after `fopen()` failure and then calls `fseek()` on a null `FILE*`. The `fread()` condition is also inverted: a successful non-empty read is treated as "short read". | Return `false` immediately on open failure. Compare `fread(...) != (size_t)sz`, matching `aof_load()`. Add a `--check-aof` regression test with a valid non-empty file. |
+| 🔴 | `commands.cpp:2485-2518` | `SMOVE` can call `mem_reaccount(dst_ent)` while `dst_ent == nullptr` when moving from a multi-member source set into a missing destination. It also reaccounts the wrong entry: the source shrank, not the missing destination. | Reaccount `src_ent` after removal when it survives; create `dst_ent` before destination reaccounting. Add tests for `SMOVE src missing-dst member` with source size 1 and >1. |
+| 🔴 | `commands.cpp:966-1007`, `commands.cpp:3050` | `ZPOPMIN` mutates data but is registered without `is_write=true`. It will be categorized as read, skipped by AOF logging, skipped by write-side maxmemory/MISCONF gates, and its ACL category is wrong. | Mark the table row as write. Because it removes members, also make sure dirty counting and AOF replay cover it. |
+| 🟠 | `commands.cpp:326-367`, `commands.cpp:3170-3184` | `GETEX PERSIST` and future-time `GETEX EX/PX/EXAT/PXAT` change TTL state but do not increment `g_writes_since_save`. Because AOF logging is mutation-gated by that counter, these TTL updates are not logged or saved. Only the delete-on-past path bumps the counter. | Bump the dirty counter when TTL state changes. Keep bare `GETEX key` read-only. Add AOF/RDB restart tests for `GETEX key PX ...` and `GETEX key PERSIST`. |
+| 🟠 | `commands.cpp:837-850`, `commands.cpp:966-1007` | Sorted-set removals do not keep memory accounting stable. `ZREM` never calls `mem_reaccount()` and still leaves an empty zset key; `ZPOPMIN` reaccounts only on no-op or full key deletion, not when the zset survives with fewer members. | Reaccount surviving zsets after member removal and drop empty zsets consistently. This overlaps the roadmap's known `zrem` empty-key follow-up. |
+| 🟠 | `state.cpp:471-479` | `parse_cidr()` validates `bits`, which is still the default `32`, instead of validating `parsed`. Values like `/33` can pass validation and then shift by a negative amount in `0xFFFFFFFFu << (32 - bits)`. | Validate `parsed < 0 || parsed > 32` before assigning `bits`. Add config-load tests for `/0`, `/32`, `/33`, and `/-1`. |
+
+### 1. Persistence and durability hardening
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🟠 | `commands.cpp:1053-1064`, `server.cpp:655-664` | Configurable `dbfilename` is not honored everywhere. `SAVE` and shutdown still call `rdb_save("dump.rdb")`, while background save uses `g_config.dump_path`. `do_save()` also calls `rdb_on_save_complete()` after `rdb_save()` already did. | Route all save paths through `g_config.dump_path`. Keep save-completion bookkeeping in one place. |
+| 🟡 | `aof.cpp:135`, `aof.cpp:150-164` | AOF rewrite uses hardcoded `appendonly.aof.tmp`, even when `g_config.aof_path` points elsewhere. The final `rename()` return value is ignored, and the temp file may not be in the same directory as the target, which weakens atomic replacement. | Build the temp path beside `g_config.aof_path`, check every write/fsync/rename result, and leave the old AOF fd untouched if finalization fails. |
+| 🟡 | `aof.cpp:149-176` | If appending the rewrite delta fails before all bytes are written, the code still fsyncs, renames, repoints the fd, and reports success. | Track whether the full delta was appended. Treat short delta append, fsync failure, rename failure, or reopen failure as rewrite failure. |
+| 🟡 | `rdb.cpp:350-351`, `rdb.cpp:886-900` | RDB temp path construction uses fixed 256-byte stack buffers and `snprintf()` without checking truncation. A long configured dump path can produce a truncated temp filename. | Use `std::string tmp = filename + ".tmp." + pid` before fork-time handoff, or validate `snprintf()` length before use. |
+| 🟡 | `server.cpp:488-494` | Startup logs AOF load failure but continues serving with whatever partial state was loaded before failure. For a durability system, "failed to load appendonly.aof" should be a hard startup failure unless an explicit recovery flag is used. | Decide policy: fail fast on AOF load failure, or clearly document "best effort" recovery and add operator warnings. |
+
+### 2. ACL and config robustness
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🟠 | `commands.cpp:2822-2825`, `commands.cpp:3211-3231` | ACL category checks use "any overlapping bit grants access". Because `acl_init_categories()` derives `CAT_READ` or `CAT_WRITE` for every command and ORs extra bits on top, admin commands like `ACL` and `CONFIG` can be allowed by `+@read` unless separately denied. The `acl` key-spec is now correctly `NONE`, but the category gate is still too permissive. | Add required-category semantics for admin/dangerous commands, or stop giving those commands the broad read/write base bit. Test a user with only `+@read ~*`. |
+| 🟡 | `commands.cpp:1010-1023` | `do_auth()` copies the plaintext password into local `std::string pass` and wipes only the `cmd` copy. The local copy remains in memory until destruction and may keep capacity contents. | Hash directly from `cmd[...]` or call `secure_zero()` on `pass` before every return path after hashing. |
+| 🟡 | `state.cpp:128-147`, `state.cpp:185-190`, `server.cpp:474-476` | Several config/env parsers use `atoi()` or loose boolean checks. Inputs like `123abc`, `yesplease`, or unknown `MYRED_AOF` values can be accepted silently. | Create shared strict parsers for int ranges and yes/no booleans. Use them for file config, env overrides, and `CONFIG SET`. |
+| 🟡 | `commands.cpp:2557-2563` | `CONFIG SET` treats unknown directives as `+OK` because only `CfgResult::BADVALUE` is converted to an error. That preserves old tooling compatibility, but it makes real runtime config misleading once v9 depends on it. | Either return an error for `CfgResult::UNKNOWN` after v9, or explicitly keep a compatibility allowlist for known Redis probes. |
+| 🟡 | `state.cpp:303-319` | `CONFIG REWRITE` serializes only a subset of live config. It drops `bind`, `protected-mode`, `allow-ip`, ACL users, AOF rewrite knobs, LFU knobs, and any future TLS/security settings. | Treat rewrite as incomplete until the config table is centralized. Post-v9, prefer a directive registry with get/set/rewrite callbacks. |
+| ⚪ | `commands.cpp:2964-2994` | `ACL GETUSER` / `ACL LIST` report lossy placeholders like `+<cats>` and `#<hash>`, so they cannot round-trip the configured user state. | This matches the roadmap's design-decision note. Store raw ACL rule tokens alongside compiled permissions if faithful output becomes important. |
+
+### 3. Parser and protocol robustness
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🟡 | `resp.cpp:71-75` | RESP bulk length accumulation can signed-overflow before the `str_len > k_max_msg` check runs. `n_args` has a pre-multiply guard; bulk length should match that pattern. | Guard before multiply/add, or parse into `uint64_t` with a max check at every digit. Fuzz this parser. |
+| 🟡 | `commands.cpp:49-52` | `str2int()` ignores `errno`, so `strtoll()` overflow is accepted as `LLONG_MAX` or `LLONG_MIN`. TTL math and numeric commands then operate on clamped values as if the input was valid. | Clear/check `errno == ERANGE`; reject overflows. Consider one shared `parse_i64()` helper for config and command args. |
+| 🟡 | `commands.cpp:352-355`, `commands.cpp:2699-2725` | TTL conversions multiply user-controlled seconds by `1000` without overflow checks in live handlers and AOF rewrite translation. | Add `mul_overflow` / range checks before converting seconds to milliseconds. Reject impossible timestamps consistently. |
+| 🟡 | `resp.cpp:16-39` | Inline protocol support splits only on whitespace. This is enough for `PING_INLINE`, but it does not support Redis inline quoted strings or escapes. | Fine for benchmark compatibility, but document the subset or implement quoted inline parsing if interactive compatibility matters. |
+
+### 4. Memory accounting and eviction follow-ups
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🟡 | `state.cpp:436-443` | `mem_reaccount()` relies on the invariant `used_memory >= ent->mem`. A missed reaccount can make the later subtract underflow in release builds. Debug self-check detects drift, but not underflow. | Add a release-safe guard or assertion strategy around subtraction. Make memory drift tests cover every mutating command family. |
+| 🟡 | `commands.cpp:2202-2214` | `SADD` bumps dirty state and logs to AOF even when all members already exist. Similar no-op write inflation exists in a few handlers. | Track whether the command actually changed state before bumping `g_writes_since_save`. This keeps AOF cleaner and auto-save triggers meaningful. |
+| 🟡 | `commands.cpp:2452-2482` | `SINTERSTORE` / `SUNIONSTORE` / `SDIFFSTORE` always leave a destination set entry, even when the result is empty. Redis deletes the destination for empty store results. | Decide whether to match Redis. If yes, delete the destination when result size is zero and return `0`. |
+| 🔵 | `state.cpp:358-380` | `entry_mem_usage()` walks entire aggregate values. That is correct for exact accounting, but expensive when every write to a large collection calls `mem_reaccount()`. | Long-term: maintain per-container memory deltas at mutation sites, or store aggregate byte totals inside `EntryHash`/`EntrySet`/`ZSet`/`Deque`. |
+| 🔵 | `commands.cpp:2759-2787` | Eviction runs up to 100 victims synchronously in the write path. A keyspace with many small keys over the limit can still stall one command. | Consider budgeting by elapsed time or bytes freed per command, then returning OOM if the budget is exhausted. |
+
+### 5. Performance and code-shape improvements
+
+| Severity | Location | Problem | Suggested direction |
+|---|---|---|---|
+| 🔵 | `commands.cpp:2163-2174` | `SUNION` deduplicates by collecting all members, sorting, then unique-ing. This is O(N log N) and copies every string. | Use a temporary HMap/string set for O(N) dedupe, or emit through a scratch `EntrySet`-like structure. |
+| 🔵 | `commands.cpp:2286-2377` | `SPOP` and `SRANDMEMBER` collect every set member into a vector before sampling. That is expensive for large sets when only one or a few members are needed. | Add HMap random sampling or reservoir helpers for nested set HMaps. Reuse the keyspace random sampler idea. |
+| 🔵 | `commands.cpp:2078-2129`, `commands.cpp:2452-2482` | Set store commands compute into `std::vector<std::string>` and then insert into a new set, creating duplicate copies. | Build the destination set directly from the operation result, or use move-aware temporary nodes. |
+| 🔵 | `commands.cpp:888-963` | `ZQUERY` / `ZREVQUERY` copy results into a vector of `{string, double}` before emitting. RESP needs the count first, but the count can often be derived with a bounded walk before emission. | Two-pass count+emit can avoid storing all returned member names. Keep the vector path if the second tree walk costs more in practice. |
+| 🔵 | `commands.cpp:1118-1188` | `INFO` does an O(N) keyspace scan every call for key counts and TTL counts. On a large DB this can become an observability-induced stall. | Maintain live key counters by type/TTL, or make expensive counts optional. |
+| ⚪ | `hash.cpp:6-18` | `hash_set()` takes `const std::string value` and then `std::move(value)`, which cannot move from a const object. It copies on both insert and update paths. | Take `std::string value` by value, then move into the node, or take `std::string_view`/`const std::string&` deliberately. |
+| ⚪ | `common.h:8-16` | The pointer-to-member `container_of()` avoids the old macro, but it computes offsets through a fake object in raw storage. This is still subtle enough to deserve either tests or a simpler standard-layout-only implementation. | If all intrusive nodes are standard-layout, use an `offsetof`-style helper with explicit constraints and static assertions. |
+
+### Suggested post-v9 audit/test order
+
+1. Persistence correctness: AOF replay with ACL enabled, `--check-aof`, `GETEX` TTL replay, `ZPOPMIN` replay.
+2. Crashers/accounting: `SMOVE` missing destination, `ZREM`/`ZPOPMIN` memory drift, CIDR bad prefixes.
+3. Config/security semantics: strict parsers, `CONFIG SET UNKNOWN`, ACL admin-category gating, `AUTH` plaintext wiping.
+4. Path correctness: `dbfilename`, `appendfilename`, rewrite temp files, shutdown save path.
+5. Performance passes: set sampling, set algebra dedupe, exact memory reaccount cost, `INFO` O(N) counters.

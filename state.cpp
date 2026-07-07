@@ -117,6 +117,11 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
       // hash plaintext
       g_config.password = sha256_hex(args[0]);
     }
+    auto du = g_config.users.find("default");
+    if (du != g_config.users.end()){
+      du->second.pw_hashes.clear();
+      if (!g_config.password.empty()){ du->second.pw_hashes.push_back(g_config.password); }
+    }
     return CfgResult::OK;
   }
 
