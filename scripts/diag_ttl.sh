@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -u
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR" || exit 1
+
 CLI="redis-cli -p 1234 -a kek1234"
 pkill -x server 2>/dev/null; sleep 0.5
 rm -f appendonly.aof dump.rdb

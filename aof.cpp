@@ -225,7 +225,12 @@ bool aof_load(const char *path){
     // reply setup -> suppress re-logging, bypass auth, discard replies
     g_data.g_loading = true;
     Conn fake{};
-    fake.authenticaded = true;
+    // synthetic superuser so replay bypasses auth AND ACL — the log is trusted internal
+    User replay_user;
+    replay_user.name = "__aof_load__";
+    replay_user.enable = true;
+    replay_user.allow_cats = CAT_ALL;
+    fake.user = &replay_user;
     Buffer sink = buf_create(4096);
 
     // bytes consumed by fully parsed commands

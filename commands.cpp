@@ -1040,7 +1040,6 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (ok){
     // assign the acl identity
     conn->user = &it->second;
-    conn->authenticaded = true;
     conn->failed_attemps = 0;
     return resp_ok(out);
   }
@@ -2864,7 +2863,7 @@ static bool acl_apply_rule(User &u, const std::string &t){
   // clears everything (name reset by caller)
   if (t == "reset"){ u = User(); u.name.clear(); return true; }
   if (t == "resetpass"){ u.pw_hashes.clear(); return true; }
-  if (t == "resetkeys"){ u.key_patterns.clear(); return true; }
+  if (t == "resetkeys"){ u.key_patterns.clear(); u.all_keys = false; return true; }
 
   if (t == "allkeys" || t == "~*"){ u.all_keys = true; u.key_patterns.clear(); return true; }
 
@@ -2948,12 +2947,10 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
     auto it = g_config.users.find(cmd[2]);
     if (it == g_config.users.end()){ return resp_int(out, 0); }
     User *victim = &it->second;
-    User *fallback = &g_config.users["default"];
     // critical: no dangling Conn::user
     for (Conn *c : g_data.fd2conn){
       if (c && c->user == victim){ 
-        c->user = fallback;
-        c->authenticaded = false;
+        c->user = nullptr;
         c->want_close = true;
       }
     }
@@ -3133,7 +3130,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 
   // check authentication
-  if (!conn->authenticaded) {
+  if (!conn->user) {
     return resp_err(out, "NOAUTH authentication required");
   }
 

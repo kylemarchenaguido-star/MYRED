@@ -2,8 +2,9 @@
 
 MYRED is a from-scratch, single-threaded, RESP-speaking in-memory key–value
 database written in C++. It implements all five core Redis data types — strings,
-lists, hashes, sorted sets, and sets — plus key expiry, RDB persistence, and
-authentication. Because it speaks the real **RESP protocol**, you can talk to it
+lists, hashes, sorted sets, and sets — plus key expiry, RDB/AOF persistence,
+ACL-backed authentication, runtime config, and memory-limit policies. Because it
+speaks the real **RESP protocol**, you can talk to it
 with the official `redis-cli` and other Redis clients.
 
 > **Foundation:** this project is built on the excellent guide at
@@ -21,9 +22,11 @@ than using the STL containers.
 - **RESP protocol** — works with `redis-cli` and standard Redis client libraries
 - **All 5 data types:** strings, lists, hashes, sorted sets, sets
 - **Key expiry (TTL):** `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`, active + lazy expiration
-- **Persistence (RDB):** custom binary format with zlib compression and CRC32 integrity check
-- **`fork()`-based background save** (`BGSAVE`) — the parent keeps serving while a child snapshots
-- **Authentication** — password `AUTH`
+- **Persistence:** custom RDB snapshots plus append-only-file (AOF) replay, hybrid AOF rewrite, and CRC32-protected RDB payloads
+- **`fork()`-based background work:** `BGSAVE` and `BGREWRITEAOF` keep the parent serving clients
+- **Authentication and ACLs:** `AUTH`, named users, command/category rules, and key-pattern checks
+- **Runtime configuration:** config file, selected environment overrides, and `CONFIG GET`/`CONFIG SET`
+- **Memory management:** approximate memory accounting, `maxmemory` policies, eviction stats, `MEMORY`, and `OBJECT`
 - **Cursor iteration** — non-blocking `SCAN`/`HSCAN`/`SSCAN` with `MATCH`/`COUNT` (glob patterns)
 - **Generic keyspace commands** — `DBSIZE`, `RANDOMKEY`, `RENAME`/`RENAMENX`, `TOUCH`, `UNLINK`, `FLUSHALL`
 - **Single-threaded event loop** (`poll`, non-blocking I/O) with `TCP_NODELAY`
@@ -40,7 +43,8 @@ than using the STL containers.
   survive restarts.
 - **Persistence:** `SAVE` writes synchronously; `BGSAVE` and the periodic auto-save
   `fork()` a child that serializes a copy-on-write snapshot while the parent keeps
-  serving requests.
+  serving requests. When AOF is enabled, writes are appended as RESP frames; rewrite
+  compacts the log into an RDB preamble plus a RESP tail.
 
 ### Data structures (all hand-written)
 
@@ -75,9 +79,15 @@ This produces two binaries in `build/`: `server` and `client`.
 ```bash
 # start the server (listens on port 1234; run from the project root so it finds dump.rdb)
 ./build/server
+
+# or load a config file explicitly
+./build/server myred.conf
 ```
 
-The server requires authentication (default password `kek1234`, set in `main()`).
+The server requires authentication. The historical default password is `kek1234`.
+Set `MYRED_PASSWORD`, `MYRED_PORT`, `MYRED_AOF`, `MYRED_CONFIG`,
+`MYRED_MAXMEMORY`, or `MYRED_MAXMEMORY_POLICY` to override common settings at
+startup.
 
 ### With `redis-cli`
 
@@ -139,18 +149,21 @@ REDIS_PASSWORD=kek1234 ./build/client                  # interactive REPL
 `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SMOVE`
 
 ### Sorted sets
-`ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZQUERY`, `ZREVQUERY`
+`ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZQUERY`, `ZREVQUERY`, `ZPOPMIN`
 
 ### Admin
-`AUTH`, `INFO`, `SAVE`, `BGSAVE`
+`AUTH`, `ACL`, `PING`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
+`SAVE`, `BGSAVE`, `BGREWRITEAOF`
 
 Command names are case-insensitive.
 
 ## Testing
 
 A Python test harness (`stress_test.py`) speaks RESP directly over a socket and
-covers correctness for every command plus a concurrency/throughput stress run.
-Last result: **294/294 tests passing, 0 errors.**
+covers command correctness, auth/ACL behavior, persistence checks, memory
+accounting, maxmemory behavior, concurrent writes, and a randomized throughput
+stress run. It prints per-section timings, command latency percentiles, command
+mix, and slowest operation tables.
 
 ```bash
 # server must be running in another terminal
@@ -161,11 +174,24 @@ python3 stress_test.py --password kek1234 --correctness-only
 
 # writes a shareable log (stress_results.md by default)
 python3 stress_test.py --password kek1234 --log run.md
+
+# stress only, with a larger worker/operation count
+python3 stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
 ```
 
 > Note: the Python harness measures correctness/concurrency, not raw throughput
 > (it's bound by synchronous round-trips). For real numbers use
 > `redis-benchmark -p 1234 -a kek1234 -t set,get,lpush,rpush,lpop,rpop -P 16`.
+
+Additional shell helpers live in `scripts/`:
+
+```bash
+scripts/test_aof.sh
+scripts/test_aof_rewrite.sh
+scripts/test_aof_hybrid.sh
+scripts/diag_live.sh
+scripts/diag_ttl.sh
+```
 
 ## Project structure
 
@@ -186,7 +212,11 @@ list.h             intrusive list (connection timers)
 common.h           container_of, FNV hash
 client.cpp         a small RESP client (single-shot + REPL)
 stress_test.py     RESP test + benchmark harness
+test_memory.py     focused memory/eviction test helper
+myred.conf         example server configuration
+scripts/           AOF and diagnostic shell helpers
 docs/ROADMAP.md    milestone roadmap and next steps
+docs/CODE_REVIEW.md audit notes and future hardening ideas
 ```
 
 ## Acknowledgements

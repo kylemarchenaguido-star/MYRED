@@ -31,6 +31,16 @@ void acl_bootstrap_default(){
   }
 }
 
+// Identity assigned to a connection *before* any AUTH
+// Returns default only when it needs no password (nopass) and is enable -> auto.auth
+User *acl_initial_user(){
+  // we find not [], never fabricate a new user
+  auto it = g_config.users.find("default");
+  if (it == g_config.users.end()){ return nullptr; }
+  User &def = it->second;
+  return (def.enable && def.pw_hashes.empty() ? &def : nullptr);
+}
+
 bool parse_memory_size(const std::string &s, size_t *out){
   if (s.empty()){ return false; }
   size_t i = 0;
@@ -109,9 +119,10 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
   if (name == "requirepass"){ 
     if (!need1()){ return CfgResult::BADVALUE; }
     // no auth 
-    if (args[0].empty()){ g_config.password.clear(); return CfgResult::OK;}
-    // pre-hashed
-    if (args[0].size() == 65 && args[0][0] == '#'){
+    if (args[0].empty()){ 
+      g_config.password.clear(); 
+      
+    } else if (args[0].size() == 65 && args[0][0] == '#'){
       g_config.password = args[0].substr(1);
     } else {
       // hash plaintext

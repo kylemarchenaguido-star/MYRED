@@ -109,8 +109,7 @@ static int32_t handle_accept(int fd){
   // we create a new conn struct 
   Conn *conn = new Conn();
   conn->fd = connfd;
-  conn->authenticaded = g_config.password.empty();
-  conn->user = &g_config.users["default"]; 
+  conn->user = acl_initial_user(); 
   conn->want_read = true;
   conn->incoming = buf_create(64 * 1024);
   conn->outgoing = buf_create(64 * 1024);

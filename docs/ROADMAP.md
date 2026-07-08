@@ -181,7 +181,7 @@ Collapsed the two overloads into `template <typename Range> aof_encode(std::stri
 `try_one_request` captures the raw frame from `conn->incoming` (`buf_consume` moved *after* dispatch) and threads `(raw, raw_len)` into `do_request`. Common writes are logged with one `memcpy` (`aof_append_raw`) — no snapshot copy, no re-encode. Only the five TTL-rewrite commands (flagged `aof_rewrite` in `CmdSpec`) still snapshot + translate. Dropped a per-write heap allocation on the hot path.
 
 ### ✅ C. Hybrid AOF format (embedded RDB preamble)
-Rewrite now emits `["MYAOFRDB"][rdb_len:u64][RDB image][RESP delta]`. `rdb_build_aof_preamble` wraps a standalone `rdb_serialize` image; `rdb_load_buffer` loads an RDB from memory. `aof_load` detects the marker → fast binary load of the snapshot → RESP-replay only the tail; markerless files still load as plain RESP (backward-compatible). Load for large datasets drops from "replay N commands" to "one RDB pass + small delta". Verified by `test_aof_hybrid.sh`.
+Rewrite now emits `["MYAOFRDB"][rdb_len:u64][RDB image][RESP delta]`. `rdb_build_aof_preamble` wraps a standalone `rdb_serialize` image; `rdb_load_buffer` loads an RDB from memory. `aof_load` detects the marker → fast binary load of the snapshot → RESP-replay only the tail; markerless files still load as plain RESP (backward-compatible). Load for large datasets drops from "replay N commands" to "one RDB pass + small delta". Verified by `scripts/test_aof_hybrid.sh`.
 
 ### ✅ D. `INFO persistence` observability
 Added `aof_enabled`, `aof_current_size`, `aof_base_size`, `aof_pending_rewrite`, `aof_last_write_status` (from `g_aof_write_err`) to the `# Persistence` section — all read straight from `g_data`/`g_config`. Also bumped the `INFO` buffer to 4096 + clamped `len` (it trusted `snprintf`'s return as a length → latent OOB read).
@@ -631,7 +631,20 @@ check and before `spec.fn(...)` — auth itself stays exempt exactly like the cu
 - (c) Pub/sub channel patterns — no-op stub until v8 exists; keep the field on `User`
   now so the config/parsing format doesn't need to change again later.
 
-#### 🔶 4d — `AUTH` 2-arg form + `ACL` commands (IN PROGRESS 2026-07-06)
+#### ✅ 4d — `AUTH` 2-arg form + `ACL` commands (DONE 2026-07-07)
+
+Done end-to-end: `do_auth` handles both arg forms, `do_acl` is registered in
+`k_cmd_table` (`{"acl", {do_acl_placeholder, 2, -1}}`) and dispatched conn-aware after
+`acl_check`, and `WHOAMI/USERS/CAT/GENPASS/SETUSER/GETUSER/DELUSER/LIST` all work.
+Boot-time bug found + fixed this session: `acl_init_categories()` was never called from
+`server.cpp` (and had no prototype in `state.h`), so every `CmdSpec.acl_cats` stayed `0`
+and *every* command returned NOPERM for authenticated users; added the prototype + the
+`acl_init_categories();` call right after `acl_bootstrap_default();`. Also fixed the
+misplaced `{"acl", CAT_ADMIN|CAT_DANGEROUS}` (was in the `KeySpec` map — a type error;
+moved to the `extra` category map, added `{"acl", KeySpec::NONE}` to `ks`). Remaining
+nit folded into 4e cleanup: `resetkeys` didn't clear `all_keys`.
+
+<details><summary>original 4d notes</summary>
 
 `do_auth` (`commands.cpp` ~1010) now handles both `AUTH <pass>` (implicit `default`
 user) and `AUTH <user> <pass>`, hashes once, wipes `cmd`'s copy of the plaintext via
@@ -671,22 +684,20 @@ access through a `resetkeys` call.
   `conn->user->name`; `GENPASS` → random hex via the project's existing `mt19937_64` RNG
   (from the v5.3 review), not `rand()`.
 
-#### 🔶 4e — Per-`Conn` auth state (IN PROGRESS 2026-07-06)
+</details>
 
-`Conn::user` (`User *`) exists and is assigned at accept-time (points at `default`)
-and on successful `AUTH`. **Not yet done:** `Conn::authenticaded` was supposed to be
-*replaced* by the `nullptr`-means-unauthenticated convention, but both fields still
-coexist — `do_request`'s auth gate still checks `!conn->authenticaded`, not
-`!conn->user`. Side effect worth fixing alongside the removal: `server.cpp`'s
-accept-time setup unconditionally points every new connection's `conn->user` at
-`default` *before* any `AUTH`, regardless of whether a password is required — harmless
-today only because the separate `authenticaded` bool still gates dispatch, but it
-defeats the `nullptr` invariant the moment `authenticaded` is actually retired.
+#### ✅ 4e — Per-`Conn` auth state (DONE 2026-07-07)
 
-- Replace `Conn::authenticaded` (`state.h:83`) with `User *user = nullptr;` — `nullptr`
-  means unauthenticated. `do_request`'s `if (!conn->authenticaded)` (line 2912) becomes
-  `if (!conn->user)`. The per-command permission check is then an O(1) bitset test, no
-  re-hash/re-parse per request.
+Retired the redundant `Conn::authenticaded` bool; `Conn::user == nullptr` is now the
+single source of truth for "unauthenticated". New `acl_initial_user()` helper decides a
+new connection's starting identity from the registry: `default` iff it is `enabled` and
+`nopass` (empty `pw_hashes`), else `nullptr`. `server.cpp` accept-time sets
+`conn->user = acl_initial_user();` (no more unconditional `&users["default"]` that
+defeated the invariant). `do_request`'s gate is `if (!conn->user)` → NOAUTH. `do_auth`
+success just assigns `conn->user`; `ACL DELUSER` sets kicked connections to `nullptr`
+(not `default`) so a deleted user can never be silently re-authorized as `default`, and
+there is no dangling pointer even if `want_close` is deferred a tick. Folded in the 4d
+nit: `resetkeys` now also clears `all_keys`.
 
 #### 4f — Config file persistence
 

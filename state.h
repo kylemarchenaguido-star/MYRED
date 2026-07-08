@@ -102,8 +102,6 @@ struct Conn {
   bool want_read = false;
   bool want_write = false;
   bool want_close = false;
-  bool authenticaded = false;
-  // int(4) + bool×4(4) = 8 bytes 
   DList idle_node;
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
@@ -212,8 +210,8 @@ struct Entry {
   size_t heap_idx = NO_TTL;
   size_t mem = 0;
   uint32_t lru = 0; // 
-  EntryValue val;
   uint32_t type; 
+  EntryValue val;\
 };
 
 // Key for searching in the hashtable
@@ -273,4 +271,5 @@ bool ip_is_loopback(uint32_t peer_host); // 127.0.0.0/8
 bool ip_allowed(uint32_t peer_host); // allowlist check 
 
 void acl_bootstrap_default(); // (re)build the built in default user from require pass
-void acl_init_categories();
+void acl_init_categories(); // stamp acl_cats + KeySpec onto every CmdSpec (call at boot)
+User *acl_initial_user(); // starting identity for a new conn: default if no pass, else nullptr

@@ -8,11 +8,12 @@ Tests all commands:
   Generic: exists, type, expire, pexpire, ttl, pttl, persist, keys, scan,
            dbsize, randomkey, rename, renamenx, touch, unlink,
            expireat, pexpireat, flushall
-  ZSet:    zadd, zrem, zscore, zquery, zrevquery, zrank
+  ZSet:    zadd, zrem, zscore, zquery, zrevquery, zrank, zpopmin
   Lists:   lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim
   Hashes:  hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget,
            hsetnx, hincrby, hstrlen, hscan
-  Admin:   auth, info, save, bgsave
+  Admin:   auth, acl, config, info, save, bgsave, bgrewriteaof,
+           memory, object, ping
 
 Because the server now speaks RESP, this test also works against the
 real redis-cli for cross-validation.
@@ -29,6 +30,9 @@ Usage:
 
     # only stress
     python3 stress_test.py --stress-only
+
+    # tune stress size and metrics tables
+    python3 stress_test.py --stress-threads 16 --stress-ops 2000 --metrics-top 20
 
     # if your server requires a password
     python3 stress_test.py --password your_password_here
@@ -194,10 +198,122 @@ def recv_response(sock: socket.socket) -> Any:
     raise RespError(f"unknown RESP prefix: {line!r}")
 
 
+def _percentile(sorted_values, pct: float) -> float:
+    """Return a nearest-rank percentile from an already sorted non-empty list."""
+    if not sorted_values:
+        return 0.0
+    idx = int(round((len(sorted_values) - 1) * pct))
+    idx = max(0, min(idx, len(sorted_values) - 1))
+    return sorted_values[idx]
+
+
+class CommandMetrics:
+    """Lightweight command-level latency and error accounting."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total = 0
+        self.resp_errors = 0
+        self.transport_errors = 0
+        self.latencies = []
+        self.by_cmd = {}
+
+    def record(self, name: str, ms: float, *, resp_error: bool = False,
+               transport_error: bool = False):
+        name = (name or "<empty>").lower()
+        with self.lock:
+            self.total += 1
+            self.latencies.append(ms)
+            if resp_error:
+                self.resp_errors += 1
+            if transport_error:
+                self.transport_errors += 1
+
+            row = self.by_cmd.setdefault(name, {
+                "count": 0,
+                "resp_errors": 0,
+                "transport_errors": 0,
+                "latencies": [],
+            })
+            row["count"] += 1
+            row["latencies"].append(ms)
+            if resp_error:
+                row["resp_errors"] += 1
+            if transport_error:
+                row["transport_errors"] += 1
+
+    def report(self, top_n: int = 12):
+        with self.lock:
+            total = self.total
+            resp_errors = self.resp_errors
+            transport_errors = self.transport_errors
+            latencies = list(self.latencies)
+            by_cmd = {
+                k: {
+                    "count": v["count"],
+                    "resp_errors": v["resp_errors"],
+                    "transport_errors": v["transport_errors"],
+                    "latencies": list(v["latencies"]),
+                }
+                for k, v in self.by_cmd.items()
+            }
+
+        print(f"\n{BOLD}{BLUE}-- Command Metrics {'-' * 37}{RESET}")
+        if not latencies:
+            print("  No commands recorded.")
+            return
+
+        srt = sorted(latencies)
+        avg = sum(srt) / len(srt)
+        print(f"  Commands observed: {total}")
+        print(f"  RESP errors:       {resp_errors} (expected negative tests included)")
+        print(f"  Transport errors:  {transport_errors}")
+        print(f"  Latency avg:       {avg:.2f}ms")
+        print(f"  Latency p50/p95/p99: "
+              f"{_percentile(srt, 0.50):.2f}/"
+              f"{_percentile(srt, 0.95):.2f}/"
+              f"{_percentile(srt, 0.99):.2f}ms")
+        print(f"  Latency max:       {srt[-1]:.2f}ms")
+
+        common = sorted(by_cmd.items(),
+                        key=lambda item: item[1]["count"],
+                        reverse=True)[:top_n]
+        print("  Most used commands:")
+        for name, row in common:
+            print(f"    {name:<14} {row['count']:>6} calls")
+
+        slow = sorted(by_cmd.items(),
+                      key=lambda item: (
+                          sum(item[1]["latencies"]) / len(item[1]["latencies"])
+                      ),
+                      reverse=True)[:top_n]
+        print("  Slowest commands by average latency:")
+        for name, row in slow:
+            vals = row["latencies"]
+            avg_ms = sum(vals) / len(vals)
+            print(f"    {name:<14} {avg_ms:>8.2f}ms avg over {len(vals)} calls")
+
+
+COMMAND_METRICS = CommandMetrics()
+
+
 def cmd(sock: socket.socket, *args: str) -> Any:
     """Send a command and return the parsed reply."""
-    send_request(sock, *args)
-    return recv_response(sock)
+    name = str(args[0]) if args else "<empty>"
+    t0 = time.perf_counter()
+    try:
+        send_request(sock, *args)
+        reply = recv_response(sock)
+        COMMAND_METRICS.record(name, (time.perf_counter() - t0) * 1000)
+        return reply
+    except RespError:
+        COMMAND_METRICS.record(name, (time.perf_counter() - t0) * 1000,
+                               resp_error=True)
+        raise
+    except Exception:
+        COMMAND_METRICS.record(name, (time.perf_counter() - t0) * 1000,
+                               transport_error=True)
+        raise
+
 
 
 def make_conn(host: str, port: int) -> socket.socket:
@@ -223,29 +339,59 @@ class TestRunner:
         self.passed = 0
         self.failed = 0
         self.errors = []
+        self.started_at = time.perf_counter()
+        self.current_section = None
+        self.section_started_at = None
+        self.section_passed = 0
+        self.section_failed = 0
+        self.section_stats = []
+
+    def _record_result(self, ok: bool):
+        if ok:
+            self.section_passed += 1
+        else:
+            self.section_failed += 1
+
+    def _finish_section(self):
+        if self.current_section is None or self.section_started_at is None:
+            return
+        self.section_stats.append({
+            "title": self.current_section,
+            "passed": self.section_passed,
+            "failed": self.section_failed,
+            "duration": time.perf_counter() - self.section_started_at,
+        })
+        self.current_section = None
+        self.section_started_at = None
+        self.section_passed = 0
+        self.section_failed = 0
 
     def check(self, name: str, got: Any, expected: Any) -> bool:
         if got == expected:
             print(f"  {GREEN}✓{RESET} {name}")
             self.passed += 1
+            self._record_result(True)
             return True
         print(f"  {RED}✗{RESET} {name}\n"
               f"    got:      {got!r}\n"
               f"    expected: {expected!r}")
         self.errors.append(name)
         self.failed += 1
+        self._record_result(False)
         return False
 
     def check_type(self, name: str, got: Any, expected_type: type) -> bool:
         if isinstance(got, expected_type):
             print(f"  {GREEN}✓{RESET} {name} → {got!r}")
             self.passed += 1
+            self._record_result(True)
             return True
         print(f"  {RED}✗{RESET} {name}\n"
               f"    got type: {type(got).__name__} ({got!r})\n"
               f"    expected: {expected_type.__name__}")
         self.errors.append(name)
         self.failed += 1
+        self._record_result(False)
         return False
 
     def check_none(self, name: str, got: Any) -> bool:
@@ -265,12 +411,14 @@ class TestRunner:
         if val is not None and abs(val - expected) < tol:
             print(f"  {GREEN}✓{RESET} {name} → {got}")
             self.passed += 1
+            self._record_result(True)
             return True
         print(f"  {RED}✗{RESET} {name}\n"
               f"    got:      {got!r}\n"
               f"    expected: ~{expected}")
         self.errors.append(name)
         self.failed += 1
+        self._record_result(False)
         return False
 
     def check_true(self, name: str, condition: bool) -> bool:
@@ -283,28 +431,46 @@ class TestRunner:
         except RespError:
             print(f"  {GREEN}✓{RESET} {name}")
             self.passed += 1
+            self._record_result(True)
             return True
         print(f"  {RED}✗{RESET} {name}\n"
               f"    got:      {got!r}\n"
               f"    expected: a RESP error")
         self.errors.append(name)
         self.failed += 1
+        self._record_result(False)
         return False
 
     def section(self, title: str):
+        self._finish_section()
+        self.current_section = title
+        self.section_started_at = time.perf_counter()
         pad = max(0, 50 - len(title))
         print(f"\n{BOLD}{BLUE}── {title} {'─' * pad}{RESET}")
 
     def summary(self) -> bool:
+        self._finish_section()
         total = self.passed + self.failed
+        elapsed = time.perf_counter() - self.started_at
         print(f"\n{BOLD}{'═' * 55}{RESET}")
         print(f"{BOLD}Results: {self.passed}/{total} passed{RESET}")
+        if elapsed > 0:
+            print(f"Runtime: {elapsed:.2f}s ({total / elapsed:.1f} assertions/sec)")
         if self.failed:
             print(f"{RED}Failed tests:{RESET}")
             for e in self.errors:
                 print(f"  • {e}")
         else:
             print(f"{GREEN}All tests passed!{RESET}")
+        if self.section_stats:
+            print("Slowest sections:")
+            slow = sorted(self.section_stats,
+                          key=lambda row: row["duration"],
+                          reverse=True)[:8]
+            for row in slow:
+                total_checks = row["passed"] + row["failed"]
+                print(f"  {row['duration']:.2f}s  "
+                      f"{row['passed']}/{total_checks}  {row['title']}")
         print(f"{'═' * 55}")
         return self.failed == 0
 
@@ -1491,7 +1657,10 @@ def test_info_command(r: TestRunner, sock: socket.socket):
         r.check(f"has {s} section", s in result, True)
 
     fields = ["version:", "uptime_seconds:", "connected_clients:",
-              "total_commands:", "keys_total:", "keys_with_ttl:"]
+              "used_memory:", "maxmemory:", "maxmemory_policy:",
+              "evicted_keys:", "total_commands:", "keys_total:",
+              "keys_with_ttl:", "aof_enabled:", "aof_current_size:",
+              "aof_last_write_status:"]
     for f in fields:
         r.check(f"has {f.rstrip(':')} field", f in result, True)
 
@@ -1644,6 +1813,84 @@ def test_auth_command(r: TestRunner, host: str, port: int):
         s.close()
 
 
+def test_acl_commands(r: TestRunner, sock: socket.socket, host: str, port: int):
+    r.section("ACL: users, auth, key patterns")
+
+    username = "stress_acl_user"
+    password = "stress_acl_pass"
+    restricted = None
+
+    # Cleanup first so reruns are deterministic.
+    try:
+        cmd(sock, "acl", "deluser", username)
+    except RespError:
+        pass
+
+    r.check("acl whoami -> default", cmd(sock, "acl", "whoami"), "default")
+
+    users = cmd(sock, "acl", "users")
+    r.check_type("acl users -> array", users, list)
+    if isinstance(users, list):
+        r.check_true("acl users contains default", "default" in users)
+
+    listing = cmd(sock, "acl", "list")
+    r.check_type("acl list -> array", listing, list)
+    if isinstance(listing, list):
+        r.check_true("acl list includes default",
+                     any(isinstance(row, str) and row.startswith("user default")
+                         for row in listing))
+
+    default_user = cmd(sock, "acl", "getuser", "default")
+    r.check_type("acl getuser default -> array", default_user, list)
+    if isinstance(default_user, list):
+        r.check_true("acl getuser exposes flags", "flags" in default_user)
+        r.check_true("acl getuser exposes commands", "commands" in default_user)
+        r.check_true("acl getuser exposes keys", "keys" in default_user)
+
+    token = cmd(sock, "acl", "genpass", "64")
+    r.check_true("acl genpass 64 -> 16 hex chars",
+                 isinstance(token, str)
+                 and len(token) == 16
+                 and all(c in "0123456789abcdef" for c in token))
+    r.expect_error("acl genpass invalid bits -> error",
+                   sock, "acl", "genpass", "0")
+
+    r.check("acl setuser restricted -> OK",
+            cmd(sock, "acl", "setuser", username, "on", f">{password}",
+                "~acl:*", "+get", "+set", "+del"),
+            "OK")
+
+    try:
+        restricted = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        restricted.settimeout(TIMEOUT_SEC)
+        restricted.connect((host, port))
+        send_request(restricted, "auth", username, password)
+        r.check("auth user password -> OK", recv_response(restricted), "OK")
+
+        r.check("restricted SET allowed key -> OK",
+                cmd(restricted, "set", "acl:allowed", "1"), "OK")
+        r.check("restricted GET allowed key -> 1",
+                cmd(restricted, "get", "acl:allowed"), "1")
+        r.expect_error("restricted SET blocked by key pattern",
+                       restricted, "set", "outside:acl", "1")
+        r.expect_error("restricted ACL command denied",
+                       restricted, "acl", "whoami")
+    finally:
+        if restricted is not None:
+            restricted.close()
+
+    r.check("acl deluser restricted -> 1",
+            cmd(sock, "acl", "deluser", username), 1)
+    r.check("cleanup acl:allowed -> 1", cmd(sock, "del", "acl:allowed"), 1)
+
+    r.expect_error("acl setuser bad modifier -> error",
+                   sock, "acl", "setuser", "stress_acl_bad", "not-a-rule")
+    try:
+        cmd(sock, "acl", "deluser", "stress_acl_bad")
+    except RespError:
+        pass
+
+
 def test_persistence_roundtrip(r: TestRunner, host: str, port: int):
     """
     Verify data survives a save by saving, then re-reading.
@@ -1693,35 +1940,89 @@ class StressStats:
         self.ops       = 0
         self.errors    = 0
         self.latencies = []
+        self.by_op     = {}
         self.lock      = threading.Lock()
 
-    def record(self, ms: float):
+    def record(self, op_name: str, ms: float):
         with self.lock:
             self.ops += 1
             self.latencies.append(ms)
+            row = self.by_op.setdefault(op_name, {
+                "ops": 0,
+                "errors": 0,
+                "latencies": [],
+            })
+            row["ops"] += 1
+            row["latencies"].append(ms)
 
-    def record_error(self):
+    def record_error(self, op_name: str = "unknown"):
         with self.lock:
             self.errors += 1
+            row = self.by_op.setdefault(op_name, {
+                "ops": 0,
+                "errors": 0,
+                "latencies": [],
+            })
+            row["errors"] += 1
 
-    def report(self):
+    def report(self, top_n: int = 10):
         with self.lock:
-            if not self.latencies:
-                print("  No operations recorded.")
-                return
-            srt = sorted(self.latencies)
-            avg = sum(srt) / len(srt)
-            print(f"  Total ops:   {self.ops}")
-            print(f"  Errors:      {self.errors}")
-            print(f"  Latency avg: {avg:.2f}ms")
-            print(f"  Latency min: {srt[0]:.2f}ms")
-            print(f"  Latency max: {srt[-1]:.2f}ms")
-            print(f"  Latency p95: {srt[int(len(srt)*0.95)]:.2f}ms")
-            print(f"  Latency p99: {srt[int(len(srt)*0.99)]:.2f}ms")
-            if self.errors == 0:
-                print(f"  {GREEN}No errors!{RESET}")
-            else:
-                print(f"  {RED}{self.errors} errors!{RESET}")
+            ops = self.ops
+            errors = self.errors
+            latencies = list(self.latencies)
+            by_op = {
+                k: {
+                    "ops": v["ops"],
+                    "errors": v["errors"],
+                    "latencies": list(v["latencies"]),
+                }
+                for k, v in self.by_op.items()
+            }
+
+        if not latencies:
+            print("  No operations recorded.")
+            print(f"  Total ops:   {ops}")
+            print(f"  Errors:      {errors}")
+            if by_op:
+                print("  Error breakdown:")
+                for name, row in sorted(by_op.items()):
+                    if row["errors"]:
+                        print(f"    {name:<18} {row['errors']:>4} errors")
+            return
+        srt = sorted(latencies)
+        avg = sum(srt) / len(srt)
+        print(f"  Total ops:   {ops}")
+        print(f"  Errors:      {errors}")
+        print(f"  Latency avg: {avg:.2f}ms")
+        print(f"  Latency min: {srt[0]:.2f}ms")
+        print(f"  Latency max: {srt[-1]:.2f}ms")
+        print(f"  Latency p50: {_percentile(srt, 0.50):.2f}ms")
+        print(f"  Latency p95: {_percentile(srt, 0.95):.2f}ms")
+        print(f"  Latency p99: {_percentile(srt, 0.99):.2f}ms")
+        if errors == 0:
+            print(f"  {GREEN}No errors!{RESET}")
+        else:
+            print(f"  {RED}{errors} errors!{RESET}")
+
+        by_count = sorted(by_op.items(),
+                          key=lambda item: item[1]["ops"],
+                          reverse=True)[:top_n]
+        print("  Operation mix:")
+        for name, row in by_count:
+            print(f"    {name:<18} {row['ops']:>6} ok  {row['errors']:>4} errors")
+
+        by_slow = sorted(
+            [(name, row) for name, row in by_op.items() if row["latencies"]],
+            key=lambda item: (
+                sum(item[1]["latencies"]) / len(item[1]["latencies"])
+            ),
+            reverse=True,
+        )[:top_n]
+        print("  Slowest operations by average latency:")
+        for name, row in by_slow:
+            vals = row["latencies"]
+            avg_ms = sum(vals) / len(vals)
+            print(f"    {name:<18} {avg_ms:>8.2f}ms avg over {len(vals)} ops")
 
 
 def random_key(prefix: str = "stress") -> str:
@@ -1732,13 +2033,24 @@ def random_string(n: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase, k=n))
 
 
+STRESS_OP_NAMES = (
+    "set", "get", "del", "zadd", "zscore", "zrank", "zquery", "zrevquery",
+    "ttl_triplet", "keys", "info", "rpush", "lpush", "lrange",
+    "list_pop_trim", "hset", "hget", "hgetall", "keyspace_scan",
+    "sadd", "sismember", "smembers", "srem", "incr", "setnx", "getdel",
+    "mset", "mget", "append", "strlen", "zpopmin", "memory_usage",
+    "object_encoding", "config_get", "ping", "sscan", "hscan",
+    "srandmember", "getex_px",
+)
+
+
 def stress_worker(host: str, port: int, ops: int,
                   stats: StressStats, wid: int):
     try:
         sock = make_conn(host, port)
     except Exception as e:
         print(f"  {RED}Worker {wid} connect failed: {e}{RESET}")
-        stats.record_error()
+        stats.record_error("connect")
         return
 
     zset = f"stress_zset_{wid}"
@@ -1759,10 +2071,11 @@ def stress_worker(host: str, port: int, ops: int,
         cmd(sock, "sadd", sset, "x", "y", "z", "w")
         cmd(sock, "set", ctr, "0")
     except Exception:
-        pass
+        stats.record_error("setup")
 
     for _ in range(ops):
-        op = random.randint(0, 29)
+        op = random.randrange(len(STRESS_OP_NAMES))
+        op_name = STRESS_OP_NAMES[op]
         try:
             t0 = time.perf_counter()
             if op == 0:
@@ -1839,10 +2152,32 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "append", random_key(), random_string(4))
             elif op == 29:
                 cmd(sock, "strlen", random_key())
+            elif op == 30:
+                cmd(sock, "zpopmin", zset, str(random.randint(1, 3)))
+            elif op == 31:
+                cmd(sock, "memory", "usage", random_key())
+            elif op == 32:
+                k = random_key()
+                cmd(sock, "set", k, "v")
+                cmd(sock, "object", "encoding", k)
+            elif op == 33:
+                cmd(sock, "config", "get", "maxmemory")
+            elif op == 34:
+                cmd(sock, "ping")
+            elif op == 35:
+                cmd(sock, "sscan", sset, "0", "count", "10")
+            elif op == 36:
+                cmd(sock, "hscan", hsh, "0", "count", "10")
+            elif op == 37:
+                cmd(sock, "srandmember", sset, "-3")
+            elif op == 38:
+                k = random_key()
+                cmd(sock, "set", k, "v")
+                cmd(sock, "getex", k, "PX", "5000")
 
-            stats.record((time.perf_counter() - t0) * 1000)
+            stats.record(op_name, (time.perf_counter() - t0) * 1000)
         except Exception:
-            stats.record_error()
+            stats.record_error(op_name)
 
     try:
         cmd(sock, "del", zset)
@@ -1855,17 +2190,18 @@ def stress_worker(host: str, port: int, ops: int,
         pass
 
 
-def run_stress_test(host: str, port: int) -> bool:
+def run_stress_test(host: str, port: int, threads_count: int,
+                    ops_per_thread: int, metrics_top: int) -> bool:
     print(f"\n{BOLD}{BLUE}── Stress Test {'─' * 40}{RESET}")
-    print(f"  Threads:    {STRESS_THREADS}")
-    print(f"  Ops/thread: {STRESS_OPS}")
-    print(f"  Total ops:  {STRESS_THREADS * STRESS_OPS}")
+    print(f"  Threads:    {threads_count}")
+    print(f"  Ops/thread: {ops_per_thread}")
+    print(f"  Total ops:  {threads_count * ops_per_thread}")
 
     stats   = StressStats()
     threads = [
         threading.Thread(target=stress_worker,
-                         args=(host, port, STRESS_OPS, stats, i))
-        for i in range(STRESS_THREADS)
+                         args=(host, port, ops_per_thread, stats, i))
+        for i in range(threads_count)
     ]
     t0 = time.time()
     for t in threads: t.start()
@@ -1875,7 +2211,7 @@ def run_stress_test(host: str, port: int) -> bool:
 
     print(f"\n  Elapsed:    {elapsed:.2f}s")
     print(f"  Throughput: {throughput:.0f} ops/sec")
-    stats.report()
+    stats.report(metrics_top)
     return stats.errors == 0
 
 
@@ -1991,6 +2327,8 @@ def test_ping_command(r: TestRunner, sock: socket.socket):
 
     r.check("ping → PONG", cmd(sock, "ping"), "PONG")
     r.check("ping msg → echo", cmd(sock, "ping", "hello"), "hello")
+    r.check("mixed-case ping -> PONG", cmd(sock, "PiNg"), "PONG")
+    r.expect_error("ping too many args -> error", sock, "ping", "a", "b")
 
     # inline protocol: a bare "PING\r\n" (not a RESP array)
     sock.sendall(b"PING\r\n")
@@ -2000,15 +2338,51 @@ def test_ping_command(r: TestRunner, sock: socket.socket):
     sock.sendall(b"PING inlinemsg\r\n")
     r.check("inline PING msg → echo", recv_response(sock), "inlinemsg")
 
+    # inline parser tolerates LF-only input.
+    sock.sendall(b"PING\n")
+    r.check("inline LF-only PING -> PONG", recv_response(sock), "PONG")
+
 
 def test_config_command(r: TestRunner, sock: socket.socket):
-    r.section("CONFIG (stub)")
+    r.section("CONFIG")
 
+    r.check("config set maxmemory 0 -> OK",
+            cmd(sock, "config", "set", "maxmemory", "0"), "OK")
     res = cmd(sock, "config", "get", "maxmemory")
-    r.check_type("config get → array", res, list)
-    r.check("config set → OK", cmd(sock, "config", "set", "maxmemory", "0"), "OK")
-    r.check("config resetstat → OK", cmd(sock, "config", "resetstat"), "OK")
-    r.expect_error("config bad subcommand → error", sock, "config", "frobnicate")
+    r.check_type("config get maxmemory -> array", res, list)
+    r.check("config get maxmemory value", res, ["maxmemory", "0"])
+
+    all_res = cmd(sock, "config", "get", "*")
+    r.check_type("config get * -> array", all_res, list)
+    if isinstance(all_res, list):
+        r.check_true("config get * includes maxmemory", "maxmemory" in all_res)
+        r.check_true("config get * includes maxmemory-policy",
+                     "maxmemory-policy" in all_res)
+
+    r.check("config get unknown -> []",
+            cmd(sock, "config", "get", "does-not-exist"), [])
+
+    r.check("config set maxmemory-policy allkeys-random -> OK",
+            cmd(sock, "config", "set", "maxmemory-policy", "allkeys-random"),
+            "OK")
+    r.check("config get maxmemory-policy allkeys-random",
+            cmd(sock, "config", "get", "maxmemory-policy"),
+            ["maxmemory-policy", "allkeys-random"])
+    r.check("config set maxmemory-policy noeviction -> OK",
+            cmd(sock, "config", "set", "maxmemory-policy", "noeviction"),
+            "OK")
+
+    r.expect_error("config set maxmemory invalid -> error",
+                   sock, "config", "set", "maxmemory", "not-bytes")
+    r.expect_error("config set invalid policy -> error",
+                   sock, "config", "set", "maxmemory-policy", "bogus")
+    try:
+        r.check("config set unknown parameter handled",
+                cmd(sock, "config", "set", "unknown-setting", "1"), "OK")
+    except RespError:
+        r.check_true("config set unknown parameter rejected", True)
+    r.check("config resetstat -> OK", cmd(sock, "config", "resetstat"), "OK")
+    r.expect_error("config bad subcommand -> error", sock, "config", "frobnicate")
 
 
 def test_bgrewriteaof_command(r: TestRunner, sock: socket.socket):
@@ -2190,6 +2564,12 @@ def main():
                     help="server password (if auth is enabled)")
     ap.add_argument("--correctness-only", action="store_true")
     ap.add_argument("--stress-only",      action="store_true")
+    ap.add_argument("--stress-threads",   default=STRESS_THREADS, type=int,
+                    help="worker threads for the random stress phase")
+    ap.add_argument("--stress-ops",       default=STRESS_OPS, type=int,
+                    help="operations per worker thread in the stress phase")
+    ap.add_argument("--metrics-top",      default=12, type=int,
+                    help="number of command/operation rows to show in metrics")
     ap.add_argument("--log",              default="docs/stress_results.md",
                     help="write a copy of all output here (ANSI stripped); "
                          "pass --log '' to disable")
@@ -2197,6 +2577,10 @@ def main():
 
     host, port  = args.host, args.port
     G_PASSWORD  = args.password
+
+    if args.stress_threads < 1 or args.stress_ops < 1 or args.metrics_top < 1:
+        print(f"{RED}--stress-threads, --stress-ops, and --metrics-top must be >= 1{RESET}")
+        sys.exit(2)
 
     # mirror everything to a shareable markdown log
     if args.log:
@@ -2252,6 +2636,7 @@ def main():
             test_edge_cases(r,            sock)
             test_ping_command(r,          sock)
             test_config_command(r,        sock)
+            test_acl_commands(r,          sock, host, port)
             test_info_command(r,          sock)
             test_save_command(r,          sock)
             test_bgsave_command(r,        sock)
@@ -2279,8 +2664,11 @@ def main():
 
     # ── stress ─────────────────────────────────────────────────────────────────
     if not args.correctness_only:
-        all_ok = run_stress_test(host, port) and all_ok
+        all_ok = run_stress_test(host, port, args.stress_threads,
+                                 args.stress_ops, args.metrics_top) and all_ok
         cleanup_stress_keys(host, port)
+
+    COMMAND_METRICS.report(args.metrics_top)
 
     # ── final verdict ──────────────────────────────────────────────────────────
     print(f"\n{BOLD}{'═' * 55}{RESET}")

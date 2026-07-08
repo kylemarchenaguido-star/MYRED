@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# BGREWRITEAOF test: manual trigger + auto-trigger. Run from project root after building.
+# BGREWRITEAOF test: manual trigger + auto-trigger. Run from anywhere after building.
 set -u
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR" || exit 1
+
 PORT=1234; PASS=kek1234
 CLI="redis-cli -p $PORT -a $PASS"
 
