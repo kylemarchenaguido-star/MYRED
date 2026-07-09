@@ -136,6 +136,23 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
+  // ACL user definition 
+  if (name == "user"){
+    if (args.empty()){ err = "User directive requires a username"; return CfgResult::BADVALUE; }
+    // Create or update
+    User &u = g_config.users[args[0]]; 
+    if (u.name.empty()){ u.name = args[0]; }
+    for (size_t i = 1; i < args.size(); ++i){
+      if (!acl_apply_rule(u, args[i])){ 
+        err = "Invalid ACL rule '" + args[i] + "' for user '" + args[0] + "'";
+        return CfgResult::BADVALUE;
+      }
+    }
+    // a reset token wipes name mid-line
+    if (u.name.empty()){ u.name = args[0]; }
+    return CfgResult::OK;
+  }
+
   if (name == "port"){
     if (!need1()){ return CfgResult::BADVALUE; }
     int p = atoi(args[0].c_str());
@@ -326,6 +343,12 @@ bool config_rewrite(const char * path){
   fprintf(fp, "maxmemory-samples %d\n", g_config.maxmemory_samples);
   for (const SaveCondition &s : g_config.save_conditions){
     fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
+  }
+  // ACL users - skip 'default': it is rebuilt from requirepass + acl_bootstrap_default() at boot
+  for (const auto &kv : g_config.users){
+    if (kv.first == "default"){ continue; }
+    std::string line = acl_format_user(kv.first, kv.second, true);      // real hashes, quoted
+    fprintf(fp, "%s\n", line.c_str());
   }
   fclose(fp);
   return true;

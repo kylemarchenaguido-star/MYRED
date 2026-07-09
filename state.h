@@ -273,3 +273,5 @@ bool ip_allowed(uint32_t peer_host); // allowlist check
 void acl_bootstrap_default(); // (re)build the built in default user from require pass
 void acl_init_categories(); // stamp acl_cats + KeySpec onto every CmdSpec (call at boot)
 User *acl_initial_user(); // starting identity for a new conn: default if no pass, else nullptr
+std::string acl_format_user(const std::string &name, const User &u, bool for_config);
+bool acl_apply_rule(User &u, const std::string &t); // shared by ACL SETUSER + `user` config directive

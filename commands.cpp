@@ -2856,7 +2856,7 @@ static uint64_t acl_cat_bit(const std::string &n){
 }
 
 // apply one SETUSER modifier; false on parse error
-static bool acl_apply_rule(User &u, const std::string &t){
+bool acl_apply_rule(User &u, const std::string &t){
 
   if (t == "on"){ u.enable = true; return true; }
   if (t == "off"){ u.enable = false; return true; }
@@ -2864,6 +2864,16 @@ static bool acl_apply_rule(User &u, const std::string &t){
   if (t == "reset"){ u = User(); u.name.clear(); return true; }
   if (t == "resetpass"){ u.pw_hashes.clear(); return true; }
   if (t == "resetkeys"){ u.key_patterns.clear(); u.all_keys = false; return true; }
+
+  // pre-hashes SHA-256 digest, '#<64 hex>'
+  if (t.size() == 65 && t[0] == '#'){
+    for (size_t i = 1; i < t.size(); ++i){
+      // we reject junk
+      if (!isxdigit((unsigned char)t[i])){ return false; }
+    }
+    u.pw_hashes.push_back(t.substr(1));
+    return true;
+  }
 
   if (t == "allkeys" || t == "~*"){ u.all_keys = true; u.key_patterns.clear(); return true; }
 
@@ -2887,6 +2897,30 @@ static bool acl_apply_rule(User &u, const std::string &t){
   u.cmd_overrides[c] = false; return true; }
 
   return false;
+}
+
+// Single source of truth for rendering a user's rule
+std::string acl_format_user(const std::string &name, const User &u, bool for_config){
+  std::string s = "user " + name + (u.enable ? " on" : " off");
+  if (u.pw_hashes.empty()){ s += " nopass"; }
+  else { for (const std::string &h : u.pw_hashes){
+      s += for_config ? (" \"#" + h + "\"") : std::string(" #<hash>"); } }
+  // keys
+  if (u.all_keys){ s += " ~*"; }
+  else { for (const std::string &p : u.key_patterns){ s += " ~" + p; } }
+  // commands: full grant, or explicit deny-all base + the granted categories
+  if (u.allow_cats == CAT_ALL){ s += " +@all"; }
+  else {
+    s += " -@all";
+    static const std::pair<uint64_t, const char *> cats[] = {
+      {CAT_READ,"read"}, {CAT_WRITE,"write"}, {CAT_KEYSPACE,"keyspace"}, {CAT_ADMIN,"admin"},
+      {CAT_DANGEROUS,"dangerous"}, {CAT_FAST,"fast"}, {CAT_SLOW,"slow"}, {CAT_CONNECTION,"connection"},
+    };
+    for (const auto &c : cats){ if (u.allow_cats & c.first){ s += " +@"; s += c.second; } }
+  }
+  // per-command exceptions on top
+  for (const auto &kv : u.cmd_overrides){ s += ' '; s += (kv.second ? '+' : '-'); s += kv.first; }
+  return s;
 }
 
 static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
@@ -2979,12 +3013,8 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (sub == "list"){
     resp_arr(out, (uint32_t)g_config.users.size());
     for (auto &kv : g_config.users){
-      const User &u = kv.second;
-      std::string line = "user " + kv.first + (u.enable ? " on" : " off")
-                       + (u.pw_hashes.empty() ? " nopass" : " #<hash>")
-                       + (u.all_keys ? " ~*" : "")
-                       + (u.allow_cats == CAT_ALL ? " +@all" : "");
-      resp_str(out, line.data(), line.size());                
+      std::string line = acl_format_user(kv.first, kv.second, false);
+      resp_str(out, line.data(), line.size());
     }
     return;
   }
@@ -3023,7 +3053,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"renamenx",     {do_renamenx,      3,  3, true}},
   {"touch",        {do_touch,         2, -1}},
   {"unlink",       {do_asyncdel,      2,  2, true}},
-  {"keys",         {do_keys,          1,  1}},
+  {"keys",         {do_keys,          1,  2,}},
   {"scan",         {do_scan,          2, -1}},
   {"randomkey",    {do_randomkey,     1,  1}},
   {"dbsize",       {do_dbsize,        1,  1}},
@@ -3138,15 +3168,15 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   if (it == k_cmd_table.end()){
     return resp_err(out, "ERR unknown command");
   }
-
+  
   const CmdSpec &spec = it->second;
+  if (const char *deny = acl_check(conn->user, cmd[0], spec, cmd)){
+    return resp_err(out, deny);
+  }
+
   int argc = (int)cmd.size();
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
     return resp_err(out, "ERR wrong number of arguments");
-  }
-
-  if (const char *deny = acl_check(conn->user, cmd[0], spec, cmd)){
-    return resp_err(out, deny);
   }
 
   if (cmd[0] == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
@@ -3225,7 +3255,13 @@ void acl_init_categories(){
     CmdSpec &s = kv.second;
     s.acl_cats = s.is_write ? CAT_WRITE : CAT_READ; // base axis
     auto eit = extra.find(kv.first);
-    if (eit != extra.end()){ s.acl_cats |= eit->second; } // OR the extra bits
+    if (eit != extra.end()){ 
+      // OR the extra bits
+      s.acl_cats |= eit->second; 
+      if (eit->second & (CAT_ADMIN | CAT_DANGEROUS)){
+        s.acl_cats &= ~(CAT_READ | CAT_WRITE);
+      }
+    }
     auto kit = ks.find(kv.first);
     s.keys = (kit != ks.end()) ? kit->second : KeySpec::FIRST;
   }

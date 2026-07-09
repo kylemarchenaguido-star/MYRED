@@ -1,941 +1,871 @@
 # MYRED Roadmap
 
-Redis-compatible in-memory database built from scratch in C++.
-Speaks RESP on port 1234 — real `redis-cli` works against it.
+MYRED is a Redis-compatible in-memory database written from scratch in C++.
+It speaks RESP and is intended to work with `redis-cli`, Redis clients, and
+`redis-benchmark` where the implemented command surface allows it.
 
-**Build:** `cmake -B build && cmake --build build` → `build/server`  
-**Run:** `./build/server` (opens `dump.rdb` from CWD)  
-**Test:** `python3 stress_test.py --password kek1234`  
-**Password:** `kek1234` (hardcoded in `server.cpp main()`)
+This document is organized for agents. Use it as the project map before making
+changes.
 
----
+## How Agents Should Use This File
 
-## Current state — 2026-06-25
+Read sections in this order:
 
-**328/328 tests passing. 0 stress errors.**
+1. Current Snapshot
+2. Active Roadmap
+3. Known Bugs and Correctness Follow-ups
+4. Design Decisions
+5. Completed Milestones
+6. Backlog
 
-All 5 Redis data types implemented and full project-wide code review (v5.3) complete:
+Update rules:
 
-| Type | Commands | Status |
-|---|---|---|
-| String | get, set, del, exists, incr, decr, incrby, decrby, incrbyfloat, setnx, setex, psetex, getset, getex, getdel, mset, mget, msetnx, append, strlen, getrange, setrange | ✅ |
-| Sorted Set | zadd (variadic), zrem, zscore, zrank, zquery, zrevquery, zpopmin | ✅ |
-| List | lpush, rpush, lpop, rpop, llen, lindex, lrange, lset, linsert, lrem, ltrim | ✅ |
-| Hash | hset, hget, hdel, hexists, hlen, hgetall, hkeys, hvals, hmget, hsetnx, hincrby, hstrlen, hscan | ✅ |
-| Set | sadd, srem, sismember, smismember, scard, smembers, spop, srandmember, sscan, sinter, sunion, sdiff, sinterstore, sunionstore, sdiffstore, smove | ✅ |
+- Put new open bugs only in `Known Bugs and Correctness Follow-ups`.
+- When a bug is fixed, move it to `Resolved Bugs Archive`.
+- Put implementation tradeoffs only in `Design Decisions`.
+- Put completed work summaries only in `Completed Milestones`.
+- Keep active implementation instructions under the relevant active milestone.
+- Avoid adding session notes inline. Convert them into durable tasks, bugs, decisions,
+  or completed summaries.
 
-Generic: exists, type, keys, scan, dbsize, randomkey, rename, renamenx, touch, unlink, flushall, expire, pexpire, expireat, pexpireat, ttl, pttl, persist  
-Admin: auth, info, save, bgsave, bgrewriteaof, ping, config (stub)
+Naming conventions:
 
----
+- Version headings use `V<number> - Name`.
+- Active work uses `V<number>.<step> - Name`.
+- Status labels are `[Next]`, `[In Progress]`, `[Done]`, `[Backlog]`, `[Deferred]`.
+- Redis command names are uppercase in prose: `GET`, `ACL SETUSER`, `BGREWRITEAOF`.
+- Internal code names keep exact spelling: `CmdSpec`, `k_cmd_table`, `acl_check`.
+- Config directive names are lowercase: `requirepass`, `rename-command`, `auditlog`.
 
-## v5.2 — String commands (CURRENT WORK)
+## Current Snapshot
 
-Complete the String type to near-Redis parity. All changes in `commands.cpp` only — no new files or data structures.
+Date: 2026-07-09.
 
-### ✅ Step 1 — Variadic DEL / EXISTS (DONE 2026-06-21)
+Primary commands:
 
-- `DEL key [key...]` — loop `cmd[1..N]`, swap each key into `LookupKey`, `hm_delete` + `entry_del`, count hits, batch `g_writes_since_save += deleted`. Dispatch changed from `== 2` to `>= 2`.
-- `EXISTS key [key...]` — same loop but copy (not swap) into `LookupKey` so duplicate keys are each counted. `expire_if_needed` check before counting. Dispatch changed from `== 2` to `>= 2`.
-
-### ✅ Step 2 — Numeric: INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT (DONE 2026-06-21)
-
-One shared helper `incr_generic(cmd, out, delta)` used by all four integer commands.
-
-```
-INCR key          → cur + 1   (dispatch: cmd.size() == 2)
-DECR key          → cur - 1   (dispatch: cmd.size() == 2)
-INCRBY key N      → cur + N   (dispatch: cmd.size() == 3, parse N with str2int)
-DECRBY key N      → cur - N   (dispatch: cmd.size() == 3, parse N with str2int)
-INCRBYFLOAT key N → cur + N   (dispatch: cmd.size() == 3, parse N with str2dbl, return bulk string)
-```
-
-Key implementation details:
-- Missing key → `entry_str(ent)` is empty → treat as 0. Check: `!entry_str(ent).empty() && !str2int(entry_str(ent), cur)`.
-- Overflow guard BEFORE addition (C++ signed overflow is UB):
-  `(delta > 0 && cur > INT64_MAX - delta) || (delta < 0 && cur < INT64_MIN - delta)`
-- `DECRBY`: guard `if (by == INT64_MIN)` before negating — `-INT64_MIN` overflows `int64_t`.
-- `INCRBYFLOAT`: check `isinf(result) || isnan(result)` after addition. Format: `snprintf(buf, 64, "%.17g", result)`. Returns bulk string (`resp_str`), not integer.
-- `str2int` and `str2dbl` already exist in `commands.cpp` (~line 156–165).
-
-### ✅ Step 3 — Set variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL (DONE 2026-06-21)
-
-```
-SETNX key val              → 1 if set, 0 if key existed
-SETEX key seconds val      → set + expire (seconds). Error if ttl <= 0.
-PSETEX key ms val          → set + expire (milliseconds). Error if ttl <= 0.
-GETSET key val             → return old value (nil if missing), then set new
-GETEX key [EX|PX|EXAT|PXAT|PERSIST]  → get + optionally update/clear expiry
-GETDEL key                 → get + delete atomically. nil if missing.
+```bash
+cmake -B build
+cmake --build build
+./build/server
+python3 stress_test.py --password kek1234
+python3 stress_test.py --password kek1234 --correctness-only
 ```
 
-`SETEX`/`PSETEX` reuse `entry_set_ttl` from `state.h` (same as EXPIRE/PEXPIRE path).
+Default runtime assumptions:
 
-### ✅ Step 4 — Multi-key: MSET / MGET / MSETNX (DONE 2026-06-22)
+- Default port: `1234`.
+- Historical default password: `kek1234`.
+- Config file: `myred.conf` can be loaded explicitly with `./build/server myred.conf`
+  or via `MYRED_CONFIG`.
+- Test harness: `stress_test.py` is the primary correctness and stress harness.
+- Shell helpers live under `scripts/`.
 
-```
-MSET key val [key val...]    → always OK (dispatch: cmd.size() >= 3 && size odd)
-MGET key [key...]            → array of bulk strings / nil per key (type mismatch → nil, NOT WRONGTYPE)
-MSETNX key val [key val...]  → set ALL or NONE. Scan all keys first; if any exist → return 0.
-```
+Implemented command families:
 
-### ✅ Step 5 — Bulk/range: APPEND / STRLEN / GETRANGE / SETRANGE (DONE 2026-06-22)
-
-```
-APPEND key val             → entry_str(ent) += val, return new length. Create if missing.
-STRLEN key                 → entry_str(ent).size(). Missing → 0. WRONGTYPE on wrong type.
-GETRANGE key start end     → substring with Redis slice semantics (negative indices, clamp, never error).
-SETRANGE key offset val    → overwrite bytes at offset; zero-pad if offset > len. Return new length.
-```
-
-`GETRANGE` negative index: `if (idx < 0) idx = max(0, (int64_t)len + idx)`.  
-`SETRANGE` zero-pad: `if (offset > entry_str(ent).size()) entry_str(ent).resize(offset, '\0')`.  
-`SETRANGE` max offset: 512 MB limit — reject `offset >= 512 * 1024 * 1024`.
-
----
-
-## ✅ v5.3 — Project-wide code review (DONE 2026-06-25)
-
-Full pass over the codebase before adding AOF or replication. 328/328 tests passing.
-
-- **Entry type:** `Entry::val` replaced with `std::variant<monostate, string, ZSet, Deque, EntryHash, EntrySet>` — eliminates a whole class of type-confusion bugs and makes the union explicit.
-- **Dispatch table:** `do_request` replaced 110-branch if/else with `std::unordered_map<string_view, CmdSpec>` — O(1) dispatch, arity checked from table, ~20 lines of routing code.
-- **Error constants:** `MSG_WRONGTYPE`, `MSG_NOT_INT`, `MSG_NOT_FLOAT`, `MSG_SYNTAX`, `MSG_OUT_OF_RANGE` — kills typo class.
-- **RNG:** `srand(time(NULL))` → `std::mt19937_64` seeded from `std::random_device` — fixes modulo bias; `SPOP`/`SRANDMEMBER`/`RANDOMKEY` no longer deterministic per boot.
-- **Uniform lazy expiry:** `expire_if_needed` added to `expire_generic` / `expireat_generic` — every keyspace read now expires first.
-- **Direct-emit:** `do_keys`, `do_smembers`, `h_collect_reply` no longer collect into a `vector` then emit; use `hm_size` for upfront count and write directly into `Buffer*`.
-- **ScanCtx unification:** `HScanCtx` / `SScanCtx` merged into single `ScanCtx`.
-- **`glob_match`:** recursive `*` case replaced with O(n·m) two-pointer iterative algorithm.
-- **`container_of`:** GCC statement-expression macro replaced with portable C++ template; 56 call sites updated; type errors now caught at compile time.
-- **Server hardening:** `SO_REUSEADDR`, `accept()` while-loop, `EINTR` handling in read/write, env vars `MYRED_PORT` / `MYRED_PASSWORD`, `thread_pool_destroy` on shutdown.
-- **RDB hardening:** fork+malloc deadlock fixed (serialize in parent before fork, child uses POSIX only), `.bak` rotation before atomic rename, bounds checks in all loaders, `stat()` for post-save size.
-- **Thread pool:** graceful shutdown (`stop` flag, `thread_pool_destroy`), exception guard in worker, explicit `abort()` on pthread errors.
-- **Build:** `-Wall -Wextra -Wshadow` added; Release build uses `-O3 -DNDEBUG` by default.
-
----
-
-## v6 — Persistence hardening
-
-Two complementary durability mechanisms: RDB (point-in-time snapshots) and AOF (command log). Redis runs both together — RDB for fast restarts, AOF for durability. AOF code lives in `aof.cpp` / `aof.h`.
-
-### ✅ Step 1 — AOF write path (DONE)
-
-- Every mutating command is serialized to RESP and appended to an in-memory `g_aof_buf`, flushed to `appendonly.aof` once per event-loop tick (batched — pipelined commands share one `write()`).
-- `CmdSpec` gained `bool is_write` (default `false`); only the ~46 write commands are tagged `true`.
-- Logging is **mutation-gated**: `do_request` diffs `g_writes_since_save` across `spec.fn()` and only logs if the command actually changed state — no-op writes (`SETNX` miss, `DEL` of missing key) never reach the AOF.
-- Relative-TTL commands are translated to absolute `PEXPIREAT key <wall_ms>` in `aof_feed` so TTLs survive a restart.
-- **Bug fixed during impl:** handlers `swap()` out `cmd`'s strings, so `do_request` snapshots `cmd` *before* calling `spec.fn()`. Also fixed missing verbatim fallback in `aof_feed`, and missing counter bumps in `setex_generic` (+ `strlen` mis-tagged as write).
-
-### ✅ Step 2 — fsync policies (DONE)
-
-`Config::aof_fsync` enum (`MYRED_AOF_FSYNC=always|everysec|no`), parsed to an enum once at boot (int compare in hot path):
-
-| Mode | Durability | How |
-|---|---|---|
-| `always` | 0 loss | `fdatasync` synchronously in the loop after each flush (only when bytes were written) |
-| `everysec` | ≤1s loss | `fdatasync` posted to the **thread pool** every 1s; never blocks the loop |
-| `no` | ~30s loss | OS decides |
-
-`everysec` uses a `std::atomic<bool> g_aof_fsync_pending` CAS guard so a slow disk can't queue up a backlog of sync jobs. `fdatasync` (not `fsync`) skips non-essential metadata.
-
-### ✅ Step 3 — AOF loading / replay (DONE)
-
-`aof_load(path)` slurps the file and feeds it through the **same** `parse_resp_request` → `do_request` path the network uses (zero duplicate command logic). Key points:
-- `g_data.g_loading = true` during replay → the write gate suppresses re-logging.
-- Dummy `Conn` with `authenticaded = true` bypasses auth; replies discarded into a drained sink buffer.
-- `g_writes_since_save` reset to 0 after replay so it doesn't immediately trip the save trigger.
-
-### ✅ Step 4 — BGREWRITEAOF compaction (DONE)
-
-Two-phase fork (mirrors BGSAVE): parent serializes the whole dataset to minimal RESP commands (`cb_aof_rewrite`), forks, child writes the snapshot + `fdatasync` + `_exit`, parent appends the delta (`g_aof_rewrite_buf`, dual-written during the rewrite) and atomically `rename`s into place, then repoints the live fd. Per-type emit is batched at `k_aof_batch = 64` elements (`SET`/`ZADD`/`RPUSH`/`HSET`/`SADD`), `PEXPIREAT` emitted after the data command. Manual `BGREWRITEAOF` + auto-trigger (size in memory, gated 1/s, fires past `aof_rewrite_min_size` and `perc` growth). **Bug fixed:** `appebdonly.aof.tmp` filename typo made finalize a silent no-op.
-
-### ✅ Step 5 — RDB + AOF priority load (DONE)
-
-Startup priority: AOF wins when enabled and present (RDB ignored, warns); else RDB; else empty. **Bug fixed:** `aof_enable` must be parsed from env *before* the load decision and the AOF `open()` must come *after* the load — original ordering loaded RDB by mistake.
-
-### ✅ Step 6 — Crash recovery & AOF truncation (DONE)
-
-- **Truncation recovery:** `aof_load` stops on `parse_resp_request` returning `0` (partial tail) or `-1` (corrupt), keeps everything up to the last good offset, and `truncate()`s the file to that offset. Partial trailing writes from a crash are non-fatal.
-- **`--check-aof [--fix] [path]` CLI flag:** `aof_check` parses the AOF without executing, reports the last-good offset and command count, and (with `--fix`) truncates a bad tail. Runs before any server init, then exits.
-- **Disk-full policy:** `aof_flush` sets `g_aof_write_err` on a real write error; `do_request` then rejects write commands with `MISCONF ...` (reads still served) until a later flush drains the buffer and clears the flag — no silent data loss, no unbounded buffer growth.
-- **Signal hardening:** `SIGXFSZ` and `SIGPIPE` are `SIG_IGN`'d so a file-size limit or a client disconnect mid-write returns a handleable `errno` (`EFBIG`/`EPIPE`) instead of killing the process.
-
-### ✅ Step 7 — Config-driven save triggers (DONE)
-
-Redis-style `save N M` (save RDB if ≥M writes happened within N seconds), OR-combined across conditions.
-- **Config:** `std::vector<SaveCondition>{seconds, changes}` with defaults `{3600,1} {300,100} {60,10000}`; overridable via `MYRED_SAVE="3600 1 300 100 60 10000"` (empty string disables auto-save).
-- **Trigger:** `process_timers` loops the conditions; first match (`g_writes_since_save >= changes && elapsed >= seconds*1000`) fires `rdb_save_background()`, guarded by `g_rdb_child_pid == -1`.
-- **Dirty-counter fix:** `rdb_on_save_complete` previously did `g_writes_since_save++` (never reset!). Now each save path snapshots `g_dirty_at_save` at start, and completion **subtracts** it — so writes during a background save survive while saved changes clear. This is what makes the "changes since last save" windows meaningful.
-- **Idle wake tightened:** `next_timer_ms` derives the next-save wake from the soonest *armed* condition instead of the old `k_save_interval_ms`, so an idle-but-dirty server saves on time. `k_save_interval_ms` / `k_save_after_writes` retired.
-
----
-
-## ✅ v6 — Optimizations (DONE 2026-06-28)
-
-All five optimizations applied. Several latent bugs surfaced and were fixed along the way.
-
-### ✅ A. `aof_encode` → one template
-Collapsed the two overloads into `template <typename Range> aof_encode(std::string&, const Range&)` plus a thin `initializer_list<string_view>` forwarder (braced `{...}` calls can't deduce a generic `Range`, so the forwarder keeps those call sites working). Body lives in one place. Moved to `aof.h` (templates are implicitly inline) to dedupe across TUs.
-
-### ✅ B. Alternative write path — raw RESP bytes
-`try_one_request` captures the raw frame from `conn->incoming` (`buf_consume` moved *after* dispatch) and threads `(raw, raw_len)` into `do_request`. Common writes are logged with one `memcpy` (`aof_append_raw`) — no snapshot copy, no re-encode. Only the five TTL-rewrite commands (flagged `aof_rewrite` in `CmdSpec`) still snapshot + translate. Dropped a per-write heap allocation on the hot path.
-
-### ✅ C. Hybrid AOF format (embedded RDB preamble)
-Rewrite now emits `["MYAOFRDB"][rdb_len:u64][RDB image][RESP delta]`. `rdb_build_aof_preamble` wraps a standalone `rdb_serialize` image; `rdb_load_buffer` loads an RDB from memory. `aof_load` detects the marker → fast binary load of the snapshot → RESP-replay only the tail; markerless files still load as plain RESP (backward-compatible). Load for large datasets drops from "replay N commands" to "one RDB pass + small delta". Verified by `scripts/test_aof_hybrid.sh`.
-
-### ✅ D. `INFO persistence` observability
-Added `aof_enabled`, `aof_current_size`, `aof_base_size`, `aof_pending_rewrite`, `aof_last_write_status` (from `g_aof_write_err`) to the `# Persistence` section — all read straight from `g_data`/`g_config`. Also bumped the `INFO` buffer to 4096 + clamped `len` (it trusted `snprintf`'s return as a length → latent OOB read).
-
-### ✅ E. Smaller wins
-- **Precise `GETEX` translation** (correctness): `aof_feed` now emits `PEXPIREAT`/`PERSIST`/`DEL` for every mutating `GETEX` form instead of logging it verbatim (relative `EX`/`PX` would replay wrong). `GETDEL` stays verbatim (deterministic, correct). `getex` tagged `aof_rewrite`.
-- **`reserve()`** `g_aof_buf` (startup) and `g_aof_rewrite_buf` (per rewrite) to 64 KB — avoids reallocation churn.
-- `writev()` scatter-gather flush: **skipped** (marginal, not worth it without profiling).
-
-### Bugs fixed during the optimization pass
-- **`g_last_save_ms` uninitialized** (Step 7): defaulted to 0, so `now - 0` satisfied every `save N M` window → spurious `BGSAVE` on the *first write*, which then blocked `BGREWRITEAOF` via the fork guard. Now seeded to boot time (with `g_aof_last_fsync_ms` / `g_aof_check_ms`).
-- **`aof_feed` `return` bug**: leftover `return`s in the `EXPIRE`/`SETEX` branches skipped `g_aof_buf += frame` → relative-TTL commands were never logged live (masked by the RDB preamble on rewrite). Restructured so all branches fall through to the append.
-- **`aof_feed` `g_aof_child_pid != 1`** (should be `!= -1`): mirrored every write into `g_aof_rewrite_buf` outside a rewrite → unbounded growth. Fixed.
-
-### Optimization summary (implemented)
-
-| Concern | Approach (done) |
+| Area | Status |
 |---|---|
-| AOF write latency | Buffer in memory; one `write()` per tick; `fdatasync` not `fsync` |
-| Per-write allocation | Raw-bytes `memcpy` path — no snapshot copy / re-encode except TTL commands |
-| fsync never blocks loop | `everysec` offloads `fdatasync` to thread pool with CAS in-flight guard |
-| BGREWRITEAOF memory | Serialize in parent before fork (no CoW explosion); child does pure I/O |
-| Large-dataset load | Hybrid AOF: binary RDB preamble + RESP delta, not full RESP replay |
-| Replay correctness | `g_loading` suppresses re-logging; counter reset after load |
-| Rewrite correctness | Dual-buffer: `g_aof_buf` live + `g_aof_rewrite_buf` delta during child run |
-| TTL correctness | All relative-TTL cmds (incl. `GETEX`) logged as absolute `PEXPIREAT` |
-| No-op writes | Mutation-gated via `g_writes_since_save` delta |
-| Auto-rewrite cost | Size tracked in memory (no per-tick `stat`); check gated to 1/s |
-| Observability | `INFO persistence` exposes AOF size/state/write-status |
+| RESP2 parser and writers | Implemented |
+| Strings | Implemented |
+| Lists | Implemented |
+| Hashes | Implemented |
+| Sets | Implemented |
+| Sorted sets | Implemented subset |
+| Generic keyspace commands | Implemented subset |
+| RDB persistence | Implemented |
+| AOF persistence and rewrite | Implemented |
+| Memory accounting and eviction | Implemented |
+| Config file foundation | Implemented |
+| Password hashing baseline | Implemented |
+| ACL foundation | Implemented, needs hardening |
+| TLS | Not implemented |
+| Pub/Sub and transactions | Not implemented |
+| Replication | Not implemented |
 
----
+Do not rely on old test-count claims in this file. Run the harness for the current
+count after any command or ACL change.
 
-## v6.1 — redis-benchmark / tooling compatibility
+## Active Roadmap
 
-Goal: make standard Redis tooling (`redis-benchmark`, `redis-cli`) run against MYRED so throughput can be measured with the real C client (the Python harness is client-bound at ~1800 ops/sec and measures the client, not the server).
+### V9 - Security and Auth
 
-### ✅ `PING`
-`PING` → `+PONG`; `PING msg` → bulk-string echo of `msg`. RESP multibulk form, handled by the existing parser. Required because the default `redis-benchmark` suite leads with ping tests.
+Goal: move from one root password to a robust security model: config file, hashed
+credentials, protected mode, named users, command and key ACLs, command hardening,
+audit logging, stronger password hashing, and TLS.
 
-### ✅ `CONFIG` (stub)
-`CONFIG GET <param>` → empty array, `CONFIG SET` / `CONFIG RESETSTAT` / `CONFIG REWRITE` → `+OK`. Just enough to satisfy tooling startup probes without implementing a real config system (real config is v9).
+Completed foundations:
 
-### Usage
+- `[Done]` `V9.1 - Config File Foundation`
+  - Shared `config_apply()` maps directives to `Config`.
+  - `config_tokenize()` supports comments and quoted values.
+  - Load precedence: defaults < config file < env < runtime `CONFIG SET`.
+  - `CONFIG REWRITE` support exists for the implemented config surface.
+- `[Done]` `V9.2 - Password Hashing and Constant-Time Compare`
+  - `requirepass` is stored as SHA-256 digest or accepted as `#<hex>`.
+  - `AUTH` hashes the supplied password and compares with `ct_equal`.
+  - Plaintext command buffer is wiped with `secure_zero`.
+- `[Done]` `V9.3 - Protected Mode, Bind, and IP Allowlist`
+  - `bind` supports multiple listen addresses.
+  - Protected mode rejects non-loopback peers when no password is set.
+  - `allow-ip` CIDR entries are checked in `handle_accept`.
+- `[Done]` `V9.4 - ACL Foundation`
+  - `User` registry is stored under `Config::users`.
+  - `Conn::user` is intended to be the single auth identity.
+  - `CmdSpec` has ACL categories and key specs.
+  - `AUTH <pass>` and `AUTH <user> <pass>` are supported.
+  - `ACL SETUSER`, `GETUSER`, `DELUSER`, `LIST`, `USERS`, `WHOAMI`,
+    `CAT`, and `GENPASS` are planned as the command surface.
+  - `user` directives round-trip through config rewrite.
+
+#### V9.5 - Command Hardening and Audit Log [Next]
+
+Purpose: close the security holes that remain after ACL exists but before TLS.
+This step makes dispatch, ACL categories, dangerous-command hiding, persistence,
+and observability agree with each other.
+
+Project-specific risks this step must address:
+
+- `acl_init_categories()` derives `CAT_READ` for every non-write command, then ORs
+  `CAT_ADMIN` and `CAT_DANGEROUS` on top. If `acl_check()` only checks category
+  intersection, `+@read` can accidentally grant sensitive commands.
+- `KeySpec` is intentionally small, but `OBJECT` and `MEMORY` key subcommands need
+  key checks at index 2, and `SMOVE` should check only source and destination keys.
+- `k_cmd_table` should not remain a process-lifetime mutable command definition just
+  to support boot-time category stamping or command aliases.
+- AOF currently has a raw-frame hot path. If a command is renamed and raw aliases are
+  logged, the AOF becomes config-dependent and can leak secret aliases.
+
+##### V9.5.1 - ACL Category Semantics Fix (tagging, not guard_cats)
+
+**Design decision (2026-07-07):** the escalation is a *mistagging* bug, not a missing
+gate. `acl_init_categories()` gave `CAT_READ` to every non-write command — including
+control-plane commands (`CONFIG`/`ACL`/`KEYS`/`MEMORY`/`OBJECT`) — so `+@read`
+intersected their category set and passed the O(1) check. Fix the tag, not the check.
+
+Chosen approach (kept `acl_check` unchanged, no new `CmdSpec` field):
+
+- In `acl_init_categories()`, after ORing the `extra` bits, strip the data-plane base
+  from any control-plane command:
+  ```cpp
+  s.acl_cats = is_write ? CAT_WRITE : CAT_READ;
+  if (extra has name){
+    s.acl_cats |= extra;
+    if (extra & (CAT_ADMIN | CAT_DANGEROUS)) s.acl_cats &= ~(CAT_READ | CAT_WRITE);
+  }
+  ```
+- Result: `CONFIG = ADMIN|DANGEROUS`, `FLUSHALL = KEYSPACE|DANGEROUS`,
+  `KEYS = KEYSPACE|DANGEROUS|SLOW`. A command is either data-plane (read/write) or
+  control-plane (admin/dangerous/keyspace) — never both.
+- `acl_check` keeps its single `(spec.acl_cats & user.allow_cats) != 0` test plus the
+  existing `+cmd`/`-cmd` override and key-pattern checks. No 4th step, no hot-path cost.
+
+Rejected: `guard_cats` (second bitmask + AND-gate in `acl_check`). It only buys
+per-command *mandatory co-requirements* ("grantable by @read OR @keyspace but also
+always requires @admin"), which no real command needs — so it was speculative
+complexity over a mistag. Revisit only if such a command ever appears.
+
+Deliberate divergence from Redis: `@read` no longer implies `KEYS`/`CONFIG`, and
+`@write` no longer implies `FLUSHALL` (Redis's `+@write` does grant `FLUSHALL`). Safer
+default; to restore Redis behavior a user writes an explicit `+flushall`/`+keys`.
+
+Tests (unchanged — all satisfied by the tagging fix):
+
+- `+@read ~*` cannot run `ACL`, `CONFIG`, `MEMORY`, `OBJECT`, or `KEYS`.
+- `+@write ~*` cannot run `FLUSHALL`.
+- `+@admin ~*` can run admin commands.
+- Explicit `+acl` can run `ACL` without granting every admin command.
+
+##### V9.5.2 - Precise Key Resolution
+
+Do not keep growing the `KeySpec` enum for uncommon command shapes. Keep the enum
+for common fast paths and add a resolver hook for irregular commands.
+
+Implementation plan:
+
+- Add an optional key resolver to `CmdSpec`, for example:
+
+```cpp
+bool (*key_resolver)(const std::vector<std::string>& cmd,
+                     std::vector<std::string_view>& keys) = nullptr;
+```
+
+- If `key_resolver == nullptr`, use the existing enum path.
+- Add resolvers for:
+  - `SMOVE`: keys are `cmd[1]` and `cmd[2]`; `cmd[3]` is a member.
+  - `MEMORY USAGE key [SAMPLES n]`: key is `cmd[2]`.
+  - `MEMORY STATS` and `MEMORY DOCTOR`: no key.
+  - `OBJECT ENCODING|REFCOUNT|IDLETIME key`: key is `cmd[2]`.
+  - `CONFIG`, `ACL`, `INFO`, `PING`, and persistence commands: no key.
+- Keep enum paths for `GET`, `SET`, `DEL`, `MGET`, `MSET`, and similar commands.
+
+Tests:
+
+- A user with `~allowed:* +memory +object +smove` can access allowed keys only.
+- `SMOVE` member names are not treated as keys.
+- Blocked source or destination key returns `NOPERM`.
+
+##### V9.5.3 - `rename-command` and Disabled Commands
+
+Scope this as boot/config-file only at first. Runtime `CONFIG SET rename-command`
+should stay unsupported until there is a clear need.
+
+Config grammar:
+
+```text
+rename-command OLD NEW
+rename-command FLUSHALL ""
+```
+
+Rules:
+
+- Command names are case-insensitive; store lowercase.
+- Reject unknown `OLD`.
+- Reject duplicate `NEW`.
+- Reject empty `OLD`.
+- Reject whitespace or control characters in `NEW`.
+- Reject collisions with existing commands or earlier aliases.
+- Do not allow disabling `AUTH` if enabled users still require passwords and there is
+  no nopass path; otherwise the config can lock out every client.
+
+Recommended dispatch shape:
+
+- Replace `unordered_map<string_view, CmdSpec>` with an owning boot-built map:
+
+```cpp
+struct DispatchEntry {
+  std::string canonical;
+  CmdSpec spec;
+};
+std::unordered_map<std::string, DispatchEntry> dispatch;
+```
+
+- Build order:
+  1. create canonical command specs;
+  2. stamp ACL categories, guard categories, and key specs;
+  3. apply `rename-command`;
+  4. freeze the dispatch map for process lifetime.
+- A disabled command has no dispatch entry and returns `ERR unknown command`.
+- ACL checks use the canonical command name, not the alias.
+
+AOF rule:
+
+- Keep raw `aof_append_raw(raw, raw_len)` for normal non-renamed writes.
+- If `client_name != canonical`, append a canonicalized RESP frame for successful
+  writes by replacing `cmd[0]` with the canonical command.
+- If `spec.aof_rewrite` is true, canonicalize before the existing TTL rewrite path.
+- This preserves the v6 raw-write optimization and keeps AOF restart-safe.
+
+Tests:
+
+- `rename-command FLUSHALL ""` makes `FLUSHALL` unknown and produces no AOF entry.
+- `rename-command CONFIG __secret_config__` makes `CONFIG` unknown and the alias work.
+- A renamed write command survives restart even if the alias changes later.
+- `-config` blocks the renamed config command because ACL uses canonical names.
+
+##### V9.5.4 - Audit Log
+
+Add a narrow audit logger, not a general logging framework.
+
+Config:
+
+```text
+auditlog ""
+auditlog stderr
+auditlog /path/to/myred-audit.log
+```
+
+Optional later:
+
+```text
+auditlog-events auth,acl,admin,dangerous,deny
+auditlog-required yes
+```
+
+Connection context:
+
+- Store `peer_ip` and `peer_port` on `Conn` at accept time.
+- Do not depend on `inet_ntoa()` later.
+- Include `user=...` as `conn->user ? conn->user->name : "-"`.
+
+Events:
+
+- `auth_fail`: wrong password, disabled user, missing user.
+- `auth_success`: optional and configurable.
+- `acl_change`: `ACL SETUSER`, `ACL DELUSER`, future `ACL LOAD` or `ACL SAVE`.
+- `acl_deny`: command or key-pattern denial.
+- `admin_command`: canonical command has `CAT_ADMIN`.
+- `dangerous_command`: canonical command has `CAT_DANGEROUS`.
+- `accept_reject`: protected-mode or allowlist rejection.
+
+Line format:
+
+```text
+ts=2026-07-09T18:23:10Z event=acl_deny peer=127.0.0.1:54321 user=alice cmd=flushall reason=category
+ts=2026-07-09T18:23:22Z event=acl_change peer=127.0.0.1:54321 user=default cmd=acl sub=setuser target=bob result=ok
+ts=2026-07-09T18:23:31Z event=auth_fail peer=10.0.0.9:52100 user=default result=wrongpass
+```
+
+Implementation rules:
+
+- Use wall-clock UTC with `time()`, `gmtime_r()`, and `strftime()`.
+- Use one `write()` per audit line to an `O_APPEND | O_CLOEXEC` fd.
+- Avoid stdio buffering surprises across `fork()`.
+- Never log passwords, password hashes, or raw argument vectors.
+- `ACL SETUSER` logs target username and rule count only.
+- `CONFIG SET requirepass` logs directive name only.
+- Audit is best-effort by default; on write failure set sticky `audit_last_error` for
+  future `INFO` exposure.
+
+##### V9.5.5 - Protocol and Metadata Cleanup
+
+- Fix `ACL CAT` to emit a RESP array header before category strings.
+- Make unknown or unsupported `CONFIG SET` behavior explicit:
+  - either document current compatibility behavior, or
+  - return `ERR unsupported parameter`.
+- Add a boot metadata self-check:
+  - every command has nonzero `acl_cats`;
+  - every admin/dangerous command has the data-plane base (`CAT_READ`/`CAT_WRITE`)
+    stripped, so `@read`/`@write` cannot intersect it (V9.5.1 tagging rule);
+  - every write command has a deliberate AOF mode: raw, rewrite, or canonicalize.
+- Add stress-test coverage for hardening paths.
+- Keep destructive or crash-probing tests behind an explicit flag.
+
+Done criteria:
+
+- Restricted `+@read` and `+@write` users cannot run admin/dangerous commands unless
+  explicitly granted.
+- Key-pattern ACLs are precise for `SMOVE`, `MEMORY`, and `OBJECT`.
+- Disabled commands are unreachable and cannot dirty the DB or append to AOF.
+- Renamed write commands are persisted canonically and survive restart.
+- Audit log records auth failures, ACL changes, ACL denials, and admin/dangerous
+  command attempts without leaking secrets.
+- `stress_test.py --password kek1234 --correctness-only` covers ACL hardening,
+  rename-command, and audit assertions.
+- AOF shell tests cover at least one renamed write command.
+
+#### V9.6 - Password Hashing Upgrade [Backlog]
+
+SHA-256 is fast and unsalted. It is acceptable as the current baseline, but weak if a
+config or ACL file leaks. Upgrade credentials at rest to a salted, memory-hard KDF.
+
+Preferred path:
+
+- Add Argon2id via `libargon2`.
+- Store PHC-format strings (`$argon2id$...`) in `requirepass` and user password
+  entries.
+- Keep SHA-256 verification for existing `#<hex>` configs.
+- Rehash to Argon2id on next `CONFIG SET requirepass` or `ACL SETUSER`.
+- Keep `secure_zero()` and constant-time verification hygiene.
+
+Fallback: bcrypt if Argon2 dependency cost is too high.
+
+#### V9.7 - TLS [Backlog]
+
+TLS is the heaviest security feature and can be its own milestone.
+
+Plan:
+
+- Link OpenSSL.
+- Add `tls-port`, `tls-cert-file`, `tls-key-file`, and `tls-ca-cert-file`.
+- Optional mutual TLS: require and verify client certificates.
+- Wrap per-`Conn` I/O in an `SSL*`.
+- Integrate non-blocking `SSL_read()` and `SSL_write()` with `poll()` using
+  `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE`.
+- Add handshake timeouts.
+- Use `SSL_shutdown()` on close.
+- Support cert reload without restart only after basic TLS is stable.
+
+### V8 - Pub/Sub and Transactions [Backlog]
+
+Planned features:
+
+- `SUBSCRIBE`
+- `UNSUBSCRIBE`
+- `PUBLISH`
+- Pattern subscriptions
+- `MULTI`
+- `EXEC`
+- `DISCARD`
+- `WATCH`
+
+Notes:
+
+- Pub/Sub will make the existing ACL channel-pattern field useful.
+- Transactions need command queueing and optimistic invalidation, not just parser work.
+- Blocking or queued client state should be designed before adding blocking list
+  commands.
+
+### V10 - Replication and High Availability [Backlog]
+
+Planned features:
+
+- Master-replica mode.
+- `PSYNC`.
+- Replication backlog.
+- Partial resync.
+- Replica propagation for writes, evictions, and expirations.
+- Sentinel-style failover.
+- Cluster mode or hash-slot sharding.
+
+Important dependency:
+
+- AOF canonicalization for renamed commands should land before replication, because
+  replication must propagate canonical command intent, not client aliases.
+
+## Known Bugs and Correctness Follow-ups
+
+Open items belong here until fixed.
+
+### Security and ACL
+
+- `ACL CAT` must emit a RESP array header. Current malformed output can desynchronize
+  clients.
+- ~~Admin/dangerous ACL categories can be granted too broadly by ORed membership~~
+  → addressed in V9.5.1 by stripping the `CAT_READ`/`CAT_WRITE` base from control-plane
+  commands (tagging fix), so `@read`/`@write` no longer intersect them. No `guard_cats`.
+- `SMOVE` key checks are imprecise until a resolver checks only source and destination.
+- `MEMORY` and `OBJECT` key subcommands need key-pattern ACL checks at `cmd[2]`.
+- Full Redis ACL rule-order fidelity is not implemented. Current compiled form does
+  not preserve "last match wins" rule history.
+- Pub/Sub channel ACL patterns exist conceptually but remain no-op until Pub/Sub lands.
+- `nopass` users, selectors, `sanitize-payload`, `ACL LOAD`, and `ACL SAVE` are not
+  implemented.
+
+### Config and Command Surface
+
+- Unknown `CONFIG SET` behavior must be made explicit and tested.
+- Full `CONFIG GET/SET` coverage is incomplete; current real parameters are focused on
+  memory/security/config basics.
+- `COMMAND`, `COMMAND DOCS`, and `COMMAND COUNT` are not implemented; `redis-cli`
+  interactive mode may probe them.
+
+### Data Correctness
+
+- `ZREM` does not drop an emptied zset. Redis removes the key; `ZPOPMIN` already does.
+- Add restart-level persistence tests for mutating commands that rewrite TTLs or remove
+  keys, especially `GETEX`, `GETDEL`, `ZPOPMIN`, eviction `DEL`, and renamed commands.
+
+### Testing Gaps
+
+- Add explicit security tests for control-plane category gating (V9.5.1 tagging),
+  renamed commands, disabled commands, audit logging, and precise key ACLs.
+- Keep intentionally destructive or server-crashing edge cases behind an explicit test
+  flag.
+- Add AOF restart checks to verify canonicalized renamed writes.
+- Add one test that `ACL CAT` reply framing is a valid RESP array.
+
+## Resolved Bugs Archive
+
+This section records fixed bugs without scattering them through milestone text.
+
+### Persistence and AOF
+
+- Handlers that `swap()` command strings required `do_request` to snapshot `cmd`
+  before calling `spec.fn()`.
+- AOF write path needed a verbatim fallback in `aof_feed`.
+- `SETEX` and related TTL commands were missing counter bumps.
+- `STRLEN` was mistagged as a write command.
+- `BGREWRITEAOF` used typo `appebdonly.aof.tmp`, making finalize a silent no-op.
+- AOF load priority originally parsed `aof_enable` too late, so startup loaded RDB by
+  mistake.
+- AOF file open had to happen after load, not before load.
+- `g_last_save_ms` was uninitialized, causing an immediate spurious `BGSAVE` on first
+  write.
+- `aof_feed` branches returned before appending relative TTL frames.
+- `g_aof_child_pid != 1` should have been `!= -1`; the bug mirrored writes outside
+  rewrites and could grow `g_aof_rewrite_buf` unbounded.
+- `GETEX` AOF translation now emits deterministic `PEXPIREAT`, `PERSIST`, or `DEL`.
+- AOF truncation handles partial or corrupt tails and keeps the last good offset.
+- Disk-full AOF errors now reject future writes with `MISCONF` while reads continue.
+- `SIGXFSZ` and `SIGPIPE` are ignored so write failures return errno instead of
+  killing the server.
+
+### Memory Management
+
+- `LPOP` and `RPOP` reaccounting after `entry_del()` caused use-after-free patterns.
+- `MSET` and `MSETNX` needed per-entry reaccounting, not one outside-loop reaccount.
+- OOM gate had to exempt memory-freeing commands such as `DEL`, `UNLINK`, `FLUSHALL`,
+  `EXPIRE`, pop/rem commands, and related shrinking commands.
+- Evictions must propagate explicit `DEL` to AOF so replay does not resurrect evicted
+  keys.
+
+### Config and Auth
+
+- A leftover hardcoded `password = kek1234` clobbered config-loaded passwords.
+- `config_tokenize()` had a pre-increment bug that dropped each token's first char.
+- `#<hash>` ACL/config tokens must be quoted in config rewrite because `#` starts a
+  comment.
+- Pre-hashed ACL token validation checked the wrong length for `#` plus 64 hex chars.
+
+### ACL
+
+- `acl_init_categories()` was not called at boot, so command ACL categories stayed `0`.
+- `acl_init_categories()` needed a prototype in `state.h`.
+- `ACL` category bits were accidentally placed in the key-spec map instead of the
+  extra-category map.
+- `ACL` needed `KeySpec::NONE`.
+- `AUTH <user> <pass>` had an extra plaintext password copy that needed wiping.
+- ACL deny parser branches checked the wrong token prefix for `-@cat` and `-cmd`.
+- `acl_apply_rule()` missed a final `return false` for unrecognized tokens.
+- `ACL GENPASS` had unreachable or wrongly nested code and could send no reply.
+- `resetkeys` did not clear `all_keys`.
+- `ACL LIST` originally hid partial `~pattern` and `+@cat` rules; it should use the
+  same formatter as config rewrite.
+
+### General Hardening
+
+- `RDB` save fork/malloc deadlock was avoided by serializing in the parent before fork.
+- RDB loaders gained bounds checks.
+- RDB save uses `.bak` rotation before atomic rename.
+- `INFO` buffer was increased and `snprintf` length handling was clamped to avoid OOB
+  reads.
+- `accept()` loop, `EINTR`, `SO_REUSEADDR`, `TCP_NODELAY`, and thread-pool shutdown
+  were hardened during the project-wide review.
+
+## Design Decisions
+
+### Dispatch Table
+
+Current state:
+
+- Command dispatch uses `CmdSpec` entries in `k_cmd_table`.
+- `CmdSpec` owns handler, arity, write flag, AOF rewrite flag, ACL categories, and
+  key spec.
+- `acl_init_categories()` mutates the table at boot to derive categories from
+  `is_write`.
+
+Tradeoff:
+
+- Deriving `CAT_READ` and `CAT_WRITE` avoids duplicated truth in the initializer.
+- Losing `const` on `k_cmd_table` is the cost.
+
+Preferred upgrade:
+
+- Replace `acl_init_categories()` with `build_cmd_table()`.
+- Build specs, derive categories/key specs/guard cats, then return a frozen map.
+- This also enables owned command names for `rename-command`.
+
+### AOF Write Path
+
+- Normal successful writes use raw RESP bytes captured by `try_one_request`.
+- TTL-sensitive writes use rewrite paths that emit deterministic absolute commands.
+- No-op writes are mutation-gated by `g_writes_since_save`.
+- Renamed commands must use canonicalized AOF frames, not raw aliases.
+
+### ACL Model
+
+Current deliberate simplification:
+
+- Permissions compile to `allow_cats` plus `cmd_overrides`.
+- Enforcement is O(1) and does not replay raw ACL token history per request.
+
+Known gap:
+
+- Redis's ordered last-match-wins rule composition is not fully preserved.
+
+Upgrade path:
+
+- Store raw ordered rule tokens alongside the compiled form.
+- Replay tokens at `ACL SETUSER` time into the compiled form.
+- Keep request-time enforcement O(1).
+- Use raw tokens for `ACL LIST` and `ACL GETUSER` output only.
+
+### Memory Eviction
+
+- MYRED uses best-of-`maxmemory_samples` eviction sampling.
+- It does not implement Redis's persistent 16-slot eviction pool yet.
+- This is acceptable for the project scale and avoids stale-entry validation
+  complexity.
+- Revisit only if realistic cache workloads show poor hit rates.
+
+### Compact Encodings
+
+- MYRED currently uses heavyweight structures for all collection sizes.
+- `OBJECT ENCODING` reports honest MYRED names.
+- Listpack/intset/quicklist-style encodings are future memory optimizations, not
+  correctness requirements.
+
+### Windows Port
+
+- Windows support is not a simple socket port because persistence relies on `fork()`
+  for `BGSAVE` and `BGREWRITEAOF`.
+- A portable snapshot design must come before a serious Windows build.
+
+## Completed Milestones
+
+### V5.2 - String Command Expansion [Done]
+
+Implemented:
+
+- Variadic `DEL` and `EXISTS`.
+- `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`.
+- `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETEX`, `GETDEL`.
+- `MSET`, `MGET`, `MSETNX`.
+- `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`.
+
+Important implementation notes:
+
+- Integer operations guard signed overflow before addition or negation.
+- `INCRBYFLOAT` rejects NaN and infinity and returns bulk strings.
+- `GETRANGE` follows Redis negative-index and clamping behavior.
+- `SETRANGE` zero-pads and rejects offsets past the 512 MB limit.
+
+### V5.3 - Project-Wide Code Review [Done]
+
+Major outcomes:
+
+- `Entry::val` became a `std::variant`.
+- Dispatch moved from long if/else chain to `CmdSpec`.
+- Common error constants were introduced.
+- RNG moved from `srand(time(NULL))` to `std::mt19937_64`.
+- Lazy expiry was centralized.
+- Direct emit paths reduced temporary vectors.
+- `glob_match` became iterative.
+- `container_of` became a portable C++ template.
+- Server and RDB hardening were improved.
+- Build warnings were strengthened.
+
+### V6 - Persistence Hardening [Done]
+
+Implemented:
+
+- AOF write buffering.
+- Mutation-gated write logging.
+- TTL translation to absolute `PEXPIREAT`.
+- `appendfsync` policy support: `always`, `everysec`, `no`.
+- AOF replay through the same command path.
+- `BGREWRITEAOF` compaction.
+- RDB/AOF startup priority.
+- AOF crash recovery and truncation.
+- `--check-aof` and `--fix` tooling.
+- Disk-full policy for AOF write failures.
+- Config-driven save triggers.
+
+### V6 Optimization Pass [Done]
+
+Implemented:
+
+- One templated `aof_encode`.
+- Raw RESP write path for common AOF logging.
+- Hybrid AOF format: RDB preamble plus RESP delta.
+- `INFO persistence` observability.
+- Buffer `reserve()` improvements for AOF.
+
+Skipped:
+
+- `writev()` scatter-gather flush. It was not worth adding without profiling.
+
+### V6.1 - Redis Tooling Compatibility [Done]
+
+Implemented:
+
+- `PING`.
+- Inline protocol parsing.
+- Minimal `CONFIG` compatibility, later replaced by real config work.
+- `ZPOPMIN`.
+- Variadic `ZADD`.
+
+Remaining optional tooling gap:
+
+- `COMMAND`, `COMMAND DOCS`, and `COMMAND COUNT`.
+
+### V7 - Memory Management [Done]
+
+Implemented:
+
+- Incremental memory accounting with `Entry::mem`.
+- `used_memory` and `INFO memory`.
+- `maxmemory`.
+- Redis-style eviction policy names.
+- LRU and LFU metadata.
+- Sampling-based victim selection.
+- Write-path eviction and OOM handling.
+- AOF propagation of evictions.
+- `MEMORY USAGE`, `MEMORY STATS`, `MEMORY DOCTOR`.
+- `OBJECT ENCODING`, `OBJECT IDLETIME`, `OBJECT FREQ`, `OBJECT REFCOUNT`.
+
+Deferred:
+
+- Compact encodings.
+- Shared object refcounting.
+- Persistent 16-slot eviction pool.
+
+## Backlog
+
+### Memory and Encoding Optimizations
+
+- `embstr` for small strings.
+- Integer object storage instead of digit strings.
+- `listpack` for small hashes, zsets, and lists.
+- `intset` for all-integer sets.
+- `quicklist`-style list storage.
+- RDB and AOF support for multiple internal encodings.
+- Accurate small-object memory accounting after compact encodings land.
+
+### Object Sharing
+
+- Shared small-integer pool.
+- Real object refcounts.
+- Copy-on-mutate behavior.
+
+### Command Coverage Gaps
+
+Sorted sets:
+
+- `ZINCRBY`
+- `ZCARD`
+- `ZCOUNT`
+- `ZMSCORE`
+- `ZPOPMAX`
+- `ZRANGEBYSCORE`
+- `ZRANGEBYLEX`
+- `ZREVRANGE`
+- `ZREMRANGEBYRANK`
+- `ZREMRANGEBYSCORE`
+- `ZREMRANGEBYLEX`
+- `ZUNIONSTORE`
+- `ZINTERSTORE`
+- `ZDIFFSTORE`
+- `ZRANDMEMBER`
+- `ZSCAN`
+- `ZLEXCOUNT`
+- `ZRANGESTORE`
+- `ZMPOP`
+
+Strings and bitmaps:
+
+- `SETBIT`
+- `GETBIT`
+- `BITCOUNT`
+- `BITPOS`
+- `BITOP`
+- `BITFIELD`
+- `SUBSTR`
+- `LCS`
+
+Generic:
+
+- `COPY`
+- `SORT`
+- `SORT_RO`
+- `DUMP`
+- `RESTORE`
+- `EXPIRETIME`
+- `PEXPIRETIME`
+- `OBJECT HELP`
+- `SCAN ... TYPE`
+- `WAIT`
+
+Hashes:
+
+- `HRANDFIELD`
+- `HINCRBYFLOAT`
+
+Lists:
+
+- `LPOS`
+- `LMOVE`
+- `RPOPLPUSH`
+- `LMPOP`
+- `BLPOP`
+- `BRPOP`
+- `BLMOVE`
+
+Sets:
+
+- `SINTERCARD`
+
+New data types:
+
+- HyperLogLog (`PF*`)
+- Streams (`X*`)
+- Geo (`GEO*`)
+- Bitmaps as a first-class area
+
+### Server Observability and Tooling
+
+- `CLIENT LIST`
+- `CLIENT KILL`
+- `CLIENT SETNAME`
+- `CLIENT GETNAME`
+- `CLIENT ID`
+- `HELLO` and RESP3 handshake
+- `RESET`
+- `SLOWLOG`
+- `LATENCY`
+- `MONITOR`
+- `DEBUG`
+- `SHUTDOWN`
+- `LASTSAVE`
+- `TIME`
+- Full `CONFIG GET/SET` surface
+
+### Platform Work
+
+- Portable background snapshot design without `fork()`.
+- Windows socket layer using `WSAPoll`.
+- `WSAStartup` and `WSACleanup`.
+- `FlushFileBuffers` replacement for `fdatasync`.
+- Path handling and config path portability.
+
+## Testing Matrix
+
+Primary harness:
+
+```bash
+python3 stress_test.py --password kek1234
+python3 stress_test.py --password kek1234 --correctness-only
+python3 stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
+```
+
+Persistence helpers:
+
+```bash
+scripts/test_aof.sh
+scripts/test_aof_rewrite.sh
+scripts/test_aof_hybrid.sh
+scripts/diag_live.sh
+scripts/diag_ttl.sh
+```
+
+Benchmarking:
+
 ```bash
 redis-benchmark -p 1234 -a kek1234 -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset -n 200000 -c 50 -P 16 -q
 ```
 
-### ✅ Inline protocol
-`parse_resp_request` now handles requests not starting with `*` as inline commands: read a line (tolerates `\n` and `\r\n`), split on whitespace into args, return bytes consumed. Runaway lines past `k_max_msg` with no terminator are rejected. This makes `PING_INLINE` (bare `PING\r\n`) work alongside `PING_MBULK`.
-
-### ✅ `ZPOPMIN`
-`ZPOPMIN key [count]` — pops the lowest-score member(s) (leftmost AVL node), returns `[member, score, …]`, drops the key when the zset empties. `is_write`, deterministic → logged verbatim to AOF.
-
-### ✅ Variadic `ZADD`
-`ZADD key score member [score member ...]` now accepts multiple pairs (was single-pair, arity `4,4`). Table entry is `4, -1`; the handler enforces an even arg count, validates **all** scores before inserting any (atomicity — a bad score adds nothing), and returns the count of newly-added members.
-
-### Remaining gap (optional)
-- **`COMMAND` / `COMMAND DOCS`** — `redis-cli` interactive probes these; harmless if absent, add a stub if the interactive CLI complains. Not needed for `redis-benchmark`.
-
-With inline + `ZPOPMIN`, the **default** `redis-benchmark` suite (no `-t`) now runs clean.
-
-## v7 — Memory management
-
-Goal: bound the server's footprint with a `maxmemory` limit and evict keys under
-pressure, plus the introspection commands (`MEMORY USAGE`, `OBJECT ENCODING`) that
-tooling and humans use to reason about it. Everything here builds on the existing
-single-threaded loop, the `std::variant` `Entry`, the TTL min-heap, and the thread
-pool for async free. Do the steps in order — accounting first, because nothing else
-can be enforced or reported without it.
-
-**Status (2026-07-03): Steps 1–6 DONE — v7 feature-complete.** Accounting, `maxmemory`
-config, all 8 eviction policies, LRU/LFU metadata + sampling, the eviction/OOM trigger,
-and introspection (`MEMORY`/`OBJECT`) are implemented and verified by `test_memory.py`.
-Deferred to the **General upgrades** backlog (below v10): compact encodings
-(listpack/intset/quicklist), object sharing / real `OBJECT REFCOUNT`, and the 16-slot
-eviction pool.
-
-### ✅ Step 1 — Memory accounting (foundation) (DONE 2026-07-01)
-
-Implemented via a drift-free incremental counter: `Entry::mem` holds the bytes last
-charged to each entry, the invariant `g_data.used_memory == Σ Entry::mem` is kept by
-`mem_reaccount(ent)` (add-new-before-subtract-old), and `entry_del` discharges on the
-main thread (safe with the async-delete pool). `entry_mem_usage(Entry*)` estimates
-per-type cost; write handlers reaccount after mutating (once per distinct entry — so
-MSET reaccounts inside its loop, HSET/SADD once after theirs); RDB loaders reaccount
-each entry on the success path. `INFO memory` now reports `used_memory` +
-`used_memory_rss` + `mem_fragmentation_ratio`. Verified by `test_memory.py` (per-type
-create→drain→baseline, overwrite-stability, `FLUSHALL`→0) and a `mem_selfcheck`
-counter-vs-sweep pass under the full `stress_test.py` suite. Bugs caught along the
-way: `lpop`/`rpop` use-after-free (reaccount after `entry_del`), `mset`/`msetnx`
-single-reaccount-outside-loop. Follow-ups noted: `setrange` missing `is_write`,
-`zrem` doesn't drop an emptied zset.
-
-Before any limit can be enforced we need a live `used_memory` number. Two layers:
-
-- **Global counter** `g_data.used_memory` (`size_t`, atomic not required — single loop
-  thread). Bump it in the allocation choke points, not by walking the keyspace:
-  - `entry_new` / `entry_del_sync` — add/subtract the entry's accounted size.
-  - Every value mutation that grows/shrinks a value (`APPEND`, `SETRANGE`, `RPUSH`,
-    `HSET`, `SADD`, `ZADD`, `LREM`, …) must adjust the delta. Centralize this: a small
-    `mem_account(Entry*, ssize_t delta)` helper so handlers don't each reinvent it.
-- **Per-entry size estimator** `entry_mem_usage(const Entry*)` — walks the value by
-  type and returns an approximate byte cost (used by both the counter's initial
-  charge and by `MEMORY USAGE`):
-
-  | Type | Cost model |
-  |---|---|
-  | key | `sizeof(Entry)` + key string len + HMap slot overhead |
-  | string | `capacity()` of the `std::string` |
-  | list (deque) | ring-buffer `cap * sizeof(slot)` + sum of element lens |
-  | hash | nested HMap buckets + Σ(field+value) |
-  | set | nested HMap buckets + Σ(member) |
-  | zset | AVL nodes (`sizeof(AVLNode)` each) + HMap + Σ(member) |
-
-  Keep it *approximate and cheap* — Redis's own `MEMORY USAGE` samples large
-  aggregates rather than walking every element (see `SAMPLES` option, Step 6).
-- **`INFO memory`** section: `used_memory`, `used_memory_human`, `maxmemory`,
-  `maxmemory_policy`, `mem_fragmentation_ratio` (report RSS via `getrusage`/`statm`
-  ÷ `used_memory`), `evicted_keys`, `expired_keys`. Read straight from `g_data`.
-
-**Robustness:** the counter must never underflow — clamp at 0 and assert in debug.
-A drift between the counter and a full re-walk is the classic accounting bug; add a
-debug-only `MEMORY DOCTOR`-style self-check that compares the counter to a full
-`entry_mem_usage` sweep and warns on divergence.
-
-### ✅ Step 2 — `maxmemory` config (DONE 2026-07-03)
-
-`Config::maxmemory` (bytes) + `MaxmemoryPolicy` enum (all 8 values, default
-`noeviction`); `MYRED_MAXMEMORY` / `MYRED_MAXMEMORY_POLICY` env knobs; one shared
-`parse_memory_size` (`k/m/g` = ×1000, `kb/mb/gb` = ×1024) reused by env + `CONFIG SET`.
-`CONFIG GET/SET` upgraded from stub to real for `maxmemory` + `maxmemory-policy`
-(validates policy names; unknown params still return empty array / `+OK`, so tooling
-probes don't break). `INFO memory` reports `maxmemory` + `maxmemory_policy`. Note:
-config is runtime-only (not persisted) — a restart resets `maxmemory` to `0`.
-
-- `Config::maxmemory` (bytes, `0` = unlimited). Env knob `MYRED_MAXMEMORY`, parsed
-  with a human-size reader (`100mb`, `1gb`, `512kb` → bytes) reused by `CONFIG SET`.
-- `Config::maxmemory_policy` enum (see Step 3), default `noeviction`.
-- Wire both into the `CONFIG GET/SET` stub so they're runtime-tunable (this turns the
-  v6.1 stub into its first real parameters).
-
-### ✅ Step 3 — Eviction policies (DONE 2026-07-03)
-
-Encoded in `evict_pick_victim()`: random policies do one pick, `volatile-ttl` reads the
-TTL heap root (nearest expiry, nearly free), LRU/LFU use best-of-N sampling. A `nullptr`
-return means `noeviction` **or** a `volatile-*` policy with no TTL keys to take — both
-resolve to `-OOM` in Step 5 (the volatile-fallback rule, in one place).
-
-Eight policies, matching Redis. Store as an enum parsed once at boot / on `CONFIG SET`:
-
-| Policy | Candidate set | Victim chosen by |
-|---|---|---|
-| `noeviction` | — | none — reject writes with `-OOM` |
-| `allkeys-random` | all keys | random |
-| `volatile-random` | keys with a TTL | random |
-| `allkeys-lru` | all keys | oldest idle time |
-| `volatile-lru` | keys with a TTL | oldest idle time |
-| `allkeys-lfu` | all keys | lowest access frequency |
-| `volatile-lfu` | keys with a TTL | lowest access frequency |
-| `volatile-ttl` | keys with a TTL | nearest expiry |
-
-**Volatile fallback:** when a `volatile-*` policy has no keys with a TTL to evict and
-we're still over the limit, behave like `noeviction` (return `-OOM`) — do *not* touch
-non-volatile keys.
-
-### ✅ Step 4 — LRU / LFU metadata + approximated eviction (DONE 2026-07-03)
-
-`Entry::lru` (24-bit: coarse clock for LRU / `[16b minute | 8b counter]` for LFU),
-stamped at the single `lookup_entry` choke point (`entry_touch_access` on hit,
-`entry_init_access` on create). `g_lru_clock` bumped once per event-loop tick from the
-cached `now_ms` — no per-access syscall. LFU uses logarithmic probabilistic increment
-(`p = 1/(base·factor+1)`) + minute-based decay. Samplers: `db_random_entry` (random
-bucket across both rehash tables) and `volatile_random_entry` (off the TTL heap);
-`evict_pick_victim` keeps best-of-`maxmemory_samples` (default 5). Configs
-`maxmemory_samples` / `lfu_log_factor` / `lfu_decay_time`. **Deferred:** the persistent
-16-slot eviction pool (best-of-N is correct; pool is a sampling-quality optimization).
-
-Redis does **not** keep a true global LRU list (too much memory + pointer churn). It
-stores a small per-object field and evicts by *sampling*. Mirror that:
-
-- **Entry field:** add a `uint32_t lru` to `Entry` (24 bits used). Under an LRU policy
-  it holds a coarse access timestamp; under LFU it packs a 16-bit last-decay-time +
-  8-bit logarithmic counter. Costs 4 bytes/key.
-- **LRU clock:** a global `g_lru_clock` updated once per event-loop tick from the
-  cached monotonic time (no per-access syscall). On every keyspace *read/write* stamp
-  `ent->lru = g_lru_clock`. Idle time = `g_lru_clock - ent->lru` (handle wraparound).
-- **LFU counter:** probabilistic log increment (`p = 1/(counter*factor+1)`) on access,
-  with time-based decay so cold-but-once-hot keys age out. `lfu_log_factor` /
-  `lfu_decay_time` configs.
-- **Eviction pool:** keep a fixed 16-slot pool of best candidates across calls. Each
-  eviction round samples `maxmemory_samples` keys (default 5) via a cheap random
-  sampler over the HMap, merges them into the pool sorted by idle-time / inverse-freq
-  / nearest-TTL, and evicts from the good end. Amortizes sampling cost.
-- **Random sampler:** needs an O(1)-ish "give me a random live entry" over the dual
-  HMap. Generalize the `RANDOMKEY` reservoir path into `hm_random_entry()` that both
-  tables can serve; for `volatile-*` iterate the TTL min-heap instead (it already
-  holds exactly the keys with a TTL, and for `volatile-ttl` it's *sorted by expiry* —
-  the victim is near the heap root, nearly free).
-
-### ✅ Step 5 — Eviction trigger + write path integration (DONE 2026-07-03)
-
-`free_memory_if_needed()` runs at the top of the write path (gated on `spec.is_write`),
-evicts via `evict_pick_victim` → `entry_del` (async-frees big values + discharges
-`used_memory` on the main thread), bumps `evicted_keys`, and **propagates a synthetic
-`DEL` to the AOF via `aof_feed`** (critical: otherwise replay resurrects evicted keys).
-Bounded attempts; `nullptr` victim → `-OOM command not allowed…`. `INFO` exposes
-`evicted_keys`. **Bug fixed:** the OOM gate must exempt memory-freeing commands
-(`cmd_can_grow_memory` — `DEL`/`UNLINK`/`FLUSHALL`/`EXPIRE`/pop/rem/…), otherwise you
-deadlock over the cap with no way to recover. Verified end-to-end by `test_memory.py`'s
-maxmemory section: `noeviction` OOMs + stays bounded + evicts nothing; `allkeys-lru`
-never OOMs + holds near cap + `evicted_keys` climbs; freeing commands still work over
-the cap.
-
-- **Where:** a `free_memory_if_needed()` called at the top of `do_request` for any
-  command flagged `is_write` in `k_cmd_table` (reads never trigger eviction) — before
-  the handler runs, while over `maxmemory`.
-- **Loop:** while `used_memory > maxmemory`: pick a victim per policy, delete it,
-  subtract its size, `evicted_keys++`. Give up after a bounded number of attempts to
-  avoid stalling the loop on a pathological keyspace; if still over and policy is
-  `noeviction` (or volatile-with-no-volatiles), the triggering write returns
-  `-OOM command not allowed when used memory > 'maxmemory'`.
-- **Async free:** route large-value evictions through the existing `asyncdel`/thread
-  pool path so freeing a huge hash/zset doesn't stall the loop (same mechanism as
-  `UNLINK`).
-- **AOF / persistence correctness (critical):** an eviction is a data change. It must
-  be **propagated as an explicit `DEL key` to the AOF** (and later to replicas in v10)
-  so the log doesn't replay the evicted key back into existence. Feed it through the
-  same `aof_feed`/`aof_append_raw` path used by real `DEL`, gated by `g_loading` so
-  replay itself never evicts-and-logs.
-- **Don't evict when:** `g_loading` is true (startup replay), inside the BGSAVE/AOF
-  fork child, or `maxmemory == 0`.
-
-### ✅ Step 6 — Introspection commands (DONE 2026-07-03)
-
-`MEMORY USAGE` (→ `entry_mem_usage`; accepts `[SAMPLES n]` but computes exact — the
-estimator is already a cheap single pass), `MEMORY DOCTOR` (release-safe counter-vs-sweep
-drift check), `MEMORY STATS` (flat array). `OBJECT ENCODING` (honest MYRED names
-`raw`/`int`/`deque`/`hashtable`/`skiplist`), `IDLETIME` (non-LFU only), `FREQ` (LFU only),
-`REFCOUNT` (stub `1`). `lookup_any` = non-touching, type-agnostic lookup so `IDLETIME`
-doesn't reset the value it reports. Missing key: `USAGE`→nil, `OBJECT`→error. Compact
-encodings + real object sharing deferred — see **General upgrades**.
-
-- `MEMORY USAGE key [SAMPLES count]` → `entry_mem_usage(ent)`; for big aggregates,
-  sample `count` elements (default 5, `0` = exact) and extrapolate, matching Redis.
-- `MEMORY STATS` → array of internal figures (used, overhead, keys count, …).
-- `MEMORY DOCTOR` → human string; reuse the Step 1 counter-vs-sweep self-check.
-- `OBJECT ENCODING key` → report our encoding names. We don't have Redis's listpack/
-  intset/skiplist duality, so map honestly: string→`raw`/`int` (if `str2int` fits),
-  list→`deque`, hash→`hashtable`, set→`hashtable` (or `intset` if all-integer, if we
-  ever add that), zset→`skiplist`. Document that these are MYRED encodings.
-- `OBJECT IDLETIME key` → `(g_lru_clock - ent->lru)` in seconds (LRU policies).
-- `OBJECT FREQ key` → the LFU counter (LFU policies only; error otherwise, like Redis).
-- `OBJECT REFCOUNT key` → we don't share objects, so always `1` (stub for compat).
-
-### Optimization / robustness summary
-
-| Concern | Approach |
-|---|---|
-| Accounting cost | Incremental global counter at alloc choke points — never walk the keyspace to answer `maxmemory` |
-| `MEMORY USAGE` cost | Sample large aggregates (`SAMPLES`), don't sum every element |
-| LRU memory overhead | 4 bytes/key, sampled eviction — no global linked list |
-| LRU clock cost | One cached clock per loop tick, not a syscall per access |
-| Eviction sampling cost | 16-slot eviction pool amortized across rounds; TTL heap serves `volatile-ttl` near-free |
-| Large-value eviction stall | Async free via the existing thread pool (`asyncdel`) |
-| AOF divergence | Evictions propagate an explicit `DEL` to the AOF; suppressed during `g_loading` |
-| Counter drift | Debug self-check (`MEMORY DOCTOR`) compares counter to a full sweep |
-| Fork safety | No eviction inside the BGSAVE/rewrite child |
-| Volatile starvation | `volatile-*` with no TTL keys falls back to `-OOM`, never evicts persistent keys |
-| Loop starvation | Bounded eviction attempts per write; give up → `-OOM` rather than spin |
-
-### Suggested testing
-
-- `test_maxmemory.sh`: set a low `MYRED_MAXMEMORY`, flood keys, assert `used_memory`
-  stays bounded and `evicted_keys` climbs; assert `noeviction` returns `-OOM`.
-- Per-policy victim-selection unit checks (fill with known idle/freq/TTL spreads).
-- AOF-eviction regression: evict under load, restart, assert evicted keys stay gone
-  (the `DEL` propagation actually took).
-- Accounting regression: build a mixed dataset, compare the counter to a full
-  `entry_mem_usage` sweep (drift == bug).
-
-## v8 — Pub/Sub & Transactions
-
-- `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` + pattern subscriptions
-- `MULTI` / `EXEC` / `DISCARD` / `WATCH` — transactions
-
-## v9 — Security & auth
-
-> **Note: doing v9 before v8.** Hardening the server (real config, hashed auth, ACLs,
-> network exposure control, TLS) is higher-value than Pub/Sub right now.
-
-Goal: take MYRED from "one plaintext password, binds to `0.0.0.0`, everyone who
-authenticates is root" to a real security model — a config file, hashed credentials,
-multi-user ACLs with per-command/per-key permissions, network exposure control, and
-TLS. Today's baseline: `do_auth` compares `cmd[1] == g_config.password` (plaintext,
-non-constant-time), `conn->authenticaded` is a single bool, the listener is hardcoded
-to `INADDR_ANY`, and there's no notion of users or per-command permissions. Do the
-steps in order — the config file is the foundation everything else is declared in.
-
-### ✅ Step 1 — `redis.conf`-style config file (foundation) (DONE 2026-07-04)
-
-Shared `config_apply()` (state.cpp) is the single directive→`Config` mapper, reused by
-both `config_load_file` and `CONFIG SET` so they can't drift; `config_tokenize` handles
-`#` comments + quoted values; `config_load_file` fails with `file:line` on bad/unknown
-directives (file `save` lines replace defaults); `config_rewrite` serializes back for
-`CONFIG REWRITE`. `main()` loads the file first (argv first-non-flag or `MYRED_CONFIG`),
-then env overrides, then the `CONFIG SET` runtime layer → precedence
-`defaults < file < env < CONFIG SET`. Added `Config::port` + `Config::config_path`.
-Bugs found in transcription: leftover hardcoded `password = kek1234` line (clobbered the
-file), and a `line[++i]` pre-increment in the tokenizer that dropped each token's first
-char. `CONFIG GET` full-table extension left as a mechanical follow-up.
-
-Turn the scattered `MYRED_*` env knobs + the v6.1/v7 `CONFIG` stub into a real config layer.
-
-- **Parser:** `--config <path>` (or `MYRED_CONFIG`); line-based `directive arg [arg…]`,
-  `#` comments, quoted values. Map to `Config` fields: `requirepass`, `port`, `bind`,
-  `maxmemory`/`maxmemory-policy`, `save`, `appendonly`/`appendfsync`, `dir`, `logfile`,
-  `loglevel`, plus the v9 ones below.
-- **Precedence:** defaults → config file → env → runtime `CONFIG SET`. Load the file in
-  `main()` *before* opening sockets; keep env as overrides for backward compat.
-- **`CONFIG REWRITE`** (currently a stub `+OK`): serialize live `Config` back to the file,
-  preserving comments where practical. Extend `CONFIG GET/SET` from the v7 two-parameter
-  set to the full table.
-- **Robustness:** validate on load (port range, enum values, sizes via `parse_memory_size`);
-  reject unknown directives with `file:line` context rather than silently ignoring.
-
-### ✅ Step 2 — Password hashing + constant-time compare (DONE 2026-07-04)
-
-Header-only `sha256.h` (`sha256_hex`, `ct_equal`, `secure_zero`). `g_config.password`
-now holds the **SHA-256 digest** (or empty for no-auth), never plaintext: `config_apply`
-hashes `requirepass` (also accepts an empty value and a pre-hashed `#<hex>` form),
-`config_rewrite` emits the digest as a quoted `"#<hex>"`, and the `MYRED_PASSWORD` env +
-`kek1234` default are hashed too. `do_auth` hashes the supplied password and
-**constant-time compares** (`ct_equal`, no early return), then `secure_zero`s the
-plaintext out of the request buffer. The argon2/bcrypt upgrade is tracked as its own
-hardening step below (before TLS).
-
-- Replace the plaintext `==` with a **hash compare**. Store `requirepass` as a **SHA-256**
-  digest (hand-rolled or small vendored impl, matching the from-scratch ethos); config
-  accepts a plaintext password (hashed at load) or a pre-hashed value.
-- **Constant-time comparison** (XOR-accumulate over the full digest, no early return) —
-  the current `==` leaks match length via timing. This is the single most important
-  robustness fix in v9.
-- **Upgrade path:** note `argon2`/`bcrypt` (salted, memory-hard) as the real answer for
-  credentials at rest — needs a library; SHA-256 is the baseline.
-- **Hygiene:** `explicit_bzero` the plaintext buffer after hashing; never log passwords;
-  keep the existing max-3-attempts disconnect and add a small fixed backoff on failure.
-
-### ✅ Step 3 — Protected mode + `bind` + IP allowlist (DONE 2026-07-04)
-
-All enforced in `handle_accept` **before** a `Conn` is allocated. `ip_allowed`
-(CIDRs pre-parsed to `(net,mask)` at config load; loopback always allowed to prevent
-lockout) + protected mode (no password + non-loopback peer → `-DENIED` + close).
-Rejections `return 0` so the accept loop keeps draining other pending peers. `bind`
-now honors `Config::binds` (multiple listen fds — see below); `protected-mode` and the
-MYRED `allow-ip <cidr>` directives added to `config_apply`.
-
-All checked at `handle_accept` (before auth), so unauthorized peers never reach the loop.
-
-- **Protected mode** (Redis default): if no `requirepass` *and* bound to a non-loopback
-  address, refuse non-loopback peers with an explanatory error. Check the peer `sockaddr`.
-- **`bind`:** listen on specific interfaces instead of the hardcoded `INADDR_ANY`; support
-  multiple bind addresses (a listen fd per address, all in the `poll` set).
-- **IP allowlist:** optional CIDR list matched against the peer IP at accept; reject + log
-  others. Cheap — a handful of prefix compares.
-
-### Step 4 — ACL system (multi-user, command + key permissions)
-
-The big one. A `User` = name, enabled flag, password hash(es), allowed **command
-categories/commands**, allowed **key glob patterns**, allowed pub/sub channels.
-Builds directly on Step 2 (`sha256_hex`/`ct_equal`/`secure_zero` in `sha256.h`) and
-Step 1's config parser (`config_apply`/`config_tokenize` in `state.cpp`). Do the
-sub-steps in this order — data model first, since enforcement and parsing both need it.
-
-#### ✅ 4a — `User` struct + registry (DONE 2026-07-06)
-
-`User` struct + `CAT_*` bitflags + `Config::users` (`unordered_map`, stable addresses)
-in state.h; `acl_bootstrap_default()` (state.cpp) seeds the `default` user
-(`allow_cats=CAT_ALL`, `all_keys=true`, `pw_hashes={requirepass digest}`) — called in
-`main()` after the password is finalized. Data model only; no `Conn`/enforcement yet.
-Backward-compatible: no `user` directives → one all-powerful `default` = today's behavior.
-
-- New `struct User { std::string name; bool enabled = true; std::vector<std::string> pw_hashes; uint64_t allow_cats = 0; std::unordered_map<std::string,bool> cmd_overrides; std::vector<std::string> key_patterns; bool all_keys = false; }`
-  (multiple `pw_hashes` so a password can be rotated without a moment of lockout —
-  `AUTH` matches against any of them via `ct_equal`).
-- **Registry gotcha:** store users in `std::unordered_map<std::string, User>`, not
-  `std::vector<User>`. `Conn` will hold a raw `User *` (below); a `vector` reallocates
-  and invalidates every live `Conn::user` pointer the moment `ACL SETUSER` adds a user
-  while other clients are connected — a dangling-pointer bug that won't show up until
-  a second client connects mid-session. A `Config`-owned `unordered_map` gives stable
-  element addresses across inserts (erase is the only thing to still be careful about —
-  `ACL DELUSER` on a currently-connected user needs to null out or kick that `Conn`).
-- Pre-populate a `default` user at boot: `allow_cats = CAT_ALL`, `all_keys = true`,
-  `pw_hashes = {g_config.password}` (today's `requirepass`, already a SHA-256 digest
-  after Step 2) — this is what makes the feature backward compatible; a config with no
-  `user` directives behaves exactly like today.
-
-#### ✅ 4b — Command categories on `CmdSpec` (DONE 2026-07-06)
-
-`CmdSpec::acl_cats` + `CAT_*` bitflags (`state.h`); `acl_init_categories()`
-(`commands.cpp`) derives `@read`/`@write` from the existing `is_write` flag for all
-table entries in one pass, then merges a small `extra` map of hand-tagged
-`@admin`/`@dangerous`/`@keyspace`/`@connection`/`@fast`/`@slow` bits for the ~30
-commands that need them. Cost of the mutating pass: `k_cmd_table` lost its `const`
-(see **Design decisions** below for the trade and the `build_cmd_table()` upgrade path
-if it's ever worth restoring).
-
-- `CmdSpec` (`commands.cpp:2768`) currently has `fn, min_args, max_args, is_write,
-  aof_rewrite`. Add `uint64_t acl_cats = 0`. Define category bits as an enum/constexpr
-  set: `CAT_READ, CAT_WRITE, CAT_ADMIN, CAT_KEYSPACE, CAT_DANGEROUS, CAT_FAST, CAT_SLOW, …`.
-- **Don't hand-retype `@read`/`@write` for all 82 entries in `k_cmd_table`**
-  (`commands.cpp:2776-2880`) — derive it: `spec.is_write ? CAT_WRITE : CAT_READ` is
-  already known per-command via the existing `is_write` flag, computed once at table-
-  build time (or a small init pass over the table). Only the extra categories
-  (`@admin`, `@dangerous`, `@keyspace`) need manual per-entry tagging, and
-  `cmd_can_grow_memory`'s `no_grow` set (`commands.cpp:2883-2894`) is a ready-made
-  starting list for what counts as `@dangerous`-adjacent — same shape of "special
-  commands" set, don't invent a second taxonomy from scratch.
-- **Rule compilation semantics:** Redis ACL rules apply left-to-right, last match wins
-  (`+@read -@write +get -flushall` → category grants, then a specific command name can
-  override its own category). For this project's scope, a reasonable simplification
-  (not full Redis fidelity, worth stating as a deliberate choice): keep `allow_cats` as
-  one bitset plus a small `unordered_map<string, bool> cmd_overrides` for explicit
-  `+cmd`/`-cmd` rules, checked *before* falling back to the category bitset. `ACL
-  SETUSER` parses the rule tokens once and populates both.
-
-#### ✅ 4c — Enforcement in `do_request` (DONE 2026-07-06)
-
-`Conn::user` (raw `User*`, forward-declared, set to `default` at accept). `KeySpec`
-enum + `CmdSpec::keys` filled in the init pass (default `FIRST`, ~30 exceptions).
-`acl_check(user, name, spec, cmd)` — override-then-category command gate + per-`KeySpec`
-key-pattern match via `glob_match`; called after the arity check in `do_request`. No
-behavior change (default user = `CAT_ALL`+`all_keys`) until 4d assigns restricted users.
-Fail-closed. Known simplifications (see Future ACL upgrades): `SMOVE` member over-checked,
-`OBJECT`/`MEMORY` key (at index 2) not key-gated.
-
-Insert the check in the existing flow (`commands.cpp:2896-2925`) right after the arity
-check and before `spec.fn(...)` — auth itself stays exempt exactly like the current
-`if (cmd[0] == "auth")` bypass at line 2907:
-- (a) **Command permitted?** `cmd_overrides` lookup first, else `spec.acl_cats & conn->user->allow_cats`. Reject `NOPERM` otherwise.
-- (b) **Key patterns?** Every key argument must match one of `conn->user->key_patterns`
-  via the existing `glob_match` (`commands.cpp:1550`) unless `all_keys`. This needs a
-  **key-position descriptor** per command, since key args aren't uniformly at `cmd[1]`
-  (`GET`/`SET`: just `cmd[1]`; `DEL`/`EXISTS`/`MGET`: every arg from 1; `MSET`: every
-  *other* arg from 1). Add a small `KeySpec` enum to `CmdSpec` (`NONE, FIRST,
-  ALL_FROM_1, STRIDE2_FROM_1`) alongside `acl_cats` so this is an O(1) table lookup
-  per command, not per-command special-casing in `do_request`.
-- (c) Pub/sub channel patterns — no-op stub until v8 exists; keep the field on `User`
-  now so the config/parsing format doesn't need to change again later.
-
-#### ✅ 4d — `AUTH` 2-arg form + `ACL` commands (DONE 2026-07-07)
-
-Done end-to-end: `do_auth` handles both arg forms, `do_acl` is registered in
-`k_cmd_table` (`{"acl", {do_acl_placeholder, 2, -1}}`) and dispatched conn-aware after
-`acl_check`, and `WHOAMI/USERS/CAT/GENPASS/SETUSER/GETUSER/DELUSER/LIST` all work.
-Boot-time bug found + fixed this session: `acl_init_categories()` was never called from
-`server.cpp` (and had no prototype in `state.h`), so every `CmdSpec.acl_cats` stayed `0`
-and *every* command returned NOPERM for authenticated users; added the prototype + the
-`acl_init_categories();` call right after `acl_bootstrap_default();`. Also fixed the
-misplaced `{"acl", CAT_ADMIN|CAT_DANGEROUS}` (was in the `KeySpec` map — a type error;
-moved to the `extra` category map, added `{"acl", KeySpec::NONE}` to `ks`). Remaining
-nit folded into 4e cleanup: `resetkeys` didn't clear `all_keys`.
-
-<details><summary>original 4d notes</summary>
-
-`do_auth` (`commands.cpp` ~1010) now handles both `AUTH <pass>` (implicit `default`
-user) and `AUTH <user> <pass>`, hashes once, wipes `cmd`'s copy of the plaintext via
-`secure_zero`, matches against any of the target user's `pw_hashes` via `ct_equal`, and
-runs a dummy `ct_equal` against a fixed-length placeholder on a missing/disabled user
-so username validity doesn't leak via timing. **Bug found + fixed this session:** a
-copy of the password (`std::string pass`) made during arg parsing was never wiped —
-only `cmd`'s copy was — leaving one un-scrubbed plaintext copy alive until the
-function returned; needs a `secure_zero(&pass[0], pass.size())` added after hashing.
-
-`do_acl` is written (`commands.cpp:2893`) with `WHOAMI`/`USERS`/`CAT`/`GENPASS`/
-`SETUSER`/`DELUSER` sub-commands, `DELUSER` carefully redirecting any connected
-`Conn::user` pointers to `default` before erasing (same dangling-pointer hazard as
-4a's registry note) — but **`do_acl` is not yet registered in `k_cmd_table`**, so no
-`ACL` subcommand is actually reachable from a client yet; that one-line wiring is the
-next thing needed before any of this is testable end-to-end. `GETUSER`/`LIST` aren't
-implemented. Two bugs found + fixed this session in the rule parser
-(`acl_apply_rule`): a copy-paste pair of duplicated conditions (`-@cat` and `-cmd`
-deny rules both checked their `+`-prefixed sibling's condition instead of their own,
-making every deny-shaped rule silently unparseable) and a missing final `return
-false;` (undefined behavior on an unrecognized token). Also found + fixed: `GENPASS`
-had its `bits` assignment placed unreachably after a `return`, and the whole generator
-was nested under the optional-arg check so bare `ACL GENPASS` sent no reply at all.
-Still open, not yet fixed: `"allcomands"` typo in `acl_apply_rule` (missing an `m`,
-so the correctly-spelled Redis keyword never matches — only `+@all` works), and
-`resetkeys` doesn't clear `all_keys`, so a user with `allkeys` set retains full key
-access through a `resetkeys` call.
-
-- `do_auth` (`commands.cpp` ~1010) currently only handles `AUTH <pass>` against
-  `g_config.password`. Extend to `AUTH <user> <pass>` (2-arg) vs `AUTH <pass>` (1-arg =
-  implicit `default` user) — look up the `User` by name in the registry, `ct_equal`
-  against each of its `pw_hashes`, reusing the exact same hash/compare/wipe path
-  already written for Step 2.
-- New commands: `ACL SETUSER/GETUSER/DELUSER/LIST/USERS/WHOAMI/CAT/GENPASS` — dispatch
-  style matches the existing `CONFIG GET/SET` sub-dispatch (`do_config`), i.e. one
-  `do_acl(cmd, out, conn)` entry in `k_cmd_table` that switches on `cmd[1]`. `WHOAMI` →
-  `conn->user->name`; `GENPASS` → random hex via the project's existing `mt19937_64` RNG
-  (from the v5.3 review), not `rand()`.
-
-</details>
-
-#### ✅ 4e — Per-`Conn` auth state (DONE 2026-07-07)
-
-Retired the redundant `Conn::authenticaded` bool; `Conn::user == nullptr` is now the
-single source of truth for "unauthenticated". New `acl_initial_user()` helper decides a
-new connection's starting identity from the registry: `default` iff it is `enabled` and
-`nopass` (empty `pw_hashes`), else `nullptr`. `server.cpp` accept-time sets
-`conn->user = acl_initial_user();` (no more unconditional `&users["default"]` that
-defeated the invariant). `do_request`'s gate is `if (!conn->user)` → NOAUTH. `do_auth`
-success just assigns `conn->user`; `ACL DELUSER` sets kicked connections to `nullptr`
-(not `default`) so a deleted user can never be silently re-authorized as `default`, and
-there is no dangling pointer even if `want_close` is deferred a tick. Folded in the 4d
-nit: `resetkeys` now also clears `all_keys`.
-
-#### 4f — Config file persistence
-
-- `user` directives in `myred.conf`, parsed via a new helper alongside `config_apply`
-  (`state.cpp:81`) — this needs its own mini-parser, not a reuse of the generic
-  `name/args` shape every other directive uses, because the rule grammar is rich:
-  `user alice on >5f4dcc... ~cache:* +@read +@write -flushall`. Tokenize with the
-  existing `config_tokenize` (handles quoting already), then walk tokens applying
-  `on`/`off`, `>hash`/`<hash` (add/remove password), `~pattern` (key pattern, `~*` =
-  `all_keys`), `+@cat`/`-@cat`/`+cmd`/`-cmd` in order. Same multi-token-per-line shape
-  you just fixed for `bind` (`state.cpp:119-123`) — look at that fix before writing
-  this parser, since the "collect all args, don't assume exactly one" pattern applies
-  here too, just with a richer per-token grammar than a flat address list.
-
-### Step 5 — Command hardening + audit log
-
-- **`rename-command`** (config): rename or disable dangerous commands (`rename-command
-  FLUSHALL ""` disables; renaming `CONFIG` to a secret name). Requires building
-  `k_cmd_table` at boot (it's `const` today) so keys can be mutated/removed.
-- **Audit log:** timestamp + peer IP for AUTH failures, ACL changes, and
-  `@admin`/`@dangerous` command use → a file (ties into the Continuous "logging
-  framework" item). A disabled command must also drop out of the AOF/replication path.
-
-### Step 6 — Password hashing upgrade: argon2/bcrypt (do before TLS)
-
-Optimization/hardening of Step 2. SHA-256 is fast and unsalted → weak against offline
-brute-force if the config/ACL file leaks. Upgrade credential-at-rest to a **salted,
-memory-hard** KDF.
-
-- **argon2id** (preferred) or **bcrypt** — needs a library (`libargon2` / `libbcrypt`),
-  the first external dependency in v9 (hence *before* TLS/OpenSSL, so the build gains one
-  dep at a time).
-- Store `$argon2id$…` / `$2b$…` PHC-format strings (they embed salt + params) in place of
-  the bare SHA-256 hex; `secure_zero`/`ct_equal` and the `do_auth` flow are unchanged —
-  only the hash/verify calls swap. Per-user params (cost/memory) live in the ACL entry.
-- Keep SHA-256 verification for backward compat so existing `#<hex>` configs still load;
-  re-hash to argon2 on next `CONFIG SET requirepass` / `ACL SETUSER`.
-
-### Step 7 — TLS (heaviest; could be its own milestone)
-
-- Link **OpenSSL**. `tls-port`, `tls-cert-file`/`tls-key-file`/`tls-ca-cert-file`;
-  optional **mutual TLS** (require + verify client certs).
-- **Event-loop integration (the hard part):** wrap per-`Conn` I/O in an `SSL*`; the
-  non-blocking handshake and `SSL_read`/`SSL_write` return `SSL_ERROR_WANT_READ/WRITE`,
-  which must drive the `poll` interest flags (`want_read`/`want_write`). Abstract `Conn`
-  read/write behind a plain-vs-TLS function pointer so the loop stays protocol-agnostic.
-- **Robustness:** handshake timeouts, `SSL_shutdown` on close, cert reload without restart.
-
-### Optimization / robustness summary
-
-| Concern | Approach |
-|---|---|
-| Timing side-channel on password | Constant-time XOR-accumulate compare — never `==` / early return |
-| Password at rest | SHA-256 baseline (→ argon2/bcrypt), salted; `explicit_bzero` plaintext; never logged |
-| Per-command auth cost | User resolved once at AUTH; command check is an O(1) bitset test; key patterns via existing `glob_match` |
-| Command category lookup | Precomputed `acl_cats` bitflags in `CmdSpec`, not recomputed per request |
-| Unauthorized peers | Rejected at `accept()` (protected mode / bind / allowlist) before the command loop |
-| Config precedence | defaults < file < env < `CONFIG SET`; `CONFIG REWRITE` persists live state |
-| TLS without blocking | `SSL_ERROR_WANT_*` drives poll interest; `Conn` I/O behind a plain/TLS abstraction |
-| Dangerous commands | `rename-command` disables/renames at boot; audit log for `@admin`/`@dangerous` |
-| Fail-safe defaults | Protected mode when no password; ability to disable the `default` user |
-
-### Suggested testing
-
-- **Auth:** `AUTH` right/wrong/2-arg-user; wrong password still disconnects after 3 tries.
-- **ACL:** `SETUSER`/`GETUSER` round-trip; `NOPERM` on a denied command and on a key
-  outside the user's pattern; `default` user preserves legacy behavior.
-- **Config:** bad directive → `file:line` error; `CONFIG REWRITE` → restart → values survive.
-- **Protected mode:** no-password + remote connect refused; loopback allowed; allowlist hit/miss.
-- **Password hashing:** stored value is a digest, not plaintext; (optional) statistical
-  timing test that compare time is independent of how many leading chars match.
-- **TLS:** `openssl s_client` / `redis-cli --tls` handshake; mutual TLS with and without a
-  client cert.
-
-### Future ACL upgrades (things we can do later)
-
-Deliberate simplifications taken during Step 4, safe to revisit once the core ACL works:
-
-- **Full Redis rule fidelity:** left-to-right, last-match-wins rule application instead
-  of our `allow_cats` bitset + `cmd_overrides` map. Enables `+@all -@dangerous +get`
-  ordering nuances we currently flatten.
-- **`KeySpec::SECOND`** (and general key-position lists) so `OBJECT`/`MEMORY` key args
-  (at `cmd[2]`) and `SMOVE`'s exact key set (`cmd[1..2]`, not the member) are key-gated
-  precisely instead of `NONE`/over-checked.
-- **Per-key read vs write patterns** (`%R~`, `%W~`) — Redis lets a user read some keys
-  and write others; we have one `key_patterns` list for all access.
-- **Pub/sub channel ACL** (`&pattern`) — the `User` field exists but is a no-op until v8.
-- **`nopass` users** + `ACL SETUSER` `sanitize-payload`, selectors (`(...)`), and
-  `ACL LOAD`/`ACL SAVE` from a dedicated `aclfile`.
-- **argon2/bcrypt** password hashing — already tracked as Step 6 (before TLS).
-
-## v10 — Replication & HA
-
-- Master-replica: `PSYNC`, replication backlog, partial resync
-- Sentinel-style failover; cluster mode / hash-slot sharding
-
----
-
-## General upgrades & unsupported features (backlog)
-
-Cross-cutting improvements and known gaps surfaced while building v1–v7. Not tied to a
-single version — pull each into a milestone when it becomes worthwhile. Nothing here is
-required for correctness; it's the difference between "works" and "Redis-grade".
-
-### Compact encodings (memory optimization)
-
-The single biggest memory win we don't have. Redis stores *small* collections in flat,
-cache-friendly layouts and only converts to the heavyweight structure past a size/element
-threshold. MYRED always uses the heavyweight structure — `OBJECT ENCODING` reflects this
-honestly today (`raw`, `deque`, `hashtable`, `skiplist`).
-
-- **`embstr` / `int` for strings** — small strings allocated inline with the object;
-  integer values stored as `int64`, not text. (We *detect* `int` in `OBJECT ENCODING`
-  but still store the digits as a `std::string`.)
-- **`listpack`** — small hashes / zsets / lists as one contiguous byte blob instead of
-  HMap (+AVL) / deque. Thresholds: `hash-max-listpack-entries/value`,
-  `zset-max-listpack-entries/value`, `list-max-listpack-size`.
-- **`intset`** — all-integer sets as a sorted packed integer array (no HMap).
-- **`quicklist`** — lists as a linked list of listpacks (we use one ring-buffer deque).
-- Requires: an encoding tag per `Entry`, conversion on threshold crossing, and
-  encode/decode paths in RDB **and** AOF. Also unlocks accurate small-object accounting.
-
-### Object sharing / real refcount
-
-- Shared-integer pool (Redis shares small ints 0–9999) so `OBJECT REFCOUNT` returns real
-  counts — we stub `1`. Saves memory on integer-heavy datasets. Needs a refcount field, a
-  shared-object table, and copy-on-mutate.
-
-### Command coverage gaps (all unimplemented; * = commonly requested)
-
-- **Sorted set (biggest gap — we only have zadd/zrem/zscore/zrank/zquery/zpopmin):**
-  `ZINCRBY`*, `ZCARD`*, `ZCOUNT`, `ZMSCORE`, `ZPOPMAX`, `ZRANGEBYSCORE`*/`ZRANGEBYLEX`,
-  `ZREVRANGE`*, `ZREMRANGEBYRANK/SCORE/LEX`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`,
-  `ZRANDMEMBER`, `ZSCAN`, `ZLEXCOUNT`, `ZRANGESTORE`, `ZMPOP`.
-- **String / bitmap:** `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP`/`BITFIELD`, `SUBSTR`, `LCS`.
-- **Generic:** `COPY`, `SORT`/`SORT_RO`, `DUMP`/`RESTORE`, `EXPIRETIME`/`PEXPIRETIME`,
-  `OBJECT HELP`, `SCAN ... TYPE`, `WAIT`.
-- **Hash:** `HRANDFIELD`, `HINCRBYFLOAT`.
-- **List:** `LPOS`, `LMOVE`/`RPOPLPUSH`, `LMPOP`, and blocking `BLPOP`/`BRPOP`/`BLMOVE`
-  (needs blocking-client machinery — a substantial addition to the event loop).
-- **Set:** `SINTERCARD`.
-- **New data types (each a large effort):** HyperLogLog (`PF*`), Streams (`X*`),
-  Geo (`GEO*`), Bitmaps (as above).
-
-### Server / observability & tooling
-
-- `COMMAND` / `COMMAND DOCS` / `COMMAND COUNT` (redis-cli interactive probes these).
-- `CLIENT LIST`/`KILL`/`SETNAME`/`GETNAME`/`ID`, `HELLO` (RESP3 handshake), `RESET`.
-- `SLOWLOG`, `LATENCY`, `MONITOR`, `DEBUG`, graceful `SHUTDOWN`, `LASTSAVE`, `TIME`, `LOLWUT`.
-- Full `CONFIG GET/SET` coverage (today only `maxmemory` + `maxmemory-policy` are real) +
-  `CONFIG REWRITE` to a `redis.conf`.
-- **RESP3** (`HELLO 3`) — maps, push frames, attributes; our parser/writers are RESP2 only.
-
-### Windows port
-
-Not a simple `#ifdef _WIN32` sprinkle over sockets/paths — the real work is that
-`fork()`-based BGSAVE/BGREWRITEAOF (v6) is the architectural centerpiece of
-persistence (copy-on-write snapshot while the parent keeps serving), and Windows has
-no `fork()` equivalent at all. A real port needs the background-snapshot mechanism
-redesigned to be portable *first* — e.g. a thread that takes an explicit copy of the
-dataset instead of relying on CoW, or a respawned child process with explicitly shared
-state — before anything else about a Windows build is worth doing.
-
-Once that's solved, the rest is comparatively mechanical:
-- `poll()` → `WSAPoll` (close analog, not identical semantics — re-check `EINTR`-
-  equivalent handling and non-blocking-connect edge cases).
-- Winsock2 needs explicit `WSAStartup`/`WSACleanup`; socket options
-  (`SO_REUSEADDR`/`TCP_NODELAY`) mostly map over but double-check semantics.
-- Thread pool: already `std::thread`-based if it isn't raw pthreads — check.
-- `SIGXFSZ`/`SIGPIPE` ignoring (v9 crash hardening) has no Windows equivalent; the
-  conditions they guard against (file-size limits, write-to-closed-socket) surface
-  differently there.
-- `fdatasync` → `FlushFileBuffers`; path separators, `dump.rdb`-relative-to-CWD
-  behavior, and the config file parser's path handling all need a look.
-
-Low priority, end-of-roadmap material — flagged here so it isn't forgotten, not
-because it's imminent.
-
-### Correctness follow-ups (small, known)
-
-- `zrem` doesn't drop an emptied zset (Redis removes the key; `zpopmin` already does).
-
-### Design decisions (deliberate, not gaps)
-
-- **Eviction: best-of-N, not the 16-slot pool.** We keep `evict_pick_victim`'s
-  best-of-`maxmemory_samples` sampling (tunable; default raised to 10) rather than
-  Redis's persistent 16-slot eviction pool. Best-of-N is correct and was Redis's own
-  approach pre-3.0; the pool only sharpens victim quality at cache scale, and a
-  persistent pool would force key-based storage + stale-entry validation (a pooled
-  candidate can be async-freed between rounds) — real complexity for marginal gain at
-  this project's scale. Revisit only if a real cache workload shows poor hit rates.
-
-- **ACL rules: compiled bitset + override map, not Redis's ordered last-match-wins
-  list.** v9 Step 4 resolves `User` permissions to `allow_cats` (bitset) +
-  `cmd_overrides` (flat map, override always beats category regardless of when either
-  was set) instead of storing the raw rule token sequence and replaying Redis's
-  left-to-right resolution algorithm. Enforcement cost is identical either way (Redis
-  also compiles down to a flat per-command check at `ACL SETUSER` time, not a per-
-  request re-walk) — the simplification is purely in rule *composition* semantics.
-  Known gap: re-granting a whole category after an explicit per-command deny does
-  **not** clear that deny here (it would in Redis, if the regrant came later in the
-  token sequence); `ACL GETUSER`/`ACL LIST` can report the resolved state but can't
-  round-trip the literal rule string a user typed, since only the compiled form is
-  kept, not the history. **Post-implementation follow-up** (once Step 4 is done and
-  ACLs are in normal use — not a blocker for landing the feature): if the gap actually
-  bites, store the raw ordered rule tokens per user *alongside* the compiled form,
-  replay them into `allow_cats`/`cmd_overrides` at `SETUSER` time (enforcement stays
-  O(1)), and use the raw tokens only for `GETUSER`/`LIST` output. Bolt-on, not a
-  rewrite — don't build it preemptively.
-
-- **`k_cmd_table` lost its `const`** to let `acl_init_categories()`
-  (`commands.cpp:2962`) derive each command's `@read`/`@write` bit from the existing
-  `is_write` flag via a mutating pass (`for (auto &kv : k_cmd_table){ kv.second.acl_cats
-  = ...; }`), instead of hand-typing `CAT_READ`/`CAT_WRITE` per row in the initializer.
-  Deriving is the right call — hand-typing would duplicate the same fact `is_write`
-  already encodes, in a second, independently-editable place (same class of bug as the
-  `config_rewrite` `appendsync`/`appendfsync` drift). The `const` loss is the genuine
-  cost of that choice: the table was `static const` since the v5.3 review specifically
-  for the compile-time guarantee that no command's handler/arity could be corrupted at
-  runtime; it's now mutable for the process's whole lifetime, not just during the boot-
-  time pass, even though only `acl_init_categories()` ever touches it in practice.
-  **Upgrade path if this is ever worth doing:** replace the inline initializer with a
-  `build_cmd_table()` function that constructs the base rows *and* runs the derive
-  pass internally before returning, then bind it once to a `static const`
-  (`static const auto k_cmd_table = build_cmd_table();`) — same derivation guarantee,
-  `const` restored, no more separate `acl_init_categories()` boot call. Not worth the
-  churn for an 82-row table right now; revisit only if something else already needs to
-  touch this function.
-
----
-
-## Architecture notes
-
-- **Single-threaded `poll()` event loop**, non-blocking I/O. `TCP_NODELAY` on all accepted sockets.
-- **Thread pool (8 threads)** for background work: large ZSet/Set async deletes.
-- **fork()-based BGSAVE**: child writes snapshot, parent keeps serving. `g_rdb_child_pid` tracked.
-- **Dual HMap** with progressive rehashing. `hm_scan` uses reverse-binary cursor (safe during rehash).
-- **Entry types:** `T_STR=1`, `T_ZSET=2`, `T_DLIST=3`, `T_HASH=4`, `T_SET=5`. Value stored as `std::variant` in `Entry::val`.
-- **RDB tags** (separate from Entry::type): string=0, zset=1, list=2, hash=3, set=4.
-- **TTL:** monotonic clock in memory, wall clock on disk (survives reboots).
-- **Benchmarking:** Python harness is client-bound (~1800 ops/sec). Server min latency ~0.02 ms → ~50k ops/sec single-thread. For real numbers: `redis-benchmark -p 1234 -a kek1234 -t set,get,lpush -n 200000 -c 50 -P 16`
+Security test focus:
+
+- `AUTH` success, failure, and disconnect after repeated failures.
+- `AUTH <user> <pass>`.
+- `ACL SETUSER` and config-file round trip.
+- Command denial.
+- Key-pattern denial.
+- Protected-mode rejection.
+- Allowlist rejection.
+- Audit log redaction.
+- Renamed command canonical AOF behavior.
+
+## Architecture Notes
+
+- Single-threaded `poll()` event loop.
+- Non-blocking sockets.
+- `TCP_NODELAY` on accepted sockets.
+- Thread pool for background work and large async deletes.
+- `fork()` based `BGSAVE` and `BGREWRITEAOF`.
+- Top-level database is a dual-table HMap with progressive rehashing.
+- `hm_scan` uses reverse-binary cursor iteration.
+- Entry runtime types:
+  - `T_STR = 1`
+  - `T_ZSET = 2`
+  - `T_DLIST = 3`
+  - `T_HASH = 4`
+  - `T_SET = 5`
+- RDB tags are separate from runtime entry tags:
+  - string = 0
+  - zset = 1
+  - list = 2
+  - hash = 3
+  - set = 4
+- TTL is monotonic in memory and wall-clock on disk.
+- Python stress harness is useful for correctness and concurrency, not peak server
+  throughput.
