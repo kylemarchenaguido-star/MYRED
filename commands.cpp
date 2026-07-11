@@ -616,6 +616,14 @@ struct KeyStats {
   uint32_t with_ttl;
 };
 
+struct KeysCtx {
+  const std::string *pattern; // the glob to match against
+  std::vector<std::pair<const char *, size_t>> *hits; // matched key views
+};
+
+// forwarod declariton for do_keys
+static bool glob_match(const char *p, size_t plen, const char *s, size_t slen);
+
 // WARNING: O(N) full keyspace scan — blocks the event loop.
 // Never run against a large DB in production; steer clients to SCAN instead.
 static bool cb_keys_emit(HNode *node, void *arg) {
@@ -637,10 +645,28 @@ static bool cb_count_keys(HNode *node, void *args){
   return true;
 }
 
+static bool cb_keys_collect(HNode *node, void *arg){
+  KeysCtx *ctx = (KeysCtx*)arg;
+  Entry *ent = container_of(node, &Entry::node);
+  if (glob_match(ctx->pattern->data(), ctx->pattern->size(), ent->key.data(), ent->key.size())){
+    ctx->hits->emplace_back(ent->key.data(), ent->key.size());
+  }
+  return true;
+}
+
 static void do_keys(std::vector<std::string> &cmd, Buffer *out) {
-  (void)cmd;
-  resp_arr(out, (uint32_t)hm_size(&g_data.db));
-  hm_foreach(&g_data.db, cb_keys_emit, out);
+  // bare keys or keys * -> every key, streamed
+  if (cmd.size() < 2 || cmd[1] == "*"){
+    resp_arr(out, (uint32_t)hm_size(&g_data.db));
+    hm_foreach(&g_data.db, cb_keys_emit, out);    
+    return;
+  }
+  // keys <pattern> collect matches in one pass, then emit the exact count
+  std::vector<std::pair<const char *, size_t>> hits;
+  KeysCtx ctx { &cmd[1], &hits };
+  hm_foreach(&g_data.db, cb_keys_collect, &ctx);
+  resp_arr(out, (uint32_t)hits.size());
+  for (auto &h : hits){ resp_str(out, h.first, h.second); }
 }
 
 
@@ -1003,6 +1029,38 @@ static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out){
     }
   } else {
     mem_reaccount(ent);
+  }
+}
+
+static int g_audit_fd = -1; 
+std::string g_audit_last_error;
+
+void audit_open(const std::string &path){
+  if (g_audit_fd >= 0 && g_audit_fd != STDERR_FILENO){ close(g_audit_fd); }
+  g_audit_fd = -1;
+  if (path.empty()){ return; } // disable
+  if (path == "stderr"){ g_audit_fd = STDERR_FILENO; return; }
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
+  if (fd < 0){ g_audit_last_error = std::string("open ") + path + ": " + strerror(errno); return; }
+  g_audit_fd = fd;
+}
+
+// one write() per line: best-effort, recors a sticky error on failure
+static void audit_write(const char *event, const std::string &peer,
+                        const std::string &user, const std::string &extra){
+  if (g_audit_fd < 0){ return; }
+  char ts[32];
+  time_t now = time(nullptr);
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  std::string line = "ts=";
+  line += ts; line += " event="; line += event;
+  line += " peer="; line += peer;
+  line += " user="; line += user;
+  line += extra; line += "\n";
+  if (write(g_audit_fd, line.data(), line.size()) < 0){
+    g_audit_last_error = std::string ("write: ") + strerror(errno);
   }
 }
 
@@ -1643,7 +1701,6 @@ static bool glob_match(const char *p, size_t plen, const char *s, size_t slen) {
       }
   }
 }
-
 
 struct ScanCtx {
   std::vector<std::string> *out;
@@ -2505,7 +2562,7 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     hm_delete(&g_data.db, &src_ent->node, &hnode_same);
     entry_del(src_ent);
   } else {
-    mem_reaccount(dst_ent);
+    mem_reaccount(src_ent);
   }
   if (!dst_ent){
     dst_ent = entry_new(T_SET);
@@ -2794,6 +2851,7 @@ enum class KeySpec : uint8_t {
 };
 
 using CmdFn = void(*)(std::vector<std::string> &, Buffer *);
+using KeyResolver = void(*)(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys);
 
 struct CmdSpec {
   CmdFn fn;
@@ -2803,10 +2861,11 @@ struct CmdSpec {
   bool aof_rewrite = false; // can't be logged verbatim- needs TTL translation
   uint64_t acl_cats = 0; // filled by acl_init_categories() at boot
   KeySpec keys = KeySpec::FIRST;
+  KeyResolver key_resolver = nullptr; // when set overrides keys for extraction
 };
 
 
-static bool acl_key_allowed(const User *u, const std::string &key){
+static bool acl_key_allowed(const User *u, const std::string_view &key){
   for (const std::string &pat : u->key_patterns){
     if (glob_match(pat.data(), pat.size(), key.data(), key.size())){ return true; }
   }
@@ -2827,21 +2886,27 @@ static const char *acl_check(const User *u, const std::string &name,
   // (b) key patterns (skipped for all_keys users and no key commands)
   if (!u->all_keys){
     const char *kdeny = "NOPERM no permissions to access one of the keys used as arguments";
-    switch (spec.keys){
-      case KeySpec::NONE: break;
-      case KeySpec::FIRST: 
-        if (cmd.size() > 1 && !acl_key_allowed(u, cmd[1])){ return kdeny; }
-        break;
-      case KeySpec::ALL_FROM_1:
-        for (size_t i = 1; i < cmd.size(); ++i){
-          if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
-        }
-        break;
-      case KeySpec::STRIDE2_FROM_1:
-        for (size_t i = 1; i < cmd.size(); i += 2){
-          if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
-        }
-        break;
+    if (spec.key_resolver){
+      std::vector<std::string_view> keys;
+      spec.key_resolver(cmd, keys);
+      for (std::string_view k : keys){ if (!acl_key_allowed(u, k)){ return kdeny; } }
+    } else { 
+      switch (spec.keys){
+        case KeySpec::NONE: break;
+        case KeySpec::FIRST: 
+          if (cmd.size() > 1 && !acl_key_allowed(u, cmd[1])){ return kdeny; }
+          break;
+        case KeySpec::ALL_FROM_1:
+          for (size_t i = 1; i < cmd.size(); ++i){
+            if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
+          }
+          break;
+        case KeySpec::STRIDE2_FROM_1:
+          for (size_t i = 1; i < cmd.size(); i += 2){
+            if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
+          }
+          break;
+      }
     }
   }
   return nullptr; 
@@ -3130,6 +3195,37 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"acl",          {do_acl_placeholder, 2, -1}},
 };
 
+struct DispatchEntry {
+  std::string canonical; // original command name - used for ACL + AOF, never the alies
+  CmdSpec spec; // a copy of the (already acl-stamped) canonical spec
+};
+
+static std::unordered_map<std::string, DispatchEntry> g_dispatch;
+
+bool command_is_known(const std::string &name){ return k_cmd_table.count(name) != 0; }
+
+// build the frozen live dispatch map: canonical spexs first, then apply rename-command
+void dispatch_build(){
+  g_dispatch.clear();
+  g_dispatch.reserve(k_cmd_table.size() * 2);
+  for (auto &kv : k_cmd_table){
+    std::string name(kv.first);
+    // canonical == its own name
+    g_dispatch.emplace(name, DispatchEntry{ name, kv.second });
+  }
+  // r.first =  old (lowercase), r.second new ("" disables)
+  for (const auto &r : g_config.renames){
+    auto it = g_dispatch.find(r.first);
+    if (it == g_dispatch.end()){ continue; }
+    // preserve the original canonical
+    DispatchEntry entry = it->second;
+    // the old name stops working
+    g_dispatch.erase(it);
+    // else disable
+    if (!r.second.empty()){ g_dispatch.emplace(r.second, std::move(entry)); }
+  }
+}
+
 // Commands that can only free or leave memory unchanged are never denied under
 static bool cmd_can_grow_memory(const std::string &name){
   // name is already lower-cased
@@ -3154,8 +3250,18 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     ch = (char)tolower((unsigned char)ch);
   }
 
-  // AUTH always allowed
-  if (cmd[0] == "auth") {
+  if (cmd[0] == "auth"){
+    return do_auth(cmd, out, conn);
+  }
+
+
+  // resolve the typed name against the live map
+  auto it = g_dispatch.find(cmd[0]);
+  const bool found = (it != g_dispatch.end());
+  const std::string &canonical = found ? it->second.canonical : cmd[0];
+
+  // AUTH always allowed, even under an alias is always allowed
+  if (found && canonical == "auth") {
     return do_auth(cmd, out, conn);
   }
 
@@ -3164,13 +3270,11 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return resp_err(out, "NOAUTH authentication required");
   }
 
-  auto it = k_cmd_table.find(cmd[0]);
-  if (it == k_cmd_table.end()){
-    return resp_err(out, "ERR unknown command");
-  }
-  
-  const CmdSpec &spec = it->second;
-  if (const char *deny = acl_check(conn->user, cmd[0], spec, cmd)){
+  if (!found){ return resp_err(out, "ERR unknown command"); }
+  const CmdSpec &spec = it->second.spec;
+
+  // permission by canonical name
+  if (const char *deny = acl_check(conn->user, canonical, spec, cmd)){
     return resp_err(out, deny);
   }
 
@@ -3179,7 +3283,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return resp_err(out, "ERR wrong number of arguments");
   }
 
-  if (cmd[0] == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
+  if (canonical == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
 
   #ifndef NDEBUG
   mem_selfcheck(cmd[0].c_str());   // prints "[mem] drift..." if any handler mis-accounted
@@ -3190,7 +3294,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 
   // maxmemory enforcement: make room before a write, or refuse it
-  if (spec.is_write && cmd_can_grow_memory(cmd[0]) && !free_memory_if_needed()){
+  if (spec.is_write && cmd_can_grow_memory(canonical) && !free_memory_if_needed()){
     return resp_err(out, "OOM commands not allowed when used memory > 'maxmemory'");
   }
 
@@ -3198,12 +3302,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 
   // Snapshot before running swap() handlers/ consume cmd's
   bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading;
+  bool renamed = (cmd[0] != canonical);
   std::vector<std::string> snapshot;
-  if (may_log && spec.aof_rewrite){ snapshot  = cmd; }
+  if (may_log && (spec.aof_rewrite || renamed)){ snapshot  = cmd; }
   spec.fn(cmd, out);
 
   if (may_log && g_data.g_writes_since_save != dirty_before){
-    if (spec.aof_rewrite){
+    if (spec.aof_rewrite || renamed){
+      if (renamed){ snapshot[0] = canonical; }
       // rare: re-encode with absolute PEXPIREAT
       aof_feed(snapshot);
     } else {
@@ -3213,24 +3319,57 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 }
 
-// Populate CmdSpec::Acl_cats once at boot, the @read/@write base is derived from the
+// case insensitive subcommand compare
+static bool acl_sub_is(const std::string &s, const char *lit){
+  // cmd[1] is not lowercase
+  size_t n = strlen(lit);
+  if (s.size() != n){ return false; }
+  for (size_t i = 0; i < n; ++i){ if (tolower((unsigned char)s[i]) != lit[i]){ return false; } }
+  return true;
+}
+
+static void kr_smove(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
+  if (cmd.size() > 1){ keys.emplace_back(cmd[1]); } // source
+  if (cmd.size() > 2){ keys.emplace_back(cmd[2]); } // destination - cmd[3] is a member not a key
+}
+
+static void kr_object(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
+  // OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ key -> key at cmd[2];  HELP/STATS -> no key
+  if (cmd.size() > 2 && (acl_sub_is(cmd[1],"encoding") || acl_sub_is(cmd[1],"refcount")
+                      || acl_sub_is(cmd[1],"idletime") || acl_sub_is(cmd[1],"freq"))){
+    keys.emplace_back(cmd[2]);
+  }
+}
+
+static void kr_memory(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
+  // MEMORY USAGE key [samples n] -> key at cmd[2]; DOCTOR/STATS -> no key
+  if (cmd.size() > 2 && acl_sub_is(cmd[1], "usage")){
+    keys.emplace_back(cmd[2]);
+  }
+}
+
+// Populate CmdSpec::Acl_cats once at boot, the  @read/@write base is derived from the
 // existing is_write flag, simplified taxonomy vs redis
 void acl_init_categories(){
+
+  static const std::unordered_map<std::string_view, KeyResolver> resolvers = {
+    {"smove", kr_smove}, {"object", kr_object}, {"memory", kr_memory},
+  };
+
   static const std::unordered_map<std::string_view, KeySpec> ks = {
     // no key argument at all -> skip key checks (category-gated only)
     {"ping",KeySpec::NONE}, {"info",KeySpec::NONE}, {"config",KeySpec::NONE},
     {"dbsize",KeySpec::NONE}, {"randomkey",KeySpec::NONE},{"flushall",KeySpec::NONE},
     {"flushdb",KeySpec::NONE}, {"save",KeySpec::NONE}, {"bgsave",KeySpec::NONE},
     {"bgrewriteaof",KeySpec::NONE}, {"auth",KeySpec::NONE}, {"keys",KeySpec::NONE},
-    {"scan",KeySpec::NONE}, {"memory",KeySpec::NONE}, {"object",KeySpec::NONE},
-    {"acl", KeySpec::NONE},
+    {"scan",KeySpec::NONE}, {"acl", KeySpec::NONE},
     // every arg from index 1 is a key
     {"del",KeySpec::ALL_FROM_1}, {"unlink",KeySpec::ALL_FROM_1}, {"exists",KeySpec::ALL_FROM_1},
     {"touch",KeySpec::ALL_FROM_1}, {"mget",KeySpec::ALL_FROM_1},
     {"rename",KeySpec::ALL_FROM_1}, {"renamenx",KeySpec::ALL_FROM_1},
     {"sinter",KeySpec::ALL_FROM_1}, {"sunion",KeySpec::ALL_FROM_1}, {"sdiff",KeySpec::ALL_FROM_1},
     {"sinterstore",KeySpec::ALL_FROM_1}, {"sunionstore",KeySpec::ALL_FROM_1},
-    {"sdiffstore",KeySpec::ALL_FROM_1}, {"smove",KeySpec::ALL_FROM_1},
+    {"sdiffstore",KeySpec::ALL_FROM_1},
     // key value key value ...
     {"mset",KeySpec::STRIDE2_FROM_1},{"msetnx",KeySpec::STRIDE2_FROM_1},
   };
@@ -3264,5 +3403,8 @@ void acl_init_categories(){
     }
     auto kit = ks.find(kv.first);
     s.keys = (kit != ks.end()) ? kit->second : KeySpec::FIRST;
+
+    auto rit = resolvers.find(kv.first);
+    s.key_resolver = (rit != resolvers.end()) ? rit->second : nullptr;
   }
 }

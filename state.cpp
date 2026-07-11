@@ -136,6 +136,29 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
+  if (name == "rename-command"){
+    if (args.size() != 2){ err = "rename-command needs OLD and NEW"; return CfgResult::BADVALUE; }
+    std::string oldn = args[0], neu = args[1];
+
+    for (char &c : oldn){ c = (char)tolower((unsigned char)c); }
+    for (char &c : neu){ c = (char)tolower((unsigned char)c); }
+
+    if (oldn.empty()){ err = "rename_command OLD is empty"; return CfgResult::BADVALUE; }
+    if (!command_is_known(oldn)){ err = "rename-command: unknown command '" + oldn + "'"; return CfgResult::BADVALUE; } 
+    for (auto &r : g_config.renames){ if (r.first == oldn){ err = "rename-command: '" + oldn + "' renamed twice"; return CfgResult::BADVALUE; } }
+
+    if (!neu.empty()){
+      for (unsigned char c : neu){ if (c < 0x20 || c == 0x7f){ err = "rename-command: NEW has control chars"; return CfgResult::BADVALUE; } }
+      if (command_is_known(neu)){ err = "rename-command: NEW '" + neu + "' collides with a command"; return CfgResult::BADVALUE; }
+      for (auto &r : g_config.renames){ if (r.second == neu){ err = "rename-command: New '" + neu + "' already use"; return CfgResult::BADVALUE; } }      
+    } else if (oldn == "auth" && !g_config.password.empty()){
+      err = "refusing to disable AUTH while a password is set (would lock out clients)";
+      return CfgResult::BADVALUE;
+    }
+    g_config.renames.emplace_back(oldn, neu);
+    return CfgResult::OK;
+  }
+
   // ACL user definition 
   if (name == "user"){
     if (args.empty()){ err = "User directive requires a username"; return CfgResult::BADVALUE; }
@@ -350,6 +373,12 @@ bool config_rewrite(const char * path){
     std::string line = acl_format_user(kv.first, kv.second, true);      // real hashes, quoted
     fprintf(fp, "%s\n", line.c_str());
   }
+  
+  for (const auto &r : g_config.renames){
+    if (r.second.empty()){ fprintf(fp, "rename-command %s \"\"\n", r.first.c_str()); }
+    else { fprintf(fp, "rename-command %s %s\n", r.first.c_str(), r.second.c_str()); }
+  }
+
   fclose(fp);
   return true;
 }

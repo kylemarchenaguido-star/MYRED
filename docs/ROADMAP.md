@@ -134,7 +134,19 @@ Project-specific risks this step must address:
 - AOF currently has a raw-frame hot path. If a command is renamed and raw aliases are
   logged, the AOF becomes config-dependent and can leak secret aliases.
 
-##### V9.5.1 - ACL Category Semantics Fix (tagging, not guard_cats)
+##### ✅ V9.5.1 - ACL Category Semantics Fix (tagging, not guard_cats) — DONE 2026-07-07
+
+**Implemented this session:**
+- Tagging fix in `acl_init_categories()`: after ORing `extra`, strip
+  `CAT_READ`/`CAT_WRITE` from any command carrying `CAT_ADMIN`/`CAT_DANGEROUS`. `+@read`
+  can no longer reach `CONFIG`/`ACL`/`KEYS`/`MEMORY`/`OBJECT`; `+@write` can no longer
+  reach `FLUSHALL`. `acl_check` unchanged (single O(1) OR test).
+- **Permission-before-arity reorder** in `do_request`: `acl_check` now runs *before* the
+  arity check, so an unauthorized user always gets `NOPERM` instead of a "wrong number
+  of arguments" that would leak a command's arity/shape. Authorized users still get
+  normal arity errors. The `acl` dispatch stays after the arity check so `cmd[1]` is
+  guaranteed to exist for `do_acl`.
+- `keys` arity widened `1,1`→`1,2` to accept the pattern argument (see V9.5.1a).
 
 **Design decision (2026-07-07):** the escalation is a *mistagging* bug, not a missing
 gate. `acl_init_categories()` gave `CAT_READ` to every non-write command — including
@@ -174,28 +186,26 @@ Tests (unchanged — all satisfied by the tagging fix):
 - `+@admin ~*` can run admin commands.
 - Explicit `+acl` can run `ACL` without granting every admin command.
 
-##### V9.5.2 - Precise Key Resolution
+##### ✅ V9.5.1a - Real KEYS glob matching — DONE 2026-07-07
 
-Do not keep growing the `KeySpec` enum for uncommon command shapes. Keep the enum
-for common fast paths and add a resolver hook for irregular commands.
+`do_keys` previously ignored its argument (`(void)cmd;`) and always returned every key,
+so `keys user:*` over-returned the whole keyspace. Now it reuses the existing
+`glob_match` (the same matcher used for ACL key patterns and `HSCAN`):
+- bare `keys` or `keys *` → fast path: stream all keys, no glob, no temp buffer
+  (unchanged cost for the common case);
+- `keys <pattern>` → single-pass collect of matching keys, then emit.
 
-Implementation plan:
+##### `[Done]` V9.5.2 - Precise Key Resolution — 2026-07-09
 
-- Add an optional key resolver to `CmdSpec`, for example:
-
-```cpp
-bool (*key_resolver)(const std::vector<std::string>& cmd,
-                     std::vector<std::string_view>& keys) = nullptr;
-```
-
-- If `key_resolver == nullptr`, use the existing enum path.
-- Add resolvers for:
-  - `SMOVE`: keys are `cmd[1]` and `cmd[2]`; `cmd[3]` is a member.
-  - `MEMORY USAGE key [SAMPLES n]`: key is `cmd[2]`.
-  - `MEMORY STATS` and `MEMORY DOCTOR`: no key.
-  - `OBJECT ENCODING|REFCOUNT|IDLETIME key`: key is `cmd[2]`.
-  - `CONFIG`, `ACL`, `INFO`, `PING`, and persistence commands: no key.
-- Keep enum paths for `GET`, `SET`, `DEL`, `MGET`, `MSET`, and similar commands.
+Implemented: added `KeyResolver` (`void(*)(const cmd&, vector<string_view>& keys)`) as an
+optional `CmdSpec::key_resolver`. When set it overrides the `KeySpec` enum in `acl_check`;
+otherwise the enum fast path runs. `acl_key_allowed` was widened to take `std::string_view`
+(so the enum and resolver paths share one checker with no overload). Resolvers `kr_smove`
+(keys `cmd[1]`,`cmd[2]` — member `cmd[3]` excluded), `kr_object`/`kr_memory` (subcommand-aware
+key at `cmd[2]`, case-insensitive `acl_sub_is`) are registered via a `resolvers` map in
+`acl_init_categories`; `smove`/`object`/`memory` were removed from the `ks` enum map so the
+resolver is the single source. All index access is bounds-checked (acl_check runs before the
+arity gate).
 
 Tests:
 
@@ -203,56 +213,27 @@ Tests:
 - `SMOVE` member names are not treated as keys.
 - Blocked source or destination key returns `NOPERM`.
 
-##### V9.5.3 - `rename-command` and Disabled Commands
+##### `[Done]` V9.5.3 - `rename-command` and Disabled Commands — 2026-07-09
 
-Scope this as boot/config-file only at first. Runtime `CONFIG SET rename-command`
-should stay unsupported until there is a clear need.
+Implemented (boot/config-file only, as scoped). `k_cmd_table` stays the canonical
+ACL-stamped template; a boot-built owning map `g_dispatch`
+(`unordered_map<string, DispatchEntry{canonical, spec}>`) is the live table.
+`dispatch_build()` runs after `acl_init_categories()` (order:
+config load → `acl_bootstrap_default` → `acl_init_categories` → `dispatch_build`),
+copies each stamped spec, then applies `g_config.renames`: erase OLD, insert NEW (or
+disable when NEW is `""`). `config_apply` parses `rename-command OLD NEW` with full
+validation (unknown OLD, double-rename, NEW collision/control-chars, AUTH-lockout
+guard) via `command_is_known()`; `config_rewrite` re-emits the lines. `do_request`
+resolves via `g_dispatch`, uses **canonical** for ACL, the `acl` dispatch,
+`cmd_can_grow_memory`, and `mem_selfcheck`. AOF: non-renamed writes keep the raw
+`aof_append_raw` fast path; renamed writes snapshot + `aof_feed` with `snapshot[0]`
+set to canonical (also drives TTL translation), so the alias never reaches the log.
 
-Config grammar:
-
-```text
-rename-command OLD NEW
-rename-command FLUSHALL ""
-```
-
-Rules:
-
-- Command names are case-insensitive; store lowercase.
-- Reject unknown `OLD`.
-- Reject duplicate `NEW`.
-- Reject empty `OLD`.
-- Reject whitespace or control characters in `NEW`.
-- Reject collisions with existing commands or earlier aliases.
-- Do not allow disabling `AUTH` if enabled users still require passwords and there is
-  no nopass path; otherwise the config can lock out every client.
-
-Recommended dispatch shape:
-
-- Replace `unordered_map<string_view, CmdSpec>` with an owning boot-built map:
-
-```cpp
-struct DispatchEntry {
-  std::string canonical;
-  CmdSpec spec;
-};
-std::unordered_map<std::string, DispatchEntry> dispatch;
-```
-
-- Build order:
-  1. create canonical command specs;
-  2. stamp ACL categories, guard categories, and key specs;
-  3. apply `rename-command`;
-  4. freeze the dispatch map for process lifetime.
-- A disabled command has no dispatch entry and returns `ERR unknown command`.
-- ACL checks use the canonical command name, not the alias.
-
-AOF rule:
-
-- Keep raw `aof_append_raw(raw, raw_len)` for normal non-renamed writes.
-- If `client_name != canonical`, append a canonicalized RESP frame for successful
-  writes by replacing `cmd[0]` with the canonical command.
-- If `spec.aof_rewrite` is true, canonicalize before the existing TTL rewrite path.
-- This preserves the v6 raw-write optimization and keeps AOF restart-safe.
+Bug found + fixed this session: the auth dispatch was keyed on
+`found && canonical=="auth"`, but `AUTH` is **not** a `k_cmd_table` command (its
+handler takes `conn`), so it is never in `g_dispatch` → every command NOAUTH'd.
+Fixed by matching `AUTH` by literal `cmd[0]` before the `g_dispatch` lookup. `AUTH`
+is therefore not renameable (correct — no lock-out via aliasing). See Design Decisions.
 
 Tests:
 
@@ -393,6 +374,12 @@ Notes:
 - Transactions need command queueing and optimistic invalidation, not just parser work.
 - Blocking or queued client state should be designed before adding blocking list
   commands.
+- Keyspace notifications (`notify-keyspace-events`) should ride on Pub/Sub once
+  `PUBLISH` exists. The hook points already exist and are few: lazy expiry
+  (`expire_if_needed`), active expiry (`process_timers` TTL drain), eviction
+  (`free_memory_if_needed`), and the write handlers themselves. One
+  `notify_keyspace_event(class, event, key)` helper called from those sites covers
+  Redis-compatible `K`/`E` channel semantics without touching the dispatch path.
 
 ### V10 - Replication and High Availability [Backlog]
 
@@ -443,6 +430,24 @@ Open items belong here until fixed.
 - `ZREM` does not drop an emptied zset. Redis removes the key; `ZPOPMIN` already does.
 - Add restart-level persistence tests for mutating commands that rewrite TTLs or remove
   keys, especially `GETEX`, `GETDEL`, `ZPOPMIN`, eviction `DEL`, and renamed commands.
+
+### Persistence and AOF
+
+- `BGREWRITEAOF` in flight at shutdown is silently discarded. `aof_write_snapshot()`
+  (`aof.cpp`) never renames its own tmp file — by design, since only the parent holds
+  the mid-rewrite write delta (`g_data.g_aof_rewrite_buf`) needed to finalize it — but
+  the parent only finalizes (`aof_check_background_rewrite()`, appends delta + renames
+  `appendonly.aof.tmp` -> `aof_path`) from inside the main poll loop
+  (`server.cpp:644`). Shutdown blocks on `g_rdb_child_pid` before saving
+  (`server.cpp:657-661`) but has no matching wait/finalize for `g_aof_child_pid`, so a
+  rewrite child that is still running (or that finishes moments after the parent exits)
+  never gets reaped, its finished `.tmp` file never gets renamed in, and the old AOF is
+  kept as-is with no error printed. Reproduced: `BGREWRITEAOF` immediately followed by
+  Ctrl-C left a complete, orphaned `appendonly.aof.tmp` on disk while `appendonly.aof`
+  stayed unchanged. Fix: extract the finalize step (delta append + rename + reopen fd)
+  out of `aof_check_background_rewrite()` into its own function; at shutdown, add a
+  blocking `waitpid(g_aof_child_pid, &status, 0)` mirroring the existing RDB one, then
+  call that finalize function directly instead of relying on the next poll tick.
 
 ### Testing Gaps
 
@@ -700,6 +705,15 @@ Deferred:
 - `quicklist`-style list storage.
 - RDB and AOF support for multiple internal encodings.
 - Accurate small-object memory accounting after compact encodings land.
+- Optional jemalloc link plus allocator-stats-backed `INFO memory`. Today
+  `mem_fragmentation_ratio` is RSS divided by `used_memory`, which conflates
+  connection buffers, AOF buffers, and allocator overhead with keyspace data.
+- Account per-connection buffer memory (`Conn::incoming`/`Conn::outgoing`)
+  separately, Redis-style `INFO clients` / `MEMORY STATS` fields, so a slow
+  reader draining `KEYS` output is visible as client memory, not fragmentation.
+- Active defragmentation is explicitly deferred until after compact encodings;
+  with the current one-allocation-per-node structures there is nothing useful to
+  compact.
 
 ### Object Sharing
 
@@ -806,6 +820,102 @@ New data types:
 - `WSAStartup` and `WSACleanup`.
 - `FlushFileBuffers` replacement for `fdatasync`.
 - Path handling and config path portability.
+
+### Event Loop and Connection Scaling
+
+Current shape: one `poll()` loop that rebuilds `poll_args` from the whole
+`fd2conn` vector every tick (`server.cpp`), a 64 KB stack staging buffer in
+`handle_read` copied into `Conn::incoming`, and no ceilings on connection count
+or buffer growth. Upgrades, in dependency order:
+
+- Per-connection limits first (they are correctness/DoS issues, not just scale):
+  a `maxclients` directive enforced in `handle_accept` with a
+  `-ERR max number of clients reached` reply, an input cap on `Conn::incoming`
+  (a frame that legally declares `k_max_args` bulks of `k_max_msg` bytes can
+  demand terabytes today), and Redis-style `client-output-buffer-limit` classes
+  on `Conn::outgoing` so a slow reader of `KEYS`/`HGETALL` output gets
+  disconnected instead of ballooning the heap.
+- Read directly into the connection buffer: give `Buffer` a
+  `buf_reserve(n)`/writable-tail API and `read()` straight into `data_end`,
+  removing the 64 KB memcpy per read in `handle_read`.
+- `epoll` backend behind a tiny interface (`event_loop_add/mod/del/wait`),
+  keeping `poll()` as the portable fallback. This kills the O(connections)
+  rebuild per tick and is a prerequisite for any 10k-connection claim. Design
+  the interface so the future Windows `WSAPoll` port is a third backend.
+- Unix domain socket support (`unixsocket` directive) — trivially fits the
+  existing `listen_fds` vector and skips protected-mode/allowlist concerns for
+  local tooling.
+- Only after the above: optional io-threads (Redis 6 model). Threads only do
+  read+parse and serialize+write; command execution stays on the main thread, so
+  `g_data` keeps its single-writer discipline. The thread pool from
+  `thread_pool.cpp` is not reusable for this (it has no per-connection affinity);
+  plan a dedicated design doc before starting.
+
+### Multiple Logical Databases
+
+`SELECT`, `SWAPDB`, `MOVE`, and `COPY ... DB` need real database indexes.
+Concrete approach for the current code:
+
+- `GlobalData::db` becomes `std::vector<HMap> dbs` (default 16, `databases`
+  directive) plus a `Conn::db_index`.
+- The TTL heap can stay global: `HeapItem::ref` already points back into the
+  `Entry`, but expiry deletion needs the owning table, so `Entry` gains a small
+  `uint8_t db` field (fits existing padding next to `type`).
+- `SCAN`/`KEYS`/`DBSIZE`/`FLUSHDB` become per-index; `FLUSHALL` iterates all.
+- RDB format: bump the version and emit per-entry db byte or `SELECTDB`-style
+  records; AOF replay needs a synthetic `SELECT` frame when the writer's index
+  changes (same canonicalization channel as rename-command).
+- `INFO keyspace` reports `db0:keys=...,expires=...` lines per non-empty db.
+
+### Scripting (EVAL)
+
+Largest remaining Redis-compat feature after Pub/Sub and transactions. Sketch:
+
+- Link Lua 5.4 (vendored single-directory build keeps the no-dependency spirit;
+  system liblua as fallback).
+- `EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH` with a script cache keyed by SHA-1
+  of the body (add SHA-1 next to the existing `sha256.h`, or key the cache by
+  full body initially and defer SHA-1).
+- `redis.call()` re-enters `do_request` with a synthetic reply buffer that gets
+  translated RESP→Lua tables; errors become Lua errors.
+- Persistence/replication rule: log *effects*, not scripts. Every write a script
+  makes already flows through the normal handlers, so the existing
+  `g_writes_since_save` gate plus `aof_feed`/`aof_append_raw` capture the write
+  stream — but raw-frame capture must be disabled inside scripts (there is no
+  client frame), so script-initiated writes always take the `aof_feed` re-encode
+  path. This mirrors the rename-command canonicalization rule.
+- Atomicity is free (single-threaded loop), but the OOM and MISCONF write gates
+  in `do_request` must run per `redis.call`, and a script execution time limit
+  needs a Lua debug hook.
+
+### Structured Logging and Daemonization
+
+Everything logs via bare `fprintf(stderr, ...)` today (server, rdb, aof, config
+parsing). Before the audit log (V9.5.4) grows siblings:
+
+- A leveled logger: `loglevel debug|verbose|notice|warning`, `logfile <path>`,
+  timestamps, single `write()` per line.
+- Fork-safety rule stays: children (`rdb_write_snapshot`, `aof_write_snapshot`)
+  only use `write()` on an already-open fd — the logger API must expose that
+  path.
+- `daemonize yes` + `pidfile`; optional syslog. This is what makes protected
+  mode, audit events, and `MISCONF` states operationally visible instead of lost
+  on a detached stderr.
+
+### Differential and Fuzz Testing
+
+- Differential harness: drive the same randomized operation stream through
+  redis-py against both a real `redis-server` and MYRED, diff replies, with a
+  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
+  rule). This mechanically catches semantics drift of the "SET should discard
+  TTL" class that hand-written assertions miss.
+- libFuzzer/AFL harnesses for `parse_resp_request` and `rdb_load_buffer` — both
+  are pure functions over byte buffers, so harnesses are ~20 lines each. Corpus
+  seeds: real AOF/RDB files from the test scripts.
+- An ASan/UBSan CMake build type (`-fsanitize=address,undefined`) and a CI lane
+  that runs `stress_test.py --correctness-only` under it. The intrusive
+  `container_of` pattern and manual `Buffer` management are exactly the code
+  shapes sanitizers pay off on.
 
 ## Testing Matrix
 

@@ -479,6 +479,7 @@ int main(int argc, char **argv){
 
   acl_bootstrap_default();
   acl_init_categories();      
+  dispatch_build();
 
   // AOF takes priority over RDB
   bool aof_exists = (access(g_config.aof_path.c_str(), F_OK) == 0);

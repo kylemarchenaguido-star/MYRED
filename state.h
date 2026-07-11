@@ -110,6 +110,7 @@ struct Conn {
   Buffer incoming;
   Buffer outgoing;
   User *user = nullptr; 
+  std::string peer; // "ip:port", set once at accept - no inet_ntoa() later
 };
 
 // global hashtable
@@ -159,6 +160,7 @@ struct SaveCondition {
 struct Config {
   int port = 1234;
   std::string config_path;
+  std::string auditlog_path;
   std::string password = "";
   std::vector<std::string> binds = {"0.0.0.0"}; // one listen fd per address
   std::string dump_path = "dump.rdb";
@@ -181,6 +183,10 @@ struct Config {
   };
   // (network, maks), host byte order
   std::vector<std::pair<uint32_t, uint32_t>> allowlist;
+
+  // rename-command OLD->NEW (lowercase; NEW="" = disable)
+  std::vector<std::pair<std::string, std::string>> renames;
+
   // ACL registry - stable addresses for Conn::User
   std::unordered_map<std::string, User> users;
 
@@ -275,3 +281,10 @@ void acl_init_categories(); // stamp acl_cats + KeySpec onto every CmdSpec (call
 User *acl_initial_user(); // starting identity for a new conn: default if no pass, else nullptr
 std::string acl_format_user(const std::string &name, const User &u, bool for_config);
 bool acl_apply_rule(User &u, const std::string &t); // shared by ACL SETUSER + `user` config directive
+
+void audit_open(const std::string &path); // (re)open the sink
+void audit_event(const char *event, const Conn *conn, const std::string &extra);
+void audit_reject(const std::string &peer, const char *reason); // accept-time, no Conn yet
+
+void dispatch_build(); // build the live command map from k_cmd_table + renames
+bool command_is_known(const std::string &name);
