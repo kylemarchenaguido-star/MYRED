@@ -318,6 +318,14 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
+  if (name == "auditlog"){ 
+    // "" disables, "stderr", or a path
+    if (!need1()){ return CfgResult::BADVALUE; }
+    g_config.auditlog_path = args[0];
+    audit_open(g_config.auditlog_path); // opens the file-load and on config set
+    return CfgResult::OK;
+  }
+
   // Unknown directive
   err = "unknown directive '" + name + "'";
   return CfgResult::UNKNOWN;
@@ -379,6 +387,7 @@ bool config_rewrite(const char * path){
     else { fprintf(fp, "rename-command %s %s\n", r.first.c_str(), r.second.c_str()); }
   }
 
+  if (!g_config.auditlog_path.empty()){ fprintf(fp, "auditlog \"%s\"\n", g_config.auditlog_path.c_str()); }
   fclose(fp);
   return true;
 }

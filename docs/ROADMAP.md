@@ -242,9 +242,19 @@ Tests:
 - A renamed write command survives restart even if the alias changes later.
 - `-config` blocks the renamed config command because ACL uses canonical names.
 
-##### V9.5.4 - Audit Log
+##### `[Done]` V9.5.4 - Audit Log — 2026-07-11
 
-Add a narrow audit logger, not a general logging framework.
+Implemented a narrow logger: `auditlog ""|stderr|<path>` opens an `O_APPEND | O_CLOEXEC`
+fd via `audit_open()` (called from `config_apply`, so it opens on file-load and on
+`CONFIG SET auditlog`); `config_rewrite` persists it. `audit_write()` does one `write()`
+per line (`ts=<utc> event=… peer=<ip:port> user=<name|-> …`), best-effort with a sticky
+`g_audit_last_error`. `Conn::peer` is captured once at accept. Events wired:
+`auth_success`/`auth_fail` (do_auth), `acl_deny` with `reason=key|command` (do_request),
+`admin_command`/`dangerous_command` by canonical cats (do_request, after the `acl`
+early-return so ACL isn't double-logged), `acl_change` for setuser/deluser (do_acl,
+target + rule *count* only), `accept_reject` for allowlist/protected-mode (handle_accept).
+Never logs passwords, hashes, or rule tokens. Bugs fixed this session: peer port joined
+with `.` instead of `:`, mangled `auth_fail` field spacing, `auth_succes` typo.
 
 Config:
 
@@ -293,8 +303,7 @@ Implementation rules:
 - Never log passwords, password hashes, or raw argument vectors.
 - `ACL SETUSER` logs target username and rule count only.
 - `CONFIG SET requirepass` logs directive name only.
-- Audit is best-effort by default; on write failure set sticky `audit_last_error` for
-  future `INFO` exposure.
+- Audit is best-effort by default; on write failured
 
 ##### V9.5.5 - Protocol and Metadata Cleanup
 

@@ -27,6 +27,12 @@ static constexpr const char *MSG_NOT_FLOAT = "ERR value is not a valid float";
 static constexpr const char *MSG_SYNTAX    = "ERR syntax error";
 static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
 
+static void die(const char *msg){
+	int err = errno;
+	fprintf(stderr, "[%d] %s\n", err, msg);
+	abort();
+}
+
 // This is for the random generator
 static std::mt19937_64 g_rng{std::random_device{}()};
 
@@ -1064,6 +1070,15 @@ static void audit_write(const char *event, const std::string &peer,
   }
 }
 
+void audit_event(const char *event, const Conn *conn, const std::string &extra){
+  audit_write(event, conn ? conn->peer : "-",
+              (conn && conn->user) ? conn->user->name : std::string("-"), extra);
+}
+
+void audit_reject(const std::string &peer, const char *reason){
+  audit_write("accept_reject", peer, "-", std::string(" reason=") + reason);
+}
+
 // Authenticate 
 static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   std::string uname, pass;
@@ -1099,10 +1114,12 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
     // assign the acl identity
     conn->user = &it->second;
     conn->failed_attemps = 0;
+    audit_event("auth_success", conn, "");
     return resp_ok(out);
   }
   conn->failed_attemps++;
   if (conn->failed_attemps >= k_max_failed_auth){ conn->want_close =true; }
+  audit_event("auth_fail", conn, " target=" + uname + " result=wrongpass");
   return resp_err(out, "WRONGPASS invalid username-password pair or user is disabled");
 }
 
@@ -2610,21 +2627,17 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
     return;
   }
 
-  if (sub == "set"){
+    if (sub == "set"){
     if (cmd.size() < 4){ return resp_err(out, "ERR wrong number of arguments of 'config|set'"); }
     std::string err;
-    CfgResult res = config_apply(cmd[2], { cmd[3] }, err);
-    if (res == CfgResult::BADVALUE){ return resp_err(out, ("ERR "+ err).c_str()); }
-    // ok / unknown both
-    return resp_ok(out);
-  }
-  
-  if (sub == "rewrite"){
-    if (g_config.config_path.empty()){
-      return resp_err(out, "ERR the server is running without a config file");
+    std::string p = cmd[2]; for (char &c : p){ c = (char)tolower((unsigned char)c); }
+    if (p == "rename-command"){
+      return resp_err(out, "ERR 'rename-command' can only be set in the config file");
     }
-    return config_rewrite(g_config.config_path.c_str()) ? resp_ok(out)
-                                                        : resp_err(out, "ERR rewriting config failed");
+    CfgResult res = config_apply(cmd[2], { cmd[3] }, err);
+    if (res == CfgResult::BADVALUE){ return resp_err(out, ("ERR " + err).c_str()); }
+    if (res == CfgResult::UNKNOWN){ return resp_err(out, ("ERR Unknown config parameter '" + cmd[2] + "'").c_str()); }
+    return resp_ok(out);
   }
 
   if (sub == "resetstat"){
@@ -3004,6 +3017,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
   if (sub == "cat"){
     static const char *cats[] = {"read", "write", "keyspace", "admin", "dangerous", "fast", "slow", "connection" };
+    resp_arr(out, (uint32_t)(sizeof(cats) / sizeof(cats[0]))); // resp array header
     for (const char *c : cats){ resp_str(out, c, strlen(c)); }
     return; 
   }
@@ -3037,6 +3051,8 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
       }
     }
     if (u.name.empty()){ u.name = cmd[2]; }
+    audit_event("acl_change", conn, " sub=setuser target=" + cmd[2] +
+                " rules=" + std::to_string(cmd.size() - 3) + " result=ok"); // we count the rules, do not show
     return resp_ok(out);
   }
 
@@ -3053,6 +3069,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
         c->want_close = true;
       }
     }
+    audit_event("acl_change", conn, " sub=deluser target=" + cmd[2] + " result=ok");
     g_config.users.erase(it);
     return resp_int(out, 1);
   }
@@ -3204,7 +3221,7 @@ static std::unordered_map<std::string, DispatchEntry> g_dispatch;
 
 bool command_is_known(const std::string &name){ return k_cmd_table.count(name) != 0; }
 
-// build the frozen live dispatch map: canonical spexs first, then apply rename-command
+// build the frozen live dispatch map: canonical specs first, then apply rename-command
 void dispatch_build(){
   g_dispatch.clear();
   g_dispatch.reserve(k_cmd_table.size() * 2);
@@ -3223,6 +3240,30 @@ void dispatch_build(){
     g_dispatch.erase(it);
     // else disable
     if (!r.second.empty()){ g_dispatch.emplace(r.second, std::move(entry)); }
+  }
+}
+
+void metadata_selfcheck(){
+  int problems = 0;
+  for (const auto &kv : k_cmd_table){
+    const CmdSpec &s = kv.second;
+    const std::string_view n = kv.first;
+    // every commmand must be grantable by some category
+    if (s.acl_cats == 0){
+      fprintf(stderr, "selfcheck: '%.*s' has acl_cats==0 (was acl_init_categories() run?)\n",
+              (int)n.size(), n.data());
+      problems++;
+    }
+    // control plane commands must not carry @read/@write
+    if((s.acl_cats & (CAT_ADMIN | CAT_DANGEROUS)) && (s.acl_cats & (CAT_READ | CAT_WRITE))){
+      fprintf(stderr, "selfcheck: '%.*s' is admin/dangerous but still carries @read/@write\n",
+            (int)n.size(), n.data());
+      problems++;
+    }
+  }
+  if (problems){
+    fprintf(stderr, "selfcheck: %d command-metadata problem(s)\n", problems);
+    die("command metadata self-check failed");
   }
 }
 
@@ -3254,7 +3295,6 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return do_auth(cmd, out, conn);
   }
 
-
   // resolve the typed name against the live map
   auto it = g_dispatch.find(cmd[0]);
   const bool found = (it != g_dispatch.end());
@@ -3275,6 +3315,8 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 
   // permission by canonical name
   if (const char *deny = acl_check(conn->user, canonical, spec, cmd)){
+    audit_event("acl_deny", conn, " cmd=" + canonical +
+                " reason=" + (strstr(deny, "key") ? "key" : "command"));
     return resp_err(out, deny);
   }
 
@@ -3284,6 +3326,12 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 
   if (canonical == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
+
+  // audit sensitive commands
+  if (spec.acl_cats & (CAT_ADMIN | CAT_DANGEROUS)){
+    audit_event((spec.acl_cats & CAT_ADMIN) ? "admin_command" : "dangerous_command",
+                conn, " cmd=" + canonical);
+  }
 
   #ifndef NDEBUG
   mem_selfcheck(cmd[0].c_str());   // prints "[mem] drift..." if any handler mis-accounted

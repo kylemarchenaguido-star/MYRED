@@ -81,8 +81,15 @@ static int32_t handle_accept(int fd){
 
   uint32_t peer_host = ntohl(client_addr.sin_addr.s_addr);
 
+  char peerbuf[32];
+  snprintf(peerbuf, sizeof(peerbuf), "%u.%u.%u.%u.%u",
+          (peer_host >> 24) & 255, (peer_host >> 16) & 255, (peer_host >> 8) & 255, peer_host & 255,
+          ntohs(client_addr.sin_port));
+  std::string peer = peerbuf;
+
   // IP allowlist (loopback always allowed; empty list = allowed all)
   if (!ip_allowed(peer_host)){
+    audit_reject(peer, "allowlist");
     fprintf(stderr, "rejected %s: not in allowlist\n", inet_ntoa(client_addr.sin_addr));
     close(connfd);
     // keep acepting other pending conections
@@ -91,6 +98,7 @@ static int32_t handle_accept(int fd){
 
   // protected mode: no password + remote peer -> refuse witn an explanation
   if (g_config.protected_mode && g_config.password.empty() && !ip_is_loopback(peer_host)){
+    audit_reject(peer, "protected-mode");
     static const char deny[] = 
       "-DENIED MYRED is in protected mode with no password set. "
       "Connect from localhost, set 'requirepass', or 'protected-mode no'.\r\n";
@@ -109,6 +117,7 @@ static int32_t handle_accept(int fd){
   // we create a new conn struct 
   Conn *conn = new Conn();
   conn->fd = connfd;
+  conn->peer = peer;
   conn->user = acl_initial_user(); 
   conn->want_read = true;
   conn->incoming = buf_create(64 * 1024);
@@ -478,7 +487,8 @@ int main(int argc, char **argv){
   if (g_config.password.empty()){ g_config.password = sha256_hex("kek1234"); }   // historical default
 
   acl_bootstrap_default();
-  acl_init_categories();      
+  acl_init_categories(); 
+  metadata_selfcheck();    
   dispatch_build();
 
   // AOF takes priority over RDB
