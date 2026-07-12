@@ -14,6 +14,7 @@
 #include "set.h"
 #include "fcntl.h"     
 #include "sha256.h" 
+#include "cred.h"
 #include <unistd.h> 
 #include <algorithm>
 #include <random>
@@ -1086,29 +1087,27 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   if (cmd.size() == 2){ uname = "default"; pass = cmd[1]; }
   //AUTH <user> <pass>
   else if (cmd.size() == 3){ 
-    uname = cmd[1];
-    pass = cmd[2];
+    uname = cmd[1]; // AUTH <pass>
+    pass = cmd[2]; // AUTH <user ><pass>
   } else { return resp_err(out, "ERR wwrong number of arguments for 'auth' command"); }
 
-  // we hash once
-  std::string h = sha256_hex(pass);
-  // wipe plaintext
-  secure_zero(&cmd[cmd.size() - 1][0], cmd[cmd.size() - 1].size());
-
-  // timing equalizer
-  static const std::string k_dummy(64, '0');
   auto it = g_config.users.find(uname);
   bool ok = false;
 
   if (it != g_config.users.end() && it->second.enable){
     for (const std::string &stored : it->second.pw_hashes){
-      // match any rotation
-      if (ct_equal(h, stored)){ ok = true; break; }
+      // dispatches legacy vs PHC
+      if (cred_verify(pass, stored)){ ok = true; break; }
     }
   } else {
-    // don't leak "user exists" via timing
-    (void)ct_equal(h, k_dummy);
+    // unknown/disabled user: burn a legacy-cost verify so the reply-time class matches
+    static const std::string k_dummy(64, '0');
+    (void)cred_verify(pass, k_dummy);
   }
+
+  // wipe both plaintext copies before replying
+  secure_zero(&cmd[cmd.size() - 1][0], cmd[cmd.size() - 1].size());
+  if (!pass.empty()){ secure_zero(&pass[0], pass.size()); }
 
   if (ok){
     // assign the acl identity
@@ -2605,6 +2604,14 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
   std::string sub = cmd[1];
   for (char &c : sub){ c = (char)tolower((unsigned char)c); }
 
+  if (sub == "rewrite"){
+    if (g_config.config_path.empty()){
+      return resp_err(out, "ERR the server is running without a config file");
+    }
+    return config_rewrite(g_config.config_path.c_str()) ? resp_ok(out)
+                                                        : resp_err(out, "ERR rewriting config failed");
+  }
+
   if (sub == "get"){
     if (cmd.size() < 3){ return resp_err(out, "ERR wrong number of arguments for 'config|get'"); }
     std::string param = cmd[2];
@@ -2958,9 +2965,30 @@ bool acl_apply_rule(User &u, const std::string &t){
   if (t == "allcommands" || t == "+@all"){ u.allow_cats = CAT_ALL; u.cmd_overrides.clear(); return true; }
   if (t == "nocommands" || t == "-@all"){ u.allow_cats = 0; u.cmd_overrides.clear(); return true; }
 
-  if (t.size() > 1 && t[0] == '>'){ u.pw_hashes.push_back(sha256_hex(t.substr(1))); return true; }
-  if (t.size() > 1 && t[0] == '<'){ std::string h = sha256_hex(t.substr(1));
-  u.pw_hashes.erase(std::remove(u.pw_hashes.begin(), u.pw_hashes.end(), h), u.pw_hashes.end()); return true; }
+  // >plain : add password hashed with th ecurrent policy
+  if (t.size() > 1 && t[0] == '>'){
+    std::string h = cred_hash_new(t.substr(1));
+    if (h.empty()){ return false; }// entropy/KDF failure, reject failure
+    u.pw_hashes.push_back(std::move(h));
+    return true;
+  }
+
+  // <plain : remove any credential this plaintext matches. Salted PHC means hash
+  // equality no longer works - verify per entry
+  if (t.size() > 1 && t[0] == '<'){
+      const std::string plain = t.substr(1);
+      auto &v = u.pw_hashes;
+      v.erase(std::remove_if(v.begin(), v.end(),
+              [&] (const std::string &stored){ return cred_verify(plain, stored); }), v.end());
+      return true;
+  }
+
+  // pre-hashed PHC credential (condig round-trip / ACL setuser  user $argon2id@...)
+  if (t.rfind("$argon2id$", 0) == 0){
+    if (t.size() > 512){ return false; } // sanity cap; garbage just never verifies
+    u.pw_hashes.push_back(t);
+    return true;
+  }
 
   if (t.size() > 1 && t[0] == '~'){ u.key_patterns.push_back(t.substr(1)); return true; }
 
@@ -2982,7 +3010,10 @@ std::string acl_format_user(const std::string &name, const User &u, bool for_con
   std::string s = "user " + name + (u.enable ? " on" : " off");
   if (u.pw_hashes.empty()){ s += " nopass"; }
   else { for (const std::string &h : u.pw_hashes){
-      s += for_config ? (" \"#" + h + "\"") : std::string(" #<hash>"); } }
+      if (!for_config){ s += " #<hash>"; } // display: always redacted
+      else if (h.rfind("$argon2id$", 0) == 0){ s += " \"" + h + "\""; } // PHC: verbatim token
+      else { s += " \"#" + h + "\""; }} 
+  }                             
   // keys
   if (u.all_keys){ s += " ~*"; }
   else { for (const std::string &p : u.key_patterns){ s += " ~" + p; } }

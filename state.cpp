@@ -2,6 +2,7 @@
 #include "common.h"
 #include "hash.h"
 #include "sha256.h"
+#include "cred.h"
 #include <arpa/inet.h>  
 #include <time.h>
 #include <cctype>
@@ -124,10 +125,15 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
       
     } else if (args[0].size() == 65 && args[0][0] == '#'){
       g_config.password = args[0].substr(1);
-    } else {
+    } else if (args[0].rfind("$argon2id$", 0) == 0){
       // hash plaintext
-      g_config.password = sha256_hex(args[0]);
+      g_config.password =args[0];
+    } else {
+      // plaint text, current policy
+      g_config.password = cred_hash_new(args[0]);
+      if (g_config.password.empty()){ err = "password hashing failed"; return CfgResult::BADVALUE; }
     }
+
     auto du = g_config.users.find("default");
     if (du != g_config.users.end()){
       du->second.pw_hashes.clear();
@@ -363,7 +369,13 @@ bool config_rewrite(const char * path){
   FILE *fp = fopen(path ,"w");
   if (!fp){ return false; }
   fprintf(fp, "port %d\n", g_config.port);
-  if (!g_config.password.empty()){ fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str()); }
+    if (!g_config.password.empty()){
+    if (g_config.password.rfind("$argon2id$", 0) == 0){
+      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
+    } else {
+      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
+    }
+  }
   fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
   fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");
   fprintf(fp, "appendfilename %s\n", g_config.aof_path.c_str());

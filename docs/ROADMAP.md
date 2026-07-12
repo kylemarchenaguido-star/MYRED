@@ -39,7 +39,7 @@ Naming conventions:
 
 ## Current Snapshot
 
-Date: 2026-07-09.
+Date: 2026-07-11.
 
 Primary commands:
 
@@ -76,7 +76,7 @@ Implemented command families:
 | Memory accounting and eviction | Implemented |
 | Config file foundation | Implemented |
 | Password hashing baseline | Implemented |
-| ACL foundation | Implemented, needs hardening |
+| ACL foundation and hardening | Implemented (V9.4–V9.5) |
 | TLS | Not implemented |
 | Pub/Sub and transactions | Not implemented |
 | Replication | Not implemented |
@@ -116,253 +116,252 @@ Completed foundations:
     `CAT`, and `GENPASS` are planned as the command surface.
   - `user` directives round-trip through config rewrite.
 
-#### V9.5 - Command Hardening and Audit Log [Next]
+#### `[Done]` V9.5 - Command Hardening and Audit Log — 2026-07-11
 
-Purpose: close the security holes that remain after ACL exists but before TLS.
-This step makes dispatch, ACL categories, dangerous-command hiding, persistence,
-and observability agree with each other.
+Closed the post-ACL security gaps before TLS. All substeps done, in order:
 
-Project-specific risks this step must address:
+- `[Done]` **V9.5.1 - ACL category semantics.** `acl_init_categories()` strips
+  `CAT_READ`/`CAT_WRITE` from any admin/dangerous command, so `+@read`/`+@write` can no
+  longer reach `CONFIG`/`ACL`/`KEYS`/`MEMORY`/`OBJECT`/`FLUSHALL`; `acl_check` stays a
+  single O(1) `&` test. `acl_check` also reordered before the arity check so an
+  unauthorized user gets `NOPERM`, never an arity/shape leak. (Design Decisions: ACL
+  Category Tagging.)
+- `[Done]` **V9.5.1a - Real `KEYS` glob.** `do_keys` filters through `glob_match`; bare
+  `keys`/`keys *` keep the no-copy streaming fast path.
+- `[Done]` **V9.5.2 - Precise key resolution.** Optional subcommand-aware
+  `CmdSpec::key_resolver` overrides the `KeySpec` enum for `SMOVE` (source/dest only) and
+  `OBJECT`/`MEMORY` (key at `cmd[2]`); `acl_key_allowed` widened to `string_view`.
+- `[Done]` **V9.5.3 - `rename-command` / disable.** Boot-built owning `g_dispatch`
+  (`{canonical, spec}`) over the `k_cmd_table` template; ACL and AOF use the canonical
+  name so aliases never leak into the log. `AUTH` is matched by literal name (not a table
+  command) and cannot be renamed. Config-file only; validated and persisted.
+- `[Done]` **V9.5.4 - Audit log.** `auditlog ""|stderr|<path>`; one `write()` per line to
+  an `O_APPEND|O_CLOEXEC` fd; events `auth_success`/`auth_fail`, `acl_deny`, `acl_change`,
+  `admin_command`/`dangerous_command`, `accept_reject`; never logs secrets.
+- `[Done]` **V9.5.5 - Protocol/metadata cleanup.** `ACL CAT` emits its RESP array header;
+  `CONFIG SET` rejects unknown params and boot-only `rename-command`;
+  `metadata_selfcheck()` fails loud at boot if any command has `acl_cats==0` or a
+  control-plane command still carries `@read`/`@write`.
 
-- `acl_init_categories()` derives `CAT_READ` for every non-write command, then ORs
-  `CAT_ADMIN` and `CAT_DANGEROUS` on top. If `acl_check()` only checks category
-  intersection, `+@read` can accidentally grant sensitive commands.
-- `KeySpec` is intentionally small, but `OBJECT` and `MEMORY` key subcommands need
-  key checks at index 2, and `SMOVE` should check only source and destination keys.
-- `k_cmd_table` should not remain a process-lifetime mutable command definition just
-  to support boot-time category stamping or command aliases.
-- AOF currently has a raw-frame hot path. If a command is renamed and raw aliases are
-  logged, the AOF becomes config-dependent and can leak secret aliases.
-
-##### ✅ V9.5.1 - ACL Category Semantics Fix (tagging, not guard_cats) — DONE 2026-07-07
-
-**Implemented this session:**
-- Tagging fix in `acl_init_categories()`: after ORing `extra`, strip
-  `CAT_READ`/`CAT_WRITE` from any command carrying `CAT_ADMIN`/`CAT_DANGEROUS`. `+@read`
-  can no longer reach `CONFIG`/`ACL`/`KEYS`/`MEMORY`/`OBJECT`; `+@write` can no longer
-  reach `FLUSHALL`. `acl_check` unchanged (single O(1) OR test).
-- **Permission-before-arity reorder** in `do_request`: `acl_check` now runs *before* the
-  arity check, so an unauthorized user always gets `NOPERM` instead of a "wrong number
-  of arguments" that would leak a command's arity/shape. Authorized users still get
-  normal arity errors. The `acl` dispatch stays after the arity check so `cmd[1]` is
-  guaranteed to exist for `do_acl`.
-- `keys` arity widened `1,1`→`1,2` to accept the pattern argument (see V9.5.1a).
-
-**Design decision (2026-07-07):** the escalation is a *mistagging* bug, not a missing
-gate. `acl_init_categories()` gave `CAT_READ` to every non-write command — including
-control-plane commands (`CONFIG`/`ACL`/`KEYS`/`MEMORY`/`OBJECT`) — so `+@read`
-intersected their category set and passed the O(1) check. Fix the tag, not the check.
-
-Chosen approach (kept `acl_check` unchanged, no new `CmdSpec` field):
-
-- In `acl_init_categories()`, after ORing the `extra` bits, strip the data-plane base
-  from any control-plane command:
-  ```cpp
-  s.acl_cats = is_write ? CAT_WRITE : CAT_READ;
-  if (extra has name){
-    s.acl_cats |= extra;
-    if (extra & (CAT_ADMIN | CAT_DANGEROUS)) s.acl_cats &= ~(CAT_READ | CAT_WRITE);
-  }
-  ```
-- Result: `CONFIG = ADMIN|DANGEROUS`, `FLUSHALL = KEYSPACE|DANGEROUS`,
-  `KEYS = KEYSPACE|DANGEROUS|SLOW`. A command is either data-plane (read/write) or
-  control-plane (admin/dangerous/keyspace) — never both.
-- `acl_check` keeps its single `(spec.acl_cats & user.allow_cats) != 0` test plus the
-  existing `+cmd`/`-cmd` override and key-pattern checks. No 4th step, no hot-path cost.
-
-Rejected: `guard_cats` (second bitmask + AND-gate in `acl_check`). It only buys
-per-command *mandatory co-requirements* ("grantable by @read OR @keyspace but also
-always requires @admin"), which no real command needs — so it was speculative
-complexity over a mistag. Revisit only if such a command ever appears.
-
-Deliberate divergence from Redis: `@read` no longer implies `KEYS`/`CONFIG`, and
-`@write` no longer implies `FLUSHALL` (Redis's `+@write` does grant `FLUSHALL`). Safer
-default; to restore Redis behavior a user writes an explicit `+flushall`/`+keys`.
-
-Tests (unchanged — all satisfied by the tagging fix):
-
-- `+@read ~*` cannot run `ACL`, `CONFIG`, `MEMORY`, `OBJECT`, or `KEYS`.
-- `+@write ~*` cannot run `FLUSHALL`.
-- `+@admin ~*` can run admin commands.
-- Explicit `+acl` can run `ACL` without granting every admin command.
-
-##### ✅ V9.5.1a - Real KEYS glob matching — DONE 2026-07-07
-
-`do_keys` previously ignored its argument (`(void)cmd;`) and always returned every key,
-so `keys user:*` over-returned the whole keyspace. Now it reuses the existing
-`glob_match` (the same matcher used for ACL key patterns and `HSCAN`):
-- bare `keys` or `keys *` → fast path: stream all keys, no glob, no temp buffer
-  (unchanged cost for the common case);
-- `keys <pattern>` → single-pass collect of matching keys, then emit.
-
-##### `[Done]` V9.5.2 - Precise Key Resolution — 2026-07-09
-
-Implemented: added `KeyResolver` (`void(*)(const cmd&, vector<string_view>& keys)`) as an
-optional `CmdSpec::key_resolver`. When set it overrides the `KeySpec` enum in `acl_check`;
-otherwise the enum fast path runs. `acl_key_allowed` was widened to take `std::string_view`
-(so the enum and resolver paths share one checker with no overload). Resolvers `kr_smove`
-(keys `cmd[1]`,`cmd[2]` — member `cmd[3]` excluded), `kr_object`/`kr_memory` (subcommand-aware
-key at `cmd[2]`, case-insensitive `acl_sub_is`) are registered via a `resolvers` map in
-`acl_init_categories`; `smove`/`object`/`memory` were removed from the `ks` enum map so the
-resolver is the single source. All index access is bounds-checked (acl_check runs before the
-arity gate).
-
-Tests:
-
-- A user with `~allowed:* +memory +object +smove` can access allowed keys only.
-- `SMOVE` member names are not treated as keys.
-- Blocked source or destination key returns `NOPERM`.
-
-##### `[Done]` V9.5.3 - `rename-command` and Disabled Commands — 2026-07-09
-
-Implemented (boot/config-file only, as scoped). `k_cmd_table` stays the canonical
-ACL-stamped template; a boot-built owning map `g_dispatch`
-(`unordered_map<string, DispatchEntry{canonical, spec}>`) is the live table.
-`dispatch_build()` runs after `acl_init_categories()` (order:
-config load → `acl_bootstrap_default` → `acl_init_categories` → `dispatch_build`),
-copies each stamped spec, then applies `g_config.renames`: erase OLD, insert NEW (or
-disable when NEW is `""`). `config_apply` parses `rename-command OLD NEW` with full
-validation (unknown OLD, double-rename, NEW collision/control-chars, AUTH-lockout
-guard) via `command_is_known()`; `config_rewrite` re-emits the lines. `do_request`
-resolves via `g_dispatch`, uses **canonical** for ACL, the `acl` dispatch,
-`cmd_can_grow_memory`, and `mem_selfcheck`. AOF: non-renamed writes keep the raw
-`aof_append_raw` fast path; renamed writes snapshot + `aof_feed` with `snapshot[0]`
-set to canonical (also drives TTL translation), so the alias never reaches the log.
-
-Bug found + fixed this session: the auth dispatch was keyed on
-`found && canonical=="auth"`, but `AUTH` is **not** a `k_cmd_table` command (its
-handler takes `conn`), so it is never in `g_dispatch` → every command NOAUTH'd.
-Fixed by matching `AUTH` by literal `cmd[0]` before the `g_dispatch` lookup. `AUTH`
-is therefore not renameable (correct — no lock-out via aliasing). See Design Decisions.
-
-Tests:
-
-- `rename-command FLUSHALL ""` makes `FLUSHALL` unknown and produces no AOF entry.
-- `rename-command CONFIG __secret_config__` makes `CONFIG` unknown and the alias work.
-- A renamed write command survives restart even if the alias changes later.
-- `-config` blocks the renamed config command because ACL uses canonical names.
-
-##### `[Done]` V9.5.4 - Audit Log — 2026-07-11
-
-Implemented a narrow logger: `auditlog ""|stderr|<path>` opens an `O_APPEND | O_CLOEXEC`
-fd via `audit_open()` (called from `config_apply`, so it opens on file-load and on
-`CONFIG SET auditlog`); `config_rewrite` persists it. `audit_write()` does one `write()`
-per line (`ts=<utc> event=… peer=<ip:port> user=<name|-> …`), best-effort with a sticky
-`g_audit_last_error`. `Conn::peer` is captured once at accept. Events wired:
-`auth_success`/`auth_fail` (do_auth), `acl_deny` with `reason=key|command` (do_request),
-`admin_command`/`dangerous_command` by canonical cats (do_request, after the `acl`
-early-return so ACL isn't double-logged), `acl_change` for setuser/deluser (do_acl,
-target + rule *count* only), `accept_reject` for allowlist/protected-mode (handle_accept).
-Never logs passwords, hashes, or rule tokens. Bugs fixed this session: peer port joined
-with `.` instead of `:`, mangled `auth_fail` field spacing, `auth_succes` typo.
-
-Config:
-
-```text
-auditlog ""
-auditlog stderr
-auditlog /path/to/myred-audit.log
-```
-
-Optional later:
-
-```text
-auditlog-events auth,acl,admin,dangerous,deny
-auditlog-required yes
-```
-
-Connection context:
-
-- Store `peer_ip` and `peer_port` on `Conn` at accept time.
-- Do not depend on `inet_ntoa()` later.
-- Include `user=...` as `conn->user ? conn->user->name : "-"`.
-
-Events:
-
-- `auth_fail`: wrong password, disabled user, missing user.
-- `auth_success`: optional and configurable.
-- `acl_change`: `ACL SETUSER`, `ACL DELUSER`, future `ACL LOAD` or `ACL SAVE`.
-- `acl_deny`: command or key-pattern denial.
-- `admin_command`: canonical command has `CAT_ADMIN`.
-- `dangerous_command`: canonical command has `CAT_DANGEROUS`.
-- `accept_reject`: protected-mode or allowlist rejection.
-
-Line format:
-
-```text
-ts=2026-07-09T18:23:10Z event=acl_deny peer=127.0.0.1:54321 user=alice cmd=flushall reason=category
-ts=2026-07-09T18:23:22Z event=acl_change peer=127.0.0.1:54321 user=default cmd=acl sub=setuser target=bob result=ok
-ts=2026-07-09T18:23:31Z event=auth_fail peer=10.0.0.9:52100 user=default result=wrongpass
-```
-
-Implementation rules:
-
-- Use wall-clock UTC with `time()`, `gmtime_r()`, and `strftime()`.
-- Use one `write()` per audit line to an `O_APPEND | O_CLOEXEC` fd.
-- Avoid stdio buffering surprises across `fork()`.
-- Never log passwords, password hashes, or raw argument vectors.
-- `ACL SETUSER` logs target username and rule count only.
-- `CONFIG SET requirepass` logs directive name only.
-- Audit is best-effort by default; on write failured
-
-##### V9.5.5 - Protocol and Metadata Cleanup
-
-- Fix `ACL CAT` to emit a RESP array header before category strings.
-- Make unknown or unsupported `CONFIG SET` behavior explicit:
-  - either document current compatibility behavior, or
-  - return `ERR unsupported parameter`.
-- Add a boot metadata self-check:
-  - every command has nonzero `acl_cats`;
-  - every admin/dangerous command has the data-plane base (`CAT_READ`/`CAT_WRITE`)
-    stripped, so `@read`/`@write` cannot intersect it (V9.5.1 tagging rule);
-  - every write command has a deliberate AOF mode: raw, rewrite, or canonicalize.
-- Add stress-test coverage for hardening paths.
-- Keep destructive or crash-probing tests behind an explicit flag.
-
-Done criteria:
-
-- Restricted `+@read` and `+@write` users cannot run admin/dangerous commands unless
-  explicitly granted.
-- Key-pattern ACLs are precise for `SMOVE`, `MEMORY`, and `OBJECT`.
-- Disabled commands are unreachable and cannot dirty the DB or append to AOF.
-- Renamed write commands are persisted canonically and survive restart.
-- Audit log records auth failures, ACL changes, ACL denials, and admin/dangerous
-  command attempts without leaking secrets.
-- `stress_test.py --password kek1234 --correctness-only` covers ACL hardening,
-  rename-command, and audit assertions.
-- AOF shell tests cover at least one renamed write command.
+Deferred to Backlog: `stress_test.py` ACL/rename/audit coverage; `INFO audit_last_error`
+exposure; optional `auditlog-events` / `auditlog-required` filters.
 
 #### V9.6 - Password Hashing Upgrade [Backlog]
 
-SHA-256 is fast and unsalted. It is acceptable as the current baseline, but weak if a
-config or ACL file leaks. Upgrade credentials at rest to a salted, memory-hard KDF.
+SHA-256 is fast and unsalted: fine against wire sniffing, weak if `myred.conf` or an
+ACL line leaks (GPU cracking of unsalted fast hashes). Upgrade credentials at rest to
+Argon2id while keeping every existing config loadable.
 
-Preferred path:
+Prerequisite: fix the `sha256_hex` padding bug (CODE_REVIEW 2026-07-09, N5) first.
+Migration code will verify legacy digests; it must verify *correct* ones.
 
-- Add Argon2id via `libargon2`.
-- Store PHC-format strings (`$argon2id$...`) in `requirepass` and user password
-  entries.
-- Keep SHA-256 verification for existing `#<hex>` configs.
-- Rehash to Argon2id on next `CONFIG SET requirepass` or `ACL SETUSER`.
-- Keep `secure_zero()` and constant-time verification hygiene.
+Current write/verify sites (all of them, so nothing is missed):
 
-Fallback: bcrypt if Argon2 dependency cost is too high.
+- Verify: `do_auth` (`commands.cpp:1083`) — hashes once, `ct_equal` against each entry
+  of `User::pw_hashes`, dummy-compare for unknown users, `failed_attemps` counter.
+- Store: `config_apply("requirepass")` (`state.cpp:119-137`), `acl_apply_rule`
+  `>pass` / `<pass` / `#<hex>` (`commands.cpp:2943-2963`), env `MYRED_PASSWORD`
+  (`server.cpp:482`), historical default (`server.cpp:487`).
+- Render: `acl_format_user` (config rewrite + `ACL LIST`), which already quotes
+  hash tokens.
+
+##### V9.6.1 - Credential abstraction (no behavior change)
+
+Do not scatter `if (argon2)` branches across those sites. Add a small module
+(`cred.h/cred.cpp`, alongside `sha256.h`) that owns the stored-credential format:
+
+- A stored credential stays a `std::string` inside `User::pw_hashes` (no struct churn,
+  config round-trip untouched). Two self-describing forms:
+  - legacy: 64 lowercase hex chars = SHA-256 digest (verified forever);
+  - PHC: `$argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<tag_b64>`.
+- API — exactly three functions, and every site above switches to them:
+  - `std::string cred_hash_new(const std::string &plain)` — Argon2id, fresh random
+    salt (16 B via `getrandom()`; do NOT use `g_rng`, it is not seeded for security).
+  - `bool cred_verify(const std::string &plain, const std::string &stored)` —
+    dispatches on the `$argon2id$` prefix vs 64-hex; tag comparison stays
+    constant-time (`ct_equal` on the decoded tag); unknown format returns false.
+  - `bool cred_needs_rehash(const std::string &stored)` — true for legacy digests and
+    for PHC strings whose `m/t/p` are below current policy.
+- `acl_apply_rule` gains one branch: a token starting with `$argon2id$` is accepted as
+  a pre-hashed credential (same idea as `#<hex>`). Note `<pass` removal can no longer
+  hash-and-compare — salts differ — so it must `cred_verify` against each stored entry
+  and erase matches. That is O(n) KDF runs, but it is an admin-time operation on a
+  tiny vector; acceptable.
+- Build: `find_package`/pkg-config for `libargon2` behind a CMake option
+  (`MYRED_ARGON2`, default ON). When OFF or missing, `cred_hash_new` falls back to
+  SHA-256 with a startup warning — the zero-dependency build keeps working. Skip
+  bcrypt entirely; one optional dependency is enough.
+
+Parameters: start with OWASP baseline `m=19456 KiB, t=2, p=1` as constants. Only add
+`argon2-*` config directives if tuning is ever actually needed — each directive is
+rewrite/round-trip surface.
+
+##### V9.6.2 - Async verification (the optimization that makes it viable)
+
+Argon2id costs tens of milliseconds and ~19 MiB *by design*. Running it inside
+`do_auth` on the event loop stalls every connected client per AUTH attempt and hands
+an attacker a DoS lever (spam AUTH → server frozen). This is the core engineering work
+of V9.6:
+
+- Build a generic worker→loop completion channel first (it is also what V9.7's
+  handshake offload and future async jobs need — build once):
+  - an `eventfd` (or self-pipe) registered in the `poll()` loop;
+  - a mutex-guarded completion queue drained by the main thread when the eventfd fires;
+  - `loop_post(fn, arg)` callable from `thread_pool` workers.
+- `do_auth` flow becomes: parse args → copy plaintext into a worker-owned buffer →
+  set `conn->auth_pending = true` → `thread_pool_queue` the verify → return without
+  replying. Worker runs `cred_verify` (against each stored hash), `secure_zero`s its
+  plaintext copy, posts `{conn_id, user_name, ok}`.
+- Main thread on completion: resolve the conn, set `conn->user`, emit
+  `+OK`/`-WRONGPASS` into `conn->outgoing`, flip `want_write`, run the existing
+  `failed_attemps`/`audit_event` logic.
+- Two correctness traps, both mandatory:
+  - **Conn liveness**: the client can disconnect mid-verify and the fd can be reused.
+    Do not capture `Conn*` in the completion. Add a monotonically increasing
+    `uint64_t Conn::id` stamped at accept; completions carry the id and are dropped if
+    `fd2conn` no longer maps to a conn with that id.
+  - **Pipeline gating**: while `auth_pending`, `try_one_request` must stop parsing
+    (return false, leave bytes buffered) so pipelined commands cannot run with the
+    pre-AUTH identity.
+- DoS bound: cap concurrent verifications (counter, e.g. 4): beyond the cap, either
+  queue the AUTH or reply `-BUSY`. Bounds Argon2 memory to `cap × m` and keeps the
+  worker pool from starving `entry_del`/fsync jobs.
+- Timing hygiene: unknown users must take the same path — verify against a baked-in
+  dummy PHC string instead of today's `ct_equal(h, k_dummy)`, so "user exists" is not
+  distinguishable by response time class.
+- AOF replay is unaffected: the replay identity is synthetic and never AUTHs.
+
+##### V9.6.3 - Migration and rotation
+
+- On successful AUTH where `cred_needs_rehash(stored)` is true: the plaintext is still
+  in hand — compute `cred_hash_new`, replace that `pw_hashes` entry in place (worker
+  computes, completion applies it on the main thread), log an `audit_event`
+  (`cred_rehash`, username only). Never auto-run `CONFIG REWRITE`; the operator
+  persists when ready.
+- `CONFIG SET requirepass <plain>` and `ACL SETUSER >plain` produce Argon2id directly.
+  These are admin-rate operations: synchronous hashing is acceptable at first;
+  offload later only if it shows up.
+- `g_config.password` currently doubles as "the default user's digest"
+  (`acl_bootstrap_default`, protected-mode check `password.empty()`). Keep it a
+  stored-credential string; only `.empty()` is ever tested outside `cred_*`.
+
+Tests / done criteria:
+
+- PHC round-trip through config rewrite and restart (quoting preserved).
+- Legacy `#<hex>` configs still authenticate; first AUTH flips the entry to PHC in
+  memory; `ACL LIST` shows a redacted marker, never the hash.
+- AUTH storm (50 clients × wrong passwords) leaves PING p99 on other connections flat
+  — this is the assertion that proves the async design.
+- Unknown-user vs wrong-password timing in the same class.
+- `--correctness-only` green with `MYRED_ARGON2=OFF` (fallback path).
 
 #### V9.7 - TLS [Backlog]
 
-TLS is the heaviest security feature and can be its own milestone.
+TLS is the heaviest security feature. The event loop, not OpenSSL, is where the risk
+lives: today plaintext I/O touches exactly four places — accept
+(`handle_accept`, `server.cpp:71`), read (`handle_read`, `server.cpp:410`), write
+(`handle_write`, `server.cpp:391`), close (`conn_destroy`) — and readiness is derived
+purely from application intent (`want_read`/`want_write`). TLS breaks that assumption,
+so the milestone is ordered to absorb the breakage before any crypto exists.
 
-Plan:
+Prerequisites: CODE_REVIEW 2026-07-09 N3 (timer busy-loop) and N4 (protocol-error
+wedge / missing input caps) — TLS multiplies buffering complexity and must not land on
+top of a loop that spins or buffers unboundedly.
 
-- Link OpenSSL.
-- Add `tls-port`, `tls-cert-file`, `tls-key-file`, and `tls-ca-cert-file`.
-- Optional mutual TLS: require and verify client certificates.
-- Wrap per-`Conn` I/O in an `SSL*`.
-- Integrate non-blocking `SSL_read()` and `SSL_write()` with `poll()` using
-  `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE`.
-- Add handshake timeouts.
-- Use `SSL_shutdown()` on close.
-- Support cert reload without restart only after basic TLS is stable.
+##### V9.7.1 - Transport seam (zero-behavior-change refactor, no OpenSSL yet)
+
+- Introduce a per-conn transport layer and route ALL socket I/O through it:
+
+  ```cpp
+  enum class IoResult { OK, WANT_READ, WANT_WRITE, PEER_CLOSED, ERR };
+  IoResult tr_read (Conn *c, uint8_t *buf, size_t cap, size_t *n);
+  IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n);
+  void     tr_close(Conn *c);   // plaintext: close(fd)
+  ```
+
+- The key semantic change the loop must learn now: with TLS, a *read* attempt can
+  demand POLLOUT and a *write* attempt can demand POLLIN (handshake and record
+  processing). So poll flags become `application intent + transport demand`: add
+  `Conn::tr_want_read`/`tr_want_write` set from `IoResult`, and OR them into `pfd.events`
+  next to the existing flags. The `assert(conn->want_read)` /
+  `assert(conn->want_write)` pairs in the poll loop must be relaxed accordingly.
+- Plaintext maps trivially (`EAGAIN` on read → WANT_READ, on write → WANT_WRITE), so
+  the whole stress suite verifies this refactor with zero crypto in the build. Do not
+  start V9.7.2 until it is green.
+
+##### V9.7.2 - Context, config, listeners
+
+- Config: `tls-port` (0 = disabled; may coexist with plaintext `port`),
+  `tls-cert-file`, `tls-key-file`, `tls-ca-cert-file`,
+  `tls-auth-clients yes|no|optional`. All boot-only at first; wire through
+  `config_apply` + `config_rewrite` like the V9.1 directives.
+- One global `SSL_CTX` at boot: `TLS1.2` minimum (`SSL_CTX_set_min_proto_version`),
+  `SSL_OP_NO_RENEGOTIATION`, default ECDHE ciphers, and
+  `SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` — the second
+  flag is mandatory because `Buffer` slides/reallocs between write retries
+  (`buf_consume`/`buf_append`), which vanilla OpenSSL rejects on a retried
+  `SSL_write`.
+- Listener vector becomes `{fd, bool is_tls}`; `handle_accept` on a TLS listener
+  creates the `SSL`, `SSL_set_fd`, `SSL_set_accept_state` — and returns. No
+  synchronous `SSL_accept`; the handshake is loop-driven state.
+- Accept-time policy (allowlist, protected mode, `audit_reject`) stays where it is:
+  those checks are IP-based and need no handshake.
+
+##### V9.7.3 - Handshake as connection state
+
+- `Conn::tls_handshaking = true` until `SSL_do_handshake` returns 1. While set, the
+  poll loop calls `SSL_do_handshake` on readiness and maps
+  `SSL_ERROR_WANT_READ/WANT_WRITE` to the transport-demand flags; on success it clears
+  the flag and enters the normal read-intent state.
+- Handshake timeout rides the existing io_list timer machinery — the conn is already
+  on `io_list` with `k_io_timeout_ms`; add a tighter `tls-handshake-timeout`
+  (default 10 s) checked in `process_timers` for handshaking conns. A TCP connect that
+  never speaks TLS must not hold a slot for 30 s.
+- Failed handshakes: `audit_event("tls_handshake_fail", ...)`, destroy. AUTH remains
+  required after the handshake (mTLS-derived identity is explicitly out of scope until
+  a later step).
+
+##### V9.7.4 - Data path rules
+
+`handle_read`/`handle_write` swap `read()`/`write()` for `tr_read`/`tr_write`. Three
+OpenSSL behaviors must be encoded as rules, or they become heisenbugs:
+
+- **Classify with `SSL_get_error`, never errno.** `SSL_ERROR_ZERO_RETURN` = clean
+  close-notify → `want_close`. `SSL_ERROR_SYSCALL` with 0 return = dirty EOF.
+- **Drain `SSL_pending()` after every successful `SSL_read`.** Decrypted bytes can sit
+  inside the SSL object with nothing left on the socket; returning to `poll()` without
+  draining stalls the reply until the peer happens to send another byte. The
+  `while (try_one_request(conn))` loop already handles multi-command buffers — the
+  transport must guarantee it received *all* currently decryptable bytes.
+- **`SSL_shutdown` once, best-effort, then `SSL_free`** in `tr_close`. Do not wait for
+  the peer's close-notify; a synchronous bidirectional shutdown is a hang primitive.
+
+##### V9.7.5 - Optimizations (strictly after correctness)
+
+- **Session resumption first** — biggest win, near-zero code:
+  `SSL_CTX_set_session_cache_mode(SSL_SESS_CACHE_SERVER)` plus default TLS 1.3
+  tickets. Reconnect-heavy tooling (`redis-benchmark` without `-k`) drops from full
+  handshakes to resumed ones.
+- **Record-sized flushes**: TLS records cap at 16 KB; the single `outgoing` Buffer
+  already batches pipelined replies into large `tr_write` calls — keep that property,
+  never introduce per-reply `SSL_write` calls.
+- **`SSL_MODE_RELEASE_BUFFERS`**: reclaims ~34 KB per idle connection.
+- **Handshake CPU**: if accept storms show up, mitigate in this order — resumption,
+  accept-rate cap per tick, and only as a last resort offload `SSL_do_handshake` to
+  the thread pool using the V9.6.2 completion channel (same conn-id liveness rule).
+- **kTLS** (`SSL_OP_ENABLE_KTLS`): measure before adopting; not planned.
+- **Cert reload without restart** (explicitly last): build a fresh `SSL_CTX`, swap the
+  global pointer; existing conns keep the old ctx alive via OpenSSL refcounting.
+
+Tests / done criteria:
+
+- `redis-cli --tls --cacert ...` runs the correctness suite against `tls-port`;
+  plaintext and TLS listeners serve simultaneously.
+- Python harness gains `--tls` (`ssl.wrap_socket` over the existing client).
+- Handshake-timeout test: TCP connect, send nothing, conn reaped at the TLS deadline.
+- Mid-handshake disconnect and mid-write disconnect leak nothing (run under ASan).
+- Large pipeline (>16 KB replies) over TLS byte-identical to plaintext.
+- V9.7.1 refactor alone passes the full plaintext stress suite unchanged.
 
 ### V8 - Pub/Sub and Transactions [Backlog]
 
@@ -433,6 +432,30 @@ Open items belong here until fixed.
   memory/security/config basics.
 - `COMMAND`, `COMMAND DOCS`, and `COMMAND COUNT` are not implemented; `redis-cli`
   interactive mode may probe them.
+
+### Process Lifecycle and Error Handling
+
+- `die()` (`server.cpp:42-46`) prints `[errno] msg` and then calls `abort()` for every
+  call site, with no distinction between an ordinary, expected operational failure and
+  an actual internal-invariant violation. `abort()`/`SIGABRT` conventionally means "the
+  program reached a structurally impossible state" and exists to leave a debuggable
+  core dump — but several `die()` call sites are just routine startup mistakes: a
+  missing/misspelled config path (`server.cpp:480`, `if (cfg_path &&
+  !config_load_file(cfg_path)){ die("invalid config file"); }`), a bind failure such as
+  `EADDRINUSE`/`EADDRNOTAVAIL` (`server.cpp:580`, `"listener setup"`), and `fcntl`
+  failures setting non-blocking mode (`server.cpp:52`, `server.cpp:59`). Reproduced:
+  `./build/server myred.cond` (typo'd filename) prints `fatal: cannot open config
+  myred.cond: No such file or directory` then `Aborted (core dumped)` — an alarming,
+  crash-looking exit for what is just a bad CLI argument, and it leaves a core-dump
+  artifact (subject to whatever `core_pattern`/`ulimit -c` the host has configured) on
+  every single bad invocation. Fix: split `die()` into two helpers — `panic(msg)`
+  (unchanged: print + `abort()`) reserved for genuine internal-invariant violations, and
+  a new `fatal_exit(msg)` (print + `exit(1)`, no core dump) for ordinary
+  startup/operational failures. Route `"invalid config file"`, `"listener setup"`, and
+  the two `"fcntl error"` sites to `fatal_exit()`; the runtime `poll()` failure
+  (`server.cpp:609`, `die("poll")`) is the one call site that plausibly stays a `panic()`
+  — a `poll()` failure mid-operation (as opposed to at startup) more likely indicates an
+  actual fd-management bug worth a debuggable core dump.
 
 ### Data Correctness
 
@@ -582,6 +605,25 @@ Upgrade path:
 - Replay tokens at `ACL SETUSER` time into the compiled form.
 - Keep request-time enforcement O(1).
 - Use raw tokens for `ACL LIST` and `ACL GETUSER` output only.
+
+### ACL Category Tagging
+
+The `+@read` escalation (a read-only user reaching `CONFIG`/`KEYS`/`ACL`) was a
+*mistagging*, not a missing gate: `acl_init_categories()` gave `CAT_READ` to every
+non-write command. Fix: strip `CAT_READ`/`CAT_WRITE` from any command carrying
+`CAT_ADMIN`/`CAT_DANGEROUS`, so a command is either data-plane or control-plane, never
+both — `acl_check` stays a single O(1) `&`.
+
+Rejected: a second `guard_cats` bitmask + AND-gate. It only expresses per-command
+mandatory co-requirements ("grantable by @read but also always needs @admin"), which no
+real command needs; revisit only if one appears.
+
+Divergence from Redis (deliberate): `@read` no longer implies `KEYS`/`CONFIG`, `@write`
+no longer implies `FLUSHALL`. Grant explicitly (`+keys`, `+flushall`) to restore.
+
+`AUTH` is intentionally not a `k_cmd_table` command (its handler needs `conn`); it is
+matched by literal name before dispatch and can never be renamed or disabled, so no
+config can lock out every client by aliasing it away.
 
 ### Memory Eviction
 

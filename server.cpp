@@ -32,6 +32,7 @@
 #include "commands.h"
 #include "aof.h"
 #include "sha256.h"
+#include "cred.h"
 
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
@@ -479,12 +480,16 @@ int main(int argc, char **argv){
   if (cfg_path && !config_load_file(cfg_path)){ die("invalid config file"); }
 
 
-  if (const char *e = getenv("MYRED_PASSWORD")){ g_config.password = sha256_hex(e); }
+  if (const char *e = getenv("MYRED_PASSWORD")){ g_config.password = cred_hash_new(e); }
   if (const char *e = getenv("MYRED_PORT")){ int p = atoi(e); if (p > 0 && p < 65536){ g_config.port = p; } }
   if (const char *e = getenv("MYRED_AOF")){ g_config.aof_enable = (e[0] == '1' || e[0] == 'y'); }
 
 
-  if (g_config.password.empty()){ g_config.password = sha256_hex("kek1234"); }   // historical default
+  if (g_config.password.empty()){ g_config.password = cred_hash_new("kek1234"); }   // historical default
+
+  #ifndef MYRED_HAVE_ARGON2
+    fprintf(stderr, "startup: build without libargon2 - new password hashes fall back to lgeacy SHA-256\n");
+  #endif
 
   acl_bootstrap_default();
   acl_init_categories(); 

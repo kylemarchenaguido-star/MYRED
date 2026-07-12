@@ -122,11 +122,11 @@ inline std::string sha256_hex(const std::string &msg){
     if (len < 56){ 
         while (i < 56){ data[i++] = 0; }
     } else {
-        while (i < 64){ 
-            data[i++] = 0; 
-            myred_sha::transform(st, data);
-            for (int k = 0; k < 56; k++){ data[k] = 0; }
-        }
+        // 0x80 + 8 byte length dont fit in this block: zero-fill the rest,
+        // flush it once, then start a fresh all zero block for the length
+        while (i < 64){ data[i++] = 0; }
+        myred_sha::transform(st, data);
+        for (int k = 0; k < 56; k++){ data[k] = 0; }
     }
     bitlen += uint64_t(len) * 8;
     for (int k = 0; k < 8; ++k){
