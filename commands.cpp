@@ -1089,6 +1089,8 @@ struct AuthJob {
   std::vector<std::string> hashes; // snapshot, the worker does not touch g_config.users
   bool user_known = false; // snapshot of exits+enable+has_password
   bool ok = false; 
+  std::string matched; // which stored credential verified
+  std::string rehashed; // its argon2id replacement, empty = no upgraded needed
 };  
 
 static int g_auth_inflight = 0; // main-thread only (queue++ / completetion--)
@@ -1111,6 +1113,19 @@ static void auth_complete(AuthJob *job){
   if (ok){
     c->user = &it->second;
     c->failed_attemps = 0;
+    // rehash on auth: swap in the upgrade only if the exact old entry still exists
+    if (!job->rehashed.empty()){
+      auto &v = it->second.pw_hashes;
+      auto slot = std::find(v.begin(), v.end(), job->matched);
+      if (slot != v.end()){
+        *slot = job->rehashed;
+        if (job->uname == "default" && g_config.password == job->matched){
+          // keep requirepass rewwrite in sync
+          g_config.password = job->rehashed;
+        }
+        audit_event("cred_rehash", c, " target=" + job->uname);
+      }
+    }
     audit_event("auth_success", c, "");
     resp_ok(&c->outgoing);
   } else {
@@ -1125,9 +1140,17 @@ static void auth_complete(AuthJob *job){
 
 // worker thread: KDF only, no shared state
 static void auth_verify_job(void *arg){
-  AuthJob *job = (AuthJob *)arg;
+  AuthJob *job = (AuthJob *)arg; 
   for (const std::string &stored : job->hashes){
-    if (cred_verify(job->pass, stored)){ job->ok = true; break; }
+    if (cred_verify(job->pass, stored)){ 
+      job->ok = true;
+      // migration window: the plaintext exists here, upgrade weak entries now
+      if (job->user_known && cred_needs_rehash(stored)){
+        job->matched = stored;
+        job->rehashed = cred_hash_new(job->pass); // empty on failure, skipped
+      }
+      break;
+    }
   }
   if (!job->pass.empty()){ secure_zero(&job->pass[0], job->pass.size()); }
   loop_post([job](){ auth_complete(job); });

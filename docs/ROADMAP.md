@@ -148,148 +148,52 @@ exposure; optional `auditlog-events` / `auditlog-required` filters.
 
 #### V9.6 - Password Hashing Upgrade [In Progress]
 
-SHA-256 is fast and unsalted: fine against wire sniffing, weak if `myred.conf` or an
-ACL line leaks (GPU cracking of unsalted fast hashes). Upgrade credentials at rest to
-Argon2id while keeping every existing config loadable.
+Credentials at rest upgraded from unsalted SHA-256 to Argon2id (OWASP baseline
+m=19456 KiB, t=2, p=1) with async verification, while every pre-existing config stays
+loadable. V9.6.1–V9.6.3 shipped; V9.6.4 (audit bug sweep) is the active step.
 
-Prerequisite: fix the `sha256_hex` padding bug (CODE_REVIEW 2026-07-09, N5) first.
-Migration code will verify legacy digests; it must verify *correct* ones.
-`[Done]` 2026-07-12 — KAT-verified against hashlib for lengths 0-200 + NIST vectors;
-old code failed at exactly `len%64 >= 56`. No stored digest changed (all short passwords).
+- `[Done]` **N5 prerequisite** — 2026-07-12. `sha256_hex` padding bug (`len%64 >= 56`)
+  fixed; KAT-verified against NIST vectors + hashlib (lengths 0–200).
+- `[Done]` **V9.6.1 - Credential abstraction** — 2026-07-12. `cred.h/cred.cpp`:
+  `cred_hash_new` / `cred_verify` / `cred_needs_rehash` + `cred_dummy()`. Stored
+  credentials are self-describing strings: 64-hex legacy SHA-256 (verified forever)
+  vs `$argon2id$...` PHC. All six write/verify sites switched; PHC tokens round-trip
+  `acl_apply_rule`, `requirepass`, `acl_format_user`, and config rewrite. CMake
+  `MYRED_ARGON2` (default ON) with SHA-256 fallback + boot warning.
+- `[Done]` **V9.6.2 - Async verification** — 2026-07-12. eventfd completion channel
+  (`loop_post`/`loop_drain`); `AuthJob` runs `cred_verify` on the thread pool
+  (deep-copied hash snapshot, worker-wiped plaintext) and `auth_complete` applies the
+  result on the loop. `Conn::id` liveness (fd-reuse safe), `auth_pending` pipeline
+  gating + `conn_resume`, `k_max_auth_inflight=4` → `-BUSY` (~76 MiB Argon2 cap),
+  unmatchable random dummy for unknown/disabled users (uniform timing class, can
+  never authenticate). Proof on an argon2 build: PING p50=3.84 ms / p99=6.55 ms on
+  another conn during a 4-thread AUTH storm (a sync verify would sit at 20–60 ms+).
+- `[Done]` **V9.6.3 - Migration and rotation** — 2026-07-13. Rehash-on-AUTH: the
+  worker computes `cred_hash_new` in the only window where plaintext exists; the
+  completion applies it by value-matched compare-and-swap (safe against mid-verify
+  rotation), syncs `g_config.password` for the default user so `CONFIG REWRITE`
+  persists the upgrade, and audits `cred_rehash` (username only). Config is never
+  auto-rewritten; a restart before rewrite just re-migrates on first AUTH.
+  `CONFIG SET requirepass` / `ACL SETUSER >plain` hash to Argon2id directly (V9.6.1).
+  `test_async_auth.py` green incl. the migration + audit-redaction test.
 
-Current write/verify sites (all of them, so nothing is missed):
+##### `[In Progress]` V9.6.4 - Audit bug sweep (pre-TLS cleanup)
 
-- Verify: `do_auth` (`commands.cpp:1083`) — hashes once, `ct_equal` against each entry
-  of `User::pw_hashes`, dummy-compare for unknown users, `failed_attemps` counter.
-- Store: `config_apply("requirepass")` (`state.cpp:119-137`), `acl_apply_rule`
-  `>pass` / `<pass` / `#<hex>` (`commands.cpp:2943-2963`), env `MYRED_PASSWORD`
-  (`server.cpp:482`), historical default (`server.cpp:487`).
-- Render: `acl_format_user` (config rewrite + `ACL LIST`), which already quotes
-  hash tokens.
+Fix every open bug the audits have found before starting TLS. V9.7 explicitly depends
+on N3 (timer busy-loop) and N4 (protocol-error wedge), and TLS buffering must not land
+on top of open loop/persistence bugs.
 
-##### `[Done]` V9.6.1 - Credential abstraction — 2026-07-12
-
-Implemented as planned below: `cred.h/cred.cpp` (three-function API), all six
-write/verify sites switched, `$argon2id$` tokens accepted in `acl_apply_rule` and
-`requirepass`, PHC emitted bare/quoted by `acl_format_user` + `config_rewrite`,
-CMake `MYRED_ARGON2` (default ON, SHA-256 fallback with boot warning when
-`libargon2-dev` is absent). Fallback behavior tested end-to-end; argon2 branch
-compile-verified. `do_auth` now also wipes its local plaintext copy.
-
-<details><summary>original plan</summary>
-
-Do not scatter `if (argon2)` branches across those sites. Add a small module
-(`cred.h/cred.cpp`, alongside `sha256.h`) that owns the stored-credential format:
-
-- A stored credential stays a `std::string` inside `User::pw_hashes` (no struct churn,
-  config round-trip untouched). Two self-describing forms:
-  - legacy: 64 lowercase hex chars = SHA-256 digest (verified forever);
-  - PHC: `$argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<tag_b64>`.
-- API — exactly three functions, and every site above switches to them:
-  - `std::string cred_hash_new(const std::string &plain)` — Argon2id, fresh random
-    salt (16 B via `getrandom()`; do NOT use `g_rng`, it is not seeded for security).
-  - `bool cred_verify(const std::string &plain, const std::string &stored)` —
-    dispatches on the `$argon2id$` prefix vs 64-hex; tag comparison stays
-    constant-time (`ct_equal` on the decoded tag); unknown format returns false.
-  - `bool cred_needs_rehash(const std::string &stored)` — true for legacy digests and
-    for PHC strings whose `m/t/p` are below current policy.
-- `acl_apply_rule` gains one branch: a token starting with `$argon2id$` is accepted as
-  a pre-hashed credential (same idea as `#<hex>`). Note `<pass` removal can no longer
-  hash-and-compare — salts differ — so it must `cred_verify` against each stored entry
-  and erase matches. That is O(n) KDF runs, but it is an admin-time operation on a
-  tiny vector; acceptable.
-- Build: `find_package`/pkg-config for `libargon2` behind a CMake option
-  (`MYRED_ARGON2`, default ON). When OFF or missing, `cred_hash_new` falls back to
-  SHA-256 with a startup warning — the zero-dependency build keeps working. Skip
-  bcrypt entirely; one optional dependency is enough.
-
-Parameters: start with OWASP baseline `m=19456 KiB, t=2, p=1` as constants. Only add
-`argon2-*` config directives if tuning is ever actually needed — each directive is
-rewrite/round-trip surface.
-
-</details>
-
-##### `[Done]` V9.6.2 - Async verification — 2026-07-12
-
-Implemented as planned: eventfd completion channel (`loop_post`/`loop_drain` in
-`server.cpp`, mutex-guarded job vector drained on the poll loop), `do_auth` queues an
-`AuthJob` (deep-copied hash snapshot, worker-owned plaintext, wiped by the worker) to
-the thread pool, `auth_complete` applies the result on the main thread. Both
-correctness traps closed: `Conn::id` liveness stamping (completions for a dead/reused
-fd are dropped) and `auth_pending` pipeline gating + `conn_resume` drain. DoS bound:
-`k_max_auth_inflight = 4` → `-BUSY`, capping Argon2 memory at ~76 MiB.
-Unknown/disabled/nopass users verify against an unmatchable random dummy
-(`cred_dummy`, `user_known=false`), so the timing class matches and the dummy can
-never authenticate. Verified by `test_async_auth.py` (6/6 on an argon2-linked build):
-pipelined AUTH+PING+SET replies in order, repeated failures close the conn, 8 parallel
-AUTHs all complete, and PING on another conn during a 4-thread AUTH storm stayed at
-p50=3.84 ms / p99=6.55 ms — a synchronous Argon2id verify would sit at 20–60 ms+.
-
-<details><summary>original plan</summary>
-
-Argon2id costs tens of milliseconds and ~19 MiB *by design*. Running it inside
-`do_auth` on the event loop stalls every connected client per AUTH attempt and hands
-an attacker a DoS lever (spam AUTH → server frozen). This is the core engineering work
-of V9.6:
-
-- Build a generic worker→loop completion channel first (it is also what V9.7's
-  handshake offload and future async jobs need — build once):
-  - an `eventfd` (or self-pipe) registered in the `poll()` loop;
-  - a mutex-guarded completion queue drained by the main thread when the eventfd fires;
-  - `loop_post(fn, arg)` callable from `thread_pool` workers.
-- `do_auth` flow becomes: parse args → copy plaintext into a worker-owned buffer →
-  set `conn->auth_pending = true` → `thread_pool_queue` the verify → return without
-  replying. Worker runs `cred_verify` (against each stored hash), `secure_zero`s its
-  plaintext copy, posts `{conn_id, user_name, ok}`.
-- Main thread on completion: resolve the conn, set `conn->user`, emit
-  `+OK`/`-WRONGPASS` into `conn->outgoing`, flip `want_write`, run the existing
-  `failed_attemps`/`audit_event` logic.
-- Two correctness traps, both mandatory:
-  - **Conn liveness**: the client can disconnect mid-verify and the fd can be reused.
-    Do not capture `Conn*` in the completion. Add a monotonically increasing
-    `uint64_t Conn::id` stamped at accept; completions carry the id and are dropped if
-    `fd2conn` no longer maps to a conn with that id.
-  - **Pipeline gating**: while `auth_pending`, `try_one_request` must stop parsing
-    (return false, leave bytes buffered) so pipelined commands cannot run with the
-    pre-AUTH identity.
-- DoS bound: cap concurrent verifications (counter, e.g. 4): beyond the cap, either
-  queue the AUTH or reply `-BUSY`. Bounds Argon2 memory to `cap × m` and keeps the
-  worker pool from starving `entry_del`/fsync jobs.
-- Timing hygiene: unknown users must take the same path — verify against a baked-in
-  dummy PHC string instead of today's `ct_equal(h, k_dummy)`, so "user exists" is not
-  distinguishable by response time class.
-- AOF replay is unaffected: the replay identity is synthetic and never AUTHs.
-
-</details>
-
-##### `[In Progress]` V9.6.3 - Migration and rotation
-
-Note: the second and third bullets below were already satisfied by V9.6.1
-(`CONFIG SET requirepass` / `ACL SETUSER >plain` call `cred_hash_new` directly;
-`g_config.password` is only `.empty()`-tested outside `cred_*`). The remaining work
-is rehash-on-AUTH.
-
-- On successful AUTH where `cred_needs_rehash(stored)` is true: the plaintext is still
-  in hand — compute `cred_hash_new`, replace that `pw_hashes` entry in place (worker
-  computes, completion applies it on the main thread), log an `audit_event`
-  (`cred_rehash`, username only). Never auto-run `CONFIG REWRITE`; the operator
-  persists when ready.
-- `CONFIG SET requirepass <plain>` and `ACL SETUSER >plain` produce Argon2id directly.
-  These are admin-rate operations: synchronous hashing is acceptable at first;
-  offload later only if it shows up.
-- `g_config.password` currently doubles as "the default user's digest"
-  (`acl_bootstrap_default`, protected-mode check `password.empty()`). Keep it a
-  stored-credential string; only `.empty()` is ever tested outside `cred_*`.
-
-Tests / done criteria:
-
-- PHC round-trip through config rewrite and restart (quoting preserved).
-- Legacy `#<hex>` configs still authenticate; first AUTH flips the entry to PHC in
-  memory; `ACL LIST` shows a redacted marker, never the hash.
-- AUTH storm (50 clients × wrong passwords) leaves PING p99 on other connections flat
-  — this is the assertion that proves the async design.
-- Unknown-user vs wrong-password timing in the same class.
-- `--correctness-only` green with `MYRED_ARGON2=OFF` (fallback path).
+- Worklist: `docs/CODE_REVIEW.md` → **"Consolidated Bug Audit — 2026-07-13"**. Every
+  ROADMAP known bug and every 2026-07-07/07-09 finding was re-verified against the
+  2026-07-13 tree: fixed items are recorded with evidence, open items are ranked
+  (🔴 7, 🟠 13, 🟡 13, plus 🔵/⚪ polish) with a suggested fix order.
+- Headline finding: **N1 is live** — the AOF replay user never sets `all_keys`, so
+  `acl_check`'s key gate NOPERMs every keyed command in the RESP tail into the
+  discarded sink on every restart (hybrid AOF silently loses the whole delta). Fix
+  first, with an AOF-restart-with-ACL regression test.
+- Done criteria: every 🔴/🟠 item closed (or explicitly re-filed to Backlog with a
+  reason); each fix lands with a regression test where feasible; statuses ticked in
+  CODE_REVIEW.md and fixed items moved to the roadmap's Resolved Bugs Archive.
 
 #### V9.7 - TLS [Backlog]
 
@@ -444,87 +348,14 @@ Important dependency:
 
 ## Known Bugs and Correctness Follow-ups
 
-Open items belong here until fixed.
+Consolidated 2026-07-13: every open bug that lived here was moved to
+`docs/CODE_REVIEW.md` → **"Consolidated Bug Audit — 2026-07-13 (V9.6.4 worklist)"**,
+where each item was re-verified against the current tree, ranked by severity, and
+given a fix order. That section is the working list while V9.6.4 runs. New bugs still
+get filed here first, then folded into that audit.
 
-### Security and ACL
-
-- `ACL CAT` must emit a RESP array header. Current malformed output can desynchronize
-  clients.
-- ~~Admin/dangerous ACL categories can be granted too broadly by ORed membership~~
-  → addressed in V9.5.1 by stripping the `CAT_READ`/`CAT_WRITE` base from control-plane
-  commands (tagging fix), so `@read`/`@write` no longer intersect them. No `guard_cats`.
-- `SMOVE` key checks are imprecise until a resolver checks only source and destination.
-- `MEMORY` and `OBJECT` key subcommands need key-pattern ACL checks at `cmd[2]`.
-- Full Redis ACL rule-order fidelity is not implemented. Current compiled form does
-  not preserve "last match wins" rule history.
-- Pub/Sub channel ACL patterns exist conceptually but remain no-op until Pub/Sub lands.
-- `nopass` users, selectors, `sanitize-payload`, `ACL LOAD`, and `ACL SAVE` are not
-  implemented.
-
-### Config and Command Surface
-
-- Unknown `CONFIG SET` behavior must be made explicit and tested.
-- Full `CONFIG GET/SET` coverage is incomplete; current real parameters are focused on
-  memory/security/config basics.
-- `COMMAND`, `COMMAND DOCS`, and `COMMAND COUNT` are not implemented; `redis-cli`
-  interactive mode may probe them.
-
-### Process Lifecycle and Error Handling
-
-- `die()` (`server.cpp:42-46`) prints `[errno] msg` and then calls `abort()` for every
-  call site, with no distinction between an ordinary, expected operational failure and
-  an actual internal-invariant violation. `abort()`/`SIGABRT` conventionally means "the
-  program reached a structurally impossible state" and exists to leave a debuggable
-  core dump — but several `die()` call sites are just routine startup mistakes: a
-  missing/misspelled config path (`server.cpp:480`, `if (cfg_path &&
-  !config_load_file(cfg_path)){ die("invalid config file"); }`), a bind failure such as
-  `EADDRINUSE`/`EADDRNOTAVAIL` (`server.cpp:580`, `"listener setup"`), and `fcntl`
-  failures setting non-blocking mode (`server.cpp:52`, `server.cpp:59`). Reproduced:
-  `./build/server myred.cond` (typo'd filename) prints `fatal: cannot open config
-  myred.cond: No such file or directory` then `Aborted (core dumped)` — an alarming,
-  crash-looking exit for what is just a bad CLI argument, and it leaves a core-dump
-  artifact (subject to whatever `core_pattern`/`ulimit -c` the host has configured) on
-  every single bad invocation. Fix: split `die()` into two helpers — `panic(msg)`
-  (unchanged: print + `abort()`) reserved for genuine internal-invariant violations, and
-  a new `fatal_exit(msg)` (print + `exit(1)`, no core dump) for ordinary
-  startup/operational failures. Route `"invalid config file"`, `"listener setup"`, and
-  the two `"fcntl error"` sites to `fatal_exit()`; the runtime `poll()` failure
-  (`server.cpp:609`, `die("poll")`) is the one call site that plausibly stays a `panic()`
-  — a `poll()` failure mid-operation (as opposed to at startup) more likely indicates an
-  actual fd-management bug worth a debuggable core dump.
-
-### Data Correctness
-
-- `ZREM` does not drop an emptied zset. Redis removes the key; `ZPOPMIN` already does.
-- Add restart-level persistence tests for mutating commands that rewrite TTLs or remove
-  keys, especially `GETEX`, `GETDEL`, `ZPOPMIN`, eviction `DEL`, and renamed commands.
-
-### Persistence and AOF
-
-- `BGREWRITEAOF` in flight at shutdown is silently discarded. `aof_write_snapshot()`
-  (`aof.cpp`) never renames its own tmp file — by design, since only the parent holds
-  the mid-rewrite write delta (`g_data.g_aof_rewrite_buf`) needed to finalize it — but
-  the parent only finalizes (`aof_check_background_rewrite()`, appends delta + renames
-  `appendonly.aof.tmp` -> `aof_path`) from inside the main poll loop
-  (`server.cpp:644`). Shutdown blocks on `g_rdb_child_pid` before saving
-  (`server.cpp:657-661`) but has no matching wait/finalize for `g_aof_child_pid`, so a
-  rewrite child that is still running (or that finishes moments after the parent exits)
-  never gets reaped, its finished `.tmp` file never gets renamed in, and the old AOF is
-  kept as-is with no error printed. Reproduced: `BGREWRITEAOF` immediately followed by
-  Ctrl-C left a complete, orphaned `appendonly.aof.tmp` on disk while `appendonly.aof`
-  stayed unchanged. Fix: extract the finalize step (delta append + rename + reopen fd)
-  out of `aof_check_background_rewrite()` into its own function; at shutdown, add a
-  blocking `waitpid(g_aof_child_pid, &status, 0)` mirroring the existing RDB one, then
-  call that finalize function directly instead of relying on the next poll tick.
-
-### Testing Gaps
-
-- Add explicit security tests for control-plane category gating (V9.5.1 tagging),
-  renamed commands, disabled commands, audit logging, and precise key ACLs.
-- Keep intentionally destructive or server-crashing edge cases behind an explicit test
-  flag.
-- Add AOF restart checks to verify canonicalized renamed writes.
-- Add one test that `ACL CAT` reply framing is a valid RESP array.
+Feature gaps that were listed here (missing features, not defects) moved to Backlog →
+"ACL and Command-Surface Feature Gaps".
 
 ## Resolved Bugs Archive
 
@@ -807,6 +638,18 @@ Deferred:
 - Shared small-integer pool.
 - Real object refcounts.
 - Copy-on-mutate behavior.
+
+### ACL and Command-Surface Feature Gaps
+
+Moved from "Known Bugs" 2026-07-13 — missing features, not defects:
+
+- Full Redis ACL rule-order fidelity ("last match wins") — upgrade path recorded in
+  Design Decisions → ACL Model.
+- Pub/Sub channel-pattern enforcement (no-op until V8 lands).
+- `nopass`, selectors, `sanitize-payload`, `ACL LOAD`, `ACL SAVE`.
+- `COMMAND`, `COMMAND DOCS`, `COMMAND COUNT` (`redis-cli` interactive mode probes
+  these).
+- Full `CONFIG GET/SET` coverage (also under Server Observability and Tooling).
 
 ### Command Coverage Gaps
 

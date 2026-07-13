@@ -222,3 +222,203 @@ nice for symmetry, but it is not a bug.
 5. Accounting/semantics batch: N6, N7, carry-over `ZREM` reaccount, `S*STORE` empty dest.
 6. Security batch: N12, N16, N5 (+ carry-over `parse_cidr`, `AUTH` wipe, `CONFIG SET` unknown).
 7. Protocol/compat polish: N11, N13, N19.
+
+---
+
+## Consolidated Bug Audit — 2026-07-13 (V9.6.4 worklist)
+
+Scope: every open item from ROADMAP "Known Bugs and Correctness Follow-ups" (now moved
+here) merged with the 2026-07-07 / 2026-07-09 findings above. **Each item was
+re-verified against the working tree of 2026-07-13**; line numbers are against that
+tree unless marked otherwise. This section is the single worklist for V9.6.4; the
+ROADMAP no longer carries bug bodies.
+
+### A. Verified fixed since 2026-07-09
+
+| Item | Fixed by / evidence |
+|---|---|
+| 🟠 N5 — `sha256_hex` padding (`len%64 >= 56`) | V9.6 prerequisite, 2026-07-12. KAT-verified against NIST vectors + hashlib for lengths 0–200. |
+| 🟡 `do_auth` plaintext copy left unwiped | V9.6.1/V9.6.2 — `do_auth` wipes the `cmd` copy on every path; the worker owns the only other copy and `secure_zero`s it after verify (`commands.cpp:1132`). |
+| 🟡 `CONFIG SET <unknown>` returned `+OK` | V9.5.5 — `commands.cpp:2724` returns `ERR Unknown config parameter`. |
+| 🟠 `ACL CAT` missing RESP array header (ROADMAP) | V9.5.5 — `commands.cpp:3129` emits `resp_arr` before the elements. |
+| 🟠 `SMOVE` imprecise key checks (ROADMAP) | V9.5.2 — `kr_smove` resolver (`commands.cpp:3488`) checks source + destination only. |
+| 🟠 `OBJECT`/`MEMORY` key at `cmd[2]` unchecked (ROADMAP) | V9.5.2 — `kr_object`/`kr_memory` resolvers (`commands.cpp:3493-3513`). |
+| ⚪ `dispatch_build`/`command_is_known` declared but undefined | V9.5.3 — both defined; `g_dispatch` built at boot. |
+| ⚪ `state.h:218` stray `\` line-continuation | Gone — no trailing backslash remains in `state.h`. |
+| 🟠 Audit-log peer separator (`peer=ip.port`) | Fixed 2026-07-13 — `server.cpp:115` formats `%u.%u.%u.%u:%u`. |
+
+(Already recorded fixed on 2026-07-09: replay `fake.user` assigned-in-shape, `SMOVE`
+reaccount, `do_keys` glob, V9.5.1 admin-category tagging, `MSETNX`.)
+
+### B. Open — the V9.6.4 worklist
+
+Every unmarked line below was re-verified **open** on 2026-07-13.
+
+#### 🔴 Critical
+
+- [ ] **N1 — AOF replay silently loses the whole RESP tail.** `aof.cpp:229-233` builds
+  the replay user with `allow_cats = CAT_ALL` but never `all_keys = true` (defaults
+  `false`, `state.h:96`). `acl_check` (`commands.cpp:2985`) then runs the key gate with
+  an empty `key_patterns` list, and `acl_key_allowed` returns `false` for every key —
+  every keyed command (`SET`, `DEL`, `HSET`, …) is NOPERM'd into the discarded sink.
+  Plain AOF: dataset fails to load. Hybrid AOF: RDB preamble loads, the **entire delta
+  is lost, on every restart, today**. Fix: `replay_user.all_keys = true;` + count error
+  replies in the sink and fail loudly + an AOF-restart-with-ACL regression test.
+- [ ] **N2 — `migrate_pos` never reset** (`hashtable.cpp:50-57`, no reset in
+  `hm_trigger_rehashing` or on completion): the second rehash strands entries in
+  `older` forever and `newer` can never resize again — every HMap degrades toward O(n)
+  on long-running instances. Fix: `hmap->migrate_pos = 0;` in `hm_trigger_rehashing()`.
+- [ ] **N3 — timer sentinel `(uint8_t)-1`** (`server.cpp:231`): once any write is
+  pending, `next_timer_ms()` returns 0 and `poll()` busy-spins at ~100% CPU until the
+  save window elapses (up to an hour on defaults). Fix: `(uint64_t)-1`. **TLS
+  prerequisite.**
+- [ ] **N4 — protocol-error wedge / no input cap** (`server.cpp:406-409`): a parse
+  error logs "bad RESP" and returns — bad bytes are never consumed and the conn never
+  closed, so it re-parses forever while `incoming` grows unbounded. Fix: reply
+  `-ERR Protocol error`, set `want_close`; add a per-connection input cap. **TLS
+  prerequisite.**
+- [ ] **`aof_check()` crash + inverted read** (`aof.cpp:279-292`): no `return` after
+  `fopen` failure (`fseek` on a null `FILE*` segfaults), and `if (fread(...))` treats
+  a *successful* read as "short read" — `--check-aof` fails on every valid non-empty
+  AOF and crashes on a missing one.
+- [ ] **`ZPOPMIN` not `is_write`** (`commands.cpp:3268` — `{do_zpopmin, 2, 3}`):
+  mutates and deletes keys but is ACL-read, skips the MISCONF/OOM write gates, and is
+  never AOF-logged — `ZADD`+`ZPOPMIN` resurrects popped members after replay.
+- [ ] **BGREWRITEAOF discarded at shutdown** (from ROADMAP): shutdown waits only for
+  `g_rdb_child_pid` (`server.cpp:741`); a running AOF-rewrite child is never reaped and
+  its finished `.tmp` is never renamed in — reproduced (orphaned `appendonly.aof.tmp`).
+  Fix: extract the finalize step (delta append + rename + fd reopen) out of
+  `aof_check_background_rewrite()`; at shutdown `waitpid(g_aof_child_pid, ...)` then
+  finalize directly, mirroring the RDB wait.
+
+#### 🟠 Bugs
+
+- [ ] **N6 — `GETSET` no reaccount** (`commands.cpp:301-304`): the existing-key swap
+  never calls `mem_reaccount(ent)` → permanent `used_memory` drift → spurious
+  evictions/OOM under `maxmemory`. Same handler also keeps the TTL (Redis discards it).
+- [ ] **N7 — `SET` keeps TTL on overwrite** (`commands.cpp:237-246`): Redis discards
+  TTL on plain `SET` (`KEEPTTL` exists to keep it). The divergence propagates through
+  raw AOF frames. Fix: `entry_set_ttl(ent, -1)` on overwrite; decide `SETNX`-family
+  semantics deliberately.
+- [ ] **`ZREM` no reaccount, no empty-key drop** (`commands.cpp:870-884`); `ZPOPMIN`
+  reaccounts only on no-op or full deletion.
+- [ ] **`GETEX` TTL changes not dirty-counted** (`commands.cpp:349` PERSIST,
+  `commands.cpp:373` future EX/PX/EXAT/PXAT): `entry_set_ttl` without a
+  `g_writes_since_save` bump → never AOF-logged; only the past-timestamp delete path
+  bumps. `EXAT` also multiplies `v * 1000` unchecked (TTL overflow carry-over).
+- [ ] **N8 — `rdb_save` fsyncs before flushing stdio** (`rdb.cpp:372`; no `fflush`
+  anywhere in rdb.cpp): the image tail can sit in the `FILE*` buffer at fsync time →
+  truncated dump on power loss.
+- [ ] **N9 — busy path clobbers `g_dirty_at_save`** (`rdb.cpp:908`): writes made during
+  an in-flight background save lose their dirty status when it completes.
+- [ ] **N10 — compressed-RDB bounds** (`rdb.cpp:779-781`): `memcpy(&usize, payload, 4)`
+  without `payload_size >= 4`; `usize` unchecked → OOB read / multi-GB allocation on a
+  corrupt-but-CRC-"valid" file.
+- [ ] **N11 — `SRANDMEMBER` negative count unclamped** (`commands.cpp:2519-2521`):
+  `n = (size_t)(-count)`; the `resp_arr((uint32_t)n)` header truncates while the loop
+  emits all `n` → protocol desync + unbounded output from one 30-byte command.
+- [ ] **N12 — `acl_bootstrap_default` clobbers a configured default user**
+  (`state.cpp:21-34`, runs *after* `config_load_file`): unconditionally resets to
+  `CAT_ALL`/all-keys and clears overrides — `user default ...` hardening in myred.conf
+  is silently discarded. Fix: bootstrap only when the config didn't define `default`;
+  otherwise only sync `pw_hashes` from `requirepass`.
+- [ ] **N13 — directive spelling** (`state.cpp:281,292`):
+  `auto_aof_rewrite-percentage` / `auto_aof_rewrite-min-size` (underscore/hyphen mix);
+  a real redis.conf line fails the boot. Accept the hyphenated names; keep old
+  spellings as aliases.
+- [ ] **`parse_cidr` validates the wrong variable** (`state.cpp:555-559`): checks
+  `bits` (still the constant 32 at that point) instead of `parsed`, then assigns —
+  `/33` and `/-1` reach the `0xFFFFFFFFu << (32 - bits)` shift (UB).
+- [ ] **`SAVE`/shutdown hardcode `dump.rdb`**, `do_save` double-calls
+  `rdb_on_save_complete` (2026-07-09 refs `commands.cpp:1084`, `server.cpp:663`; not
+  re-verified line-exactly — re-check when fixing).
+- [ ] **AOF rewrite tmp/finalize fragility** (`aof.cpp:135,150-176`): hardcoded
+  `appendonly.aof.tmp` regardless of `aof_path`; short-delta/open/rename failures are
+  ignored and `g_aof_last_rewrite_ok` stays `true`.
+
+#### 🟡 Robustness
+
+- [ ] **N14 — `next_timer_ms` return overflow** (`server.cpp:248`):
+  `(int32_t)(next_ms - now_ms)` goes negative for a timer >24.8 days out → `poll()`
+  blocks forever. Clamp to `INT32_MAX` (or a max periodic tick).
+- [ ] **N15 — idle/io timer split is dead code** (poll loop vs `conn_set_timer`):
+  `timer_type` stays stale (`IO`); wrong timeout class the moment the two constants
+  diverge.
+- [ ] **N16 — `kek1234` fallback password** (`server.cpp:544`): a publicly-known
+  default credential that also defeats protected mode (password exists → loopback-only
+  refusal never engages). Safer default: no password + protected mode.
+- [ ] **N17 — RDB set-load failure leaks the partial entry**; expired-skip paths ignore
+  cursor-read failures (`rdb.cpp:696-699`, per 2026-07-09 — not re-verified).
+- [ ] **N18 — `Buffer` zero-capacity growth loop** (`buffer.cpp:35-37`): `new_cap = 0*2`
+  never terminates; latent. Floor growth at `max(old_cap*2, 64)`.
+- [ ] **Loose `atoi` config/env parsing** (`state.cpp:187,244,283`, env in server.cpp):
+  `123abc` accepted silently. Shared strict int/bool parsers for file config, env, and
+  `CONFIG SET`.
+- [ ] **`config_rewrite` drops directives** (`state.cpp:368+`): still missing `bind`,
+  `protected-mode`, `allow-ip`, auto-AOF-rewrite and LFU knobs (users, rename-command,
+  auditlog now covered). Related hardening (V9.6 review): rewrite is full-regeneration
+  — write atomically (tmp+rename) and add a config round-trip regression test.
+- [ ] **`SADD`/`ZADD` no-op writes dirty the AOF** (`commands.cpp:2362-2363` for SADD;
+  ZADD same shape): `g_writes_since_save` bumps even when nothing changed.
+- [ ] **`S*STORE` empty result leaves an empty destination** (`set_make_dest`,
+  `commands.cpp:2266`, always creates): Redis deletes the destination.
+- [ ] **N19 — reply-semantics divergences** (`LSET` missing key → `:0` vs `-ERR no such
+  key`; `LTRIM` → `:0` vs `+OK`; `SPOP k <non-int>` → empty array vs error; negative
+  `SCAN` cursors accepted) — per 2026-07-09, not re-verified.
+- [ ] **N20 — client.cpp `std::stoi` throws on malformed replies** (dev tool only).
+- [ ] **AOF-load-failure policy** (server.cpp startup): logs the failure and serves
+  whatever partial state loaded; decide fail-fast vs documented best-effort.
+- [ ] **`die()` vs `fatal_exit()` split** (from ROADMAP, design preserved): `die()`
+  (`server.cpp:57`) prints then `abort()`s — a core-dump-producing, crash-looking exit
+  — for routine startup mistakes: bad config path (`server.cpp:536`), listener setup
+  (`:636`), fcntl (`:67,74`), eventfd (`:644`). Reproduced: a typo'd config filename
+  prints the error then `Aborted (core dumped)`. Fix: `panic(msg)` (print + `abort()`)
+  reserved for internal-invariant violations — the runtime `poll()` failure (`:672`) is
+  the one plausible keeper — and `fatal_exit(msg)` (print + `exit(1)`) for the
+  operational sites.
+
+#### 🔵 Performance / ⚪ polish (fix only after everything above is green)
+
+- [ ] Eviction deletes up to 100 victims synchronously in the write path.
+- [ ] `SUNION` sort-dedupe; `SPOP`/`SRANDMEMBER` collect the full set; set-algebra
+  store commands double-copy.
+- [ ] `INFO` does an O(N) keyspace scan per call.
+- [ ] `entry_mem_usage` full walk on every `mem_reaccount`.
+- [ ] `hash_set(const std::string value)` copies on both paths.
+- [ ] `str_hash` computes 32-bit FNV into a `uint64_t` (upper half always zero).
+- [ ] `mem_selfcheck` runs before the handler, blaming the wrong command.
+- [ ] `rdb.cpp:829-831` comment contradicts the (correct) old-format rejection;
+  `state.h` comment/typo nits (`failed_attemps`, "5s -> 5000ms" over 30 s).
+
+#### Testing debt (from ROADMAP Testing Gaps — closes with the batches above)
+
+- [ ] AOF-restart-with-ACL test (pairs with N1); restart tests for `GETEX`, `GETDEL`,
+  `ZPOPMIN`, eviction `DEL`, and renamed-command canonicalized frames.
+- [ ] Security tests: control-plane category gating (V9.5.1), renamed/disabled
+  commands, audit-log redaction, precise key ACLs; one test that `ACL CAT` framing is
+  a valid RESP array.
+- [ ] Destructive/server-crashing edge cases behind an explicit test flag.
+
+### C. Not bugs — feature gaps returned to ROADMAP Backlog
+
+Full Redis ACL rule-order fidelity ("last match wins"); Pub/Sub channel-pattern
+enforcement (blocked on V8); `nopass`, selectors, `sanitize-payload`, `ACL LOAD`,
+`ACL SAVE`; full `CONFIG GET/SET` coverage; `COMMAND` / `COMMAND DOCS` /
+`COMMAND COUNT`.
+
+### Suggested fix order (V9.6.4)
+
+1. **N1** + the AOF-restart-with-ACL regression test (the data loss is live today);
+   fold `ZPOPMIN is_write` and the `GETEX` dirty-count fix into the same test batch.
+2. **N3** and **N4** — two-line loop fixes with big blast radius; both are TLS
+   prerequisites.
+3. **N2** — one line, then a soak check (insert 10M keys; `older.tab` frees, lookups
+   stay flat).
+4. Persistence batch: `aof_check`, shutdown AOF finalize, N8, N9, N10, rewrite
+   tmp/finalize, `SAVE` dbfilename.
+5. Accounting/semantics batch: N6, N7, `ZREM`, `SADD`/`ZADD` no-ops, `S*STORE` empty
+   dest, N11.
+6. Config/security batch: N12, N13, N16, `parse_cidr`, strict parsers,
+   `config_rewrite` coverage + atomic write, `die()`/`fatal_exit` split.
+7. Robustness polish: N14, N15, N17, N18, N19, N20, AOF-load policy.
+8. 🔵/⚪ items last.
