@@ -2,10 +2,10 @@
 #include "sha256.h"
 #include <cstdio>
 #include <cstring>
-
-#ifdef MYRED_HAVE_ARGON2
 #include <cerrno>
 #include <sys/random.h>
+
+#ifdef MYRED_HAVE_ARGON2
 #include <argon2.h>
 #endif
 
@@ -16,7 +16,6 @@ static constexpr uint32_t k_par = 1;
 static constexpr uint32_t k_salt_len = 16;
 static constexpr uint32_t k_tag_len = 32;
 
-#ifdef MYRED_HAVE_ARGON2
 // Security grade randomness for salts. NOT g_rng
 static bool fill_random(uint8_t *buf, size_t n){
     size_t got = 0;
@@ -27,7 +26,6 @@ static bool fill_random(uint8_t *buf, size_t n){
     }
     return true;
 }
-#endif
 
 std::string cred_hash_new(const std::string &plain){
 #ifdef MYRED_HAVE_ARGON2
@@ -76,4 +74,24 @@ bool cred_needs_rehash(const std::string &stored){
     // fallback build cannot produce anything stronger
     return false; 
 #endif
+}
+
+// A credential hashed from 16 random bytes that are immediately discarded
+// Pre-warmed at boot so the first unknow-user AUTH doesn't pay the init cost.
+const std::string &cred_dummy(){
+    // we use a lambda here because building the dummy takes a lot of steps
+    // the lambda calls after the declaring it   
+    static const std::string d = [](){
+        uint8_t junk[16];
+        std::string plain(32, 'x');
+        if (fill_random(junk, sizeof(junk))){
+        static const char *hx = "0123456789abcdef";
+        for (int i = 0; i < 16; ++i){ plain[2*i] = hx[junk[i] >> 4]; plain[2*i+1] = hx[junk[i] & 0xf]; }
+        }
+        std::string h = cred_hash_new(plain);
+        secure_zero(&plain[0], plain.size());
+        if (h.empty()){ h = std::string(64, '0'); }   // entropy failure: still a valid-shaped dummy
+        return h;
+    }();
+    return d;
 }

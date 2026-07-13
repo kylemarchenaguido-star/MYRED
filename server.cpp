@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
+#include <pthread.h>
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -15,6 +16,7 @@
 #include <netinet/tcp.h>
 #include <sys/wait.h>   // for waitpid
 #include <sys/stat.h>  // fstat
+#include <sys/eventfd.h>
 // C++
 #include <string>
 #include <vector>
@@ -33,6 +35,19 @@
 #include "aof.h"
 #include "sha256.h"
 #include "cred.h"
+
+// worker constant 
+static int g_loop_efd = -1;
+static pthread_mutex_t g_loop_mu = PTHREAD_MUTEX_INITIALIZER;
+static std::vector<std::function<void()>> g_loop_jobs;
+
+// global flag — set to true when Ctrl+C is pressed
+static bool g_stop = false;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    g_stop = true;
+}
 
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
@@ -59,14 +74,28 @@ static void fd_set_nb(int fd){
   if (errno){ die("fcntl error"); }
 }
 
-// global flag — set to true when Ctrl+C is pressed
-static bool g_stop = false;
-
-static void signal_handler(int sig) {
-    (void)sig;
-    g_stop = true;
+// callable from any worker thread
+void loop_post(std::function<void()> fn){
+  pthread_mutex_lock(&g_loop_mu);
+  g_loop_jobs.push_back(std::move(fn));
+  pthread_mutex_unlock(&g_loop_mu);
+  uint64_t one = 1;
+  (void)!write(g_loop_efd, &one, sizeof(one));
 }
 
+
+// main thread only
+static void loop_drain(){
+  uint64_t n = 0;
+  // clears the counter
+  (void)!read(g_loop_efd, &n, sizeof(n)); 
+  std::vector<std::function<void()>> jobs;
+  pthread_mutex_lock(&g_loop_mu);
+  // run outside the lock
+  jobs.swap(g_loop_jobs);
+  pthread_mutex_unlock(&g_loop_mu);
+  for (auto &fn : jobs){ fn(); }
+}
 
 // callback when the socket is ready
 static int32_t handle_accept(int fd){
@@ -83,9 +112,9 @@ static int32_t handle_accept(int fd){
   uint32_t peer_host = ntohl(client_addr.sin_addr.s_addr);
 
   char peerbuf[32];
-  snprintf(peerbuf, sizeof(peerbuf), "%u.%u.%u.%u.%u",
-          (peer_host >> 24) & 255, (peer_host >> 16) & 255, (peer_host >> 8) & 255, peer_host & 255,
-          ntohs(client_addr.sin_port));
+  snprintf(peerbuf, sizeof(peerbuf), "%u.%u.%u.%u:%u", 
+    (peer_host >> 24) & 255, (peer_host >> 16) & 255, (peer_host >> 8) & 255, peer_host & 255,
+    ntohs(client_addr.sin_port));
   std::string peer = peerbuf;
 
   // IP allowlist (loopback always allowed; empty list = allowed all)
@@ -118,6 +147,7 @@ static int32_t handle_accept(int fd){
   // we create a new conn struct 
   Conn *conn = new Conn();
   conn->fd = connfd;
+  conn->id = g_data.next_conn_id++;
   conn->peer = peer;
   conn->user = acl_initial_user(); 
   conn->want_read = true;
@@ -366,6 +396,9 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
 
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
+  // nothing runs with the pre-auth identity
+  if (conn->auth_pending){ return false; }
+
   std::vector<std::string> cmd;
   int32_t consumed = parse_resp_request(&conn->incoming, cmd);
 
@@ -375,7 +408,7 @@ static bool try_one_request(Conn *conn){
     return false;
   }
 
-  // capture the raw frame BEFORe consuming/dispatching. logged berbatim for aof
+  // capture the raw frame BEFORE consuming/dispatching. logged verbatim for aof
   const char *raw = (const char *)buf_data(&conn->incoming);
   size_t raw_len = (size_t)consumed;
 
@@ -384,6 +417,11 @@ static bool try_one_request(Conn *conn){
 
   // moved after do_request, raw must stay valid
   buf_consume(&conn->incoming, raw_len);
+  if (conn->auth_pending){
+    conn->want_read = false;
+    conn->want_write = false;  
+    return false; 
+  }
   conn->want_read = false;
   conn->want_write = true;
   return true;
@@ -425,7 +463,7 @@ static void handle_read(Conn *conn){
     conn_set_timer(conn, ConnTimer::IO);
   }
   
-  while (try_one_request(conn)) {};
+  while (try_one_request(conn)) {}
 
   if(buf_size(&conn->outgoing) > 0){
     conn->want_read = false;
@@ -433,6 +471,24 @@ static void handle_read(Conn *conn){
     // this is a optimization 
     return handle_write(conn);
   } // else wants to keep reading.
+}
+
+// After an async completion wrote a reply: drain any request that were buffered
+// while gated, then flush - the mirror of handle_read's tail.
+void conn_resume(Conn *conn){
+  if (!conn->want_close){
+    while (try_one_request(conn)){}
+  }
+  if (buf_size(&conn->outgoing) > 0){
+    conn->want_read = false;
+    conn->want_write =true;
+    handle_write(conn); // same as handle_read
+  } else {
+    conn->want_read = true;
+    conn->want_write = false;
+  }
+  // poll loop won't see this conn's flags otherwise
+  if (conn->want_close){ conn_destroy(conn); }
 }
 
 int main(int argc, char **argv){
@@ -582,17 +638,24 @@ int main(int argc, char **argv){
     fprintf(stderr,"listening on %s:%d\n", addr.c_str(), g_config.port);
   }
 
+  // pre-warm and pay the KDF cost at boot
+  (void)cred_dummy(); 
+  g_loop_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (g_loop_efd < 0){ die("eventfd"); }
+
   const size_t nlisten = listen_fds.size();
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
 
   while(!g_stop){
     
     poll_args.clear(); //This just clean the arguments for poll.
-    // listen fds occupy [0, nlisten]
+    // listen fds occupy [0, nlisten]; eventfd at [nlisten]; conns after
     for (int lfd : listen_fds){
       struct pollfd pfd = {lfd, POLLIN, 0};
       poll_args.push_back(pfd);
     }
+
+    poll_args.push_back({ g_loop_efd, POLLIN, 0});
 
     for (Conn *conn : g_data.fd2conn){
       if(!conn){continue;}
@@ -616,8 +679,11 @@ int main(int argc, char **argv){
       }
     }
 
+    // run completetions
+    if (poll_args[nlisten].revents & POLLIN){ loop_drain(); }
+
     //This is for to handle the connections of sockets
-    for(size_t i = nlisten; i < poll_args.size(); i++){ // we skip the 1st
+    for (size_t i = nlisten + 1; i < poll_args.size(); i++){ // we skip the 1st
       uint32_t ready = poll_args[i].revents;
       if (ready == 0){ // no events fired up
         continue;

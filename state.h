@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
@@ -111,6 +112,8 @@ struct Conn {
   Buffer outgoing;
   User *user = nullptr; 
   std::string peer; // "ip:port", set once at accept - no inet_ntoa() later
+  bool auth_pending = false; // a worker is verifyng this conn's auth; parsing is gated
+  uint64_t id = 0; // monotonic, stamped at accept - completions check it
 };
 
 // global hashtable
@@ -132,6 +135,7 @@ struct GlobalData{
   size_t g_last_save_size_bytes = 0; // size of last dump
   size_t used_memory = 0;
   bool g_last_save_ok = true; // did the last save succeded
+  uint64_t next_conn_id = -1; // 0 = "never a real conn"  
   // statdistics// written per command
   uint64_t g_server_start_ms = 0;
   uint64_t g_total_commands = 0;
@@ -281,6 +285,9 @@ void acl_init_categories(); // stamp acl_cats + KeySpec onto every CmdSpec (call
 User *acl_initial_user(); // starting identity for a new conn: default if no pass, else nullptr
 std::string acl_format_user(const std::string &name, const User &u, bool for_config);
 bool acl_apply_rule(User &u, const std::string &t); // shared by ACL SETUSER + `user` config directive
+
+void loop_post(std::function<void()> fn); // worker, main loop completion channel
+void conn_resume(Conn *conn); // drain buffered requests + flush after an async completion
 
 void audit_open(const std::string &path); // (re)open the sink
 void audit_event(const char *event, const Conn *conn, const std::string &extra);

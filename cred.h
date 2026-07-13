@@ -10,3 +10,4 @@
 std::string cred_hash_new(const std::string &plain); // hash with current policy; "" on failure
 bool cred_verify(const std::string &plain, const std::string &stored); // constant time tag compare
 bool cred_needs_rehash(const std::string &stored); // true if weaker than current policy
+const std::string &cred_dummy(); // baked-in unmatchable credential 

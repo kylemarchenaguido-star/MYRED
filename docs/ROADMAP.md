@@ -146,7 +146,7 @@ Closed the post-ACL security gaps before TLS. All substeps done, in order:
 Deferred to Backlog: `stress_test.py` ACL/rename/audit coverage; `INFO audit_last_error`
 exposure; optional `auditlog-events` / `auditlog-required` filters.
 
-#### V9.6 - Password Hashing Upgrade [Backlog]
+#### V9.6 - Password Hashing Upgrade [In Progress]
 
 SHA-256 is fast and unsalted: fine against wire sniffing, weak if `myred.conf` or an
 ACL line leaks (GPU cracking of unsalted fast hashes). Upgrade credentials at rest to
@@ -154,6 +154,8 @@ Argon2id while keeping every existing config loadable.
 
 Prerequisite: fix the `sha256_hex` padding bug (CODE_REVIEW 2026-07-09, N5) first.
 Migration code will verify legacy digests; it must verify *correct* ones.
+`[Done]` 2026-07-12 — KAT-verified against hashlib for lengths 0-200 + NIST vectors;
+old code failed at exactly `len%64 >= 56`. No stored digest changed (all short passwords).
 
 Current write/verify sites (all of them, so nothing is missed):
 
@@ -165,7 +167,16 @@ Current write/verify sites (all of them, so nothing is missed):
 - Render: `acl_format_user` (config rewrite + `ACL LIST`), which already quotes
   hash tokens.
 
-##### V9.6.1 - Credential abstraction (no behavior change)
+##### `[Done]` V9.6.1 - Credential abstraction — 2026-07-12
+
+Implemented as planned below: `cred.h/cred.cpp` (three-function API), all six
+write/verify sites switched, `$argon2id$` tokens accepted in `acl_apply_rule` and
+`requirepass`, PHC emitted bare/quoted by `acl_format_user` + `config_rewrite`,
+CMake `MYRED_ARGON2` (default ON, SHA-256 fallback with boot warning when
+`libargon2-dev` is absent). Fallback behavior tested end-to-end; argon2 branch
+compile-verified. `do_auth` now also wipes its local plaintext copy.
+
+<details><summary>original plan</summary>
 
 Do not scatter `if (argon2)` branches across those sites. Add a small module
 (`cred.h/cred.cpp`, alongside `sha256.h`) that owns the stored-credential format:
@@ -196,7 +207,25 @@ Parameters: start with OWASP baseline `m=19456 KiB, t=2, p=1` as constants. Only
 `argon2-*` config directives if tuning is ever actually needed — each directive is
 rewrite/round-trip surface.
 
-##### V9.6.2 - Async verification (the optimization that makes it viable)
+</details>
+
+##### `[Done]` V9.6.2 - Async verification — 2026-07-12
+
+Implemented as planned: eventfd completion channel (`loop_post`/`loop_drain` in
+`server.cpp`, mutex-guarded job vector drained on the poll loop), `do_auth` queues an
+`AuthJob` (deep-copied hash snapshot, worker-owned plaintext, wiped by the worker) to
+the thread pool, `auth_complete` applies the result on the main thread. Both
+correctness traps closed: `Conn::id` liveness stamping (completions for a dead/reused
+fd are dropped) and `auth_pending` pipeline gating + `conn_resume` drain. DoS bound:
+`k_max_auth_inflight = 4` → `-BUSY`, capping Argon2 memory at ~76 MiB.
+Unknown/disabled/nopass users verify against an unmatchable random dummy
+(`cred_dummy`, `user_known=false`), so the timing class matches and the dummy can
+never authenticate. Verified by `test_async_auth.py` (6/6 on an argon2-linked build):
+pipelined AUTH+PING+SET replies in order, repeated failures close the conn, 8 parallel
+AUTHs all complete, and PING on another conn during a 4-thread AUTH storm stayed at
+p50=3.84 ms / p99=6.55 ms — a synchronous Argon2id verify would sit at 20–60 ms+.
+
+<details><summary>original plan</summary>
 
 Argon2id costs tens of milliseconds and ~19 MiB *by design*. Running it inside
 `do_auth` on the event loop stalls every connected client per AUTH attempt and hands
@@ -231,7 +260,14 @@ of V9.6:
   distinguishable by response time class.
 - AOF replay is unaffected: the replay identity is synthetic and never AUTHs.
 
-##### V9.6.3 - Migration and rotation
+</details>
+
+##### `[In Progress]` V9.6.3 - Migration and rotation
+
+Note: the second and third bullets below were already satisfied by V9.6.1
+(`CONFIG SET requirepass` / `ACL SETUSER >plain` call `cred_hash_new` directly;
+`g_config.password` is only `.empty()`-tested outside `cred_*`). The remaining work
+is rehash-on-AUTH.
 
 - On successful AUTH where `cred_needs_rehash(stored)` is true: the plaintext is still
   in hand — compute `cred_hash_new`, replace that `pw_hashes` entry in place (worker

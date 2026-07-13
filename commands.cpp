@@ -1080,6 +1080,59 @@ void audit_reject(const std::string &peer, const char *reason){
   audit_write("accept_reject", peer, "-", std::string(" reason=") + reason);
 }
 
+// async auth: parse on the loop, KDF on a worker, apply on the loop
+struct AuthJob {
+  int fd; // where to find the conn again
+  uint64_t conn_id; // unique: dropped if the fd was reused
+  std::string uname;
+  std::string pass; // worker owned plaintext: worker wipes it
+  std::vector<std::string> hashes; // snapshot, the worker does not touch g_config.users
+  bool user_known = false; // snapshot of exits+enable+has_password
+  bool ok = false; 
+};  
+
+static int g_auth_inflight = 0; // main-thread only (queue++ / completetion--)
+static const int k_max_auth_inflight = 4; // bounds argon2 memory to 4 x 19MIB
+
+// main thread (via loop_post)
+static void auth_complete(AuthJob *job){
+  g_auth_inflight--;
+  Conn *c = (job->fd >= 0 && (size_t)job->fd < g_data.fd2conn.size())
+             ? g_data.fd2conn[job->fd] : nullptr; 
+  // conn died mid-verify
+  if (!c || c->id != job->conn_id){ delete job; return; }
+  c->auth_pending = false;
+
+  // re-resolve now, the user may have been deleted/disable during the verify
+  // and unknown-user jobs must never authenticate even if ok were somehow true
+  auto it = g_config.users.find(job->uname);
+  bool ok = job->ok && job->user_known
+            && it != g_config.users.end() && it->second.enable;
+  if (ok){
+    c->user = &it->second;
+    c->failed_attemps = 0;
+    audit_event("auth_success", c, "");
+    resp_ok(&c->outgoing);
+  } else {
+    c->failed_attemps++;
+    if (c->failed_attemps >= k_max_failed_auth){ c->want_close =true; }
+    audit_event("auth_fail", c, " target=" + job->uname + " result=wrongpass");
+    resp_err(&c->outgoing, "WRONGPASS invalid username-password pair or user is disable");
+  }
+  delete job;
+  conn_resume(c);
+}
+
+// worker thread: KDF only, no shared state
+static void auth_verify_job(void *arg){
+  AuthJob *job = (AuthJob *)arg;
+  for (const std::string &stored : job->hashes){
+    if (cred_verify(job->pass, stored)){ job->ok = true; break; }
+  }
+  if (!job->pass.empty()){ secure_zero(&job->pass[0], job->pass.size()); }
+  loop_post([job](){ auth_complete(job); });
+}
+
 // Authenticate 
 static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   std::string uname, pass;
@@ -1091,35 +1144,37 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
     pass = cmd[2]; // AUTH <user ><pass>
   } else { return resp_err(out, "ERR wwrong number of arguments for 'auth' command"); }
 
+  // Dos bound
+  if (g_auth_inflight >= k_max_auth_inflight){
+    secure_zero(&cmd[cmd.size() - 1][0], cmd[cmd.size() - 1].size());
+    if (!pass.empty()){ secure_zero(&pass[0], pass.size()); }
+    return resp_err(out, "BUSY too many pending AUTH attempts, try again");
+  }
+
+  AuthJob *job = new AuthJob();
+  job->fd = conn->fd;
+  job->conn_id = conn->id;
+  job->uname = uname;
+  job->pass = std::move(pass);
+
   auto it = g_config.users.find(uname);
-  bool ok = false;
-
-  if (it != g_config.users.end() && it->second.enable){
-    for (const std::string &stored : it->second.pw_hashes){
-      // dispatches legacy vs PHC
-      if (cred_verify(pass, stored)){ ok = true; break; }
-    }
+  if (it != g_config.users.end() && it->second.enable && !it->second.pw_hashes.empty()){
+    job->user_known = true;
+    // deep copy: registry can mutate mid-verify
+    job->hashes = it->second.pw_hashes;
   } else {
-    // unknown/disabled user: burn a legacy-cost verify so the reply-time class matches
-    static const std::string k_dummy(64, '0');
-    (void)cred_verify(pass, k_dummy);
+    job->user_known = false;
+    job->hashes.push_back(cred_dummy());
   }
 
-  // wipe both plaintext copies before replying
+  // wipe the cmd copy now
   secure_zero(&cmd[cmd.size() - 1][0], cmd[cmd.size() - 1].size());
-  if (!pass.empty()){ secure_zero(&pass[0], pass.size()); }
 
-  if (ok){
-    // assign the acl identity
-    conn->user = &it->second;
-    conn->failed_attemps = 0;
-    audit_event("auth_success", conn, "");
-    return resp_ok(out);
-  }
-  conn->failed_attemps++;
-  if (conn->failed_attemps >= k_max_failed_auth){ conn->want_close =true; }
-  audit_event("auth_fail", conn, " target=" + uname + " result=wrongpass");
-  return resp_err(out, "WRONGPASS invalid username-password pair or user is disabled");
+  conn->auth_pending =true;
+  g_auth_inflight++;
+  thread_pool_queue(&g_data.thread_pool, auth_verify_job, job);
+  // no reply here, auth_complete() writes it into conn->outgoing
+  (void)out;
 }
 
 // SAVE - Do save - stays blocking
