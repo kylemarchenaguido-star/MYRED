@@ -19,7 +19,7 @@ suite continues, so one deadlock does not hide the other results.
 
 Usage:
     ./build/server myred.conf &
-    python3 test_async_auth.py --password s3cret
+    python3 scripts/test_async_auth.py --password s3cret
 """
 
 import socket, argparse, sys, time, threading, hashlib
@@ -182,7 +182,7 @@ def test_wrong_password():
 def test_parallel_auth():
     """N concurrent AUTHs: every completion must be delivered to the right conn."""
     N = 8
-    results: list[object] = [None] * N   # holds "OK", an error string, or None
+    results: list = [None] * N   # holds "OK", an error string, or None
 
     def worker(i):
         try:

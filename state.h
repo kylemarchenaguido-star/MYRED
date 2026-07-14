@@ -18,6 +18,7 @@
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
+static constexpr size_t k_max_incoming = 2 * k_max_msg; // generous pipeline room
 constexpr size_t k_max_args = 65536;
 // secondes * miliseconds (5s -> 5000ms)
 constexpr uint64_t k_idle_timeout_ms = 30 * 1000;

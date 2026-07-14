@@ -228,7 +228,7 @@ static int32_t next_timer_ms() {
   }
   // check the periodic wake up
   if (g_data.g_writes_since_save > 0){
-    uint64_t soonest = (uint8_t)-1;
+    uint64_t soonest = (uint64_t)-1;
     for (const SaveCondition &sc : g_config.save_conditions){
       if (g_data.g_writes_since_save >= sc.changes){
         soonest = std::min(soonest, g_data.g_last_save_ms + sc.seconds * 1000);
@@ -238,6 +238,11 @@ static int32_t next_timer_ms() {
       next_ms = std::min(next_ms, soonest);
     }
   }
+
+  if (g_rdb_child_pid != -1 || g_aof_child_pid != -1){
+    next_ms = std::min(next_ms, now_ms + 100);
+  }
+
   // no timers 
   if (next_ms == (uint64_t)-1){ return -1; }
   // already expired
@@ -245,7 +250,9 @@ static int32_t next_timer_ms() {
   // rare case idk ??
   if (next_ms == UINT64_MAX) {return -1;}
 
-  return (int32_t)(next_ms - now_ms);
+  uint64_t wait = next_ms - now_ms;
+  if (wait > (uint64_t)INT32_MAX){ return INT32_MAX; }
+  return (int32_t)wait;
 }
 
 static bool aof_flush(){
@@ -405,6 +412,8 @@ static bool try_one_request(Conn *conn){
   if (consumed == 0) { return false; }
   if (consumed < 0){
     fprintf(stderr, "bad RESP from fd %d\n", conn->fd);
+    buf_append(&conn->outgoing, "-ERR Protocol error\r\n", 21);
+    conn->want_close = true;
     return false;
   }
 
@@ -457,6 +466,14 @@ static void handle_read(Conn *conn){
   }
   // add new data to the incoming buffer
   buf_append(&conn->incoming, buf, (size_t)rv);
+
+  // a client that streams framing without ever completing a command must not grow us unbounded
+  if (buf_size(&conn->incoming) > k_max_incoming){
+    fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
+    buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
+    conn->want_close = true;
+    return;
+  }
 
   // We set the conn to IO (stop the idle)
   if (conn->timer_type == ConnTimer::IDLE){
@@ -730,9 +747,9 @@ int main(int argc, char **argv){
   if (g_data.g_aof_fd >= 0){
     aof_flush();
     fdatasync(g_data.g_aof_fd);
-    close(g_data.g_aof_fd);
   }
-
+  aof_rewrite_wait_shutdown();
+  if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_fd); }
   fprintf(stderr, "Shutting down, saving...\n");
 
   // if a background save is running, wait for it first

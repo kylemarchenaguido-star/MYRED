@@ -7,6 +7,7 @@ void aof_rewrite_background();
 void aof_check_background_rewrite();
 bool aof_load(const char *path);
 bool aof_check(const char *path, bool fix);
+void aof_rewrite_wait_shutdown();
 
 template <typename Range>
 static void aof_encode(std::string &dst, const Range &args){

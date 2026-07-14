@@ -71,6 +71,7 @@ static void hm_help_rehashing(HMap *hmap){
 // rehashing where the table hits the number factor
 static void hm_trigger_rehashing(HMap *hmap){
     hmap->older = hmap->newer; // move the older table into the newer one
+    hmap->migrate_pos = 0;
     h_init(&hmap->newer, (hmap->newer.mask + 1) * 2); // create a new empty table with double size of the old one
 }
 

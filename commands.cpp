@@ -3265,7 +3265,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"zrank",        {do_zrank,         3,  3}},
   {"zquery",       {do_zquery,        6,  6}},
   {"zrevquery",    {do_zquery_reversed,6, 6}},
-  {"zpopmin",      {do_zpopmin,       2,  3}},
+  {"zpopmin",      {do_zpopmin,       2,  3, true}},
   // list
   {"lpush",        {do_lpush,         3, -1, true}},
   {"rpush",        {do_rpush,         3, -1, true}},

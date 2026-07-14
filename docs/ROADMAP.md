@@ -21,7 +21,8 @@ Read sections in this order:
 Update rules:
 
 - Put new open bugs only in `Known Bugs and Correctness Follow-ups`.
-- When a bug is fixed, move it to `Resolved Bugs Archive`.
+- When a bug is fixed, record it in `docs/CODE_REVIEW.md` → `Resolved Bugs Archive`
+  (the archive moved out of this file on 2026-07-13).
 - Put implementation tradeoffs only in `Design Decisions`.
 - Put completed work summaries only in `Completed Milestones`.
 - Keep active implementation instructions under the relevant active milestone.
@@ -47,8 +48,8 @@ Primary commands:
 cmake -B build
 cmake --build build
 ./build/server
-python3 stress_test.py --password kek1234
-python3 stress_test.py --password kek1234 --correctness-only
+python3 scripts/stress_test.py --password kek1234
+python3 scripts/stress_test.py --password kek1234 --correctness-only
 ```
 
 Default runtime assumptions:
@@ -186,14 +187,17 @@ on top of open loop/persistence bugs.
 - Worklist: `docs/CODE_REVIEW.md` → **"Consolidated Bug Audit — 2026-07-13"**. Every
   ROADMAP known bug and every 2026-07-07/07-09 finding was re-verified against the
   2026-07-13 tree: fixed items are recorded with evidence, open items are ranked
-  (🔴 7, 🟠 13, 🟡 13, plus 🔵/⚪ polish) with a suggested fix order.
-- Headline finding: **N1 is live** — the AOF replay user never sets `all_keys`, so
-  `acl_check`'s key gate NOPERMs every keyed command in the RESP tail into the
-  discarded sink on every restart (hybrid AOF silently loses the whole delta). Fix
-  first, with an AOF-restart-with-ACL regression test.
+  (🔴 5, 🟠 14, 🟡 13, plus 🔵/⚪ polish — N1 + N2 fixed 2026-07-13, N21 filed) with a
+  suggested fix order.
+- Headline finding **N1 closed 2026-07-13**: the AOF replay user never set
+  `all_keys`, so `acl_check`'s key gate NOPERM'd every keyed RESP-tail command on
+  every restart. Fixed (`replay_user.all_keys = true` + replay-error counting),
+  regression `scripts/test_aof_restart.py`. That test also surfaced **N21** (idle server
+  defers rewrite finalize — filed 🟠, fix with N3/N14). Next up: fix-order step 2,
+  N3 + N4 (TLS prerequisites).
 - Done criteria: every 🔴/🟠 item closed (or explicitly re-filed to Backlog with a
   reason); each fix lands with a regression test where feasible; statuses ticked in
-  CODE_REVIEW.md and fixed items moved to the roadmap's Resolved Bugs Archive.
+  CODE_REVIEW.md and fixed items recorded in its Resolved Bugs Archive.
 
 #### V9.7 - TLS [Backlog]
 
@@ -356,74 +360,6 @@ get filed here first, then folded into that audit.
 
 Feature gaps that were listed here (missing features, not defects) moved to Backlog →
 "ACL and Command-Surface Feature Gaps".
-
-## Resolved Bugs Archive
-
-This section records fixed bugs without scattering them through milestone text.
-
-### Persistence and AOF
-
-- Handlers that `swap()` command strings required `do_request` to snapshot `cmd`
-  before calling `spec.fn()`.
-- AOF write path needed a verbatim fallback in `aof_feed`.
-- `SETEX` and related TTL commands were missing counter bumps.
-- `STRLEN` was mistagged as a write command.
-- `BGREWRITEAOF` used typo `appebdonly.aof.tmp`, making finalize a silent no-op.
-- AOF load priority originally parsed `aof_enable` too late, so startup loaded RDB by
-  mistake.
-- AOF file open had to happen after load, not before load.
-- `g_last_save_ms` was uninitialized, causing an immediate spurious `BGSAVE` on first
-  write.
-- `aof_feed` branches returned before appending relative TTL frames.
-- `g_aof_child_pid != 1` should have been `!= -1`; the bug mirrored writes outside
-  rewrites and could grow `g_aof_rewrite_buf` unbounded.
-- `GETEX` AOF translation now emits deterministic `PEXPIREAT`, `PERSIST`, or `DEL`.
-- AOF truncation handles partial or corrupt tails and keeps the last good offset.
-- Disk-full AOF errors now reject future writes with `MISCONF` while reads continue.
-- `SIGXFSZ` and `SIGPIPE` are ignored so write failures return errno instead of
-  killing the server.
-
-### Memory Management
-
-- `LPOP` and `RPOP` reaccounting after `entry_del()` caused use-after-free patterns.
-- `MSET` and `MSETNX` needed per-entry reaccounting, not one outside-loop reaccount.
-- OOM gate had to exempt memory-freeing commands such as `DEL`, `UNLINK`, `FLUSHALL`,
-  `EXPIRE`, pop/rem commands, and related shrinking commands.
-- Evictions must propagate explicit `DEL` to AOF so replay does not resurrect evicted
-  keys.
-
-### Config and Auth
-
-- A leftover hardcoded `password = kek1234` clobbered config-loaded passwords.
-- `config_tokenize()` had a pre-increment bug that dropped each token's first char.
-- `#<hash>` ACL/config tokens must be quoted in config rewrite because `#` starts a
-  comment.
-- Pre-hashed ACL token validation checked the wrong length for `#` plus 64 hex chars.
-
-### ACL
-
-- `acl_init_categories()` was not called at boot, so command ACL categories stayed `0`.
-- `acl_init_categories()` needed a prototype in `state.h`.
-- `ACL` category bits were accidentally placed in the key-spec map instead of the
-  extra-category map.
-- `ACL` needed `KeySpec::NONE`.
-- `AUTH <user> <pass>` had an extra plaintext password copy that needed wiping.
-- ACL deny parser branches checked the wrong token prefix for `-@cat` and `-cmd`.
-- `acl_apply_rule()` missed a final `return false` for unrecognized tokens.
-- `ACL GENPASS` had unreachable or wrongly nested code and could send no reply.
-- `resetkeys` did not clear `all_keys`.
-- `ACL LIST` originally hid partial `~pattern` and `+@cat` rules; it should use the
-  same formatter as config rewrite.
-
-### General Hardening
-
-- `RDB` save fork/malloc deadlock was avoided by serializing in the parent before fork.
-- RDB loaders gained bounds checks.
-- RDB save uses `.bak` rotation before atomic rename.
-- `INFO` buffer was increased and `snprintf` length handling was clamped to avoid OOB
-  reads.
-- `accept()` loop, `EINTR`, `SO_REUSEADDR`, `TCP_NODELAY`, and thread-pool shutdown
-  were hardened during the project-wide review.
 
 ## Design Decisions
 
@@ -852,9 +788,9 @@ parsing). Before the audit log (V9.5.4) grows siblings:
 Primary harness:
 
 ```bash
-python3 stress_test.py --password kek1234
-python3 stress_test.py --password kek1234 --correctness-only
-python3 stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
+python3 scripts/stress_test.py --password kek1234
+python3 scripts/stress_test.py --password kek1234 --correctness-only
+python3 scripts/stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
 ```
 
 Persistence helpers:

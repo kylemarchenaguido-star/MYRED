@@ -139,14 +139,9 @@ void aof_rewrite_background(){
   fprintf(stderr, "aof_rewrite: started (pid=%d)\n", pid);
 }
 
-
-void aof_check_background_rewrite(){
-  if (g_aof_child_pid == -1){ return; }
-  int status = 0;
-  pid_t r = waitpid(g_aof_child_pid, &status, WNOHANG);
-  if (r == 0){ return; } // still running
-
-  if (r == g_aof_child_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0){
+// parent side, child hax exited: append the delta, swap files, repoint the live fd
+static void aof_rewrite_reap(pid_t r, int status){
+    if (r == g_aof_child_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0){
     const char *tmp = "appendonly.aof.tmp";
     // append the delta that accumulated during the rewrite
     int fd = open(tmp, O_WRONLY | O_APPEND);
@@ -181,6 +176,24 @@ void aof_check_background_rewrite(){
   }
   g_data.g_aof_rewrite_buf.clear();
   g_aof_child_pid = -1;
+}
+
+void aof_check_background_rewrite(){
+  if (g_aof_child_pid == -1){ return; }
+  int status = 0;
+  pid_t r = waitpid(g_aof_child_pid, &status, WNOHANG);
+  if (r == 0){ return; } // still running
+  aof_rewrite_reap(r, status);
+}
+
+// shutdown: an in-flight rewrite is finished work - wait for it and finalize
+void aof_rewrite_wait_shutdown(){
+  if (g_aof_child_pid == -1){ return; }
+  fprintf(stderr, "aof_rewrite: waiting for in-flight rewrite before shutdown\n");
+  int status = 0;
+  pid_t r = waitpid(g_aof_child_pid, &status, 0); // blocking
+  aof_rewrite_reap(r, status);
+
 }
 
 bool aof_load(const char *path){
@@ -230,12 +243,15 @@ bool aof_load(const char *path){
     replay_user.name = "__aof_load__";
     replay_user.enable = true;
     replay_user.allow_cats = CAT_ALL;
+    replay_user.all_keys = true;
     fake.user = &replay_user;
     Buffer sink = buf_create(4096);
 
     // bytes consumed by fully parsed commands
     size_t good_offset = 0;
     size_t replayed = 0;
+    size_t replay_error = 0;
+    std::string first_err, first_err_cmd;
     while (buf_size(&buf)){
         std::vector<std::string> cmd;
         int32_t consumed = parse_resp_request(&buf, cmd);
@@ -253,6 +269,19 @@ bool aof_load(const char *path){
         good_offset += (size_t)consumed;
 
         do_request(cmd, &sink, &fake, nullptr, 0);
+        // an error reply during replay means memory is diverging from the log
+        if (buf_size(&sink) && buf_data(&sink)[0] == '-'){
+          if (replay_error == 0){
+            size_t n = buf_size(&sink);
+            if (n > 128){ n = 128; }
+            first_err.assign((const char *)buf_data(&sink), n);
+            while (!first_err.empty() && (first_err.back() == '\r' || first_err.back() == '\n')){
+              first_err.pop_back();
+            }
+            first_err_cmd = cmd.empty() ? "?" : cmd[0];
+          }
+          replay_error++;
+        }
         // we drain the replay so sink do not grow
         buf_consume(&sink, buf_size(&sink));
         replayed++;
@@ -263,7 +292,12 @@ bool aof_load(const char *path){
     // replay isn't "unsaved work"
     g_data.g_writes_since_save = 0;
 
-    fprintf(stderr, "aof_load: replayed %zu commands (%zu bytes)\n", replayed, good_offset);
+    if (replay_error){
+      fprintf(stderr,
+        "aof_load: WARNING %zu of %zu replayed commands returned an error "
+        "(first: %s -> %s). In-memory state does NOT match the AOF.\n",
+        replay_error, replayed, first_err_cmd.c_str(), first_err.c_str());
+    }
 
     // crash-recovery: if there was a bad/partial tail, trim the file to the last good command
     size_t good_total = resp_offset + good_offset;
@@ -272,12 +306,14 @@ bool aof_load(const char *path){
             fprintf(stderr, "aof_load: truncated AOF to %zu good bytes\n", good_total);
         }
     }
-    return true;
+    fprintf(stderr, "aof_load: replayed %zu commands (%zu bytes)\n", replayed, good_offset);
+
+    return replay_error == 0;
 }
 
 bool aof_check(const char *path, bool fix){
   FILE *fp = fopen(path,  "rb");
-  if (!fp){ fprintf(stderr, "check-aof: cannot open %s: %s\n", path, strerror(errno)); }
+  if (!fp){ fprintf(stderr, "check-aof: cannot open %s: %s\n", path, strerror(errno)); return false; }
 
   fseek(fp, 0, SEEK_END);
   long sz = ftell(fp);
@@ -287,7 +323,7 @@ bool aof_check(const char *path, bool fix){
 
   Buffer buf = buf_create((size_t)sz);
   std::vector<uint8_t> raw((size_t)sz);
-  if (fread(raw.data(), 1, (size_t)sz, fp)){
+  if (fread(raw.data(), 1, (size_t)sz, fp) != (size_t)sz){
     fprintf(stderr, "check-aof: short read\n"); fclose(fp); buf_destroy(&buf); return false;
   }
   fclose(fp);
