@@ -240,6 +240,7 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out){
     return resp_err(out, "WRONGTYPE wrong type");
   }
   entry_str(ent).swap(cmd[2]);
+  entry_set_ttl(ent, -1);
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return resp_ok(out);
@@ -300,6 +301,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
       }
       std::string old = std::move(entry_str(ent)); // extract the old value
       entry_str(ent).swap(cmd[2]); // set the new value
+      entry_set_ttl(ent, -1);
       g_data.g_writes_since_save++;
       return resp_str(out, old.data(), old.size());
     }
@@ -880,6 +882,9 @@ static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
   
   zset_delete(&entry_zset(ent), znode);
   g_data.g_writes_since_save++;
+  if (hm_size(&entry_zset(ent).hmap) == 0){
+    
+  }
   return resp_int(out, 1);
 }
 

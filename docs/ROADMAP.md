@@ -575,6 +575,26 @@ Deferred:
 - Real object refcounts.
 - Copy-on-mutate behavior.
 
+### Hand-Tuned Hot Paths (Assembly / Intrinsics)
+
+Purely opportunistic/educational track — not on the critical path of any active
+milestone.
+
+- Candidate: `str_hash` (`common.h:21-27`, FNV-1a) — called on essentially every
+  keyed command (`SET`/`GET`/`HSET`/... across `commands.cpp`/`rdb.cpp`/`zset.cpp`).
+  Gate any work here on profiling first (`perf record`/`perf report` against a
+  `redis-benchmark` run) — don't assume it's hot without measuring.
+- FNV-1a's byte-at-a-time serial dependency chain means a line-for-line asm port
+  of the same algorithm won't beat `-O2`'s output. A real win needs a different
+  algorithm alongside the low-level rewrite — e.g. hardware CRC32 via
+  `_mm_crc32_u64`, or xxHash — not "asm-ify FNV as written."
+- Preference order if pursued: compiler intrinsics (`<immintrin.h>`,
+  `__builtin_*`) first — compiler still owns register allocation/ABI; a
+  standalone `.s` translation unit (own CMake `enable_language(ASM)` target,
+  `extern "C"` linkage) only if intrinsics can't express what's needed; inline
+  `asm volatile` inside a `.cpp` last, since it's the hardest to keep clobber-list
+  correct and ties the code to one compiler's dialect.
+
 ### ACL and Command-Surface Feature Gaps
 
 Moved from "Known Bugs" 2026-07-13 — missing features, not defects:
@@ -735,24 +755,51 @@ Concrete approach for the current code:
 
 ### Scripting (EVAL)
 
-Largest remaining Redis-compat feature after Pub/Sub and transactions. Sketch:
+Largest remaining Redis-compat feature after Pub/Sub and transactions.
 
-- Link Lua 5.4 (vendored single-directory build keeps the no-dependency spirit;
-  system liblua as fallback).
-- `EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH` with a script cache keyed by SHA-1
-  of the body (add SHA-1 next to the existing `sha256.h`, or key the cache by
-  full body initially and defer SHA-1).
-- `redis.call()` re-enters `do_request` with a synthetic reply buffer that gets
-  translated RESP→Lua tables; errors become Lua errors.
-- Persistence/replication rule: log *effects*, not scripts. Every write a script
-  makes already flows through the normal handlers, so the existing
-  `g_writes_since_save` gate plus `aof_feed`/`aof_append_raw` capture the write
-  stream — but raw-frame capture must be disabled inside scripts (there is no
-  client frame), so script-initiated writes always take the `aof_feed` re-encode
-  path. This mirrors the rename-command canonicalization rule.
+Decision (2026-07-14): **custom language + bytecode VM, not embedded Lua.**
+Deliberately scoped as a small Redis-scripting DSL, not a general-purpose
+language — no closures, coroutines, metatables, or modules. This is an
+educational track (writing an interpreter from scratch) that happens to fit
+the problem well: EVAL only ever needs values, branching, loops, calls, and one
+privileged builtin, and a script has no state that outlives one invocation, so
+the usual hardest part of a from-scratch language — GC — is not needed at all
+(see memory model below). Sits in Backlog with no deadline pressure, which is
+exactly the condition under which this bet is reasonable.
+
+Pipeline:
+
+- Lexer → recursive-descent parser → AST → single-pass compiler to flat
+  bytecode (stack-based VM, not tree-walking — a tree-walker re-traverses the
+  AST every run, which is both slower and not the design any real language
+  ships).
+- Values: nil, boolean, number (int/double, kept distinct for RESP fidelity),
+  string, table/array (needed both to receive multi-bulk RESP replies and to
+  build multi-bulk `redis.call` arguments).
+- Memory: bump/arena allocator scoped to one `EVAL` invocation, freed wholesale
+  on return. No cross-invocation state exists in Redis's EVAL model, so no GC
+  is required — this is the one deliberate simplification that makes "write it
+  from scratch, make it good" tractable alongside everything else in flight.
+- `redis.call`/`redis.pcall` is a VM opcode that re-enters `do_request` with a
+  synthetic reply buffer, translating RESP→VM values and back; `redis.call`
+  errors abort script execution, `redis.pcall` catches them as a VM-level
+  error value.
+- Safety: the VM's dispatch loop checks an instruction counter every iteration
+  against a configured max-instructions-per-script limit — the from-scratch
+  equivalent of hooking Lua's `debug` API for a time limit, and simpler since
+  it's just an integer compare already inside the loop.
+- `EVAL`/`EVALSHA`/`SCRIPT LOAD|EXISTS|FLUSH`: cache compiled bytecode objects
+  keyed by SHA-1 of the script source (add SHA-1 next to the existing
+  `sha256.h`); `EVALSHA` looks up that cache directly, no recompilation.
+- Persistence/replication rule (language-independent, carries over unchanged):
+  log *effects*, not scripts. Every write a script makes already flows through
+  the normal handlers, so the existing `g_writes_since_save` gate plus
+  `aof_feed`/`aof_append_raw` capture the write stream — but raw-frame capture
+  must be disabled inside scripts (there is no client frame), so
+  script-initiated writes always take the `aof_feed` re-encode path. This
+  mirrors the rename-command canonicalization rule.
 - Atomicity is free (single-threaded loop), but the OOM and MISCONF write gates
-  in `do_request` must run per `redis.call`, and a script execution time limit
-  needs a Lua debug hook.
+  in `do_request` must still run per `redis.call` — the VM doesn't bypass them.
 
 ### Structured Logging and Daemonization
 
