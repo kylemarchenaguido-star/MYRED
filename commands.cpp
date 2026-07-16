@@ -34,13 +34,6 @@ static void die(const char *msg){
 	abort();
 }
 
-// This is for the random generator
-static std::mt19937_64 g_rng{std::random_device{}()};
-
-static size_t rand_idx(size_t n){
-  return std::uniform_int_distribution<size_t>(0 , n - 1)(g_rng);
-}
-
 enum class Lookup{
   OK,
   MISSING,
@@ -148,26 +141,8 @@ static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
 
 // A unifromly-ish random live entry from the ehole keyspace (both rehash tables).
 static Entry *db_random_entry(){
-  HMap *m = &g_data.db;
-  size_t total = m->newer.size + m->older.size;
-  if (total == 0){ return nullptr; }
-  HTab *t = (rand_idx(total) < m->newer.size) ? &m->newer : &m->older;
-  if (!t->tab || t->size == 0){ t = (t == &m->newer) ? &m->older : &m->newer; }
-  if (!t->tab || t->size == 0){ return nullptr; }
-
-  size_t start = rand_idx(t->mask + 1);
-  // scan forward to a non-empty bucket
-  for (size_t probe = 0; probe <= t->mask; ++probe){
-    HNode *h = t->tab[(start + probe) & t->mask];
-    if (h){
-      size_t len = 0;
-      for (HNode *c = h; c; c = c->next){ ++len; }
-      size_t pick = rand_idx(len);
-      for (size_t i = 0; i < pick; ++i){ h = h->next; }
-      return container_of(h, &Entry::node);
-    }
-  }
-  return nullptr; 
+  HNode *h = hm_random(&g_data.db);
+  return h ? container_of(h, &Entry::node) : nullptr; 
 }
 
 // A random key that has a TTL - the ttl heap holds exactly those.
@@ -2471,33 +2446,30 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
     case Lookup::OK:  break;
   }
-  std::vector<std::string> members;
-  hm_foreach(&entry_set(ent), cb_collect_members, &members);
-  if (members.empty()){
-    return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+  HMap *set = &entry_set(ent);
+  if (hm_size(set) == 0){   // defensive; empty sets are dropped by mutators
+    return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
   }
 
   if (cmd.size() == 2){
-    // single pop - pick one random member
-    size_t idx = (size_t)(rand_idx(members.size()));
-    const std::string &picked = members[idx];
-    resp_str(out, picked.data(), picked.size());
-    set_remove(&entry_set(ent), picked);
+    // single pop
+    SetNode *sn = container_of(hm_random(set), &SetNode::node);
+    resp_str(out, sn->member.data(), sn->member.size());
+    hm_delete(set, &sn->node, &hnode_same);
+    delete sn;
   } else {
     int64_t count = 0;
     if (!str2int(cmd[2], count)){ return resp_err(out, MSG_NOT_INT); }
     if (count < 0){ return resp_err(out, "ERR value is out of range, must be positive"); }
     if (count == 0){ return resp_arr(out, 0); }
-    // partial Fisher-Yates: shuffle the first 'n' slots
-    size_t n = ((size_t)count < members.size()) ? (size_t)count : members.size();
-    for (size_t i =0; i < n; ++i){
-      size_t j = i + (size_t)(rand_idx(members.size() - i));
-      std::swap(members[i], members[j]);
-    }
+
+    size_t n = ((size_t)count < hm_size(set)) ? (size_t)count : hm_size(set);
     resp_arr(out, (uint32_t)n);
     for (size_t i = 0; i < n; ++i){
-      resp_str(out, members[i].data(), members[i].size());
-      set_remove(&entry_set(ent), members[i]);
+      SetNode *sn = container_of(hm_random(set), &SetNode::node);
+      resp_str(out, sn->member.data(), sn->member.size());
+      hm_delete(set, &sn->node, &hnode_same);
+      delete sn;
     }
   }
   if (hm_size(&entry_set(ent)) == 0){
@@ -2517,45 +2489,48 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
     case Lookup::MISSING: return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
     case Lookup::OK:  break;
   }
-  std::vector<std::string> members;
-  hm_foreach(&entry_set(ent), cb_collect_members, &members);
-  if (members.empty()){
-    return (cmd.size() >= 3) ? resp_arr(out, 0): resp_nil(out);
+  HMap *set = &entry_set(ent);
+  size_t size = hm_size(set);
+  if (size == 0){   // defensive; empty sets are dropped by mutators
+    return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
   }
- if (cmd.size() == 2){
-    size_t idx = (size_t)(rand_idx(members.size()));
-    return resp_str(out, members[idx].data(), members[idx].size());
- }
 
- int64_t count = 0;
- if (!str2int(cmd[2], count)){
-    return resp_err(out, MSG_NOT_INT);
- }
- if (count == 0){ return resp_arr(out, 0); }
+  if (cmd.size() == 2){
+    SetNode *sn = container_of(hm_random(set), &SetNode::node);
+    return resp_str(out, sn->member.data(), sn->member.size());
+  }
 
- if (count > 0){
-  // distinct members up to min(count, size)
-  size_t n = ((size_t)count < members.size() ? (size_t)count : members.size());
-  for (size_t i = 0; i < n; ++i){
-    size_t j = i + (size_t)(rand_idx(members.size() - i));
-    std::swap(members[i], members[j]);
+  int64_t count = 0;
+  if (!str2int(cmd[2], count)){ return resp_err(out, MSG_NOT_INT); }
+  if (count == 0){ return resp_arr(out, 0); }
+
+  if (count > 0){
+    // distinct members up to min(count, size): pop k random nodes, emit, reinsert
+    size_t n = ((size_t)count < size) ? (size_t)count : size;
+    std::vector<SetNode *> picked;
+    picked.reserve(n);
+    for (size_t i = 0; i < n; ++i){
+      SetNode *sn = container_of(hm_random(set), &SetNode::node);
+      hm_delete(set, &sn->node, &hnode_same);
+      picked.push_back(sn);
+    }
+    resp_arr(out, (uint32_t)n);
+    for (SetNode *sn : picked){
+      resp_str(out, sn->member.data(), sn->member.size());
+      hm_insert(set, &sn->node);
+    }
+  } else {
+    // negative count: |count| members with replacement
+    if ((count == INT64_MIN) || -count > (int64_t)k_max_args){
+      return resp_err(out, "ERR count is out of range");
+    }
+    size_t n = (size_t)(-count);
+    resp_arr(out, (uint32_t)n);
+    for (size_t i = 0; i < n; ++i){
+      SetNode *sn = container_of(hm_random(set), &SetNode::node);
+      resp_str(out, sn->member.data(), sn->member.size());
+    }
   }
-  resp_arr(out, (uint32_t)n);
-  for (size_t i = 0; i < n; ++i){
-    resp_str(out, members[i].data(), members[i].size());
-  }
- } else {
-  // negative count: |count| members with replacement
-  if ((count == INT64_MIN) || -count > (int64_t)k_max_args){
-    return resp_err(out, "ERR count is out of range");
-  }
-  size_t n = (size_t)(-count);
-  resp_arr(out, (uint32_t)n);
-  for (size_t i = 0; i < n; ++i){
-    size_t idx = (size_t)(rand_idx(members.size()));
-    resp_str(out, members[idx].data(), members[idx].size());
-  }
- }
 }
 
 static void cb_sscan(HNode *node, void *arg){
@@ -3483,10 +3458,6 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
                 conn, " cmd=" + canonical);
   }
 
-  #ifndef NDEBUG
-  mem_selfcheck(cmd[0].c_str());   // prints "[mem] drift..." if any handler mis-accounted
-  #endif
-
   if (spec.is_write && g_config.aof_enable && g_data.g_aof_write_err && !g_data.g_loading){
     return resp_err(out, "MISCONF Errors writing to the AOF file, can't accept writes");
   }
@@ -3515,6 +3486,9 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
       aof_append_raw(raw, raw_len);
     }
   }
+  #ifndef NDEBUG
+  mem_selfcheck(canonical.c_str());   // prints "[mem] drift..." if any handler mis-accounted
+  #endif
 }
 
 // case insensitive subcommand compare

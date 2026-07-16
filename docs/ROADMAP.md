@@ -361,6 +361,15 @@ get filed here first, then folded into that audit.
 Feature gaps that were listed here (missing features, not defects) moved to Backlog →
 "ACL and Command-Surface Feature Gaps".
 
+- **SPOP is nondeterministic but AOF-logged verbatim** (filed 2026-07-16, found while
+  reworking SPOP sampling): `k_cmd_table` logs SPOP raw, so AOF replay re-runs the
+  random pick and removes *different* members than the original run — silent state
+  divergence that the replay error counter cannot detect (the replayed command
+  succeeds). Redis propagates SPOP as SREM of the actually-popped members. Fix needs a
+  handler-fed AOF path: a `CmdSpec` flag (e.g. `aof_self`) telling `do_request` not to
+  log, plus `do_spop` feeding a synthetic `SREM key member...` via `aof_feed` (same
+  mechanism eviction already uses for its synthetic DEL).
+
 ## Design Decisions
 
 ### Dispatch Table

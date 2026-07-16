@@ -182,41 +182,21 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 
 ##### Easy — single line, single file, no design tradeoff
 
-- [ ] **`hash_set` copies on both paths** (`hash.cpp:6-22`): the update-existing branch
-  (line 12) does `->value = value;`, copying the by-value parameter into the member
-  instead of moving it; the new-field branch (line 18) already does `std::move`
-  correctly. Fix: `->value = std::move(value);`.
-- [ ] **`str_hash` upper 32 bits always zero** (`common.h:21-27`): the hash is computed
-  in a `uint32_t h` and returned widened to `uint64_t`, so only 32 bits of entropy ever
-  feed `HTab`'s `hcode & mask` bucket selection. Fix properly: switch to a real 64-bit
-  FNV-1a (different offset-basis/prime constants) — widening the return type alone
-  doesn't add entropy that was never computed.
-- [ ] **`mem_selfcheck` blames the wrong command** (`commands.cpp:3487`): the call runs
-  *before* the handler executes (`do_request`), so a detected drift gets attributed to
-  the command about to run rather than the one that actually caused it. Fix: move the
-  call to after the handler runs. Debug-only build (`#ifndef NDEBUG`), zero release
-  impact either way.
-
-##### Needs a decision first — small diff, but changes a guarantee
-
-- [ ] **`entry_mem_usage` full walk on every `mem_reaccount`** (`state.cpp:579-584`):
-  the sampled variant already exists (`entry_mem_usage_sampled`, `state.cpp:545-574`,
-  currently only used by `OBJECT MEMORY`/similar one-off queries) and swapping it in is
-  textually a one-line change — but `mem_reaccount`'s own comment documents an
-  exactness invariant (`used_memory >= ent->mem`, kept safe via
-  add-new-before-subtract-old ordering). Sampling makes `used_memory` approximate
-  instead of exact, and sampling error compounds across repeated mutations of the same
-  entry. Decide the acceptable sample count/drift deliberately before swapping it in —
-  don't treat this as a drive-by fix.
+- [x] **`hash_set` copies on both paths.** FIXED 2026-07-16: by-value param de-consted
+  (a `const` by-value param makes `std::move` silently copy), both branches move.
+- [x] **`str_hash` upper 32 bits always zero.** FIXED 2026-07-16: real 64-bit FNV-1a
+  (64-bit offset basis + prime).
+- [x] **`mem_selfcheck` blames the wrong command.** FIXED 2026-07-16: call moved to
+  the end of `do_request`, after the handler + AOF feed.
 
 ##### Harder — multi-file, or a real design task
 
-- [ ] **`SPOP`/`SRANDMEMBER` full materialization** (`commands.cpp:2467-2528`): both
-  walk the *entire* set into a `std::vector` via `hm_foreach` just to pick 1 or k
-  random members — O(n) time and memory for what should often be O(1)/O(k). A real fix
-  needs reservoir sampling during the bucket walk, or — more realistically — is the
-  same work as the already-planned Compact Encodings backlog item (intset/listpack
-  with O(1) random access), not a standalone task.
+- [x] **`SPOP`/`SRANDMEMBER` full materialization.** FIXED 2026-07-16: new `hm_random`
+  hashtable primitive (weighted two-table bucket walk, deduped with
+  `db_random_entry`); SPOP pops by node — removal makes distinctness free, O(k);
+  SRANDMEMBER positive count uses pop-and-reinsert for distinct sampling, negative
+  count k independent draws. Follow-up: SPOP AOF replay nondeterminism filed in
+  ROADMAP Known Bugs 2026-07-16.
 - [ ] **Set-algebra store commands double-copy** (`set_store_result`,
   `commands.cpp:2636-2653`): builds a `result` vector from the union/inter/diff
   computation, then `set_add`s each member into the destination set. `set_add` takes

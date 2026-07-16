@@ -3,13 +3,13 @@
 #include "str_node.h"
 #include <vector>
 
-bool hash_set(HMap *h, const std::string &field, const std::string value){
+bool hash_set(HMap *h, const std::string &field, std::string value){
     StringKey key;
     sk_init(&key, field);
 
     HNode *found = hm_lookup(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
     if (found){
-        container_of(found, &HashNode::node)->value = value; // update existing
+        container_of(found, &HashNode::node)->value = std::move(value); // update existing
         return false;
     }
     // create a new field for the hash 

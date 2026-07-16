@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdlib.h>     // calloc(), free()
 #include "hashtable.h"
+#include "common.h"
 
 // Initialiazer for the hashtable 
 static void h_init(HTab *htab, size_t n){
@@ -135,6 +136,29 @@ static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *), void *arg){
 // "short-circuit stops scanning older table if callback returns false; early-stop is not visible to the caller — all current callbacks return true unconditionally".
 void hm_foreach(HMap *hmap, bool(*f)(HNode *, void *), void *arg){
     h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
+}
+
+// this is db_random_entry for HNode's
+HNode *hm_random(HMap *hmap){
+    size_t total = hmap->newer.size + hmap->older.size;
+    if (total == 0){ return NULL; }
+    // pick a table weighted by its share of the keys
+    HTab *t = (rand_idx(total) < hmap->newer.size) ? &hmap->newer : &hmap->older;
+    if (!t->tab || t->size == 0){ t = (t == &hmap->newer) ? &hmap->older : &hmap->newer; }
+    if (!t->tab || t->size == 0){ return NULL; }
+
+    size_t start = rand_idx(t->mask + 1);
+    for (size_t probe = 0; probe <= t->mask; ++probe){
+        HNode *h = t->tab[(start + probe) & t->mask];
+        if (h){
+            size_t len = 0;
+            for (HNode *c = h; c; c = c->next){ ++len; }
+            size_t pick = rand_idx(len);
+            for (size_t i = 0; i < pick; ++i){ h = h->next; }
+            return h;
+        }
+    }
+    return NULL;
 }
 
 // 64-bit bit reversal helper (just reverses a 64 bit with a mask in 6 steps)
