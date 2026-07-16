@@ -32,7 +32,7 @@ void buf_append(Buffer *buf, const uint8_t *data, size_t len){
     if (space_at_back < len){
       // Option B still not enough
       size_t old_cap = buf->buffer_end - buf->buffer_begin;
-      size_t new_cap = old_cap * 2;
+      size_t new_cap = old_cap ? old_cap * 2 : 64;
 
       while (new_cap < data_size + len) new_cap *= 2;
 

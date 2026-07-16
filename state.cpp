@@ -17,16 +17,39 @@ Config g_config;
 static void heap_delete(std::vector<HeapItem> &a, size_t pos);
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t);
 
+// whole-string decimal integer, no trailing garbage, no silent overflow
+bool parse_int_strict(const char *s, long *out){
+  if (!s || !*s){ return false; }
+  char *end = nullptr;
+  errno = 0;
+  long v =  strtol(s, &end, 10);
+  if (errno == ERANGE || end == s || *end != '\0'){ return false; }
+  *out = v;
+  return true;
+}
+
+bool parse_bool_strict(const std::string &s, bool *out){
+  if (s == "yes") { *out = true; return true; }
+  if (s == "no") { *out = false; return true; }
+  return false;
+}
+
+
 // Build/refresh the built in default user from the current requirepass digest
 void acl_bootstrap_default(){
+  auto it = g_config.users.find("default");
+  if (it != g_config.users.end()){
+    // config defined 'user default'
+    if (it->second.pw_hashes.empty() && !g_config.password.empty()){
+      it->second.pw_hashes.push_back(g_config.password);
+    }
+    return;
+  }
   User &u = g_config.users["default"]; // operator [] insearts if absent; address stays stable
   u.name ="default";
   u.enable = true;
   u.allow_cats = CAT_ALL;
   u.all_keys = true;
-  u.key_patterns.clear();
-  u.cmd_overrides.clear();
-  u.pw_hashes.clear();
   if (!g_config.password.empty()){
     u.pw_hashes.push_back(g_config.password);
   }
@@ -184,12 +207,12 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
 
   if (name == "port"){
     if (!need1()){ return CfgResult::BADVALUE; }
-    int p = atoi(args[0].c_str());
-    if (p < 1 || p > 65535){
+    long p = 0;
+    if (!parse_int_strict(args[0].c_str(), &p) || p < 1 || p > 65535){
       err = "invalid port";
-      return CfgResult::BADVALUE;
+      return CfgResult::BADVALUE;  
     }
-    g_config.port = p;
+    g_config.port = (int)p;
     return CfgResult::OK;
   }
 
@@ -201,7 +224,12 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
 
   if (name == "protected-mode"){
     if(!need1()){ return CfgResult::BADVALUE; }
-    g_config.protected_mode = (args[0] == "yes");
+    bool b = false;
+    if (!parse_bool_strict(args[0], &b)){
+      err= "expected yes/no";
+      return CfgResult::BADVALUE; 
+    }
+    g_config.protected_mode = b;
     return CfgResult::OK;
   }
 
@@ -241,19 +269,24 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
 
   if (name == "maxmemory-samples"){
     if (!need1()){ return CfgResult::BADVALUE; }
-    int n = atoi(args[0].c_str());
-    if (n < 1){
-      err = "invalid samples";
+    long p = 0;
+    if (!parse_int_strict(args[0].c_str(), &p) || p < 1){
+      err = "invalid memory samples";
       return CfgResult::BADVALUE;
     }
-    g_config.maxmemory_samples = n;
+    g_config.maxmemory_samples = (int)p;
     return CfgResult::OK;
   }
 
   // AOF persistence
   if (name == "appendonly"){
     if (!need1()){ return CfgResult::BADVALUE; }
-    g_config.aof_enable = (args[0] == "yes");
+    bool b = false;
+    if (!parse_bool_strict(args[0], &b)){
+      err = "expected yes/no";
+      return CfgResult::BADVALUE;
+    }
+    g_config.aof_enable = b;
     return CfgResult::OK;
   }
 
@@ -278,18 +311,18 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
-  if (name == "auto_aof_rewrite-percentage"){
+  if (name == "auto-aof-rewrite-percentage" || name == "auto_aof_rewrite-percentage"){
     if (!need1()){ return CfgResult::BADVALUE; }
-    int n = atoi(args[0].c_str());
-    if (n < 0){
+    long p = 0;
+    if (!parse_int_strict(args[0].c_str(), &p) || p < 0){
       err = "invalid";
       return CfgResult::BADVALUE;
     }
-    g_config.aof_rewrite_perc = n;
+    g_config.aof_rewrite_perc = (int)p;
     return CfgResult::OK;
   }
 
-  if (name == "auto_aof_rewrite-min-size"){
+  if (name == "auto-aof-rewrite-min-size" || name == "auto_aof_rewrite-min-size"){
     if (!need1()){ return CfgResult::BADVALUE; }
     size_t b = 0;
     if (!parse_memory_size(args[0], &b)){
@@ -555,7 +588,7 @@ bool parse_cidr(const std::string &s, uint32_t *net, uint32_t *mask){
     long parsed = strtol(bits_str, &end, 10);
     // no digits, or trailing garbage
     if (end == bits_str || *end != '\0'){ return false; }
-    if (bits < 0 || bits > 32){ return false; }
+    if (parsed < 0 || parsed > 32){ return false; }
     bits = (int)parsed;
   }
   struct in_addr a;

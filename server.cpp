@@ -49,29 +49,37 @@ static void signal_handler(int sig) {
     g_stop = true;
 }
 
+// operational failure (bad config, port taken, ...): report and exit cleanly
+static void fatal_exit(const char *msg){
+  int err =  errno;
+  if (err){ fprintf(stderr, "fatal: %s (%s)\n", msg, strerror(errno)); }
+  else { fprintf(stderr, "fatal: %s\n", msg); }
+  exit(1);
+}
+
+// internal invariant violated: abort so there is a core dump to debug
+static void panic(const char *msg){
+  fprintf(stderr, "panic: [%d] %s\n", errno, msg);
+  abort();
+}
+
 //Helper function for syscalls 
 static void msg_errno(const char *msg) {
   fprintf(stderr, "[errno:%s]\n", msg);
-}
-
-static void die(const char *msg){
-	int err = errno;
-	fprintf(stderr, "[%d] %s\n", err, msg);
-	abort();
 }
 
 static void fd_set_nb(int fd){
   errno = 0;
   int flags = fcntl(fd, F_GETFL,0);
   if (errno){
-    die("fcntl error");
+    fatal_exit("fcntl error");
     return;
   }
   flags |= O_NONBLOCK;
 
   errno = 0;
   (void) fcntl(fd, F_SETFL, flags);
-  if (errno){ die("fcntl error"); }
+  if (errno){ fatal_exit("fcntl error"); }
 }
 
 // callable from any worker thread
@@ -449,9 +457,10 @@ static void handle_write(Conn *conn){
   // remove the data from outgoing
   buf_consume(&conn->outgoing, (size_t)rv);
 
-  if(buf_size(&conn->outgoing) == 0){ // all data writen 
+  if (buf_size(&conn->outgoing) == 0){ // all data writen 
     conn->want_read = true;
     conn->want_write = false;
+    conn_set_timer(conn, ConnTimer::IDLE); 
   }// want to keep writing 
 }
 
@@ -550,15 +559,16 @@ int main(int argc, char **argv){
   }
   
   if (cfg_path){ fprintf(stderr, "startup: loading config %s\n", cfg_path); }
-  if (cfg_path && !config_load_file(cfg_path)){ die("invalid config file"); }
+  if (cfg_path && !config_load_file(cfg_path)){ fatal_exit("invalid config file"); }
 
 
   if (const char *e = getenv("MYRED_PASSWORD")){ g_config.password = cred_hash_new(e); }
-  if (const char *e = getenv("MYRED_PORT")){ int p = atoi(e); if (p > 0 && p < 65536){ g_config.port = p; } }
+  if (const char *e = getenv("MYRED_PORT")){
+    long p = 0;
+    if (parse_int_strict(e, &p) && p > 0 && p < 65536){ g_config.port = (int)p; }
+    else { fprintf(stderr, "warning: bad MYRED_PORT '%s' ignored\n", e); }
+  }
   if (const char *e = getenv("MYRED_AOF")){ g_config.aof_enable = (e[0] == '1' || e[0] == 'y'); }
-
-
-  if (g_config.password.empty()){ g_config.password = cred_hash_new("kek1234"); }   // historical default
 
   #ifndef MYRED_HAVE_ARGON2
     fprintf(stderr, "startup: build without libargon2 - new password hashes fall back to lgeacy SHA-256\n");
@@ -621,16 +631,18 @@ int main(int argc, char **argv){
     else { g_config.aof_fysnc = Aoffsync::EVERYSEC; }
   }
 
-  const char *rmin_enve = getenv("MYRED_AOF_REWRITE_MIN");
-  if (rmin_enve){
-    long long v = atoll(rmin_enve);
-    if (v > 0){ g_config.aof_rewrite_min_size = (size_t)v; }
+  const char *rmin_env = getenv("MYRED_AOF_REWRITE_MIN");
+  if (rmin_env){
+    long v = 0;
+    if (parse_int_strict(rmin_env, &v) && v > 0){ g_config.aof_rewrite_min_size = (size_t)v; }
+    else { fprintf(stderr, "warning: bad MYRED_AOF_REWRITE_MIN '%s' ignored\n", rmin_env); }
   }
 
   const char *rperc_env = getenv("MYRED_AOF_REWRITE_PERC");
   if (rperc_env){
-    int v = atoi(rperc_env);
-    if (v > 0){ g_config.aof_rewrite_perc = v; }
+    long v = 0;
+    if (parse_int_strict(rperc_env, &v) && v > 0){ g_config.aof_rewrite_perc = (int)v; }
+    else { fprintf(stderr, "warning: bad MYRED_AOF_REWRITE_PERC '%s' ignored\n", rperc_env); }
   }
 
   const char *maxmen_env = getenv("MYRED_MAXMEMORY");
@@ -650,7 +662,7 @@ int main(int argc, char **argv){
   for (const std::string &addr : g_config.binds){
     int lfd = listen_on(addr, g_config.port);
     // fail fast if any addrees can't bind 
-    if (lfd < 0){ die("listener setup"); }
+    if (lfd < 0){ fatal_exit("listener setup"); }
     listen_fds.push_back(lfd);
     fprintf(stderr,"listening on %s:%d\n", addr.c_str(), g_config.port);
   }
@@ -658,7 +670,7 @@ int main(int argc, char **argv){
   // pre-warm and pay the KDF cost at boot
   (void)cred_dummy(); 
   g_loop_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (g_loop_efd < 0){ die("eventfd"); }
+  if (g_loop_efd < 0){ fatal_exit("eventfd"); }
 
   const size_t nlisten = listen_fds.size();
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
@@ -686,7 +698,7 @@ int main(int argc, char **argv){
     int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
 
     if(rv < 0 && errno == EINTR){continue;}
-    if(rv < 0){die("poll");}
+    if(rv < 0){ panic("poll");}
 
     // any listening socket ready -> drain its backlog
     for (size_t i = 0; i < nlisten; i++){
@@ -712,9 +724,7 @@ int main(int argc, char **argv){
       if (!conn){continue;}
 
       // update the idle timer and putting the conn at the end of the list
-      conn->last_active_ms = get_monotonic_msec();
-      dlist_detach(&conn->idle_node);
-      dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+      conn_set_timer(conn, conn->timer_type);
 
       // Connection are ready to write and read
       if(ready & POLLIN){
@@ -759,7 +769,7 @@ int main(int argc, char **argv){
     g_rdb_child_pid = -1;
   }
 
-  rdb_save("dump.rdb");
+  rdb_save(g_config.dump_path.c_str());
   fprintf(stderr, "Saved. Goodbye.\n");
   return 0;
 }

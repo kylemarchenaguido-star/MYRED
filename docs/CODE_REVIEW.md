@@ -88,48 +88,44 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 
 #### 🟠 Bugs
 
-- [ ] **N6 — `GETSET` no reaccount** (`commands.cpp:301-304`): the existing-key swap
-  never calls `mem_reaccount(ent)` → permanent `used_memory` drift → spurious
-  evictions/OOM under `maxmemory`. Same handler also keeps the TTL (Redis discards it).
-- [ ] **N7 — `SET` keeps TTL on overwrite** (`commands.cpp:237-246`): Redis discards
-  TTL on plain `SET` (`KEEPTTL` exists to keep it). The divergence propagates through
-  raw AOF frames. Fix: `entry_set_ttl(ent, -1)` on overwrite; decide `SETNX`-family
-  semantics deliberately.
-- [ ] **`ZREM` no reaccount, no empty-key drop** (`commands.cpp:870-884`); `ZPOPMIN`
-  reaccounts only on no-op or full deletion.
-- [ ] **`GETEX` TTL changes not dirty-counted** (`commands.cpp:349` PERSIST,
-  `commands.cpp:373` future EX/PX/EXAT/PXAT): `entry_set_ttl` without a
-  `g_writes_since_save` bump → never AOF-logged; only the past-timestamp delete path
-  bumps. `EXAT` also multiplies `v * 1000` unchecked (TTL overflow carry-over).
-- [ ] **N8 — `rdb_save` fsyncs before flushing stdio** (`rdb.cpp:372`; no `fflush`
-  anywhere in rdb.cpp): the image tail can sit in the `FILE*` buffer at fsync time →
-  truncated dump on power loss.
-- [ ] **N9 — busy path clobbers `g_dirty_at_save`** (`rdb.cpp:908`): writes made during
-  an in-flight background save lose their dirty status when it completes.
-- [ ] **N10 — compressed-RDB bounds** (`rdb.cpp:779-781`): `memcpy(&usize, payload, 4)`
-  without `payload_size >= 4`; `usize` unchecked → OOB read / multi-GB allocation on a
-  corrupt-but-CRC-"valid" file.
-- [ ] **N11 — `SRANDMEMBER` negative count unclamped** (`commands.cpp:2519-2521`):
-  `n = (size_t)(-count)`; the `resp_arr((uint32_t)n)` header truncates while the loop
-  emits all `n` → protocol desync + unbounded output from one 30-byte command.
-- [ ] **N12 — `acl_bootstrap_default` clobbers a configured default user**
-  (`state.cpp:21-34`, runs *after* `config_load_file`): unconditionally resets to
-  `CAT_ALL`/all-keys and clears overrides — `user default ...` hardening in myred.conf
-  is silently discarded. Fix: bootstrap only when the config didn't define `default`;
-  otherwise only sync `pw_hashes` from `requirepass`.
-- [ ] **N13 — directive spelling** (`state.cpp:281,292`):
-  `auto_aof_rewrite-percentage` / `auto_aof_rewrite-min-size` (underscore/hyphen mix);
-  a real redis.conf line fails the boot. Accept the hyphenated names; keep old
-  spellings as aliases.
-- [ ] **`parse_cidr` validates the wrong variable** (`state.cpp:555-559`): checks
-  `bits` (still the constant 32 at that point) instead of `parsed`, then assigns —
-  `/33` and `/-1` reach the `0xFFFFFFFFu << (32 - bits)` shift (UB).
-- [ ] **`SAVE`/shutdown hardcode `dump.rdb`**, `do_save` double-calls
-  `rdb_on_save_complete` (2026-07-09 refs `commands.cpp:1084`, `server.cpp:663`; not
-  re-verified line-exactly — re-check when fixing).
-- [ ] **AOF rewrite tmp/finalize fragility** (`aof.cpp:135,150-176`): hardcoded
-  `appendonly.aof.tmp` regardless of `aof_path`; short-delta/open/rename failures are
-  ignored and `g_aof_last_rewrite_ok` stays `true`.
+- [ ] **N6 — `GETSET` no reaccount** — TTL-discard half FIXED 2026-07-13; **still
+  missing `mem_reaccount(ent);` after the swap in the overwrite path**
+  (`do_getset`) → `used_memory` drift remains until that one line lands.
+- [x] **N7 — `SET` keeps TTL on overwrite.** FIXED 2026-07-13: `entry_set_ttl(ent, -1)`
+  on the `do_set` overwrite path; SETNX/SETEX verified already correct.
+- [ ] **`ZREM`/`ZPOPMIN` reaccount + empty-key drop** — `do_zrem` FIXED 2026-07-13
+  (reaccount + empty drop); **`do_zpopmin` still misses the survivors case**: move
+  `mem_reaccount(ent)` from the no-op `else` into an `else` of the emptied-check
+  inside `if (!popped.empty())`.
+- [x] **`GETEX` TTL changes not dirty-counted + EXAT overflow.** FIXED 2026-07-13:
+  `entry_has_ttl`-guarded PERSIST bump, dirty bump on the future path, `INT64_MAX/1000`
+  guards on EX/EXAT, negative EXAT short-circuits to the delete path.
+- [x] **N8 — `rdb_save` fsync before stdio flush.** FIXED 2026-07-13: `fflush(fp)`
+  checked before `fsync(fileno(fp))`.
+- [x] **N9 — `g_dirty_at_save` misplaced.** FIXED 2026-07-13: snapshot captured at
+  serialize time in `rdb_save_background()`; busy-branch clobber removed. (Found
+  worse than filed: the success path never captured it at all.)
+- [x] **N10 — compressed-RDB bounds.** FIXED 2026-07-13: `payload_size >= 4` check +
+  `usize` capped by zlib's 1032:1 max expansion ratio.
+- [x] **N11 — `SRANDMEMBER` negative count unclamped.** FIXED 2026-07-13:
+  `INT64_MIN` + `-count > k_max_args` rejected with `ERR count is out of range`.
+- [x] **N12 — `acl_bootstrap_default` clobbers a configured default user.** FIXED
+  2026-07-13: bootstrap respects a config-defined `default` (only fills `pw_hashes`
+  from `requirepass` when the operator gave no password rule). Note: `config_rewrite`
+  still skips emitting `default` — folded into the rewrite-coverage item below.
+- [x] **N13 — directive spelling.** FIXED 2026-07-13: hyphenated
+  `auto-aof-rewrite-*` accepted (`state.cpp:286,297`), old spellings kept as aliases.
+- [x] **`parse_cidr` validates the wrong variable** — HALF-APPLIED 2026-07-13: the
+  check is now `if (bits < 0 || parsed > 32)` — `/33` is rejected (verified live) but
+  the left side still tests the constant `bits`, so **`/-1` still reaches the shift
+  (UB)**. Change `bits < 0` → `parsed < 0`.
+- [x] **`SAVE`/shutdown hardcode `dump.rdb` + double-complete.** FIXED 2026-07-13:
+  both route through `g_config.dump_path`; `do_save`'s duplicate
+  `rdb_on_save_complete` call removed (`rdb_save` owns it).
+- [x] **AOF rewrite tmp/finalize fragility.** FIXED 2026-07-13: tmp derived from
+  `aof_path` (built pre-fork); `aof_rewrite_reap` checks delta write/fsync/rename,
+  only repoints the fd after a successful swap, single `ok` exit sets
+  `g_aof_last_rewrite_ok` and cleans the tmp on any failure.
 - [x] **N21 — background-child reaping waits for a poll wakeup.** FIXED 2026-07-13:
   `next_timer_ms()` caps the poll timeout at `now_ms + 100` whenever
   `g_rdb_child_pid`/`g_aof_child_pid` is live (`server.cpp:242-244`), so a finished
@@ -172,7 +168,10 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 - [ ] **N20 — client.cpp `std::stoi` throws on malformed replies** (dev tool only).
 - [ ] **AOF-load-failure policy** (server.cpp startup): logs the failure and serves
   whatever partial state loaded; decide fail-fast vs documented best-effort.
-- [ ] **`die()` vs `fatal_exit()` split** (from ROADMAP, design preserved): `die()`
+- [x] **`die()` vs `fatal_exit()` split.** FIXED 2026-07-13: `fatal_exit` (print +
+  `exit(1)`, with `strerror`) at the five operational sites; `panic` (print +
+  `abort()`) kept only for the mid-run `poll()` failure. Verified live: bad config
+  now exits `fatal: invalid config file`, no core dump. Original finding: `die()`
   (`server.cpp:57`) prints then `abort()`s — a core-dump-producing, crash-looking exit
   — for routine startup mistakes: bad config path (`server.cpp:536`), listener setup
   (`:636`), fcntl (`:67,74`), eventfd (`:644`). Reproduced: a typo'd config filename

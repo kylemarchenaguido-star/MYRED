@@ -125,6 +125,8 @@ void aof_rewrite_background(){
   g_data.g_aof_rewrite_buf.clear(); // start the delta clean
   g_data.g_aof_rewrite_buf.reserve(64 * 1024);
 
+  std::string tmp = g_config.aof_path + ".tmp";
+
   pid_t pid = fork();
   if (pid < 0){
     fprintf(stderr, "aof_rewrite: fork failed: %s\n", strerror(errno));
@@ -132,7 +134,7 @@ void aof_rewrite_background(){
     return;
   }
   if (pid == 0){
-    aof_write_snapshot(&buf, "appendonly.aof.tmp"); // never returns
+    aof_write_snapshot(&buf, tmp.c_str()); // never returns
   }
   buf_destroy(&buf);
   g_aof_child_pid = pid; // from here, aof_feed mirrors writes into g_aof_rewrite_buf
@@ -141,41 +143,58 @@ void aof_rewrite_background(){
 
 // parent side, child hax exited: append the delta, swap files, repoint the live fd
 static void aof_rewrite_reap(pid_t r, int status){
-    if (r == g_aof_child_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0){
-    const char *tmp = "appendonly.aof.tmp";
-    // append the delta that accumulated during the rewrite
-    int fd = open(tmp, O_WRONLY | O_APPEND);
-    if (fd >= 0){
+  std::string tmp = g_config.aof_path + ".tmp";
+  bool ok = false;
+  if (r == g_aof_child_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0){
+    int fd  = open(tmp.c_str(), O_WRONLY | O_APPEND);
+    if (fd < 0){
+      fprintf(stderr, "aof_rewrite: cannot open %s: %s\n", tmp.c_str(), strerror(errno));
+    } else {
       const std::string &d = g_data.g_aof_rewrite_buf;
       size_t off = 0;
+      bool werr = false;
       while (off < d.size()){
-        ssize_t n = write(fd, d.data() + off, d.size() - off);
-        if (n < 0){ if (errno  == EINTR) { continue; } break;}
+        ssize_t n = write(fd, d.data(), d.size() - off);
+        if (n < 0){
+          if (errno == EINTR){ continue; }
+          fprintf(stderr, "aof_rewrite: delta write failed: %s\n", strerror(errno));
+          werr = true;
+          break;
+        }
         off += (size_t)n;
-      }  
-      fsync(fd);
-      close(fd);
-      // atomic swap
-      rename(tmp, g_config.aof_path.c_str());
-      // repoint the live fd at the new, compacted file
-      if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_fd); }
-      g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-
-      struct stat st;
-      if (g_data.g_aof_fd >= 0 && fstat(g_data.g_aof_fd, &st) ==  0){
-        g_data.g_aof_current_size  = (size_t)st.st_size;
-        g_data.g_aof_base_size  = (size_t)st.st_size;
       }
-      g_data.g_aof_last_rewrite_ok = true;
-      fprintf(stderr, "aof_rewrite: completed, %zu delta bytes\n", d.size());
+      if (!werr && fsync(fd) != 0){
+        fprintf(stderr, "aof_rewrite: fsync failed: %s\n", strerror(errno));
+        werr = true;
+      }
+      close(fd);
+      if (!werr){
+        if (rename(tmp.c_str(), g_config.aof_path.c_str()) != 0){
+          fprintf(stderr, "aof_rewrite: rename failed: %s\n", strerror(errno));
+        } else {
+          // swap done - rpoint the live fd at the new, compacted file
+          if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_current_size); }
+          g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+          if (g_data.g_aof_fd < 0){
+            fprintf(stderr, "aof_rewrite: cannot open %s: %s\n", g_config.aof_path.c_str(), strerror(errno));
+          }
+          struct stat st;
+          if (g_data.g_aof_fd >= 0 && fstat(g_data.g_aof_fd, &st) == 0){
+            g_data.g_aof_current_size = (size_t)st.st_size;
+            g_data.g_aof_base_size = (size_t)st.st_size;
+          }
+          ok = true;
+          fprintf(stderr, "aof_rewrite: completed %zu delta bytes\n", d.size());
+        }
+      } else {
+        fprintf(stderr, "aof_rewrite: child failed (status = %d), keeping old AOF\n", status);
+      }
+      if (!ok){ unlink(tmp.c_str()); }
+      g_data.g_aof_last_rewrite_ok = ok;
+      g_data.g_aof_rewrite_buf.clear();
+      g_aof_child_pid = -1;
     }
-  } else {
-    g_data.g_aof_last_rewrite_ok = false;
-    fprintf(stderr, "aof_rewrite: child failed (status=%d), keeping old AOF\n", status);
-    unlink("appendonly.aof.tmp");
   }
-  g_data.g_aof_rewrite_buf.clear();
-  g_aof_child_pid = -1;
 }
 
 void aof_check_background_rewrite(){

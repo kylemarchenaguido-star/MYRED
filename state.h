@@ -297,3 +297,6 @@ void audit_reject(const std::string &peer, const char *reason); // accept-time, 
 void dispatch_build(); // build the live command map from k_cmd_table + renames
 bool command_is_known(const std::string &name);
 void metadata_selfcheck(); // assert ACL/category invariants at boot; die() on violation
+
+bool parse_int_strict(const char *s, long *out);
+bool parse_bool_strict(const std::string &s, bool *out);

@@ -312,8 +312,8 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
   ent->key = std::move(lk.key);
   ent->node.hcode = lk.node.hcode;
   entry_str(ent).swap(cmd[2]);
-  hm_insert(&g_data.db, &ent->node);
   mem_reaccount(ent);
+  hm_insert(&g_data.db, &ent->node);
   g_data.g_writes_since_save++;
   resp_nil(out);
 }
@@ -349,7 +349,10 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
 
   if (opt == "persist"){
     if (cmd.size() != 3){ return resp_err(out, MSG_SYNTAX); }
-    entry_set_ttl(ent, -1);
+    if (entry_has_ttl(ent)){
+      entry_set_ttl(ent, -1);
+      g_data.g_writes_since_save++;
+    }
     return resp_str(out, entry_str(ent).data(), entry_str(ent).size());
   }
 
@@ -358,9 +361,12 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
   if (!str2int(cmd[3], v)){ return resp_err(out, MSG_NOT_INT); }
 
   int64_t ttl_ms = 0;
-  if (opt == "ex"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v * 1000; }
+  if (opt == "ex"){ if (v <= 0 || v > INT64_MAX / 1000) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v * 1000; }
   else if (opt == "px"){ if (v <= 0) return resp_err(out, "ERR invalid expire time in getex command"); ttl_ms = v; }
-  else if (opt == "exat"){ ttl_ms = v * 1000 - (int64_t)get_wall_msec(); }
+  else if (opt == "exat"){ 
+    if (v > INT64_MAX / 1000){ return resp_err(out, "ERR invalid expire time in getex command"); }
+    ttl_ms = v * 1000 - (int64_t)get_wall_msec(); 
+  }
   else if (opt == "pxat"){ ttl_ms = v - (int64_t)get_wall_msec(); }
   else { return resp_err(out, MSG_SYNTAX); }
 
@@ -373,6 +379,7 @@ static void do_getex(std::vector<std::string> &cmd, Buffer *out){
     return resp_str(out, val.data(), val.size());
   }
   entry_set_ttl(ent, ttl_ms);
+  g_data.g_writes_since_save++;
   resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
 
@@ -883,7 +890,10 @@ static void do_zrem( std::vector<std::string> &cmd, Buffer *out){
   zset_delete(&entry_zset(ent), znode);
   g_data.g_writes_since_save++;
   if (hm_size(&entry_zset(ent).hmap) == 0){
-    
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+  } else {
+    mem_reaccount(ent);
   }
   return resp_int(out, 1);
 }
@@ -1034,14 +1044,14 @@ static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out){
 
   if (!popped.empty()){
     g_data.g_writes_since_save++;
-    // emptied -> drop the key
     if (hm_size(&zset->hmap) == 0){
       hm_delete(&g_data.db, &ent->node, &hnode_same);
       entry_del(ent);
+    } else {
+      mem_reaccount(ent);
     }
-  } else {
-    mem_reaccount(ent);
   }
+
 }
 
 static int g_audit_fd = -1; 
@@ -1212,8 +1222,7 @@ static void do_save(std::vector<std::string> &cmd, Buffer *out){
   if (g_rdb_child_pid != -1){
     return resp_err(out, "ERR background save in progress");
   }
-  if (rdb_save("dump.rdb")){
-  rdb_on_save_complete(g_config.dump_path.c_str());   
+  if (rdb_save(g_config.dump_path.c_str())){
     resp_ok(out);
   } else {
     resp_err(out, "ERR save failed");
@@ -2522,6 +2531,9 @@ static void do_srandmember(std::vector<std::string> &cmd, Buffer *out){
   }
  } else {
   // negative count: |count| members with replacement
+  if ((count == INT64_MIN) || -count > (int64_t)k_max_args){
+    return resp_err(out, "ERR count is out of range");
+  }
   size_t n = (size_t)(-count);
   resp_arr(out, (uint32_t)n);
   for (size_t i = 0; i < n; ++i){

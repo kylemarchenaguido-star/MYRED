@@ -368,6 +368,15 @@ bool rdb_save(const char* filename){
     return false;
   }
 
+  // fsync syncs what the kernel has, we cleanup
+  if (fflush(fp) != 0){
+    fprintf(stderr, "rdb_save: fflush failed: %s\n", strerror(errno));
+    fclose(fp);
+    remove(tmp);
+    g_data.g_dirty_at_save = 0;
+    return false;
+  }
+
   // force the data into disk
   if (fsync((fileno(fp))) != 0){
     fprintf(stderr, "rdb_save; fsync failed: %s\n", strerror(errno));
@@ -448,14 +457,13 @@ static bool rdb_load_string_entry(RDBCursor *c){
   if (has_ttl){
     if (!cursor_read_u64(c, &expire_at)){ return false; }
     // check if expired 
-    if (expire_at <= get_wall_msec()){
-      // expired
-      std::string key, val;
-      cursor_read_str(c, &key);
-      cursor_read_str(c, &val);
-      fprintf(stderr, "rdb_load: skipping expired key\n");
-      return true;
-    }
+  if (expire_at <= get_wall_msec()){
+    // expired
+    std::string key, val;
+    if (!cursor_read_str(c, &key) || !cursor_read_str(c, &val)){ return false; }
+    fprintf(stderr, "rdb_load: skipping expired key\n");
+    return true;
+  }
   }
 
   // read key
@@ -497,23 +505,21 @@ static bool rdb_load_zset_entry(RDBCursor *c){
     if (expire_at <= now_ms){
       std::string key;
       uint32_t n_members = 0;
-      cursor_read_str(c, &key); // skip key
-      if (!cursor_read_u32(c, &n_members)){ return false; }; // skip member count
+      if (!cursor_read_str(c, &key)){ return false; } // skip key
+      if (!cursor_read_u32(c, &n_members)){ return false; } // skip member count
       if (n_members > (size_t)(c->end - c->pos) / 12){
         fprintf(stderr, "rdb_load: zset n_numbers %u too large for the remaining bytes\n", n_members);
         return false;
       }
-      for (uint32_t i = 0; i< n_members; ++i){
+      for (uint32_t i = 0; i < n_members; ++i){
         double score = 0;
         std::string name;
-        cursor_read(c, &score, 8); // skip score
-        cursor_read_str(c, &name); // skip name
+        if (!cursor_read(c, &score, 8) || !cursor_read_str(c, &name)){ return false; }
       }
       fprintf(stderr, "rdb_load: skipping expired zset\n");
       return true;
     }
   }
-
   // key 
   std::string key;
   if (!cursor_read_str(c, &key)){ return false; }
@@ -564,18 +570,17 @@ static bool rdb_load_deque_entry(RDBCursor *c){
   uint64_t expire_at = 0;
   if (has_ttl){
      if (!cursor_read_u64(c, &expire_at)) { return false; }
-     if (expire_at <= get_wall_msec()){
+    if (expire_at <= get_wall_msec()){
       // expired so we read and discard
       std::string key;
       uint32_t n = 0;
-      cursor_read_str(c, &key);
-      cursor_read_u32(c, &n);
+      if (!cursor_read_str(c, &key) || !cursor_read_u32(c, &n)){ return false; }
       for (uint32_t i = 0; i < n; ++i){
         std::string tmp;
-        cursor_read_str(c, &tmp);
+        if (!cursor_read_str(c, &tmp)){ return false; }
       }
       return true;
-     }
+    }
   }
 
   std::string key;
@@ -696,6 +701,15 @@ static bool rdb_load_set_entry(RDBCursor *c){
   for (uint32_t i = 0; i < n; ++i){
     std::string m;
     if (!cursor_read_str(c, &m)){ return false; }
+    if (expire_at <= get_wall_msec()){
+      std::string key; uint32_t n = 0;
+      if (!cursor_read_str(c, &key) || !cursor_read_u32(c, &n)){ return false; }
+      for (uint32_t i = 0; i < n; ++i){
+        std::string m;
+        if (!cursor_read_str(c, &m)){ return false; }
+      }
+      return true;
+    }
     set_add(&entry_set(ent), m);
   }
   hm_insert(&g_data.db, &ent->node);
@@ -775,9 +789,18 @@ bool rdb_load_buffer(const uint8_t *data, size_t size){
   size_t payload_size = content_size - 14;
 
   if (compressed){
+    if (payload_size < 4){
+      fprintf(stderr, "rdb_load: truncated compressed header\n");
+      return false;
+    }
     // read uncompressed size
     uint32_t usize = 0;
     memcpy(&usize, payload, 4);
+    // zlib max expansion is ~1032:1 - anything beyond is a corrupt length field
+    if ((uint64_t)usize > (uint64_t)(payload_size - 4) * 1032 + 4096){
+      fprintf(stderr, "rdb_load: implausible uncompressed size %u\n", usize);
+      return false;
+    }
     uint8_t *dec = rdb_decompress(payload + 4, payload_size - 4, usize);
     if (!dec){ return false; }
     bool ok = rdb_parse_entries(dec, usize, n_entries);
@@ -905,7 +928,6 @@ static void rdb_write_snapshot(const Buffer *buf, const char *filename){
 void rdb_save_background(){
   // dont start a fork is one is running
   if (g_rdb_child_pid != -1){
-    g_data.g_dirty_at_save = g_data.g_writes_since_save;
     fprintf(stderr, "rdb_save_background: save already in progress (pid=%d)\n", g_rdb_child_pid);
     return;
   }
@@ -914,12 +936,14 @@ void rdb_save_background(){
   Buffer buf = buf_create(64 * 1024);
   RDBStats stats = {};
   rdb_serialize(&buf, &stats);
+  g_data.g_dirty_at_save = g_data.g_writes_since_save;
 
   // Fork. chiled inherits the fully_built buffers as a COW copy
   pid_t pid = fork();
   if (pid < 0){
     fprintf(stderr, "rdb_save_background: fork failed: %s\n", strerror(errno));
     buf_destroy(&buf);
+    g_data.g_dirty_at_save = 0;
     return;
   }
 
