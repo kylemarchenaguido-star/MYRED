@@ -302,6 +302,7 @@ static void do_getset(std::vector<std::string> &cmd, Buffer *out){
       std::string old = std::move(entry_str(ent)); // extract the old value
       entry_str(ent).swap(cmd[2]); // set the new value
       entry_set_ttl(ent, -1);
+      mem_reaccount(ent);
       g_data.g_writes_since_save++;
       return resp_str(out, old.data(), old.size());
     }
@@ -863,15 +864,26 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out){
 
   // add or update the tuple
   int64_t added = 0;
+  bool changed = false;
+  ZSet *zs = &entry_zset(ent);
   for (size_t i = 2; i + 1 < cmd.size(); i += 2){
     double score;
     str2dbl(cmd[i], score);
-    if (zset_insert(&entry_zset(ent), cmd[i + 1].data(), cmd[i + 1].size(), score)){
+    if (ZNode *zn = zset_lookup(zs, cmd[i + 1].data(), cmd[i + 1].size())){
+      if (zn->score != score){
+        zset_update(zs, zn, score);
+        changed = true;
+      }
+    } else {
+      zset_insert(zs, cmd[i + 1].data(), cmd[i + 1].size(), score);
       ++added;
+      changed = true;
     }
   }
-  mem_reaccount(ent);
-  g_data.g_writes_since_save++;
+  if (changed){
+    mem_reaccount(ent);
+    g_data.g_writes_since_save++;
+  }
   return resp_int(out, added);
 }
 
@@ -1510,7 +1522,7 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
     case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
-    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::MISSING:   return resp_err(out, "ERR no such key");
     case Lookup::OK:        break;
   }
 
@@ -1681,7 +1693,7 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
   switch (lookup_entry(cmd[1], T_DLIST, false, &ent)){
     case Lookup::WRONGTYPE: return resp_err(out, "WRONGTYPE wrong type");
-    case Lookup::MISSING:   return resp_int(out, 0);
+    case Lookup::MISSING:   return resp_ok(out);
     case Lookup::OK:        break;
   }
 
@@ -1834,6 +1846,7 @@ static void cb_scan(HNode *node, void *arg){
 static void do_scan(std::vector<std::string> &cmd, Buffer *out){
   int64_t cursor = 0;
   if (!str2int(cmd[1], cursor)) { return resp_err(out, "ERR invalid cursor"); }
+  if (cursor < 0){ return resp_err(out, "ERR invalid cursor"); }
 
   size_t count = 10;
   const std::string *pattern = nullptr;
@@ -2066,6 +2079,7 @@ static void do_hscan(std::vector<std::string> &cmd, Buffer *out){
 
   int64_t cursor = 0;
   if (!str2int(cmd[2], cursor)){ return resp_err(out, "ERR invalid cursor"); }
+  if (cursor < 0){ return resp_err(out, "ERR invalid cursor"); }
 
   size_t count = 10;
   const std::string *pattern = nullptr;
@@ -2373,8 +2387,10 @@ static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
   for (size_t i = 2; i < cmd.size(); ++i){
     if (set_add(&entry_set(ent), cmd[i])){ ++added;}
   }
-  mem_reaccount(ent);
-  g_data.g_writes_since_save++;
+  if (added > 0){
+    mem_reaccount(ent);
+    g_data.g_writes_since_save++;  
+  }
   return resp_int(out, added);
 }
 
@@ -2469,9 +2485,8 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     set_remove(&entry_set(ent), picked);
   } else {
     int64_t count = 0;
-    if (!str2int(cmd[2], count) || count < 0){
-      return resp_arr(out, 0);
-    }
+    if (!str2int(cmd[2], count)){ return resp_err(out, MSG_NOT_INT); }
+    if (count < 0){ return resp_err(out, "ERR value is out of range, must be positive"); }
     if (count == 0){ return resp_arr(out, 0); }
     // partial Fisher-Yates: shuffle the first 'n' slots
     size_t n = ((size_t)count < members.size()) ? (size_t)count : members.size();
@@ -2559,6 +2574,7 @@ static void do_sscan(std::vector<std::string> &cmd, Buffer *out){
 
   int64_t cursor = 0;
   if (!str2int(cmd[2], cursor)){ return resp_err(out, "ERR invalid cursor"); }
+  if (cursor < 0){ return resp_err(out, "ERR invalid cursor"); }
 
   size_t count = 10;
   const std::string *pattern = nullptr;
@@ -2616,37 +2632,45 @@ static void do_sdiff(std::vector<std::string> &cmd, Buffer *out){
   for (auto &m : result){ resp_str(out, m.data(), m.size()); }
 }
 
+// helper for store handlers
+static void set_store_result(const std::string &dkey, std::vector<std::string> &result, Buffer *out){
+  if (result.empty()){
+    LookupKey lk; lk.key = dkey;
+    lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
+    if (HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq)){
+      Entry *old = container_of(node, &Entry::node);
+      hm_delete(&g_data.db, &old->node, &hnode_same);
+      entry_del(old);
+      g_data.g_writes_since_save++;
+    }
+    return resp_int(out, 0);
+  }
+  Entry *dest = set_make_dest(dkey);
+  for (auto &m : result){ set_add(&entry_set(dest), m); }
+  mem_reaccount(dest);
+  g_data.g_writes_since_save++;
+  resp_int(out, (int64_t)hm_size(&entry_set(dest)));
+}
+
 // SINTERSTORE dest key [key...] -- compute first, then store, so dest can be a source
 static void do_sinterstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sinter_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
-  Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&entry_set(dest), m); }
-  mem_reaccount(dest);
-  g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
+  set_store_result(cmd[1], result, out);
 }
 
 // SUNIONSTORE dest key [key...] -- compute first, then store, so dest can be a source
 static void do_sunionstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sunion_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
-  Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&entry_set(dest), m); }
-  mem_reaccount(dest);
-  g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
+  set_store_result(cmd[1], result, out);
 }
 
 // SDIFFSTORE dest key [key...] -- compute first, then store, so dest can be a source
 static void do_sdiffstore(std::vector<std::string> &cmd, Buffer *out){
   std::vector<std::string> result;
   if (!sdiff_impl(cmd, 2, result)){ return resp_err(out, "WRONGTYPE wrong type"); }
-  Entry *dest = set_make_dest(cmd[1]);
-  for (auto &m : result){ set_add(&entry_set(dest), m); }
-  mem_reaccount(dest);
-  g_data.g_writes_since_save++;
-  return resp_int(out, (int64_t)hm_size(&entry_set(dest)));
+  set_store_result(cmd[1], result, out);
 }
 
 // SMOVE src dst member

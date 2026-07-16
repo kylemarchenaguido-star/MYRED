@@ -399,10 +399,22 @@ bool config_load_file(const char *path){
 
 // serialize live config back
 bool config_rewrite(const char * path){
-  FILE *fp = fopen(path ,"w");
+  std::string tmp = std::string(path) + ".tmp";
+  FILE *fp = fopen(tmp.c_str() ,"w");
   if (!fp){ return false; }
   fprintf(fp, "port %d\n", g_config.port);
-    if (!g_config.password.empty()){
+  if (!g_config.binds.empty()){
+    fprintf(fp, "bind");
+    for (const std::string &b : g_config.binds){ fprintf(fp, " %s", b.c_str()); }
+    fprintf(fp, "\n");
+  }
+  fprintf(fp, "protected-mode %s\n", g_config.protected_mode ? "yes" : "no");
+  for (const auto &a : g_config.allowlist){
+    struct in_addr ia;
+    ia.s_addr = htonl(a.first);
+    fprintf(fp, "allow-ip %s/%d\n", inet_ntoa(ia), __builtin_popcount(a.second));
+  }
+  if (!g_config.password.empty()){
     if (g_config.password.rfind("$argon2id$", 0) == 0){
       fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
     } else {
@@ -420,6 +432,10 @@ bool config_rewrite(const char * path){
   for (const SaveCondition &s : g_config.save_conditions){
     fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
   }
+
+  fprintf(fp, "auto-aof-rewrite-percentage %d\n", g_config.aof_rewrite_perc);
+  fprintf(fp, "auto-aof-rewrite-min-size %zu\n", g_config.aof_rewrite_min_size);
+
   // ACL users - skip 'default': it is rebuilt from requirepass + acl_bootstrap_default() at boot
   for (const auto &kv : g_config.users){
     if (kv.first == "default"){ continue; }
@@ -433,7 +449,14 @@ bool config_rewrite(const char * path){
   }
 
   if (!g_config.auditlog_path.empty()){ fprintf(fp, "auditlog \"%s\"\n", g_config.auditlog_path.c_str()); }
+
+  if (fflush(fp) != 0 || fsync(fileno(fp)) != 0){
+    fclose(fp);
+    unlink(tmp.c_str());
+    return false;
+  }
   fclose(fp);
+  if (rename(tmp.c_str(), path) != 0){ unlink(tmp.c_str()); return false; }
   return true;
 }
 

@@ -69,7 +69,7 @@ static void tree_insert(ZSet *zset, ZNode *node){
     zset->root = avl_fix(&node->tree);
 }
 // Update the score of a node by re-inserting the tree
-static void zset_update(ZSet *zset, ZNode *node, double score) {
+void zset_update(ZSet *zset, ZNode *node, double score) {
     if (node->score== score) {
         return;
     }

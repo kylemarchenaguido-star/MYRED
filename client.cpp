@@ -1,4 +1,3 @@
-// ── client.cpp ────────────────────────────────────────────────────
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <climits>
 
 static int g_fd = -1;
 
@@ -55,6 +55,16 @@ static std::string read_line(int fd) {
     return line;
 }
 
+
+static bool parse_reply_int(const std::string &s, int *out){
+  char *end = nullptr;
+  errno = 0;
+  long v = strtol(s.c_str(), &end, 10);
+  if (errno == ERANGE || end == s.c_str() || *end != '\0' || v > INT_MAX || v < INT_MIN){ return false; }
+  *out = (int)v;
+  return true;
+}
+
 static std::string read_response(int fd) {
     std::string line = read_line(fd);
     if (line.empty()) return "(error) empty response";
@@ -73,10 +83,10 @@ static std::string read_response(int fd) {
         return "(integer) " + data;
 
     case '$': {
-        int len = std::stoi(data);
+        int len = 0;
+        if (!parse_reply_int(data, &len)) return "(error) malformed bulk length";
         if (len < 0) return "(nil)";
         std::string val(len, '\0');
-        // read exactly len bytes
         size_t got = 0;
         while ((int)got < len) {
             int n = read(fd, &val[got], len - (int)got);
@@ -88,7 +98,8 @@ static std::string read_response(int fd) {
     }
 
     case '*': {
-        int count = std::stoi(data);
+        int count = 0;
+        if (!parse_reply_int(data, &count)) return "(error) malformed array length";
         if (count < 0) return "(nil)";
         std::string result;
         for (int i = 0; i < count; i++) {

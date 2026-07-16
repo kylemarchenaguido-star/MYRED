@@ -88,15 +88,12 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 
 #### 🟠 Bugs
 
-- [ ] **N6 — `GETSET` no reaccount** — TTL-discard half FIXED 2026-07-13; **still
-  missing `mem_reaccount(ent);` after the swap in the overwrite path**
-  (`do_getset`) → `used_memory` drift remains until that one line lands.
+- [x] **N6 — `GETSET` no reaccount + kept TTL.** FIXED 2026-07-13: overwrite path
+  now discards the TTL and reaccounts (verified in tree).
 - [x] **N7 — `SET` keeps TTL on overwrite.** FIXED 2026-07-13: `entry_set_ttl(ent, -1)`
   on the `do_set` overwrite path; SETNX/SETEX verified already correct.
-- [ ] **`ZREM`/`ZPOPMIN` reaccount + empty-key drop** — `do_zrem` FIXED 2026-07-13
-  (reaccount + empty drop); **`do_zpopmin` still misses the survivors case**: move
-  `mem_reaccount(ent)` from the no-op `else` into an `else` of the emptied-check
-  inside `if (!popped.empty())`.
+- [x] **`ZREM`/`ZPOPMIN` reaccount + empty-key drop.** FIXED 2026-07-13: both drop
+  the emptied key and reaccount survivors.
 - [x] **`GETEX` TTL changes not dirty-counted + EXAT overflow.** FIXED 2026-07-13:
   `entry_has_ttl`-guarded PERSIST bump, dirty bump on the future path, `INT64_MAX/1000`
   guards on EX/EXAT, negative EXAT short-circuits to the delete path.
@@ -115,10 +112,8 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
   still skips emitting `default` — folded into the rewrite-coverage item below.
 - [x] **N13 — directive spelling.** FIXED 2026-07-13: hyphenated
   `auto-aof-rewrite-*` accepted (`state.cpp:286,297`), old spellings kept as aliases.
-- [x] **`parse_cidr` validates the wrong variable** — HALF-APPLIED 2026-07-13: the
-  check is now `if (bits < 0 || parsed > 32)` — `/33` is rejected (verified live) but
-  the left side still tests the constant `bits`, so **`/-1` still reaches the shift
-  (UB)**. Change `bits < 0` → `parsed < 0`.
+- [x] **`parse_cidr` validates the wrong variable.** FIXED 2026-07-13:
+  `parsed < 0 || parsed > 32` verified in tree; `/33` and `/-1` both rejected.
 - [x] **`SAVE`/shutdown hardcode `dump.rdb` + double-complete.** FIXED 2026-07-13:
   both route through `g_config.dump_path`; `do_save`'s duplicate
   `rdb_on_save_complete` call removed (`rdb_save` owns it).
@@ -141,33 +136,36 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 - [x] **N14 — `next_timer_ms` return overflow.** FIXED 2026-07-13: the return is
   clamped — `wait > INT32_MAX` returns `INT32_MAX` (`server.cpp:252-254`). Previously
   a timer >24.8 days out (far-future TTL) cast negative and `poll()` blocked forever.
-- [ ] **N15 — idle/io timer split is dead code** (poll loop vs `conn_set_timer`):
-  `timer_type` stays stale (`IO`); wrong timeout class the moment the two constants
-  diverge.
-- [ ] **N16 — `kek1234` fallback password** (`server.cpp:544`): a publicly-known
-  default credential that also defeats protected mode (password exists → loopback-only
-  refusal never engages). Safer default: no password + protected mode.
-- [ ] **N17 — RDB set-load failure leaks the partial entry**; expired-skip paths ignore
-  cursor-read failures (`rdb.cpp:696-699`, per 2026-07-09 — not re-verified).
-- [ ] **N18 — `Buffer` zero-capacity growth loop** (`buffer.cpp:35-37`): `new_cap = 0*2`
-  never terminates; latent. Floor growth at `max(old_cap*2, 64)`.
-- [ ] **Loose `atoi` config/env parsing** (`state.cpp:187,244,283`, env in server.cpp):
-  `123abc` accepted silently. Shared strict int/bool parsers for file config, env, and
-  `CONFIG SET`.
-- [ ] **`config_rewrite` drops directives** (`state.cpp:368+`): still missing `bind`,
-  `protected-mode`, `allow-ip`, auto-AOF-rewrite and LFU knobs (users, rename-command,
-  auditlog now covered). Related hardening (V9.6 review): rewrite is full-regeneration
-  — write atomically (tmp+rename) and add a config round-trip regression test.
-- [ ] **`SADD`/`ZADD` no-op writes dirty the AOF** (`commands.cpp:2362-2363` for SADD;
-  ZADD same shape): `g_writes_since_save` bumps even when nothing changed.
-- [ ] **`S*STORE` empty result leaves an empty destination** (`set_make_dest`,
-  `commands.cpp:2266`, always creates): Redis deletes the destination.
-- [ ] **N19 — reply-semantics divergences** (`LSET` missing key → `:0` vs `-ERR no such
-  key`; `LTRIM` → `:0` vs `+OK`; `SPOP k <non-int>` → empty array vs error; negative
-  `SCAN` cursors accepted) — per 2026-07-09, not re-verified.
-- [ ] **N20 — client.cpp `std::stoi` throws on malformed replies** (dev tool only).
-- [ ] **AOF-load-failure policy** (server.cpp startup): logs the failure and serves
-  whatever partial state loaded; decide fail-fast vs documented best-effort.
+- [x] **N15 — idle/io timer split is dead code.** FIXED 2026-07-13: poll loop routes
+  through `conn_set_timer(conn, conn->timer_type)`; `handle_write` sets IDLE when the
+  reply drains. Classes are now real: accept→IO, reply→IDLE, read→IO.
+- [x] **N16 — `kek1234` fallback password.** FIXED 2026-07-13: fallback deleted; no
+  password = nopass default user + protected-mode loopback-only (Redis posture).
+- [x] **N17 — RDB loader leaks + blind expired-skips.** FIXED 2026-07-13: set loader
+  frees the partial entry; all five loaders' skip paths check every cursor read.
+- [x] **N18 — `Buffer` zero-capacity growth loop.** FIXED 2026-07-13:
+  `new_cap = old_cap ? old_cap * 2 : 64`.
+- [x] **Loose `atoi` config/env parsing.** FIXED 2026-07-13: `parse_int_strict` /
+  `parse_bool_strict` shared by config directives (port, samples, aof knobs,
+  appendonly, protected-mode) and env overrides.
+- [x] **`config_rewrite` drops directives + non-atomic.** FIXED 2026-07-13: emits
+  bind/protected-mode/allow-ip/auto-aof knobs; atomic tmp+fsync+rename. LFU knobs
+  deferred (no load directives exist yet). `default` user still skipped (see N12
+  note). Tmp-suffix space typo fixed same day.
+- [x] **`SADD`/`ZADD` no-op writes dirty the AOF.** FIXED 2026-07-13: SADD gates on
+  `added > 0`; ZADD tracks `changed` incl. score updates (`zset_update` exported).
+- [x] **`S*STORE` empty result leaves an empty destination.** FIXED 2026-07-13:
+  shared `set_store_result()` deletes the destination on an empty result (dirty-bumps
+  only when a pre-existing dest was removed); three handlers deduped through it.
+- [x] **N19 — reply-semantics divergences.** FIXED 2026-07-13 (all four re-verified
+  live first): `LSET` missing → `ERR no such key`; `LTRIM` missing → `OK`;
+  `SPOP` non-int/negative count → error; `SCAN`/`HSCAN`/`SSCAN` reject negative
+  cursors.
+- [x] **N20 — client.cpp `std::stoi` throws.** FIXED 2026-07-13: `parse_reply_int`
+  (strtol, whole-string, range-checked) at both `$`/`*` header sites.
+- [x] **AOF-load-failure policy.** DECIDED + FIXED 2026-07-13: fail-fast —
+  `fatal_exit` on `aof_load` failure (unreadable file or replay divergence via the N1
+  error counter); operator repair path is `--check-aof --fix`.
 - [x] **`die()` vs `fatal_exit()` split.** FIXED 2026-07-13: `fatal_exit` (print +
   `exit(1)`, with `strerror`) at the five operational sites; `panic` (print +
   `abort()`) kept only for the mid-run `poll()` failure. Verified live: bad config
@@ -182,16 +180,63 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
 
 #### 🔵 Performance / ⚪ polish (fix only after everything above is green)
 
-- [ ] Eviction deletes up to 100 victims synchronously in the write path.
-- [ ] `SUNION` sort-dedupe; `SPOP`/`SRANDMEMBER` collect the full set; set-algebra
-  store commands double-copy.
-- [ ] `INFO` does an O(N) keyspace scan per call.
-- [ ] `entry_mem_usage` full walk on every `mem_reaccount`.
-- [ ] `hash_set(const std::string value)` copies on both paths.
-- [ ] `str_hash` computes 32-bit FNV into a `uint64_t` (upper half always zero).
-- [ ] `mem_selfcheck` runs before the handler, blaming the wrong command.
-- [ ] `rdb.cpp:829-831` comment contradicts the (correct) old-format rejection;
-  `state.h` comment/typo nits (`failed_attemps`, "5s -> 5000ms" over 30 s).
+##### Easy — single line, single file, no design tradeoff
+
+- [ ] **`hash_set` copies on both paths** (`hash.cpp:6-22`): the update-existing branch
+  (line 12) does `->value = value;`, copying the by-value parameter into the member
+  instead of moving it; the new-field branch (line 18) already does `std::move`
+  correctly. Fix: `->value = std::move(value);`.
+- [ ] **`str_hash` upper 32 bits always zero** (`common.h:21-27`): the hash is computed
+  in a `uint32_t h` and returned widened to `uint64_t`, so only 32 bits of entropy ever
+  feed `HTab`'s `hcode & mask` bucket selection. Fix properly: switch to a real 64-bit
+  FNV-1a (different offset-basis/prime constants) — widening the return type alone
+  doesn't add entropy that was never computed.
+- [ ] **`mem_selfcheck` blames the wrong command** (`commands.cpp:3487`): the call runs
+  *before* the handler executes (`do_request`), so a detected drift gets attributed to
+  the command about to run rather than the one that actually caused it. Fix: move the
+  call to after the handler runs. Debug-only build (`#ifndef NDEBUG`), zero release
+  impact either way.
+
+##### Needs a decision first — small diff, but changes a guarantee
+
+- [ ] **`entry_mem_usage` full walk on every `mem_reaccount`** (`state.cpp:579-584`):
+  the sampled variant already exists (`entry_mem_usage_sampled`, `state.cpp:545-574`,
+  currently only used by `OBJECT MEMORY`/similar one-off queries) and swapping it in is
+  textually a one-line change — but `mem_reaccount`'s own comment documents an
+  exactness invariant (`used_memory >= ent->mem`, kept safe via
+  add-new-before-subtract-old ordering). Sampling makes `used_memory` approximate
+  instead of exact, and sampling error compounds across repeated mutations of the same
+  entry. Decide the acceptable sample count/drift deliberately before swapping it in —
+  don't treat this as a drive-by fix.
+
+##### Harder — multi-file, or a real design task
+
+- [ ] **`SPOP`/`SRANDMEMBER` full materialization** (`commands.cpp:2467-2528`): both
+  walk the *entire* set into a `std::vector` via `hm_foreach` just to pick 1 or k
+  random members — O(n) time and memory for what should often be O(1)/O(k). A real fix
+  needs reservoir sampling during the bucket walk, or — more realistically — is the
+  same work as the already-planned Compact Encodings backlog item (intset/listpack
+  with O(1) random access), not a standalone task.
+- [ ] **Set-algebra store commands double-copy** (`set_store_result`,
+  `commands.cpp:2636-2653`): builds a `result` vector from the union/inter/diff
+  computation, then `set_add`s each member into the destination set. `set_add` takes
+  `const std::string &member` (`set.h:13`), so it can never move even from an rvalue —
+  every store double-copies. Fix requires changing `set_add`'s signature in
+  `set.h`/`set.cpp` and auditing every call site (`do_sadd`, RDB/AOF replay) so none of
+  them regress.
+- [ ] **Eviction deletes up to 100 victims synchronously** (`free_memory_if_needed`,
+  `commands.cpp:2952-2966`): already deliberately bounded (`attempts = 100`, own
+  comment: "bounded, we don't stall the loop") — not unbounded or dangerous today.
+  Making it truly incremental across event-loop ticks (mirroring the HMap
+  progressive-rehash pattern from N2) means carrying eviction state across calls and
+  deciding what the triggering write command does in the meantime — a real design
+  task, not a quick patch.
+- [ ] **`INFO` O(N) keyspace scan** (`get_keys_stats`, `commands.cpp:690`): walks every
+  key via `hm_foreach` on every `INFO` call. Fix means maintaining running
+  `keys_with_ttl`/`keys_no_ttl` counters incremented/decremented at every site that
+  sets/clears a TTL or expires/deletes a key (`entry_set_ttl`, `expire_if_needed`,
+  every delete path) — conceptually simple per site, but those sites are scattered
+  across the whole command surface, so the change is broad rather than deep.
 
 #### Testing debt (from ROADMAP Testing Gaps — closes with the batches above)
 
@@ -229,6 +274,15 @@ enforcement (blocked on V8); `nopass`, selectors, `sanitize-payload`, `ACL LOAD`
 ## Resolved Bugs Archive
 
 This section records fixed bugs without scattering them through milestone text.
+
+### V9.6.4 Bug Sweep — 2026-07-13
+
+The entire consolidated worklist above (every 🔴, 🟠, and 🟡 item) was fixed and
+verified in a single sweep on 2026-07-13; each `[x]` entry in section B carries its
+own cause/fix/evidence, so they are not duplicated here. Highlights with dedicated
+archive entries below: N1 (AOF replay data loss), N2 (`migrate_pos`), the
+`next_timer_ms` triple (N3/N14/N21). Still open after the sweep: the 🔵/⚪
+performance-and-polish list and the Testing-debt items.
 
 ### Persistence and AOF
 

@@ -588,8 +588,9 @@ int main(int argc, char **argv){
       fprintf(stderr, "startup: AOF and RDB both present -> loading AOF, ignording RDB\n");
     }
     if (!aof_load(g_config.aof_path.c_str())){
-      fprintf(stderr, "startup: AOF load failed\n");
-    }
+      fatal_exit("AOF load failed - refusing to serve partial data "
+                 "(inspect/repair with: ./build/server --check-aof --fix)");
+     }
   } else if (rdb_exists){
     if (!rdb_load(g_config.dump_path.c_str())){
       fprintf(stderr, "startup: RDB load failed, starting empty\n");

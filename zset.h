@@ -28,3 +28,4 @@ ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len);
 void zset_clear(ZSet *zset);
 ZNode *znode_offset(ZNode *node, int64_t offset);
 int64_t avl_rank(AVLNode *node);
+void zset_update(ZSet *zset, ZNode *node, double score);
