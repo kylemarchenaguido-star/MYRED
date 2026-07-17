@@ -10,7 +10,7 @@ struct SetNode{
 };
 
 // true if new member
-bool set_add(HMap *h, const std::string &member);
+bool set_add(HMap *h, std::string member);
 bool set_is_member(HMap *h, const std::string &member);
 // true if remove
 bool set_remove(HMap *h, const std::string &member);

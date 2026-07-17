@@ -700,17 +700,8 @@ static bool rdb_load_set_entry(RDBCursor *c){
   ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
   for (uint32_t i = 0; i < n; ++i){
     std::string m;
-    if (!cursor_read_str(c, &m)){ return false; }
-    if (expire_at <= get_wall_msec()){
-      std::string key; uint32_t n = 0;
-      if (!cursor_read_str(c, &key) || !cursor_read_u32(c, &n)){ return false; }
-      for (uint32_t i = 0; i < n; ++i){
-        std::string m;
-        if (!cursor_read_str(c, &m)){ return false; }
-      }
-      return true;
-    }
-    set_add(&entry_set(ent), m);
+    if (!cursor_read_str(c, &m)){ entry_del(ent); return false; }
+    set_add(&entry_set(ent), std::move(m));
   }
   hm_insert(&g_data.db, &ent->node);
   if (has_ttl){

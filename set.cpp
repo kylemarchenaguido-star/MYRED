@@ -4,14 +4,14 @@
 #include <vector>
 
 // True if a set is added
-bool set_add(HMap *h, const std::string &member){
+bool set_add(HMap *h, std::string member){
     StringKey key;
     sk_init(&key, member);
 
     if (hm_lookup(h, &key.node, &str_node_eq<SetNode, &SetNode::member>)){ return false; }
 
     SetNode *sn = new SetNode();
-    sn->member = member;
+    sn->member = std::move(member);
     sn->node.hcode = key.node.hcode;
     hm_insert(h, &sn->node);
     return true;

@@ -2360,7 +2360,7 @@ static void do_sadd(std::vector<std::string> &cmd, Buffer *out){
   }
   int64_t added = 0;
   for (size_t i = 2; i < cmd.size(); ++i){
-    if (set_add(&entry_set(ent), cmd[i])){ ++added;}
+    if (set_add(&entry_set(ent), std::move(cmd[i]))){ ++added;}
   }
   if (added > 0){
     mem_reaccount(ent);
@@ -2438,6 +2438,9 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
   hm_foreach(&entry_set(ent), cb_members_emit, out);
 }
 
+// forward declaration just for this function
+static void aof_feed(const std::vector<std::string> &cmd);
+
 // SPOP key [count]
 static void do_spop(std::vector<std::string> &cmd, Buffer *out){
   Entry *ent;
@@ -2451,11 +2454,16 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
   }
 
+  bool feed = g_config.aof_enable && !g_data.g_loading;
+  std::vector<std::string> synth;
+  if (feed){ synth = { "srem", cmd[1] }; }
+
   if (cmd.size() == 2){
     // single pop
     SetNode *sn = container_of(hm_random(set), &SetNode::node);
     resp_str(out, sn->member.data(), sn->member.size());
     hm_delete(set, &sn->node, &hnode_same);
+    if (feed){ synth.push_back(std::move(sn->member)); }
     delete sn;
   } else {
     int64_t count = 0;
@@ -2469,9 +2477,11 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
       SetNode *sn = container_of(hm_random(set), &SetNode::node);
       resp_str(out, sn->member.data(), sn->member.size());
       hm_delete(set, &sn->node, &hnode_same);
+      if (feed){ synth.push_back(std::move(sn->member)); }
       delete sn;
     }
   }
+  if (feed){ aof_feed(synth); }
   if (hm_size(&entry_set(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
@@ -2621,7 +2631,7 @@ static void set_store_result(const std::string &dkey, std::vector<std::string> &
     return resp_int(out, 0);
   }
   Entry *dest = set_make_dest(dkey);
-  for (auto &m : result){ set_add(&entry_set(dest), m); }
+  for (auto &m : result){ set_add(&entry_set(dest), std::move(m)); }
   mem_reaccount(dest);
   g_data.g_writes_since_save++;
   resp_int(out, (int64_t)hm_size(&entry_set(dest)));
@@ -2680,7 +2690,7 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out){
     dst_ent->node.hcode = str_hash((const uint8_t *)dst_ent->key.data(), dst_ent->key.size());
     hm_insert(&g_data.db, &dst_ent->node);
   }
-  set_add(&entry_set(dst_ent), cmd[3]);
+  set_add(&entry_set(dst_ent), std::move(cmd[3]));
   mem_reaccount(dst_ent);
   g_data.g_writes_since_save++;
   return resp_int(out, 1);
@@ -2973,6 +2983,7 @@ struct CmdSpec {
   int max_args;
   bool is_write = false;
   bool aof_rewrite = false; // can't be logged verbatim- needs TTL translation
+  bool aof_self = false; // non deterministic: handler feeds a deterministic form itself
   uint64_t acl_cats = 0; // filled by acl_init_categories() at boot
   KeySpec keys = KeySpec::FIRST;
   KeyResolver key_resolver = nullptr; // when set overrides keys for extraction
@@ -3315,7 +3326,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"smismember",   {do_smismember,    3, -1}},
   {"scard",        {do_scard,         2,  2}},
   {"smembers",     {do_smembers,      2,  2}},
-  {"spop",         {do_spop,          2,  3, true}},
+  {"spop",         {do_spop,          2,  3, true, false, true}},
   {"srandmember",  {do_srandmember,   2,  3}},
   {"sscan",        {do_sscan,         3, -1}},
   {"sinter",       {do_sinter,        2, -1}},
@@ -3470,7 +3481,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   uint32_t dirty_before = g_data.g_writes_since_save;
 
   // Snapshot before running swap() handlers/ consume cmd's
-  bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading;
+  bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
   std::vector<std::string> snapshot;
   if (may_log && (spec.aof_rewrite || renamed)){ snapshot  = cmd; }

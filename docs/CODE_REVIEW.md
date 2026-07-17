@@ -197,13 +197,16 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
   SRANDMEMBER positive count uses pop-and-reinsert for distinct sampling, negative
   count k independent draws. Follow-up: SPOP AOF replay nondeterminism filed in
   ROADMAP Known Bugs 2026-07-16.
-- [ ] **Set-algebra store commands double-copy** (`set_store_result`,
-  `commands.cpp:2636-2653`): builds a `result` vector from the union/inter/diff
-  computation, then `set_add`s each member into the destination set. `set_add` takes
-  `const std::string &member` (`set.h:13`), so it can never move even from an rvalue —
-  every store double-copies. Fix requires changing `set_add`'s signature in
-  `set.h`/`set.cpp` and auditing every call site (`do_sadd`, RDB/AOF replay) so none of
-  them regress.
+- [x] **SPOP AOF replay nondeterminism** (follow-up to the item above). FIXED
+  2026-07-16: new `CmdSpec::aof_self` flag (dispatcher skips verbatim logging);
+  `do_spop` feeds a synthetic deterministic `SREM key member...` of the
+  actually-popped members via `aof_feed` — same mechanism as eviction's synthetic
+  DEL. Replay-equivalent because `do_srem` drops emptied keys.
+- [x] **Set-algebra store commands double-copy.** FIXED 2026-07-16: `set_add` takes
+  `std::string` by value + `std::move` (same idiom as `hash_set`); all four call
+  sites move (`do_sadd`, `set_store_result`, `do_smove`, RDB set loader). Bonus: the
+  call-site audit surfaced the 🔴 `rdb_load_set_entry` non-TTL data-loss bug (see
+  ROADMAP Known Bugs, also fixed 2026-07-16).
 - [ ] **Eviction deletes up to 100 victims synchronously** (`free_memory_if_needed`,
   `commands.cpp:2952-2966`): already deliberately bounded (`attempts = 100`, own
   comment: "bounded, we don't stall the loop") — not unbounded or dangerous today.

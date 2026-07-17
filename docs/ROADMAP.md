@@ -361,7 +361,22 @@ get filed here first, then folded into that audit.
 Feature gaps that were listed here (missing features, not defects) moved to Backlog →
 "ACL and Command-Surface Feature Gaps".
 
-- **SPOP is nondeterministic but AOF-logged verbatim** (filed 2026-07-16, found while
+- **`rdb_load_set_entry` destroys every non-TTL set on load** 🔴 — FIXED 2026-07-16
+  (inner garbled skip block deleted, `entry_del` on member-read failure; `-Wshadow`
+  warnings gone, build warning-free again). Original filing follows. (filed
+  2026-07-16, found while auditing `set_add` call sites): the
+  correct expired-set skip exists at `rdb.cpp:679-686`, but a garbled duplicate of it
+  sits *inside* the member loop (`rdb.cpp:704-712`). When `has_ttl == 0`, `expire_at`
+  stays 0 so `expire_at <= get_wall_msec()` is always true: after the first member it
+  misreads the next member as a key, misreads raw bytes as a count, desyncs the
+  cursor, returns early, and leaks `ent` — the set is lost and every entry after it
+  in the RDB file is corrupted. The `-Wshadow` warnings at `rdb.cpp:701-708` point at
+  exactly this block. Fix: delete the inner block; also `entry_del(ent)` before the
+  `return false` on member-read failure (matches the hash loader).
+
+- **SPOP is nondeterministic but AOF-logged verbatim** — FIXED 2026-07-16:
+  `CmdSpec::aof_self` flag + `do_spop` feeds synthetic `SREM` of popped members via
+  `aof_feed`. Original filing follows. (filed 2026-07-16, found while
   reworking SPOP sampling): `k_cmd_table` logs SPOP raw, so AOF replay re-runs the
   random pick and removes *different* members than the original run — silent state
   divergence that the replay error counter cannot detect (the replayed command
