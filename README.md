@@ -24,9 +24,18 @@ than using the STL containers.
 - **Key expiry (TTL):** `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`, active + lazy expiration
 - **Persistence:** custom RDB snapshots plus append-only-file (AOF) replay, hybrid AOF rewrite, and CRC32-protected RDB payloads
 - **`fork()`-based background work:** `BGSAVE` and `BGREWRITEAOF` keep the parent serving clients
-- **Authentication and ACLs:** `AUTH`, named users, command/category rules, and key-pattern checks
-- **Runtime configuration:** config file, selected environment overrides, and `CONFIG GET`/`CONFIG SET`
-- **Memory management:** approximate memory accounting, `maxmemory` policies, eviction stats, `MEMORY`, and `OBJECT`
+- **Authentication and ACLs:** `AUTH`, named users, command/category rules, and
+  key-pattern checks; passwords stored as **Argon2id** (legacy SHA-256 still
+  verifies), with verification offloaded to a thread pool so the event loop never
+  blocks on a hash
+- **Security hardening:** protected mode, multi-address `bind` + IP allowlist,
+  audit log, `rename-command`/disable, control-plane category gating
+- **Runtime configuration:** config file, selected environment overrides,
+  `CONFIG GET`/`CONFIG SET`, and `CONFIG REWRITE`
+- **Memory management:** approximate memory accounting, `maxmemory` policies with
+  **incremental eviction** (bounded batches continued across event-loop ticks —
+  Redis `EVICT_RUNNING` semantics, so an overshoot never spuriously OOMs writes),
+  eviction stats, `MEMORY`, and `OBJECT`
 - **Cursor iteration** — non-blocking `SCAN`/`HSCAN`/`SSCAN` with `MATCH`/`COUNT` (glob patterns)
 - **Generic keyspace commands** — `DBSIZE`, `RANDOMKEY`, `RENAME`/`RENAMENX`, `TOUCH`, `UNLINK`, `FLUSHALL`
 - **Single-threaded event loop** (`poll`, non-blocking I/O) with `TCP_NODELAY`
@@ -84,10 +93,11 @@ This produces two binaries in `build/`: `server` and `client`.
 ./build/server myred.conf
 ```
 
-The server requires authentication. The historical default password is `kek1234`.
-Set `MYRED_PASSWORD`, `MYRED_PORT`, `MYRED_AOF`, `MYRED_CONFIG`,
-`MYRED_MAXMEMORY`, or `MYRED_MAXMEMORY_POLICY` to override common settings at
-startup.
+Without a config file the server runs open on loopback (protected mode rejects
+non-loopback peers when no password is set). Set `requirepass` in the config to
+require `AUTH`; the historical dev password is `kek1234`. Set `MYRED_PASSWORD`,
+`MYRED_PORT`, `MYRED_AOF`, `MYRED_CONFIG`, `MYRED_MAXMEMORY`, or
+`MYRED_MAXMEMORY_POLICY` to override common settings at startup.
 
 ### With `redis-cli`
 
@@ -151,41 +161,55 @@ REDIS_PASSWORD=kek1234 ./build/client                  # interactive REPL
 ### Sorted sets
 `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZQUERY`, `ZREVQUERY`, `ZPOPMIN`
 
-### Admin
-`AUTH`, `ACL`, `PING`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
+### Admin / connection
+`AUTH`, `ACL`, `PING`, `ECHO`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
 `SAVE`, `BGSAVE`, `BGREWRITEAOF`
 
-Command names are case-insensitive.
+Command names are case-insensitive. Besides RESP framing, plain-text **inline
+commands** are accepted (newline-terminated), and empty inline lines are ignored
+— so `redis-cli --pipe` bulk loading works end to end.
 
 ## Testing
 
-A Python test harness (`stress_test.py`) speaks RESP directly over a socket and
-covers command correctness, auth/ACL behavior, persistence checks, memory
-accounting, maxmemory behavior, concurrent writes, and a randomized throughput
-stress run. It prints per-section timings, command latency percentiles, command
-mix, and slowest operation tables.
+A Python test harness (`scripts/stress_test.py`) speaks RESP directly over a
+socket and covers command correctness (including protocol edge cases like inline
+commands), auth/ACL behavior, persistence checks, memory accounting, maxmemory +
+incremental eviction, concurrent writes, and a randomized stress run. It prints
+per-section timings, command latency percentiles, command mix, and slowest
+operation tables. Drop `--password` if the server runs without one.
 
 ```bash
 # server must be running in another terminal
-python3 stress_test.py --password kek1234
+python3 scripts/stress_test.py --password kek1234
 
 # correctness only
-python3 stress_test.py --password kek1234 --correctness-only
+python3 scripts/stress_test.py --password kek1234 --correctness-only
 
-# writes a shareable log (stress_results.md by default)
-python3 stress_test.py --password kek1234 --log run.md
+# writes a shareable log (docs/stress_results.md by default)
+python3 scripts/stress_test.py --password kek1234 --log run.md
 
 # stress only, with a larger worker/operation count
-python3 stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
+python3 scripts/stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
+
+# + redis-benchmark speed baseline (per-test invocations and timeouts)
+python3 scripts/stress_test.py --password kek1234 --bench
 ```
 
 > Note: the Python harness measures correctness/concurrency, not raw throughput
-> (it's bound by synchronous round-trips). For real numbers use
-> `redis-benchmark -p 1234 -a kek1234 -t set,get,lpush,rpush,lpop,rpop -P 16`.
+> (it's bound by synchronous round-trips — under the concurrent stress phase,
+> per-command latencies include queueing behind O(N) commands like `KEYS`, not
+> just server time). For real numbers use `--bench` or `redis-benchmark`
+> directly, and **benchmark a Release build only**
+> (`cmake -B build -DCMAKE_BUILD_TYPE=Release`): a Debug build runs a
+> whole-keyspace memory audit after every command.
 
-Additional shell helpers live in `scripts/`:
+Additional helpers in `scripts/`:
 
 ```bash
+scripts/test_evict_tick.sh      # incremental eviction regression (EVICT_RUNNING)
+scripts/test_aof_restart.py     # AOF replay across restarts (incl. ACL identity)
+scripts/test_async_auth.py      # async Argon2id AUTH / ACL suite
+scripts/test_memory.py          # focused memory/eviction checks
 scripts/test_aof.sh
 scripts/test_aof_rewrite.sh
 scripts/test_aof_hybrid.sh
@@ -211,13 +235,34 @@ thread_pool.*      background worker pool
 list.h             intrusive list (connection timers)
 common.h           container_of, FNV hash
 client.cpp         a small RESP client (single-shot + REPL)
-stress_test.py     RESP test + benchmark harness
-test_memory.py     focused memory/eviction test helper
+cred.* / sha256.*  Argon2id/SHA-256 credential hashing + verification
+aof.* / rdb.*      append-only-file and RDB snapshot persistence
 myred.conf         example server configuration
-scripts/           AOF and diagnostic shell helpers
+scripts/           all tests: stress_test.py (primary harness), persistence,
+                   auth/ACL, eviction, and diagnostic helpers
 docs/ROADMAP.md    milestone roadmap and next steps
-docs/CODE_REVIEW.md audit notes and future hardening ideas
+docs/CODE_REVIEW.md consolidated bug audit (V9.6.4: complete) + review history
 ```
+
+## Status and what's next
+
+The full V9.6.4 audit sweep is complete (2026-07-17): every filed bug — critical
+through polish — is closed, including move-semantics and hashing perf fixes,
+O(k) `SPOP`/`SRANDMEMBER`, deterministic `SPOP` AOF propagation (as `SREM`),
+incremental eviction, and O(1) `INFO` keyspace stats.
+
+Active and upcoming (see `docs/ROADMAP.md` for detail):
+
+- **V9.6.5 — General and speed test** *(active)*: restart/security/destructive
+  test debt, plus a recorded `redis-benchmark` baseline that the TLS refactor
+  must match.
+- **V9.7 — TLS**: transport seam refactor first (zero behavior change), then
+  OpenSSL contexts/listeners, handshake as connection state, data-path rules,
+  and optimizations.
+- **Known perf debt**: `mem_reaccount` recomputes container memory in O(n) per
+  mutation (visible on large lists under `--bench`); fix is delta accounting.
+- **Backlog**: compact encodings (intset/listpack-style), pub/sub, transactions,
+  replication.
 
 ## Acknowledgements
 

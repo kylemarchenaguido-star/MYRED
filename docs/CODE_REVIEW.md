@@ -27,6 +27,12 @@ working tree of 2026-07-13**; line numbers are against that tree unless marked
 otherwise. This section is the single worklist for V9.6.4; the ROADMAP no longer
 carries bug bodies.
 
+**AUDIT COMPLETE 2026-07-17.** Every 🔴/🟠/🟡 item closed 2026-07-13; every 🔵/⚪
+perf/polish item closed 2026-07-16/17 (plus bonus fixes found en route: SPOP AOF
+replay determinism, 🔴 RDB non-TTL set loader data loss, ECHO + empty-inline
+redis-cli compat, incremental eviction with `scripts/test_evict_tick.sh`). The
+remaining Testing debt items moved to ROADMAP → V9.6.5 (general and speed test).
+
 ### A. Verified fixed since 2026-07-09
 
 | Item | Fixed by / evidence |
@@ -44,9 +50,11 @@ carries bug bodies.
 (Already recorded fixed on 2026-07-09: replay `fake.user` assigned-in-shape, `SMOVE`
 reaccount, `do_keys` glob, V9.5.1 admin-category tagging, `MSETNX`.)
 
-### B. Open — the V9.6.4 worklist
+### B. The V9.6.4 worklist — CLOSED 2026-07-17
 
-Every unmarked line below was re-verified **open** on 2026-07-13.
+Every unmarked line below was re-verified **open** on 2026-07-13; all bug items
+have since been ticked with FIXED notes. Only Testing debt remains, now tracked
+under ROADMAP V9.6.5.
 
 #### 🔴 Critical
 
@@ -207,21 +215,20 @@ Every unmarked line below was re-verified **open** on 2026-07-13.
   sites move (`do_sadd`, `set_store_result`, `do_smove`, RDB set loader). Bonus: the
   call-site audit surfaced the 🔴 `rdb_load_set_entry` non-TTL data-loss bug (see
   ROADMAP Known Bugs, also fixed 2026-07-16).
-- [ ] **Eviction deletes up to 100 victims synchronously** (`free_memory_if_needed`,
-  `commands.cpp:2952-2966`): already deliberately bounded (`attempts = 100`, own
-  comment: "bounded, we don't stall the loop") — not unbounded or dangerous today.
-  Making it truly incremental across event-loop ticks (mirroring the HMap
-  progressive-rehash pattern from N2) means carrying eviction state across calls and
-  deciding what the triggering write command does in the meantime — a real design
-  task, not a quick patch.
-- [ ] **`INFO` O(N) keyspace scan** (`get_keys_stats`, `commands.cpp:690`): walks every
-  key via `hm_foreach` on every `INFO` call. Fix means maintaining running
-  `keys_with_ttl`/`keys_no_ttl` counters incremented/decremented at every site that
-  sets/clears a TTL or expires/deletes a key (`entry_set_ttl`, `expire_if_needed`,
-  every delete path) — conceptually simple per site, but those sites are scattered
-  across the whole command surface, so the change is broad rather than deep.
+- [x] **Eviction deletes up to 100 victims synchronously.** FIXED 2026-07-17:
+  Redis EVICT_RUNNING semantics — when the 100-victim batch runs out with victims
+  remaining, the write is admitted and `g_data.g_evict_pending` arms `evict_tick()`
+  (event loop) + a zero poll timeout until under the limit; OOM now means "policy
+  can't free", not "ran out of patience". Verified live by
+  `scripts/test_evict_tick.sh` (50k→5275 keys drained idle in <1s; probe writes
+  admitted during overshoot). Bonus fixes en route: ECHO command added +
+  empty inline commands silently ignored (redis-cli --pipe compat).
+- [x] **`INFO` O(N) keyspace scan.** FIXED 2026-07-17: no scattered counters needed —
+  the TTL heap already IS the `with_ttl` counter (`heap_idx != NO_TTL` ⇔ heap
+  membership, maintained by every TTL/expire/delete path); `total` is
+  `hm_size(&g_data.db)`. Two O(1) reads, `cb_count_keys` deleted.
 
-#### Testing debt (from ROADMAP Testing Gaps — closes with the batches above)
+#### Testing debt — MOVED to ROADMAP V9.6.5 (general and speed test) 2026-07-17
 
 - [ ] AOF-restart-with-ACL test (pairs with N1); restart tests for `GETEX`, `GETDEL`,
   `ZPOPMIN`, eviction `DEL`, and renamed-command canonicalized frames.

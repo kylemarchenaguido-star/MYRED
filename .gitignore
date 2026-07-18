@@ -1,6 +1,7 @@
 # CMake out-of-source build directory
 build/
 build-debug/
+build-rel/
 
 # compiled binaries (now produced under build/)
 /server

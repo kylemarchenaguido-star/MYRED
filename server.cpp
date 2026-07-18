@@ -217,6 +217,7 @@ static void conn_destroy(Conn *conn){
 
 // Timers logic 
 static int32_t next_timer_ms() {
+  if (g_data.g_evict_pending){ return 0; }
   uint64_t now_ms = get_monotonic_msec();
   uint64_t next_ms = (uint64_t)-1; // maximun value
 
@@ -423,6 +424,12 @@ static bool try_one_request(Conn *conn){
     buf_append(&conn->outgoing, "-ERR Protocol error\r\n", 21);
     conn->want_close = true;
     return false;
+  }
+
+  // empty inline line (bare \r\n)
+  if (cmd.empty()){
+    buf_consume(&conn->incoming, (size_t)consumed);
+    return true;
   }
 
   // capture the raw frame BEFORE consuming/dispatching. logged verbatim for aof
@@ -750,6 +757,7 @@ int main(int argc, char **argv){
     }
     // handle timers
     process_timers();
+    evict_tick();
     rdb_check_background_save();
     aof_check_background_rewrite();
   }

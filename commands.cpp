@@ -625,18 +625,6 @@ static bool cb_keys_emit(HNode *node, void *arg) {
     return true;
 }
 
-
-// Gets all the keys for the stats 
-static bool cb_count_keys(HNode *node, void *args){
-  KeyStats *stats = (KeyStats *)args;
-  Entry *ent = container_of(node, &Entry::node);
-  stats->total++;
-  if (entry_has_ttl(ent)){
-    stats->with_ttl++;
-  }
-  return true;
-}
-
 static bool cb_keys_collect(HNode *node, void *arg){
   KeysCtx *ctx = (KeysCtx*)arg;
   Entry *ent = container_of(node, &Entry::node);
@@ -663,8 +651,9 @@ static void do_keys(std::vector<std::string> &cmd, Buffer *out) {
 
 
 static KeyStats get_keys_stats(){
-  KeyStats stats = {0,0};
-  hm_foreach(&g_data.db, &cb_count_keys, &stats);
+  KeyStats stats;
+  stats.total = (uint32_t)hm_size(&g_data.db);
+  stats.with_ttl = (uint32_t)g_data.heap.size();
   return stats;
 }
 
@@ -2704,6 +2693,10 @@ static void do_ping(std::vector<std::string> &cmd, Buffer *out){
   return resp_simple(out, "PONG");
 }
 
+static void do_echo(std::vector<std::string> &cmd, Buffer *out){
+  return resp_str(out, cmd[1].data(), cmd[1].size());
+}
+
 static void do_config(std::vector<std::string> &cmd, Buffer *out){
   std::string sub = cmd[1];
   for (char &c : sub){ c = (char)tolower((unsigned char)c); }
@@ -2934,21 +2927,25 @@ static void aof_append_raw(const char *raw, size_t len){
 
 // Evict keys unitl we're back under maxmemory. Returns false if we can't get under
 // (noeviction, or a volatile-* policy with nothing evictable) -> caller return -OOM.
+// NEW, if the batcj runs out while victims remain, arms g_evict_pending and return true
 static bool free_memory_if_needed(){
   // unlimited
-  if (g_config.maxmemory == 0){ return true; }
+  if (g_config.maxmemory == 0){ g_data.g_evict_pending = false; return true; }
   // never during replay
   if (g_data.g_loading){ return true; }
   // already under
-  if (g_data.used_memory <= g_config.maxmemory){ return true; }
-  if (g_config.maxmemory_policy == MaxmemoryPolicy::NOEVICTION){ return false;}
+  if (g_data.used_memory <= g_config.maxmemory){ g_data.g_evict_pending = false; return true; }
+  if (g_config.maxmemory_policy == MaxmemoryPolicy::NOEVICTION){ 
+    g_data.g_evict_pending = false;
+    return false;
+  }
 
   // bounded, we don't stall the loop
   int attempts = 100;
   while (g_data.used_memory > g_config.maxmemory && --attempts > 0){
     Entry *victim = evict_pick_victim();
-    // volatile-* with no TTL keys -> OOM
-    if (!victim){ return false; }
+    // volatile-* with no TTL keys -> OOM; background eviction can't help either
+    if (!victim){ g_data.g_evict_pending = false; return false; }
 
     // CRITICAL: log an explicit DEL so AOF replay / replicas don't resurrect the key.
     // aof_feed already handles the rewrite dual-buffer; gate on aof_eanble + not loading.
@@ -2964,7 +2961,17 @@ static bool free_memory_if_needed(){
     // eviction is a change woth persisting
     g_data.g_writes_since_save++;
   }
-  return g_data.used_memory <= g_config.maxmemory;
+  if (g_data.used_memory <= g_config.maxmemory){
+    g_data.g_evict_pending = false;
+    return true;
+  }
+  g_data.g_evict_pending = true; // batch exhausted, victims remain: continue on ticks
+  return true;
+}
+
+// one bounded eviction batch per event-loop tick while over maxmemory
+void evict_tick(){
+  if (g_data.g_evict_pending){ (void)free_memory_if_needed(); }
 }
 
 enum class KeySpec : uint8_t {
@@ -3053,6 +3060,7 @@ bool acl_apply_rule(User &u, const std::string &t){
   // clears everything (name reset by caller)
   if (t == "reset"){ u = User(); u.name.clear(); return true; }
   if (t == "resetpass"){ u.pw_hashes.clear(); return true; }
+  if (t == "nopass"){ u.pw_hashes.clear(); return true; }
   if (t == "resetkeys"){ u.key_patterns.clear(); u.all_keys = false; return true; }
 
   // pre-hashes SHA-256 digest, '#<64 hex>'
@@ -3342,6 +3350,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"bgsave",       {do_bgsave,        1,  1}},
   {"bgrewriteaof", {do_bgrewriteaof,  1,  1}},
   {"ping",         {do_ping,          1,  2}},
+  {"echo",         {do_echo,          2,  2}},
   {"config",       {do_config,        2, -1}},
   {"memory",       {do_memory,        2, -1}},
   {"object",       {do_object,        2, -1}},
@@ -3433,8 +3442,15 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 
   // resolve the typed name against the live map
   auto it = g_dispatch.find(cmd[0]);
-  const bool found = (it != g_dispatch.end());
-  const std::string &canonical = found ? it->second.canonical : cmd[0];
+  bool found = (it != g_dispatch.end());
+  const CmdSpec *specp = found ? &it->second.spec : nullptr;
+  const std::string canonical = found ? it->second.canonical : cmd[0];
+
+  // AOF frames always carry canonical names
+  if (!found && g_data.g_loading){
+    auto kt = k_cmd_table.find(cmd[0]);
+    if (kt != k_cmd_table.end()){ specp = &kt->second; found = true; }
+  }
 
   // AUTH always allowed, even under an alias is always allowed
   if (found && canonical == "auth") {
@@ -3447,7 +3463,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 
   if (!found){ return resp_err(out, "ERR unknown command"); }
-  const CmdSpec &spec = it->second.spec;
+  const CmdSpec &spec = *specp;
 
   // permission by canonical name
   if (const char *deny = acl_check(conn->user, canonical, spec, cmd)){
@@ -3571,6 +3587,7 @@ void acl_init_categories(){
     {"touch",   CAT_KEYSPACE}, {"rename", CAT_KEYSPACE}, {"renamenx", CAT_KEYSPACE},
     {"ping",    CAT_CONNECTION}, {"auth", CAT_CONNECTION},
     {"info",    CAT_ADMIN},     {"memory", CAT_ADMIN}, {"object", CAT_ADMIN},
+    {"echo", CAT_CONNECTION},
   };
 
   for (auto &kv : k_cmd_table){

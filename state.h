@@ -130,6 +130,7 @@ struct GlobalData{
   // Data base globals
   uint64_t g_last_save_ms = 0; // timestamp last succesful save
   uint64_t evicted_keys = 0; // total keys removed by the maxmemory eviction policy
+  bool g_evict_pending = false; // over maxmemory with victims left; event loop keeps evicting
   uint32_t g_writes_since_save = 0; // how many keys we written
   uint32_t g_dirty_at_save = 0; // g_writes_since_save captured when a save starts
   uint32_t g_lru_clock = 0; // coarse seconds, 24-bit; bumped each event-loop tick

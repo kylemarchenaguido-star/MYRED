@@ -151,7 +151,7 @@ exposure; optional `auditlog-events` / `auditlog-required` filters.
 
 Credentials at rest upgraded from unsalted SHA-256 to Argon2id (OWASP baseline
 m=19456 KiB, t=2, p=1) with async verification, while every pre-existing config stays
-loadable. V9.6.1–V9.6.3 shipped; V9.6.4 (audit bug sweep) is the active step.
+loadable. V9.6.1–V9.6.4 shipped; V9.6.5 (general and speed test) is the active step.
 
 - `[Done]` **N5 prerequisite** — 2026-07-12. `sha256_hex` padding bug (`len%64 >= 56`)
   fixed; KAT-verified against NIST vectors + hashlib (lengths 0–200).
@@ -178,7 +178,7 @@ loadable. V9.6.1–V9.6.3 shipped; V9.6.4 (audit bug sweep) is the active step.
   `CONFIG SET requirepass` / `ACL SETUSER >plain` hash to Argon2id directly (V9.6.1).
   `test_async_auth.py` green incl. the migration + audit-redaction test.
 
-##### `[In Progress]` V9.6.4 - Audit bug sweep (pre-TLS cleanup)
+##### `[Done]` V9.6.4 - Audit bug sweep (pre-TLS cleanup) — 2026-07-17
 
 Fix every open bug the audits have found before starting TLS. V9.7 explicitly depends
 on N3 (timer busy-loop) and N4 (protocol-error wedge), and TLS buffering must not land
@@ -198,6 +198,51 @@ on top of open loop/persistence bugs.
 - Done criteria: every 🔴/🟠 item closed (or explicitly re-filed to Backlog with a
   reason); each fix lands with a regression test where feasible; statuses ticked in
   CODE_REVIEW.md and fixed items recorded in its Resolved Bugs Archive.
+- **Closed 2026-07-17**: all 🔴/🟠/🟡 done 2026-07-13; all 🔵/⚪ perf/polish done
+  2026-07-16/17 (`hash_set`/`set_add` move semantics, 64-bit FNV-1a, `mem_selfcheck`
+  placement, `hm_random` + O(k) SPOP/SRANDMEMBER, incremental eviction with
+  `evict_tick`, O(1) INFO keyspace stats). Bonus fixes found en route: SPOP AOF
+  replay determinism (`aof_self` + synthetic SREM), 🔴 RDB non-TTL set loader data
+  loss, ECHO command + empty-inline ignore (redis-cli --pipe compat). New regression
+  script: `scripts/test_evict_tick.sh`. Testing debt rolled into V9.6.5.
+
+##### `[Next]` V9.6.5 - General and speed test
+
+Full-surface validation pass before TLS: general correctness testing plus a speed
+baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
+2026-07-17 from CODE_REVIEW):
+
+- General tests: AOF-restart-with-ACL (pairs with N1); restart tests for `GETEX`,
+  `GETDEL`, `ZPOPMIN`, eviction `DEL`, renamed-command canonicalized frames;
+  security tests (control-plane category gating, renamed/disabled commands,
+  audit-log redaction, precise key ACLs, `ACL CAT` RESP framing); destructive/
+  server-crashing edge cases behind an explicit test flag.
+  - **Suites written 2026-07-17, awaiting user run**: `scripts/test_restart_matrix.py`
+    (GETEX ttl / aliased-GETDEL canonical frames / ZPOPMIN / eviction-DEL exact
+    keyspace replay; `--destructive` adds SIGKILL crash recovery) and
+    `scripts/test_security.py` (category gating, rename/disable, audit
+    redaction, key ACLs incl. SMOVE resolver, ACL CAT framing, CONFIG REWRITE
+    round-trip across restart; `--destructive` adds protocol abuse). Shared
+    helpers in `scripts/myred_testlib.py`. Both spawn private instances on
+    ports 12401/12402 — safe next to a live server. Watchpoints these may
+    expose: `acl_format_user` emits `nopass` but `acl_apply_rule` has no
+    `nopass` token (round-trip may fail to load), and AOF replay of canonical
+    names while `rename-command` is active.
+- Speed test: benchmark baseline (`redis-benchmark` where the command surface
+  allows, plus timed `stress_test.py` runs). Record the numbers — V9.7.1's
+  transport-seam refactor must prove zero perf regression against this baseline.
+- Harness updated 2026-07-17 (hold lifted): moved to `scripts/stress_test.py` (docs
+  already pointed there), new coverage for ECHO + inline protocol + empty-inline
+  ignore, FLUSHDB, SPOP/SRANDMEMBER edge semantics + randomness distribution,
+  O(1) INFO keyspace stats, incremental eviction (EVICT_RUNNING); new `--bench`
+  flag shells out to redis-benchmark for the speed baseline. Full suite green
+  (552 checks) against an isolated instance.
+- **First baseline findings (2026-07-17):** (a) benchmarks are only meaningful on a
+  Release build — the default `build/` is `CMAKE_BUILD_TYPE=Debug` (no `-O`, no
+  `-DNDEBUG`), so `mem_selfcheck` walks the whole keyspace after every command;
+  use `cmake -B build-rel -DCMAKE_BUILD_TYPE=Release` for numbers. (b) a real
+  release-mode perf bug fell out: `mem_reaccount` is O(container size) per
+  mutation — filed in Known Bugs.
 
 #### V9.7 - TLS [Backlog]
 
@@ -360,6 +405,39 @@ get filed here first, then folded into that audit.
 
 Feature gaps that were listed here (missing features, not defects) moved to Backlog →
 "ACL and Command-Surface Feature Gaps".
+
+- **`rename-command` bricks the server on AOF restart** 🔴 — FIXED 2026-07-17
+  (replay-only `k_cmd_table` fallback in `do_request` when `g_loading`;
+  `scripts/test_restart_matrix.py --destructive` green). Original filing follows.
+  (filed 2026-07-17, found by `scripts/test_restart_matrix.py`): the AOF
+  logs canonical names by design (V9.5.3), but `dispatch_build` *erases* the
+  canonical entry when a command is renamed (`commands.cpp:3384`). On the next
+  boot, replaying any canonical frame of a renamed command returns "unknown
+  command" → `aof_load` returns false → `fatal_exit("AOF load failed...")`
+  (`server.cpp:597-600`). Any write through a renamed command = server refuses
+  to start until the rename is removed. Fix: during replay (`g_data.g_loading`),
+  fall back to `k_cmd_table` for canonical names that miss `g_dispatch`.
+
+- **`nopass` breaks the ACL config round-trip** 🟠 — FIXED 2026-07-17 (`nopass`
+  token accepted in `acl_apply_rule`, clears `pw_hashes`;
+  `scripts/test_security.py --destructive` green). Original filing follows.
+  (filed 2026-07-17, found by `scripts/test_security.py`): `acl_format_user`
+  writes ` nopass` for a user with no credentials (`commands.cpp:3123`), but
+  `acl_apply_rule` has no `nopass` token, so the config written by
+  `CONFIG REWRITE` fails to load ("Invalid ACL rule 'nopass'") and the server
+  won't boot. Fix: accept `nopass` in `acl_apply_rule` (clear `pw_hashes`,
+  same as `resetpass`).
+
+- **`mem_reaccount` is O(container size) per mutation** 🔵 (filed 2026-07-17, found
+  by the first `--bench` baseline): `mem_reaccount` calls the full
+  `entry_mem_usage` (`state.cpp:580`), which walks every element of a
+  T_DLIST/T_HASH/T_SET/T_ZSET (`state.cpp:505-517`). Every LPUSH onto a 20k-element
+  list walks all 20k strings — measured degrading 15.6k→1.7k ops/s as the list
+  grew (Debug build amplifies but the walk exists in Release too).
+  `entry_mem_usage_sampled` exists but only `MEMORY USAGE` uses it. Real fix is
+  delta accounting (each mutating handler folds in the exact bytes it
+  added/removed) — broad like the old INFO item, touches every mutating command;
+  alternative is sampled reaccount at some accuracy cost. Needs a design decision.
 
 - **`rdb_load_set_entry` destroys every non-TTL set on load** 🔴 — FIXED 2026-07-16
   (inner garbled skip block deleted, `entry_del` on member-read failure; `-Wshadow`
@@ -854,31 +932,75 @@ parsing). Before the audit log (V9.5.4) grows siblings:
   `container_of` pattern and manual `Buffer` management are exactly the code
   shapes sanitizers pay off on.
 
+### Eviction Batch-Exhaustion False OOM
+
+Low priority — park until the performance/polish pass. `free_memory_if_needed`
+(`commands.cpp:2952-2967`) caps itself at 100 eviction attempts per call ("bounded, we
+don't stall the loop"), which is correct as a stall guard, but the final return —
+`return g_data.used_memory <= g_config.maxmemory;` — can't distinguish "ran out of
+batch budget while genuinely still evicting real keys" from "policy can't free
+anything" (the latter already returns `false` earlier, at the `!victim` check). Result:
+after a `CONFIG SET maxmemory` shrink under a large dataset, every write command gets
+a spurious OOM until enough separate calls have each chipped off 100 keys, even though
+eviction is working the whole time.
+
+Decision (2026-07-17): mirror Redis's approach — treat "batch exhausted but still
+making progress" as success, not failure, so the write goes through and the next
+write's call to `free_memory_if_needed` picks up where sampling naturally continues.
+Concretely: since the only way to reach the final `return` is either (a) genuinely
+under budget now, or (b) attempts exhausted while `victim` was never null, `return
+true;` unconditionally at that line is the fix — the `!victim` early-return is
+untouched, so real OOM (`noeviction`, or `volatile-*` with nothing evictable) still
+rejects correctly. Reverting to `return g_data.used_memory <= g_config.maxmemory;` is
+the strict-backpressure alternative if that's ever preferred instead.
+
+Two tradeoffs to accept consciously before applying, not just default into:
+
+- ~~MYRED has no cron/timer-driven eviction sweep~~ — resolved 2026-07-17:
+  `evict_tick()` runs a bounded batch per event-loop tick while `g_evict_pending`
+  is armed, and `next_timer_ms()` returns 0 while pending so an idle server keeps
+  draining (verified by `scripts/test_evict_tick.sh`: 50k→5.3k keys in <1s idle).
+- `used_memory` can transiently overshoot `maxmemory` by more than it does today,
+  since a write is now allowed to land on top of an already-over-budget state instead
+  of being rejected outright. That's the intended availability-over-strict-ceiling
+  tradeoff, not a bug, but worth confirming is acceptable before shipping.
+
 ## Testing Matrix
 
-Primary harness:
+Primary harness (updated 2026-07-17: ECHO/inline, FLUSHDB, SPOP/SRANDMEMBER edge
+semantics, O(1) INFO keyspace, incremental eviction, `--bench`):
 
 ```bash
-python3 scripts/stress_test.py --password kek1234
-python3 scripts/stress_test.py --password kek1234 --correctness-only
-python3 scripts/stress_test.py --password kek1234 --stress-only --stress-threads 16 --stress-ops 2000
+python3 scripts/stress_test.py
+python3 scripts/stress_test.py --correctness-only
+python3 scripts/stress_test.py --stress-only --stress-threads 16 --stress-ops 2000
+python3 scripts/stress_test.py --bench   # + redis-benchmark speed baseline
 ```
 
-Persistence helpers:
+Persistence / eviction helpers:
 
 ```bash
 scripts/test_aof.sh
 scripts/test_aof_rewrite.sh
 scripts/test_aof_hybrid.sh
+scripts/test_evict_tick.sh          # incremental eviction (EVICT_RUNNING) regression
 scripts/diag_live.sh
 scripts/diag_ttl.sh
 ```
 
-Benchmarking:
+Benchmarking — **Release build only** (`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release`;
+the default Debug build runs `mem_selfcheck`'s whole-keyspace walk after every
+command and poisons all numbers). Newly benchmarkable since 2026-07-17: SPOP
+(O(k) pop-by-node), ZADD/ZPOPMIN, LRANGE, MSET, PING (ECHO makes `redis-cli
+--pipe` work too):
 
 ```bash
-redis-benchmark -p 1234 -a kek1234 -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset -n 200000 -c 50 -P 16 -q
+redis-benchmark -p 1234 -a kek1234 -t ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange,mset -n 200000 -c 50 -P 16 -q
 ```
+
+Caveat while the `mem_reaccount` O(n) bug is open: list/large-container benchmarks
+(LPUSH/RPUSH/LPOP/RPOP/LRANGE on one growing key) measure the accounting walk, not
+the data structure — see Known Bugs.
 
 Security test focus:
 

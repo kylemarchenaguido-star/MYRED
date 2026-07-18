@@ -18,27 +18,31 @@ Tests all commands:
 Because the server now speaks RESP, this test also works against the
 real redis-cli for cross-validation.
 
-Usage:
+Usage (run from the repo root):
     # Terminal 1 — start server
-    ./server
+    ./build/server
 
     # Terminal 2 — run tests
-    python3 stress_test.py
+    python3 scripts/stress_test.py
 
     # only correctness, no stress
-    python3 stress_test.py --correctness-only
+    python3 scripts/stress_test.py --correctness-only
 
     # only stress
-    python3 stress_test.py --stress-only
+    python3 scripts/stress_test.py --stress-only
 
     # tune stress size and metrics tables
-    python3 stress_test.py --stress-threads 16 --stress-ops 2000 --metrics-top 20
+    python3 scripts/stress_test.py --stress-threads 16 --stress-ops 2000 --metrics-top 20
+
+    # redis-benchmark speed baseline (Release build only — a Debug build runs
+    # mem_selfcheck's whole-keyspace walk per command and the numbers are garbage)
+    python3 scripts/stress_test.py --bench
 
     # if your server requires a password
-    python3 stress_test.py --password your_password_here
+    python3 scripts/stress_test.py --password your_password_here
 
     # custom host/port
-    python3 stress_test.py --host 127.0.0.1 --port 1234
+    python3 scripts/stress_test.py --host 127.0.0.1 --port 1234
 """
 
 import socket
@@ -50,6 +54,8 @@ import argparse
 import sys
 import os
 import re
+import shutil
+import subprocess
 import atexit
 from typing import Any, Optional
 
@@ -86,8 +92,10 @@ class _Tee:
         self._fh.write(_ANSI_RE.sub("", data))
     def flush(self):
         self._stream.flush()
-
-        self._fh.flush()
+        try:
+            self._fh.flush()
+        except ValueError:
+            pass    # interpreter's final flush runs after atexit closed the log
 
 
 def start_logging(path: str):
@@ -162,7 +170,7 @@ def recv_response(sock: socket.socket) -> Any:
       +<str>\r\n              simple string  -> str
       -<err>\r\n              error          -> raises RespError
       :<int>\r\n              integer        -> int
-      $<len>\r\n<bytes>\r\n   bulk string    -> str  (or None if len == -1)
+      $<len>\r\n<bytes>\r\n   bulk string    -> str  (or None if len == -1) 
       *<count>\r\n<items...>  array          -> list (or None if count == -1)
     """
     line = _recv_line(sock)
@@ -2544,10 +2552,199 @@ def test_maxmemory_eviction(r: TestRunner, sock: socket.socket):
     cmd(sock, "flushall")
 
 
+def test_eviction_incremental(r: TestRunner, sock: socket.socket):
+    r.section("Memory: incremental eviction (EVICT_RUNNING semantics)")
+    CAP = 512 * 1024
+    VAL = "z" * 400
+    cmd(sock, "flushall")
+    cmd(sock, "config", "set", "maxmemory", "0")
+    cmd(sock, "config", "set", "maxmemory-policy", "allkeys-random")
+    for i in range(4000):                       # ~2 MB -> 4x over the cap
+        cmd(sock, "set", f"ev:{i}", VAL)
+    over = used_memory(sock)
+
+    cmd(sock, "config", "set", "maxmemory", str(CAP))
+    # the very next write must be admitted; pre-fix behavior OOM'd until
+    # repeated writes had chipped the overshoot off 100 keys at a time
+    r.check("write admitted during overshoot", set_result(sock, "ev:probe", "1"), "OK")
+
+    # idle drain: no further writes — evict_tick alone must get under the cap
+    deadline = time.time() + 5.0
+    um = used_memory(sock)
+    while um > CAP and time.time() < deadline:
+        time.sleep(0.2)
+        um = used_memory(sock)
+    r.check_true(f"idle drain under cap ({over} -> {um} <= {CAP})", um <= CAP)
+
+    cmd(sock, "config", "set", "maxmemory", "0")
+    cmd(sock, "config", "set", "maxmemory-policy", "noeviction")
+    cmd(sock, "flushall")
+
+
 def test_memory_commands(r: TestRunner, sock: socket.socket):
     test_memory_accounting(r, sock)
     test_memory_introspection(r, sock)
     test_maxmemory_eviction(r, sock)
+    test_eviction_incremental(r, sock)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  V9.6.5 ADDITIONS — ECHO/inline protocol, FLUSHDB, SPOP/SRANDMEMBER edge
+#  semantics, O(1) INFO keyspace stats, redis-benchmark speed baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_echo_and_inline(r: TestRunner, host: str, port: int):
+    r.section("ECHO + inline protocol")
+    sock = make_conn(host, port)
+    try:
+        r.check("echo roundtrip",       cmd(sock, "echo", "hello"), "hello")
+        r.check("echo empty string",    cmd(sock, "echo", ""), "")
+        marker = "m" * 20               # redis-cli --pipe uses a 20-byte marker
+        r.check("echo 20-byte marker",  cmd(sock, "echo", marker), marker)
+        r.check("echo whitespace-safe", cmd(sock, "echo", "a\tb c"), "a\tb c")
+        r.expect_error("echo no args → arity error",  sock, "echo")
+        r.expect_error("echo 2 args → arity error",   sock, "echo", "a", "b")
+
+        # inline commands: newline-terminated text instead of RESP framing
+        def raw_reply(payload: bytes):
+            sock.sendall(payload)
+            try:
+                return recv_response(sock)
+            except RespError as e:
+                return f"ERR:{e}"
+
+        r.check("inline ping → PONG",        raw_reply(b"ping\r\n"), "PONG")
+        r.check("inline \\n-only tolerated", raw_reply(b"echo inlinearg\n"), "inlinearg")
+        # a bare \r\n (redis-cli --pipe epilogue) must be ignored silently;
+        # if the server answered it, this reply would be that answer, not PONG
+        r.check("empty inline line ignored", raw_reply(b"\r\nping\r\n"), "PONG")
+    finally:
+        sock.close()
+
+
+def test_flushdb_command(r: TestRunner, sock: socket.socket):
+    r.section("FLUSHDB")
+    cmd(sock, "mset", "fdb1", "a", "fdb2", "b")
+    r.check_true("keys exist before flushdb", cmd(sock, "dbsize") >= 2)
+    r.check("flushdb → OK",       cmd(sock, "flushdb"), "OK")
+    r.check("dbsize → 0",         cmd(sock, "dbsize"), 0)
+    r.check("flushed key gone",   cmd(sock, "get", "fdb1"), None)
+
+
+def test_set_random_semantics(r: TestRunner, sock: socket.socket):
+    r.section("Sets: SPOP/SRANDMEMBER edge semantics (hm_random paths)")
+    cmd(sock, "del", "tsr")
+    cmd(sock, "sadd", "tsr", "a", "b", "c", "d", "e")
+
+    r.check("spop count=0 → []", cmd(sock, "spop", "tsr", "0"), [])
+    r.expect_error("spop negative count → error", sock, "spop", "tsr", "-1")
+    r.expect_error("spop non-int count → error",  sock, "spop", "tsr", "x")
+
+    # count > cardinality pops everything and deletes the key
+    popped = cmd(sock, "spop", "tsr", "100")
+    r.check_true("spop count>size returns all 5",
+                 isinstance(popped, list) and sorted(popped) == ["a", "b", "c", "d", "e"])
+    r.check("emptied set key is deleted", cmd(sock, "exists", "tsr"), 0)
+
+    cmd(sock, "sadd", "tsr", "a", "b", "c", "d", "e")
+    r.check("srandmember count=0 → []", cmd(sock, "srandmember", "tsr", "0"), [])
+
+    # distribution sanity: 200 single draws must reach every member
+    seen = set()
+    for _ in range(200):
+        seen.add(cmd(sock, "srandmember", "tsr"))
+    r.check_true("srandmember reaches all members", seen == {"a", "b", "c", "d", "e"})
+    r.check("card unchanged by draws", cmd(sock, "scard", "tsr"), 5)
+
+    # positive-count draws must never mutate (pop-and-reinsert must restore)
+    distinct_ok = True
+    for _ in range(50):
+        got = cmd(sock, "srandmember", "tsr", "3")
+        distinct_ok = distinct_ok and len(set(got)) == 3
+    r.check_true("50 count-draws all distinct",    distinct_ok)
+    r.check("card unchanged after count-draws",    cmd(sock, "scard", "tsr"), 5)
+    r.check_true("membership intact after draws",
+                 sorted(cmd(sock, "smembers", "tsr")) == ["a", "b", "c", "d", "e"])
+
+    # single pops drain every member exactly once
+    drained = sorted(cmd(sock, "spop", "tsr") for _ in range(5))
+    r.check_true("5 single pops drain all distinct", drained == ["a", "b", "c", "d", "e"])
+    r.check("spop on emptied key → nil", cmd(sock, "spop", "tsr"), None)
+    cmd(sock, "del", "tsr")
+
+
+def test_info_keyspace_stats(r: TestRunner, sock: socket.socket):
+    r.section("INFO: O(1) keyspace stats (heap-backed keys_with_ttl)")
+    cmd(sock, "flushall")
+
+    def stats():
+        return (int(info_field(sock, "keys_total") or -1),
+                int(info_field(sock, "keys_with_ttl") or -1))
+
+    r.check("empty db → (0,0)",             stats(), (0, 0))
+    cmd(sock, "mset", "ik1", "v", "ik2", "v", "ik3", "v")
+    r.check("3 keys, no ttl → (3,0)",       stats(), (3, 0))
+    cmd(sock, "expire", "ik1", "100")
+    cmd(sock, "expire", "ik2", "100")
+    r.check("2 ttls set → (3,2)",           stats(), (3, 2))
+    cmd(sock, "persist", "ik1")
+    r.check("persist decrements → (3,1)",   stats(), (3, 1))
+    cmd(sock, "set", "ik2", "v2")           # SET clears the TTL
+    r.check("SET clears ttl → (3,0)",       stats(), (3, 0))
+    cmd(sock, "pexpire", "ik3", "50")
+    time.sleep(0.3)                         # active reaper fires on the ttl heap
+    r.check("expired key leaves both → (2,0)", stats(), (2, 0))
+    cmd(sock, "del", "ik1", "ik2")
+    r.check("del → (0,0)",                  stats(), (0, 0))
+
+
+def run_redis_benchmark(host: str, port: int, password: Optional[str],
+                        requests: int, clients: int, pipeline: int) -> bool:
+    print(f"\n{BOLD}{'═' * 55}{RESET}")
+    print(f"{BOLD}  Speed baseline (redis-benchmark){RESET}")
+    print(f"{'═' * 55}")
+    exe = shutil.which("redis-benchmark")
+    if not exe:
+        print(f"{YELLOW}redis-benchmark not found — skipping (install redis-tools){RESET}")
+        return True
+
+    # start clean: leftover keys from an earlier run (e.g. a 100k-element mylist)
+    # make every later number meaningless
+    try:
+        s = make_conn(host, port)
+        cmd(s, "flushall")
+        s.close()
+    except Exception as e:
+        print(f"{YELLOW}pre-bench flushall failed: {e}{RESET}")
+
+    tests = ["ping", "set", "get", "incr", "lpush", "rpush", "lpop", "rpop",
+             "sadd", "hset", "spop", "zadd", "zpopmin", "lrange", "mset"]
+    # generous for a Release build; a Debug build will trip this on the list tests
+    per_test_timeout = max(120, requests // 1000)
+    ok = True
+    for t in tests:
+        argv = [exe, "-h", host, "-p", str(port), "-t", t,
+                "-n", str(requests), "-c", str(clients), "-P", str(pipeline), "-q"]
+        if password:
+            argv += ["-a", password]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=per_test_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"  {RED}{t.upper()}: TIMED OUT after {per_test_timeout}s{RESET} — "
+                  f"server is far below expected speed. Benchmarking needs a "
+                  f"Release build (cmake -B build-rel -DCMAKE_BUILD_TYPE=Release); "
+                  f"a Debug build audits the whole keyspace after every command.")
+            ok = False
+            continue
+        for ln in proc.stdout.splitlines():
+            if ln.strip():
+                print(f"  {ln}")
+        if proc.returncode != 0:
+            for ln in proc.stderr.splitlines():
+                print(f"  {RED}{ln}{RESET}")
+            ok = False
+    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2570,6 +2767,14 @@ def main():
                     help="operations per worker thread in the stress phase")
     ap.add_argument("--metrics-top",      default=12, type=int,
                     help="number of command/operation rows to show in metrics")
+    ap.add_argument("--bench",            action="store_true",
+                    help="run a redis-benchmark speed baseline after the other phases")
+    ap.add_argument("--bench-requests",   default=100000, type=int,
+                    help="requests per redis-benchmark test")
+    ap.add_argument("--bench-clients",    default=50, type=int,
+                    help="parallel clients for redis-benchmark")
+    ap.add_argument("--bench-pipeline",   default=16, type=int,
+                    help="pipeline depth for redis-benchmark")
     ap.add_argument("--log",              default="docs/stress_results.md",
                     help="write a copy of all output here (ANSI stripped); "
                          "pass --log '' to disable")
@@ -2633,11 +2838,14 @@ def main():
             test_extended_generic_commands(r,      sock)
             test_unlink_command(r,                 sock)
             test_set_commands(r,                   sock)
+            test_set_random_semantics(r,           sock)
             test_edge_cases(r,            sock)
             test_ping_command(r,          sock)
             test_config_command(r,        sock)
             test_acl_commands(r,          sock, host, port)
             test_info_command(r,          sock)
+            test_info_keyspace_stats(r,   sock)
+            test_flushdb_command(r,       sock)
             test_save_command(r,          sock)
             test_bgsave_command(r,        sock)
             test_bgrewriteaof_command(r,  sock)
@@ -2650,6 +2858,7 @@ def main():
 
         # tests that manage their own connections
         try:
+            test_echo_and_inline(r,       host, port)
             test_auth_command(r,          host, port)
             test_persistence_roundtrip(r, host, port)
         except Exception as e:
@@ -2667,6 +2876,17 @@ def main():
         all_ok = run_stress_test(host, port, args.stress_threads,
                                  args.stress_ops, args.metrics_top) and all_ok
         cleanup_stress_keys(host, port)
+
+    # ── speed baseline (redis-benchmark) ───────────────────────────────────────
+    if args.bench:
+        all_ok = run_redis_benchmark(host, port, G_PASSWORD, args.bench_requests,
+                                     args.bench_clients, args.bench_pipeline) and all_ok
+        try:
+            s = make_conn(host, port)
+            cmd(s, "flushall")              # benchmark keys are junk
+            s.close()
+        except Exception:
+            pass
 
     COMMAND_METRICS.report(args.metrics_top)
 
