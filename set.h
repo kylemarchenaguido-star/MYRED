@@ -9,6 +9,11 @@ struct SetNode{
     std::string member;
 };
 
+// accounting charge for one member node
+inline size_t set_node_bytes(const SetNode *sn){
+    return sizeof(SetNode) + sizeof(HNode *) + sn->member.capacity();
+}
+
 // true if new member
 bool set_add(HMap *h, std::string member);
 bool set_is_member(HMap *h, const std::string &member);

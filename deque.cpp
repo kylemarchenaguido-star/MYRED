@@ -24,6 +24,7 @@ void deque_push_front(Deque *d, const std::string &val){
     // move head back by one (wrapping)
     d->head = (d->head + d->cap - 1) & (d->cap - 1);
     d->buf[d->head] = val;
+    d->elem_bytes += d->buf[d->head].capacity();
     d->count++;
 }
 
@@ -34,6 +35,7 @@ void deque_push_back(Deque *d, const std::string &val){
     }
     size_t tail = deque_phys(d, d->count);
     d->buf[tail] = val;
+    d->elem_bytes += d->buf[tail].capacity();
     d->count++;
 }
 
@@ -57,6 +59,7 @@ bool deque_pop_front(Deque *d, std::string *out){
     if (d->count == 0){
         return false;
     }
+    d->elem_bytes -= d->buf[d->head].capacity();
     *out = std::move(d->buf[d->head]);
     d->buf[d->head].clear(); // release memory
     d->head = (d->head + 1) & (d->cap - 1);
@@ -73,6 +76,7 @@ bool deque_pop_back(Deque *d, std::string *out){
         return false;
     }
     size_t tail = deque_phys(d, d->count - 1);
+    d->elem_bytes -= d->buf[tail].capacity();
     *out = std::move(d->buf[tail]);
     d->buf[tail].clear();
     d->count--;

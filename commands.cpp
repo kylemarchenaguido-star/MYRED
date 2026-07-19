@@ -1501,7 +1501,11 @@ void do_lset(std::vector<std::string> &cmd, Buffer *out){
   }
 
   // direct write
-  entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)idx)] = cmd[3];
+  Deque &d = entry_deque(ent);
+  std::string &slot = d.buf[deque_phys(&d, (size_t)idx)];
+  d.elem_bytes -= slot.capacity();
+  slot = cmd[3];
+  d.elem_bytes += slot.capacity();
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_ok(out);
@@ -1586,11 +1590,13 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out){
 
   size_t insert_idx = before ? pivot_idx : pivot_idx + 1;
 
-  // we ensure capaxity before opening the gap
+  // we ensure capacity before opening the gap
   if (entry_deque(ent).count == entry_deque(ent).cap){ deque_grow(&entry_deque(ent)); }
 
   deque_open_gap(&entry_deque(ent), insert_idx);
-  entry_deque(ent).buf[deque_phys(&entry_deque(ent), insert_idx)] = value;
+  std::string &slot = entry_deque(ent).buf[deque_phys(&entry_deque(ent), insert_idx)];
+  slot = value;
+  entry_deque(ent).elem_bytes += slot.capacity();
 
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
@@ -1620,6 +1626,7 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
     while (i > 0){
       --i;
       if (*deque_get(&entry_deque(ent), i) == value){
+        entry_deque(ent).elem_bytes -= deque_get(&entry_deque(ent), i)->capacity();
         deque_close_gap(&entry_deque(ent), i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
@@ -1630,6 +1637,7 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out){
     size_t i = 0;
     while (i < entry_deque(ent).count){
       if (*deque_get(&entry_deque(ent), i) == value){
+        entry_deque(ent).elem_bytes -= deque_get(&entry_deque(ent), i)->capacity();
         deque_close_gap(&entry_deque(ent), i);
         removed++;
         if (limit > 0 && removed >= limit) { break; }
@@ -1686,16 +1694,20 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out){
   size_t keep = (size_t)(stop - start + 1);
 
   // if we are keeping everything, no work needed
-  if (start == 0 && (size_t)(stop + 1) == entry_deque(ent).count){
+if (start == 0 && (size_t)(stop + 1) == entry_deque(ent).count){
     return resp_ok(out);
   }
 
   // clear dropped slots, then resposition head/count, no alloc
   for (int64_t i = 0; i < start; ++i){
-    entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)].clear();
+    std::string &slot = entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)];
+    entry_deque(ent).elem_bytes -= slot.capacity();
+    std::string().swap(slot); // releases the buffer; clear() would keep it
   }
   for (int64_t i = stop + 1; i < n; ++i){
-    entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)].clear();
+    std::string &slot = entry_deque(ent).buf[deque_phys(&entry_deque(ent), (size_t)i)];
+    entry_deque(ent).elem_bytes -= slot.capacity();
+    std::string().swap(slot); // releases the buffer; clear() would keep it
   }
 
   entry_deque(ent).head = deque_phys(&entry_deque(ent), (size_t)start); // compute before changing count
@@ -2451,6 +2463,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     // single pop
     SetNode *sn = container_of(hm_random(set), &SetNode::node);
     resp_str(out, sn->member.data(), sn->member.size());
+    set->elem_bytes -= set_node_bytes(sn);
     hm_delete(set, &sn->node, &hnode_same);
     if (feed){ synth.push_back(std::move(sn->member)); }
     delete sn;
@@ -2465,6 +2478,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     for (size_t i = 0; i < n; ++i){
       SetNode *sn = container_of(hm_random(set), &SetNode::node);
       resp_str(out, sn->member.data(), sn->member.size());
+      set->elem_bytes -= set_node_bytes(sn);
       hm_delete(set, &sn->node, &hnode_same);
       if (feed){ synth.push_back(std::move(sn->member)); }
       delete sn;
@@ -2785,18 +2799,16 @@ static void do_memory(std::vector<std::string> &cmd, Buffer *out){
   for (char &c : sub){ c = (char)tolower((unsigned char)c); }
 
   if (sub == "usage"){
-    size_t samples = 5; 
     if (cmd.size() >= 4){
       std::string opt = cmd[3];
       for (char &c : opt){ c = (char)tolower((unsigned char)c); } 
       if (opt != "samples" || cmd.size() < 5){ return resp_err(out, MSG_SYNTAX); }
       int64_t n = 0;
       if (!str2int(cmd[4], n) || n < 0){ return resp_err(out, MSG_SYNTAX); }
-      samples = (size_t)n;
     }
     Entry *ent = lookup_any(cmd[2]);
     if (!ent){ return resp_nil(out); }
-    return resp_int(out, (int64_t)entry_mem_usage_sampled(ent, samples));
+    return resp_int(out, (int64_t)entry_mem_usage(ent));
   }
   if (sub == "doctor"){
     size_t sweep = 0;

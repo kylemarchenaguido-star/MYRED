@@ -11,6 +11,10 @@ struct HashNode {
     std::string value;
 };
 
+inline size_t hash_node_bytes(const HashNode *hn){
+    return sizeof(HashNode) + sizeof(HNode *) + hn->field.capacity() + hn->value.capacity();
+}
+
 // returns true if a NEW field was created, false if an exisiting one was updated
 bool hash_set(HMap *h, const std::string &field, std::string value);
 HashNode *hash_get(HMap *h, const std::string &field);

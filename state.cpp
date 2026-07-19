@@ -474,13 +474,39 @@ const char *maxmemory_policy_name(MaxmemoryPolicy p){
   return "noeviction";
 }
 
-// Per-type element accumalators
-static bool cb_mem_hash(HNode *node, void *arg){
-  HashNode *hn = container_of(node, &HashNode::node);
-  // node + 1 bucket slot
-  *(size_t *)arg += sizeof(HashNode) + sizeof(HNode *) + hn->field.capacity() + hn->value.capacity();
-  return true;
+// Approximate byte cost of one entry (key + value). Kinda cheap, walks aggregates once
+size_t entry_mem_usage(Entry *ent){
+  size_t n = sizeof(Entry) + ent->key.capacity();
+  switch (ent->type){
+    case T_STR:
+      n += entry_str(ent).capacity();
+      break;
+    case T_DLIST: {
+      Deque &d = entry_deque(ent);
+      // the ring buffer itself 
+      n += d.cap * sizeof(std::string) + d.elem_bytes;
+      break;
+    }
+    case T_HASH: n += entry_hash(ent).elem_bytes; break;
+    case T_SET:  n += entry_set(ent).elem_bytes; break;
+    case T_ZSET: n += entry_zset(ent).hmap.elem_bytes; break;
+    default: break;
+  }
+  return n;
 }
+
+
+// Recompute this entry size and fold the delta into the global counter.
+// Add-new-before-subtract-old keeps used_memory from the ever underflowing,
+// because the invariant guarantees used_memory >= ent->mem.
+void mem_reaccount(Entry *ent){
+  size_t now = entry_mem_usage(ent);
+  g_data.used_memory += now;
+  g_data.used_memory -= ent->mem;
+  ent->mem = now; 
+}
+
+#ifndef NDEBUG
 
 static bool cb_mem_set(HNode *node, void *arg){
   SetNode *sn = container_of(node, &SetNode::node);
@@ -495,100 +521,53 @@ static bool cb_mem_zset(HNode *node, void *arg){
   return true;
 }
 
-// Approximate byte cost of one entry (key + value). Kinda cheap, walks aggregates once
-size_t entry_mem_usage(Entry *ent){
-  size_t n = sizeof(Entry) + ent->key.capacity();
-  switch (ent->type){
-    case T_STR:
-      n += entry_str(ent).capacity();
-      break;
-    case T_DLIST: {
-      Deque &d = entry_deque(ent);
-      // the ring buffer itself 
-      n += d.cap * sizeof(std::string);
-      for (size_t i = 0; i < d.count; ++i){
-        // live element bytes
-        n += deque_get(&d, i)->capacity();
-      }
-      break;
-    }
-    case T_HASH: hm_foreach(&entry_hash(ent), cb_mem_hash, &n); break;
-    case T_SET: hm_foreach(&entry_set(ent), cb_mem_set, &n); break;
-    case T_ZSET: hm_foreach(&entry_zset(ent).hmap, cb_mem_zset, &n); break;
-    default: break;
-  }
-  return n;
-}
-
-struct MemSampleCtx { 
-  size_t left;
-  size_t sum;
-  size_t counted;
-  uint32_t type;
-};
-
-static bool cb_mem_sample(HNode *node, void *arg){
-  MemSampleCtx *c = (MemSampleCtx *)arg;
-  switch (c->type){
-    case T_HASH: { HashNode *hn = container_of(node, &HashNode::node);
-      c->sum += sizeof(HashNode) + sizeof(HNode *) + hn->field.capacity() + hn->value.capacity(); break; }
-    case T_SET: { SetNode *sn = container_of(node, &SetNode::node);
-      c->sum += sizeof(SetNode) + sizeof(HNode *) + sn->member.capacity(); break; }
-    case T_ZSET: { ZNode *zn = container_of(node, &ZNode::hmap); 
-      c->sum += sizeof(ZNode) + zn->len + sizeof(HNode *); break; }
-  }
-  c->counted++;
-  // stop once we've sampled 'samples' nodes
-  return --c->left > 0;
-}
-
-size_t entry_mem_usage_sampled(Entry *ent, size_t samples){
-  if (samples == 0){ return entry_mem_usage(ent); }
-  size_t base = sizeof(Entry) + ent->key.capacity();
-  switch (ent->type){
-    case T_STR:
-      // single value, no sampling
-      return base + entry_str(ent).capacity();
-    case T_DLIST: {
-      Deque &d = entry_deque(ent);
-      size_t n = base + d.cap * sizeof(std::string);
-      if (d.count == 0){ return n; }
-      size_t k = samples < d.count ? samples : d.count, sum = 0;
-      for (size_t i = 0; i < k; ++i){ sum += deque_get(&d, i)->capacity(); }
-      // extrapolate
-      return n + (size_t)((double)sum / (double)k * (double)d.count);
-    }
-    case T_HASH: case T_SET: case T_ZSET: {
-      HMap *m = ent->type == T_HASH ? &entry_hash(ent)
-              : ent->type == T_SET ?  &entry_set(ent)
-              :                       &entry_zset(ent).hmap;
-      size_t total = hm_size(m);
-      if (total == 0){ return base; }
-      MemSampleCtx c{ samples, 0, 0, ent->type };
-      hm_foreach(m, cb_mem_sample, &c);
-      if (c.counted == 0){ return base; }
-      return base + (size_t)((double)c.sum / (double)c.counted * (double)total);
-    }
-  }
-  return base;
-}
-
-// Recompute this entry size and fold the delta into the global counter.
-// Add-new-before-subtract-old keeps used_memory from the ever underflowing,
-// because the invariant guarantees used_memory >= ent->mem.
-void mem_reaccount(Entry *ent){
-  size_t now = entry_mem_usage(ent);
-  g_data.used_memory += now;
-  g_data.used_memory -= ent->mem;
-  ent->mem = now; 
-}
-
-#ifndef NDEBUG
 static bool cb_mem_sum(HNode *node, void *arg){
   Entry *e = container_of(node, &Entry::node);
   *(size_t *)arg += entry_mem_usage(e);
   return true;
 }
+
+static bool cb_mem_hash(HNode *node, void *arg){
+  *(size_t *)arg += hash_node_bytes(container_of(node, &HashNode::node));
+  return true;
+}
+
+// independent recount of deque element bytes, catches elem-bytes drift
+// independent recount vs the maintained elem_bytes counters — catches drift
+static bool cb_bytes_check(HNode *node, void *arg){
+  (void)arg;
+  Entry *e = container_of(node, &Entry::node);
+  size_t sum = 0, counter = 0;
+  const char *what = nullptr;
+  switch (e->type){
+    case T_DLIST: {
+      Deque &d = entry_deque(e);
+      for (size_t i = 0; i < d.count; ++i){ sum += deque_get(&d, i)->capacity(); }
+      counter = d.elem_bytes; what = "deque";
+      break;
+    }
+    case T_HASH:
+      hm_foreach(&entry_hash(e), cb_mem_hash, &sum);
+      counter = entry_hash(e).elem_bytes; what = "hash";
+      break;
+    case T_SET:
+      hm_foreach(&entry_set(e), cb_mem_set, &sum);
+      counter = entry_set(e).elem_bytes; what = "set";
+      break;
+    case T_ZSET:
+      hm_foreach(&entry_zset(e).hmap, cb_mem_zset, &sum);
+      counter = entry_zset(e).hmap.elem_bytes; what = "zset";
+      break;
+    default: return true;
+  }
+  if (sum != counter){
+    fprintf(stderr, "[mem] %s elem_bytes drift on '%s': counter=%zu walk=%zu\n",
+            what, e->key.c_str(), counter, sum);
+  }
+  return true;
+}
+
+
 void mem_selfcheck(const char *where){
   size_t sweep = 0;
   hm_foreach(&g_data.db, cb_mem_sum, &sweep);
@@ -597,6 +576,8 @@ void mem_selfcheck(const char *where){
             where, g_data.used_memory, sweep,
             (ssize_t)sweep - (ssize_t)g_data.used_memory);
   }
+  hm_foreach(&g_data.db, cb_bytes_check, nullptr);
+
 }
 #endif
 

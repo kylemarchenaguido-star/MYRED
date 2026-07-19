@@ -115,6 +115,7 @@ void hm_insert(HMap *hmap, HNode *node){
 void hm_clear(HMap *hmap){
     free(hmap->newer.tab);
     free(hmap->older.tab);
+    hmap->elem_bytes = 0;
     *hmap = HMap{};
 }
 

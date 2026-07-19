@@ -14,6 +14,7 @@ bool set_add(HMap *h, std::string member){
     sn->member = std::move(member);
     sn->node.hcode = key.node.hcode;
     hm_insert(h, &sn->node);
+    h->elem_bytes += set_node_bytes(sn);
     return true;
 }
 
@@ -30,6 +31,7 @@ bool set_remove(HMap *h, const std::string &member){
     sk_init(&key, member);
     HNode *found = hm_delete(h, &key.node, &str_node_eq<SetNode, &SetNode::member>);
     if (!found){ return false; }
+    h->elem_bytes -= set_node_bytes(container_of(found, &SetNode::node));
     delete container_of(found, &SetNode::node);
     return true;
 }

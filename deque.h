@@ -9,6 +9,7 @@ struct Deque {
     size_t cap = 0; // allocated slots
     size_t head = 0; // index of the first elements
     size_t count = 0; // number of elements
+    size_t elem_bytes = 0; // sum capacity() of the live elements (for entry_mem_usage)
 };
 
 inline void deque_init(Deque *d){
@@ -16,6 +17,7 @@ inline void deque_init(Deque *d){
     d->cap = 0;
     d->head = 0;
     d->count = 0;
+    d->elem_bytes = 0;
 }
 
 inline void deque_free(Deque *d){
@@ -24,6 +26,7 @@ inline void deque_free(Deque *d){
     d->cap = 0;
     d->head = 0;
     d->count = 0;
+    d->elem_bytes = 0;
 }
 
 inline size_t deque_phys(const Deque *d, size_t logical){

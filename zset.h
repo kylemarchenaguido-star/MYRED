@@ -19,6 +19,10 @@ struct ZNode {
     char name[0]; // array (can use extra space because is at the end of the struct)
 };
 
+inline size_t znode_byte(const ZNode *zn){
+    return sizeof(ZNode) + zn->len + sizeof(HNode *);
+}
+
 // point queries and updates
 bool zset_insert(ZSet *zset, const char *name, size_t len, double score);
 ZNode *zset_lookup(ZSet *zset, const char *name, size_t len);

@@ -84,9 +84,28 @@ def main():
     srv = None
     try:
         # --- lifetime 1: exercise every write path under test ---------------
-        print("\nphase 1: GETEX ttl, aliased GETDEL, ZPOPMIN, eviction DELs")
+        print("\nphase 1: eviction DELs, GETEX ttl, aliased GETDEL, ZPOPMIN")
         srv = Server(server_bin, workdir, conf, "seed", port)
         s = connect(port, PASSWORD)
+
+        # eviction FIRST: allkeys-random can evict ANY key, so the sentinel
+        # keys for the ttl/getdel/zpopmin checks must not exist yet — only the
+        # ev:* fodder may be sacrificed
+        val = "e" * 400
+        for i in range(200):
+            cmd(s, "SET", f"ev:{i}", val)
+        cmd(s, "CONFIG", "SET", "maxmemory-policy", "allkeys-random")
+        cmd(s, "CONFIG", "SET", "maxmemory", "65536")
+        for i in range(200, 300):
+            try:
+                cmd(s, "SET", f"ev:{i}", val)
+            except RuntimeError:
+                pass  # OOM replies are fine; we only need evictions to fire
+        time.sleep(0.5)  # let evict_tick drain
+        cmd(s, "CONFIG", "SET", "maxmemory", "0")
+        cmd(s, "CONFIG", "SET", "maxmemory-policy", "noeviction")
+        dbsize = cmd(s, "DBSIZE")
+        check("eviction actually removed keys", dbsize < 300, f"dbsize={dbsize}")
 
         check("SET rm:str", cmd(s, "SET", "rm:str", "v1") == "OK")
 
@@ -113,23 +132,6 @@ def main():
         check("zpopmin kept b", cmd(s, "ZSCORE", "rm:z", "b") is not None)
 
         cmd(s, "HSET", "rm:h", "f", "v")
-
-        # eviction: overshoot a small cap so random victims produce synthetic DELs
-        val = "e" * 400
-        for i in range(200):
-            cmd(s, "SET", f"ev:{i}", val)
-        cmd(s, "CONFIG", "SET", "maxmemory-policy", "allkeys-random")
-        cmd(s, "CONFIG", "SET", "maxmemory", "65536")
-        for i in range(200, 300):
-            try:
-                cmd(s, "SET", f"ev:{i}", val)
-            except RuntimeError:
-                pass  # OOM replies are fine; we only need evictions to fire
-        time.sleep(0.5)  # let evict_tick drain
-        cmd(s, "CONFIG", "SET", "maxmemory", "0")
-        cmd(s, "CONFIG", "SET", "maxmemory-policy", "noeviction")
-        dbsize = cmd(s, "DBSIZE")
-        check("eviction actually removed keys", dbsize < 300, f"dbsize={dbsize}")
 
         before = snapshot(s)
         ttl_before = cmd(s, "TTL", "rm:ttl")

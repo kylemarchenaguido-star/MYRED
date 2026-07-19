@@ -147,11 +147,11 @@ Closed the post-ACL security gaps before TLS. All substeps done, in order:
 Deferred to Backlog: `stress_test.py` ACL/rename/audit coverage; `INFO audit_last_error`
 exposure; optional `auditlog-events` / `auditlog-required` filters.
 
-#### V9.6 - Password Hashing Upgrade [In Progress]
+#### V9.6 - Password Hashing Upgrade [Done]
 
 Credentials at rest upgraded from unsalted SHA-256 to Argon2id (OWASP baseline
 m=19456 KiB, t=2, p=1) with async verification, while every pre-existing config stays
-loadable. V9.6.1–V9.6.4 shipped; V9.6.5 (general and speed test) is the active step.
+loadable. All substeps V9.6.1–V9.6.5 shipped; milestone closed 2026-07-18.
 
 - `[Done]` **N5 prerequisite** — 2026-07-12. `sha256_hex` padding bug (`len%64 >= 56`)
   fixed; KAT-verified against NIST vectors + hashlib (lengths 0–200).
@@ -206,7 +206,7 @@ on top of open loop/persistence bugs.
   loss, ECHO command + empty-inline ignore (redis-cli --pipe compat). New regression
   script: `scripts/test_evict_tick.sh`. Testing debt rolled into V9.6.5.
 
-##### `[Next]` V9.6.5 - General and speed test
+##### `[Done]` V9.6.5 - General and speed test — 2026-07-18
 
 Full-surface validation pass before TLS: general correctness testing plus a speed
 baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
@@ -217,7 +217,9 @@ baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
   security tests (control-plane category gating, renamed/disabled commands,
   audit-log redaction, precise key ACLs, `ACL CAT` RESP framing); destructive/
   server-crashing edge cases behind an explicit test flag.
-  - **Suites written 2026-07-17, awaiting user run**: `scripts/test_restart_matrix.py`
+  - **Suites GREEN 2026-07-18** (both with `--destructive`; en route they caught
+    and got fixed: 🔴 rename-command AOF-restart brick, 🟠 nopass round-trip):
+    `scripts/test_restart_matrix.py`
     (GETEX ttl / aliased-GETDEL canonical frames / ZPOPMIN / eviction-DEL exact
     keyspace replay; `--destructive` adds SIGKILL crash recovery) and
     `scripts/test_security.py` (category gating, rename/disable, audit
@@ -231,6 +233,15 @@ baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
 - Speed test: benchmark baseline (`redis-benchmark` where the command surface
   allows, plus timed `stress_test.py` runs). Record the numbers — V9.7.1's
   transport-seam refactor must prove zero perf regression against this baseline.
+  - **BASELINE RECORDED 2026-07-18 — the V9.7.1 zero-regression reference.**
+    Release build, WSL2 loopback, `-n 100000 -c 50 -P 16` (`--bench`), post
+    delta-accounting, ops/sec:
+    PING 1.01M · SET 1.06M · GET 1.02M · INCR 1.00M · LPUSH 870k · RPUSH 935k ·
+    LPOP 990k · RPOP 885k · SADD 917k · HSET 926k · SPOP 1.02M · ZADD 917k ·
+    ZPOPMIN 1.06M · MSET(10 keys) 327k · LRANGE 100/300/500/600 el:
+    103k/41.5k/25.5k/16.9k (output-bound, scales ~linearly with range).
+    Growth check (`-r 100000 -n 200000`): SADD 656k · HSET 629k · ZADD 299k —
+    flat as containers grow. Full log in `docs/stress_results.md`.
 - Harness updated 2026-07-17 (hold lifted): moved to `scripts/stress_test.py` (docs
   already pointed there), new coverage for ECHO + inline protocol + empty-inline
   ignore, FLUSHDB, SPOP/SRANDMEMBER edge semantics + randomness distribution,
@@ -244,7 +255,7 @@ baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
   release-mode perf bug fell out: `mem_reaccount` is O(container size) per
   mutation — filed in Known Bugs.
 
-#### V9.7 - TLS [Backlog]
+#### V9.7 - TLS [Next]
 
 TLS is the heaviest security feature. The event loop, not OpenSSL, is where the risk
 lives: today plaintext I/O touches exactly four places — accept
@@ -428,8 +439,16 @@ Feature gaps that were listed here (missing features, not defects) moved to Back
   won't boot. Fix: accept `nopass` in `acl_apply_rule` (clear `pw_hashes`,
   same as `resetpass`).
 
-- **`mem_reaccount` is O(container size) per mutation** 🔵 (filed 2026-07-17, found
-  by the first `--bench` baseline): `mem_reaccount` calls the full
+- **`mem_reaccount` is O(container size) per mutation** 🔵 — FIXED 2026-07-18.
+  Phase 1 (lists: `Deque::elem_bytes` maintained counter, O(1)
+  `entry_mem_usage`, debug drift detector, LTRIM `.clear()` retention fix) and
+  Phase 2 (hash/set/zset via `HMap::elem_bytes`; `entry_mem_usage_sampled`
+  deleted, `MEMORY USAGE` now exact) both applied. Evidence: growth benchmark
+  flat instead of degrading — SADD 655.7k / HSET 628.9k / ZADD 299.4k ops/s at
+  `-r 100000 -n 200000 -c 50 -P 16` (Release, WSL2). Drift-verified 2026-07-18:
+  Debug-build `cb_bytes_check` audit over the full correctness suite = zero
+  drift lines (after two fixes it caught: the zset_delete `#ifdef NDEBUG`
+  inversion and the LINSERT SSO-residue over-subtract). (filed 2026-07-17, found by the first `--bench` baseline): `mem_reaccount` calls the full
   `entry_mem_usage` (`state.cpp:580`), which walks every element of a
   T_DLIST/T_HASH/T_SET/T_ZSET (`state.cpp:505-517`). Every LPUSH onto a 20k-element
   list walks all 20k strings — measured degrading 15.6k→1.7k ops/s as the list

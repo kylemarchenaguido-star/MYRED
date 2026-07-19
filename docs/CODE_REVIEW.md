@@ -230,12 +230,14 @@ under ROADMAP V9.6.5.
 
 #### Testing debt — MOVED to ROADMAP V9.6.5 (general and speed test) 2026-07-17
 
-- [ ] AOF-restart-with-ACL test (pairs with N1); restart tests for `GETEX`, `GETDEL`,
-  `ZPOPMIN`, eviction `DEL`, and renamed-command canonicalized frames.
-- [ ] Security tests: control-plane category gating (V9.5.1), renamed/disabled
-  commands, audit-log redaction, precise key ACLs; one test that `ACL CAT` framing is
-  a valid RESP array.
-- [ ] Destructive/server-crashing edge cases behind an explicit test flag.
+- [x] AOF-restart-with-ACL test; restart tests for `GETEX`, `GETDEL`, `ZPOPMIN`,
+  eviction `DEL`, renamed-command frames. DONE 2026-07-18:
+  `scripts/test_aof_restart.py` + `scripts/test_restart_matrix.py` (green).
+- [x] Security tests. DONE 2026-07-18: `scripts/test_security.py` (green) —
+  gating, rename/disable, audit redaction, key ACLs + SMOVE resolver, `ACL CAT`
+  framing, CONFIG REWRITE round-trip.
+- [x] Destructive/server-crashing edge cases. DONE 2026-07-18: `--destructive`
+  flags in both suites (SIGKILL crash recovery; protocol abuse + liveness).
 
 ### C. Not bugs — feature gaps returned to ROADMAP Backlog
 

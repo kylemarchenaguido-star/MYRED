@@ -25,6 +25,7 @@ struct HMap
     HTab newer; // active table
     HTab older; // draining table, only exists on rehashing
     size_t migrate_pos = 0; // next bucket index in older to migrate 
+    size_t elem_bytes = 0; // sum per node bytes, maintained by the typed layer (hash/zset/set)
 };
 
 //get

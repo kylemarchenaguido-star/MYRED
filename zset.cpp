@@ -90,6 +90,7 @@ bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
     }
     ZNode *node = znode_new(name, len, score);
     hm_insert(&zset->hmap, &node->hmap);
+    zset->hmap.elem_bytes += znode_byte(node);
     tree_insert(zset, node);
     return true;
 
@@ -135,9 +136,11 @@ void zset_delete(ZSet *zset, ZNode *node) {
     key.name = node->name;
     key.len = node->len;
     HNode *found = hm_delete(&zset->hmap, &key.node, &hcmp);
+    (void)found;
     assert(found);
     //remove from the tree
     zset->root = avl_del(&node->tree);
+    zset->hmap.elem_bytes -= znode_byte(node);
     //deallocate the node
     znode_del(node);
 }

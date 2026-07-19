@@ -9,7 +9,10 @@ bool hash_set(HMap *h, const std::string &field, std::string value){
 
     HNode *found = hm_lookup(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
     if (found){
-        container_of(found, &HashNode::node)->value = std::move(value); // update existing
+        HashNode *hn = container_of(found, &HashNode::node);
+        h->elem_bytes -= hn->value.capacity();
+        hn->value = std::move(value);
+        h->elem_bytes += hn->value.capacity();
         return false;
     }
     // create a new field for the hash 
@@ -18,6 +21,7 @@ bool hash_set(HMap *h, const std::string &field, std::string value){
     hn->value = std::move(value);
     hn->node.hcode = key.node.hcode;
     hm_insert(h, &hn->node);
+    h->elem_bytes += hash_node_bytes(hn);
     return true;
 }
 
@@ -36,6 +40,7 @@ bool hash_del(HMap *h, const std::string &field){
     HNode *found = hm_delete(h, &key.node, &str_node_eq<HashNode, &HashNode::field>);
     if(!found){ return false; }
 
+    h->elem_bytes -= hash_node_bytes(container_of(found, &HashNode::node));
     delete container_of(found, &HashNode::node);
     return true;
 }
