@@ -2752,6 +2752,9 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
     if (p == "rename-command"){
       return resp_err(out, "ERR 'rename-command' can only be set in the config file");
     }
+    if (p.rfind("tls-", 0) == 0){
+      return resp_err(out, "ERR TLS parameters can only be set in the config file");
+    }
     CfgResult res = config_apply(cmd[2], { cmd[3] }, err);
     if (res == CfgResult::BADVALUE){ return resp_err(out, ("ERR " + err).c_str()); }
     if (res == CfgResult::UNKNOWN){ return resp_err(out, ("ERR Unknown config parameter '" + cmd[2] + "'").c_str()); }

@@ -87,6 +87,14 @@ enum class CfgResult {
   BADVALUE
 };
 
+enum class TlsAuthClients {
+  NO,
+  YES,
+  OPTIONAL
+};
+
+typedef struct ssl_st SSL; // OpenSSL's own typedef; we keep openss/ss.h out of this header
+
 struct User {
   uint64_t allow_cats = 0; // granted category bits
   std::unordered_map<std::string, bool> cmd_overrides; // explicit +cmd / -cmd
@@ -104,17 +112,20 @@ struct Conn {
   bool want_read = false;
   bool want_write = false;
   bool want_close = false;
+  bool tr_want_read = false; // transport demands POLLIN ti finish its current op
+  bool tr_want_write = false; // transport demands POLLOUT (TLS: a read can need it)
   DList idle_node;
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
   uint32_t failed_attemps = 0;
-  // 40 bytes total above → Buffer needs align 8, no padding needed
+  // 48 bytes total above → Buffer needs align 8, no padding needed
   Buffer incoming;
   Buffer outgoing;
   User *user = nullptr; 
   std::string peer; // "ip:port", set once at accept - no inet_ntoa() later
   bool auth_pending = false; // a worker is verifyng this conn's auth; parsing is gated
   uint64_t id = 0; // monotonic, stamped at accept - completions check it
+  SSL *ssl = nullptr; // non-null = TLS conn; owned by the transport, freed in tr_close
 };
 
 // global hashtable
@@ -165,6 +176,12 @@ struct SaveCondition {
 //global config
 struct Config {
   int port = 1234;
+  // TLS - all boot-only; CONFIG SET rejects tls-*
+  int tls_port = 0; // 0 = disable; coexists with plaintext port
+  std::string tls_cert_file;
+  std::string tls_key_file;
+  std::string tls_ca_cert_file;
+  TlsAuthClients tls_auth_clients = TlsAuthClients::NO;
   std::string config_path;
   std::string auditlog_path;
   std::string password = "";

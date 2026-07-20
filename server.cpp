@@ -35,6 +35,13 @@
 #include "aof.h"
 #include "sha256.h"
 #include "cred.h"
+#include "transport.h"
+
+struct Listener {
+  int fd;
+  bool is_tls;
+};  
+
 
 // worker constant 
 static int g_loop_efd = -1;
@@ -82,6 +89,14 @@ static void fd_set_nb(int fd){
   if (errno){ fatal_exit("fcntl error"); }
 }
 
+static void conn_destroy(Conn *conn){
+  tr_close(conn);
+  g_data.fd2conn[conn->fd] = NULL;
+  dlist_detach(&conn->idle_node);
+  delete conn;
+  g_data.connected_clients--;
+}
+
 // callable from any worker thread
 void loop_post(std::function<void()> fn){
   pthread_mutex_lock(&g_loop_mu);
@@ -106,7 +121,7 @@ static void loop_drain(){
 }
 
 // callback when the socket is ready
-static int32_t handle_accept(int fd){
+static int32_t handle_accept(int fd, bool is_tls){
   // accept logic
   struct sockaddr_in client_addr =  {};
   socklen_t addrlen = sizeof(client_addr);
@@ -176,6 +191,11 @@ static int32_t handle_accept(int fd){
   g_data.connected_clients++;
   g_data.fd2conn[conn->fd] = conn;
 
+  if (is_tls && !tr_tls_attach(conn)){
+    conn_destroy(conn); // SSL_new failed, wew drop this conn only
+    return 0;
+  }
+
   return 0;
 }
 
@@ -205,14 +225,6 @@ static int listen_on(const std::string &addr, int port){
     return -1;
   }
   return fd;
-}
-
-static void conn_destroy(Conn *conn){
-  (void)close(conn->fd);
-  g_data.fd2conn[conn->fd] = NULL;
-  dlist_detach(&conn->idle_node);
-  delete conn;
-  g_data.connected_clients--;
 }
 
 // Timers logic 
@@ -453,16 +465,16 @@ static bool try_one_request(Conn *conn){
 
 static void handle_write(Conn *conn){
   assert(buf_size(&conn->outgoing) > 0);
-  ssize_t rv = write(conn->fd, buf_data(&conn->outgoing), buf_size(&conn->outgoing));
-  if(rv < 0 && errno == EAGAIN){ return; }
-  if (rv < 0 && errno == EINTR){ return; }
-
-  if (rv < 0) {
+  size_t n = 0;
+  IoResult r = tr_write(conn, buf_data(&conn->outgoing), buf_size(&conn->outgoing), &n);
+  if (r == IoResult::WANT_READ || r == IoResult::WANT_WRITE){ return; }
+  if (r != IoResult::OK){ 
     conn->want_close = true;
     return;
-  }
+   }
+
   // remove the data from outgoing
-  buf_consume(&conn->outgoing, (size_t)rv);
+  buf_consume(&conn->outgoing, n);
 
   if (buf_size(&conn->outgoing) == 0){ // all data writen 
     conn->want_read = true;
@@ -473,15 +485,15 @@ static void handle_write(Conn *conn){
 
 static void handle_read(Conn *conn){
   uint8_t buf [64 * 1024];
-  ssize_t rv = read(conn->fd, buf, sizeof(buf));
-  if (rv < 0 && errno == EAGAIN){return;}
-  if (rv < 0 && errno == EINTR){ return; }
-  if(rv <= 0) {
+  size_t n = 0;
+  IoResult r = tr_read(conn, buf, sizeof(buf), &n);
+  if (r == IoResult::WANT_READ || r == IoResult::WANT_WRITE){ return; }
+  if (r != IoResult::OK){ 
     conn->want_close = true;
     return;
   }
   // add new data to the incoming buffer
-  buf_append(&conn->incoming, buf, (size_t)rv);
+  buf_append(&conn->incoming, buf, n);
 
   // a client that streams framing without ever completing a command must not grow us unbounded
   if (buf_size(&conn->incoming) > k_max_incoming){
@@ -666,13 +678,26 @@ int main(int argc, char **argv){
     else { fprintf(stderr, "warning: bad MYRED_MAXMEMORY_POLICY '%s'\n", policy_env); }
   }
 
-  std::vector<int> listen_fds;
+  {
+    std::string tls_err;
+    if (!tr_tls_init(tls_err)){ fatal_exit(tls_err.c_str()); }
+  }
+
+  std::vector<Listener> listeners;
   for (const std::string &addr : g_config.binds){
     int lfd = listen_on(addr, g_config.port);
     // fail fast if any addrees can't bind 
     if (lfd < 0){ fatal_exit("listener setup"); }
-    listen_fds.push_back(lfd);
+    listeners.push_back({lfd, false});
     fprintf(stderr,"listening on %s:%d\n", addr.c_str(), g_config.port);
+  }
+  if (g_config.tls_port != 0){
+    for (const std::string &addr : g_config.binds){
+      int lfd = listen_on(addr, g_config.tls_port);
+      if (lfd < 0){ fatal_exit("tls listener setup"); }
+      listeners.push_back({lfd, true});
+      fprintf(stderr, "listening on %s:%d (TLS)\n", addr.c_str(), g_config.tls_port);
+    }
   }
 
   // pre-warm and pay the KDF cost at boot
@@ -680,16 +705,15 @@ int main(int argc, char **argv){
   g_loop_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   if (g_loop_efd < 0){ fatal_exit("eventfd"); }
 
-  const size_t nlisten = listen_fds.size();
+  const size_t nlisten = listeners.size();
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
 
   while(!g_stop){
     
     poll_args.clear(); //This just clean the arguments for poll.
     // listen fds occupy [0, nlisten]; eventfd at [nlisten]; conns after
-    for (int lfd : listen_fds){
-      struct pollfd pfd = {lfd, POLLIN, 0};
-      poll_args.push_back(pfd);
+    for (const Listener &l : listeners){
+      poll_args.push_back({l.fd, POLLIN, 0});
     }
 
     poll_args.push_back({ g_loop_efd, POLLIN, 0});
@@ -697,8 +721,8 @@ int main(int argc, char **argv){
     for (Conn *conn : g_data.fd2conn){
       if(!conn){continue;}
       struct pollfd pfd = {conn->fd, POLLERR, 0}; // This is for the flags of the aplication
-      if (conn->want_read){ pfd.events |= POLLIN; }
-      if (conn->want_write){ pfd.events |= POLLOUT; }
+      if (conn->want_read || conn->tr_want_read)  { pfd.events |= POLLIN; }
+      if (conn->want_write || conn->tr_want_write){ pfd.events |= POLLOUT; }
       poll_args.push_back(pfd);
     }
 
@@ -712,7 +736,7 @@ int main(int argc, char **argv){
     for (size_t i = 0; i < nlisten; i++){
       if (poll_args[i].revents) {
         // we accept on that fd
-        while (handle_accept(poll_args[i].fd) == 0) {}
+        while (handle_accept(listeners[i].fd, listeners[i].is_tls) == 0) {}
       }
     }
 
@@ -736,12 +760,10 @@ int main(int argc, char **argv){
 
       // Connection are ready to write and read
       if(ready & POLLIN){
-        assert(conn->want_read);
-        handle_read(conn);
+        if (conn->want_read || conn->tr_want_read){ handle_read(conn); } 
       }
       if(ready & POLLOUT){
-        assert(conn->want_write);
-        handle_write(conn);
+        if (conn->want_write || conn->tr_want_write){ handle_write(conn); } 
       }
       //Close the socket from erros 
       if((ready & POLLERR) || conn->want_close){

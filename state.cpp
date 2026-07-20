@@ -216,6 +216,36 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
+  if (name == "tls-port"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    long p = 0;
+    if (!parse_int_strict(args[0].c_str(), &p) || p < 0 || p > 65535){
+      err = "invalid tls-port";
+      return CfgResult::BADVALUE;
+    }
+    g_config.tls_port = (int)p;
+    return CfgResult::OK;
+  }
+
+  if (name == "tls-cert-file" || name == "tls-key-file" || name == "tls-ca-cert-file"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    if      (name == "tls-cert-file") { g_config.tls_cert_file = args[0]; }
+    else if (name == "tls-key-file")  { g_config.tls_key_file = args[0]; }
+    else                              { g_config.tls_ca_cert_file = args[0]; }
+    return CfgResult::OK;
+  }
+
+  if (name == "tls-auth-clients"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    std::string v = args[0];
+    for (char &c : v){ c = (char)tolower((unsigned char)c); }
+    if      (v == "yes")     {g_config.tls_auth_clients = TlsAuthClients::YES; }
+    else if (v == "nos")     {g_config.tls_auth_clients = TlsAuthClients::NO; }
+    else if (v == "optional"){g_config.tls_auth_clients = TlsAuthClients::OPTIONAL; }
+    else { err = "tls-auth-clients mus be yes, no, or optional"; return CfgResult::BADVALUE; }
+    return CfgResult::OK;
+  }
+
   if (name == "bind"){
     if (args.empty()){ err = "bind needs at least one address"; return CfgResult::BADVALUE; }
     g_config.binds = args;
@@ -414,12 +444,22 @@ bool config_rewrite(const char * path){
     ia.s_addr = htonl(a.first);
     fprintf(fp, "allow-ip %s/%d\n", inet_ntoa(ia), __builtin_popcount(a.second));
   }
-  if (!g_config.password.empty()){
-    if (g_config.password.rfind("$argon2id$", 0) == 0){
-      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
-    } else {
-      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
-    }
+  // TLS 
+  if (g_config.tls_port != 0){ 
+    fprintf(fp, "tls-port %d\n", g_config.tls_port); 
+  }
+  if (!g_config.tls_cert_file.empty()){ 
+    fprintf(fp, "tls-cert-file \"%s\"\n", g_config.tls_cert_file.c_str());
+   }
+  if (!g_config.tls_key_file.empty()){ 
+    fprintf(fp, "tls-key-file \"%s\"\n", g_config.tls_key_file.c_str());
+   }
+  if (!g_config.tls_ca_cert_file.empty()){ 
+    fprintf(fp, "tls-ca-cert-file \"%s\"\n", g_config.tls_ca_cert_file.c_str());
+   }
+  if (g_config.tls_auth_clients != TlsAuthClients::NO){
+    fprintf(fp, "tls-auth-clients %s\n",
+      g_config.tls_auth_clients == TlsAuthClients::YES ? "yes" : "optional");
   }
   fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
   fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");

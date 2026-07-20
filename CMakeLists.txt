@@ -15,6 +15,7 @@ add_compile_options(-Wall -Wextra -Wshadow)
 # dependencies: zlib (RDB compression) and pthreads (thread pool)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 # optional: Argon2id for new password hashes (falls back to SHA-256 when absent)
 option(MYRED_ARGON2 "Hash new passwords with Argon2id (libargon2)" ON)
 if(MYRED_ARGON2)
@@ -47,8 +48,9 @@ add_executable(server
   set.cpp
   aof.cpp
   cred.cpp
+  transport.cpp
 )
-target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
+target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 if(MYRED_HAVE_ARGON2)
   target_compile_definitions(server PRIVATE MYRED_HAVE_ARGON2)

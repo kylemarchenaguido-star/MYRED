@@ -242,6 +242,15 @@ baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
     103k/41.5k/25.5k/16.9k (output-bound, scales ~linearly with range).
     Growth check (`-r 100000 -n 200000`): SADD 656k · HSET 629k · ZADD 299k —
     flat as containers grow. Full log in `docs/stress_results.md`.
+  - **Native-Linux reference (same commit, laptop, no WSL), 2026-07-18** —
+    uniformly ~2.2-2.5x the WSL numbers, confirming the WSL baseline was
+    environment-limited, not server-limited: PING 2.78M · SET 2.22M · GET
+    2.50M · INCR 2.22M · LPUSH 2.00M · RPUSH 2.13M · LPOP 2.33M · RPOP 2.27M ·
+    SADD 2.08M · HSET 2.08M · SPOP 2.63M · ZADD 1.92M · ZPOPMIN 2.27M ·
+    MSET(10) 833k · LRANGE 100/300/500/600: 211k/74k/44k/36k. Concurrent
+    stress phase: p50 0.21ms, max 17ms, `KEYS` contention cost 13ms (vs 333ms
+    on WSL — the WSL tail was loopback queueing, not server work). V9.7.1
+    regression comparisons must be same-machine, same-environment.
 - Harness updated 2026-07-17 (hold lifted): moved to `scripts/stress_test.py` (docs
   already pointed there), new coverage for ECHO + inline protocol + empty-inline
   ignore, FLUSHDB, SPOP/SRANDMEMBER edge semantics + randomness distribution,
