@@ -2,6 +2,7 @@
 #include "common.h"
 #include "str_node.h"
 #include <vector>
+#include <utility>
 
 bool hash_set(HMap *h, const std::string &field, std::string value){
     StringKey key;

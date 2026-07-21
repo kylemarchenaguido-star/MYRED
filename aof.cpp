@@ -13,6 +13,9 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <cerrno>
+#include <vector>
+#include <string_view>
 
 // AOF
 pid_t g_aof_child_pid = -1;

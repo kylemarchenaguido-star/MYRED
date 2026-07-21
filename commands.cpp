@@ -20,7 +20,11 @@
 #include <random>
 #include <unordered_map>
 #include <string_view>
-#include <unordered_set> 
+#include <unordered_set>
+#include <vector>
+#include <utility>
+#include <ctime>
+#include <cerrno>
 
 static constexpr const char *MSG_WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
 static constexpr const char *MSG_NOT_INT   = "ERR value is not an integer or out of range";

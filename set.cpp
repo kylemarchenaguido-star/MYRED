@@ -2,6 +2,7 @@
 #include "str_node.h"
 #include "common.h"
 #include <vector>
+#include <utility>
 
 // True if a set is added
 bool set_add(HMap *h, std::string member){

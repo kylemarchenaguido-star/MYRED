@@ -1,4 +1,5 @@
 #include "deque.h"
+#include <utility>
 
 // INVARIANT: cap is always a power of two (so deque_phys can use & instead of %)
 void deque_grow(Deque *d){

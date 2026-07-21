@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <cstring>
+#include <vector>
 #include "resp.h"
 #include "state.h"
 

@@ -1,5 +1,9 @@
 #pragma once
 #include <sys/types.h>
+#include <cstdio>
+#include <string>
+#include <string_view>
+#include <initializer_list>
 
 extern pid_t g_aof_child_pid;
 

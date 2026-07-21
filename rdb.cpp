@@ -11,6 +11,8 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <cerrno>
+#include <utility>
 
 // RDB
 pid_t g_rdb_child_pid = -1;

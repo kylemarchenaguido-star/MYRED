@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
+#include <utility>
+#include <vector>
 
 GlobalData g_data;
 Config g_config;

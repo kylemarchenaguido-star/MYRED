@@ -21,6 +21,9 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <functional>
+#include <utility>
+#include <algorithm>
 // project
 #include "hashtable.h"
 #include "common.h"

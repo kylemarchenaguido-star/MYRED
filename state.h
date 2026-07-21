@@ -15,6 +15,7 @@
 #include <vector>
 #include <unordered_map>
 #include <functional>
+#include <utility>
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
