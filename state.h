@@ -60,6 +60,7 @@ enum {
 enum class ConnTimer {
   IDLE,
   IO,
+  HANDSHAKE, // TLS conns pre-handshake: tighet deadline, own list
 };
 
 // Modes for the aof
@@ -112,8 +113,9 @@ struct Conn {
   bool want_read = false;
   bool want_write = false;
   bool want_close = false;
-  bool tr_want_read = false; // transport demands POLLIN ti finish its current op
+  bool tr_want_read = false; // transport demands POLLIN to finish its current op
   bool tr_want_write = false; // transport demands POLLOUT (TLS: a read can need it)
+  bool tls_handshaking = false; // SSL_do_handshake not yet done; data path is gated
   DList idle_node;
   uint64_t last_active_ms = 0;
   ConnTimer timer_type = ConnTimer::IO;
@@ -135,6 +137,7 @@ struct GlobalData{
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)
+  DList hs_list; // TLS conns mid-handshake (ConnTimer::HANDSHAKE deadlines)
   // timers for ttls
   std::vector<HeapItem> heap;
   ThreadPool thread_pool;
@@ -182,6 +185,7 @@ struct Config {
   std::string tls_key_file;
   std::string tls_ca_cert_file;
   TlsAuthClients tls_auth_clients = TlsAuthClients::NO;
+  int tls_handshake_timeout_ms = 10 * 1000; // boot-only, like all tls-*
   std::string config_path;
   std::string auditlog_path;
   std::string password = "";

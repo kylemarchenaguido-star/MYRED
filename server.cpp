@@ -42,6 +42,8 @@ struct Listener {
   bool is_tls;
 };  
 
+// Forward declaration to use it in handle_accept
+static void conn_set_timer(Conn *conn, ConnTimer type);
 
 // worker constant 
 static int g_loop_efd = -1;
@@ -191,11 +193,17 @@ static int32_t handle_accept(int fd, bool is_tls){
   g_data.connected_clients++;
   g_data.fd2conn[conn->fd] = conn;
 
-  if (is_tls && !tr_tls_attach(conn)){
-    conn_destroy(conn); // SSL_new failed, wew drop this conn only
-    return 0;
+  if (is_tls){
+    if (!tr_tls_attach(conn)){
+      conn_destroy(conn); // SSL_new failed, wew drop this conn only
+      return 0; 
+    }
+    conn->tls_handshaking = true;
+    // transport owns this conn until the handshake completes
+    conn->want_read = false;
+    conn->tr_want_read = true;
+    conn_set_timer(conn, ConnTimer::HANDSHAKE); // moves from io_list to hs_list
   }
-
   return 0;
 }
 
@@ -242,6 +250,11 @@ static int32_t next_timer_ms() {
   if (!dlist_empty(&g_data.io_list)){
     Conn *conn = container_of(g_data.io_list.next, &Conn::idle_node);
     next_ms = std::min(next_ms, conn->last_active_ms + k_io_timeout_ms);
+  }
+  // check the front of the hs_list
+  if (!dlist_empty(&g_data.hs_list)){
+    Conn *conn = container_of(g_data.hs_list.next, &Conn::idle_node);
+    next_ms = std::min(next_ms, conn->last_active_ms + (uint64_t)g_config.tls_handshake_timeout_ms);
   }
   // check the heap
   if (!g_data.heap.empty()){
@@ -342,6 +355,18 @@ static void process_timers(){
     conn->want_close = true;
     conn_destroy(conn);
   }
+  // a TCP connect thet never speaks TLS must not hold a slot for 30s
+  while (!dlist_empty(&g_data.hs_list)){
+    Conn *conn = container_of(g_data.hs_list.next, &Conn::idle_node);
+    uint64_t expired = conn->last_active_ms + (uint64_t)g_config.tls_handshake_timeout_ms;
+    if (expired > now_ms){ 
+      break; 
+    }
+    fprintf(stderr, "TLS handshake timeout: closing fd %d\n", conn->fd);
+    audit_event("tls_handshake_timeout", conn, "");
+    conn_destroy(conn);
+  }
+
   // TTL timers using a heap
   const size_t k_max_works = 2000;
   size_t nworks = 0;
@@ -415,6 +440,8 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
   // insert at the back
   if (type == ConnTimer::IDLE){
     dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+  } else if (type == ConnTimer::HANDSHAKE){
+    dlist_insert_before(&g_data.hs_list, &conn->idle_node);
   } else {
     dlist_insert_before(&g_data.io_list, &conn->idle_node);
   }
@@ -461,6 +488,22 @@ static bool try_one_request(Conn *conn){
   conn->want_read = false;
   conn->want_write = true;
   return true;
+}
+
+static void handle_tls_handshake(Conn *conn){
+  IoResult r = tr_handshake(conn);
+  // POLL again
+  if (r == IoResult::WANT_READ || r == IoResult::WANT_WRITE){ return; }
+  if (r != IoResult::OK){
+    audit_event("tls_handshake_fail", conn, " reason=" + tr_tls_error());
+    conn->want_close = true;
+    return;
+  }
+  // tunnel up: hand the conn to the application in its normal read-intent state
+  conn->tls_handshaking = false;
+  conn->want_read = true;
+  conn->want_write = false;
+  conn_set_timer(conn, ConnTimer::IO);
 }
 
 static void handle_write(Conn *conn){
@@ -563,9 +606,10 @@ int main(int argc, char **argv){
   g_data.g_aof_check_ms      = g_data.g_server_start_ms;
 
 
-  // initialiaze idle connection list and io waiting list
+  // initialiaze idle connection list and io waiting list and tls handshake list
   dlist_init(&g_data.idle_list);
   dlist_init(&g_data.io_list);
+  dlist_init(&g_data.hs_list);
 
   thread_pool_init(&g_data.thread_pool, 8);
 
@@ -757,6 +801,13 @@ int main(int argc, char **argv){
 
       // update the idle timer and putting the conn at the end of the list
       conn_set_timer(conn, conn->timer_type);
+
+      if (conn->tls_handshaking){
+        if (ready & (POLLIN | POLLOUT)){ handle_tls_handshake(conn); }
+        if ((ready & POLLERR) || conn->want_close){ conn_destroy(conn); }
+        // no data path until the handshake is done
+        continue;
+      }
 
       // Connection are ready to write and read
       if(ready & POLLIN){

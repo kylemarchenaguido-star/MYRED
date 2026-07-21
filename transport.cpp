@@ -42,10 +42,16 @@ bool tr_tls_init(std::string &err){
     // buffer address changed. PARTIAL_WRITE matches write()'s short-write contract.
     SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
-    if (SSL_CTX_use_PrivateKey_file(g_tls_ctx, g_config.tls_key_file.c_str(), SSL_FILETYPE_PEM) != 1){
+    if (SSL_CTX_use_certificate_chain_file(g_tls_ctx, g_config.tls_cert_file.c_str()) != 1){
         err = tls_err_string("loading tls-cert-file '" + g_config.tls_cert_file + "'");
         return false;
     }
+
+    if (SSL_CTX_use_PrivateKey_file(g_tls_ctx, g_config.tls_key_file.c_str(), SSL_FILETYPE_PEM) != 1){
+        err = tls_err_string("loading tls-key-file '" + g_config.tls_key_file + "'");
+        return false;
+    }
+
 
     if (SSL_CTX_check_private_key(g_tls_ctx) != 1){
         err = "tls-key-file does not match tls-cert-file";
@@ -111,10 +117,30 @@ IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n){
         return IoResult::OK;
     }
     if (errno == EAGAIN || errno == EINTR){
-        c->want_write = true;
+        c->tr_want_write = true;
         return IoResult::WANT_WRITE;
     }
     return IoResult::ERR;
+}
+
+IoResult tr_handshake(Conn *c){
+    c->tr_want_read = false;
+    c->tr_want_write = false;
+    ERR_clear_error(); // stale queue entries would misattribute this call's failure
+    int rv = SSL_do_handshake(c->ssl);
+    if (rv == 1){ return IoResult::OK; }
+    int e = SSL_get_error(c->ssl, rv);
+    if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
+    if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
+    return IoResult::ERR;
+}
+
+std::string tr_tls_error(){
+    char buf[256] = "unknown error";
+    unsigned long e = ERR_get_error();
+    if (e) { ERR_error_string_n(e, buf, sizeof(buf)); }
+    ERR_clear_error();
+    return buf;
 }
 
 void tr_close(Conn *c){

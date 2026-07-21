@@ -26,3 +26,9 @@ void tr_close(Conn *c);
 // tr_tls_attach wraps a freshly accepted fd in a server-state SSL
 bool tr_tls_init(std::string &err);
 bool tr_tls_attach(Conn *c);
+
+// OK = done, WANT_* = poll and come back,
+// ERR = fatal (audit + destroy). Only called while Conn::tls_handshaking.
+IoResult tr_handshake(Conn *c);
+// last openSSL error as text, for audit event; drains the error queue
+std::string tr_tls_error();

@@ -245,6 +245,16 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     else { err = "tls-auth-clients mus be yes, no, or optional"; return CfgResult::BADVALUE; }
     return CfgResult::OK;
   }
+  if (name == "tls-handshake-timeout"){
+    if (!need1()){ return CfgResult::BADVALUE; }
+    long s = 0;
+    if (!parse_int_strict(args[0].c_str(), &s) || s < 1 || s > 3600){
+      err = "invalid tls-handshake-timeout (seconds, 1-3600)";
+      return CfgResult::BADVALUE;
+    }
+    g_config.tls_handshake_timeout_ms = (int)s * 1000;
+    return CfgResult::OK;
+  }
 
   if (name == "bind"){
     if (args.empty()){ err = "bind needs at least one address"; return CfgResult::BADVALUE; }
@@ -460,6 +470,9 @@ bool config_rewrite(const char * path){
   if (g_config.tls_auth_clients != TlsAuthClients::NO){
     fprintf(fp, "tls-auth-clients %s\n",
       g_config.tls_auth_clients == TlsAuthClients::YES ? "yes" : "optional");
+  }
+  if (g_config.tls_handshake_timeout_ms != 10 * 1000){
+    fprintf(fp, "tls-handshake-timeout %d\n", g_config.tls_handshake_timeout_ms / 1000);
   }
   fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
   fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");

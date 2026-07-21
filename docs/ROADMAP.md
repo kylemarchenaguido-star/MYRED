@@ -264,7 +264,7 @@ baseline, absorbing the Testing debt items from the V9.6.4 audit (moved here
   release-mode perf bug fell out: `mem_reaccount` is O(container size) per
   mutation — filed in Known Bugs.
 
-#### V9.7 - TLS [Next]
+#### V9.7 - TLS [In progress]
 
 TLS is the heaviest security feature. The event loop, not OpenSSL, is where the risk
 lives: today plaintext I/O touches exactly four places — accept
@@ -277,7 +277,7 @@ Prerequisites: CODE_REVIEW 2026-07-09 N3 (timer busy-loop) and N4 (protocol-erro
 wedge / missing input caps) — TLS multiplies buffering complexity and must not land on
 top of a loop that spins or buffers unboundedly.
 
-##### V9.7.1 - Transport seam (zero-behavior-change refactor, no OpenSSL yet)
+##### V9.7.1 - Transport seam (zero-behavior-change refactor, no OpenSSL yet) [Done 2026-07-19]
 
 - Introduce a per-conn transport layer and route ALL socket I/O through it:
 
@@ -298,7 +298,7 @@ top of a loop that spins or buffers unboundedly.
   the whole stress suite verifies this refactor with zero crypto in the build. Do not
   start V9.7.2 until it is green.
 
-##### V9.7.2 - Context, config, listeners
+##### V9.7.2 - Context, config, listeners [Done 2026-07-19]
 
 - Config: `tls-port` (0 = disabled; may coexist with plaintext `port`),
   `tls-cert-file`, `tls-key-file`, `tls-ca-cert-file`,
@@ -316,7 +316,7 @@ top of a loop that spins or buffers unboundedly.
 - Accept-time policy (allowlist, protected mode, `audit_reject`) stays where it is:
   those checks are IP-based and need no handshake.
 
-##### V9.7.3 - Handshake as connection state
+##### V9.7.3 - Handshake as connection state [Done 2026-07-19]
 
 - `Conn::tls_handshaking = true` until `SSL_do_handshake` returns 1. While set, the
   poll loop calls `SSL_do_handshake` on readiness and maps
