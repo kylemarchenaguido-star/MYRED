@@ -94,33 +94,65 @@ IoResult tr_read(Conn *c, uint8_t *buf, size_t cap, size_t *n){
   c->tr_want_read = false;
   c->tr_want_write = false;
   *n = 0;
-  ssize_t rv = read(c->fd, buf, cap);
-  if (rv > 0){
-    *n = (size_t)rv;
-    return IoResult::OK;
+
+  // plaintext part
+  if (!c->ssl) {
+    ssize_t rv = read(c->fd, buf, cap);
+    if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+    if (rv == 0){ return IoResult::PEER_CLOSED; }
+    if (errno == EAGAIN || errno == EINTR){
+        c->tr_want_read = true;
+        return IoResult::WANT_READ;
+    }
+    return IoResult::ERR;
   }
-  if (rv == 0){ return IoResult::PEER_CLOSED; }
-  if (errno == EAGAIN || errno == EINTR){
-    c->tr_want_read = true;
-    return IoResult::WANT_READ;
-  }
-  return IoResult::ERR;
+
+  // TLS: one SSL_read; classify with SSL_get_error, NEVER errno, handle_read
+  // loop while tr_has_pending() reports more buffered records
+  ERR_clear_error();
+  int rv = SSL_read(c->ssl, buf, (int)cap);
+  if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+  int e = SSL_get_error(c->ssl, rv);
+  if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
+  if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
+  if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; } // clean close-notify
+  return IoResult::ERR; // SSL_ERROR_SYSCALL (dirty EOF) or SSL_ERROR_SSL
+
 }
 
 IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n){
     c->tr_want_read = false;
     c->tr_want_write = false;
     *n = 0;
-    ssize_t rv = write(c->fd, buf, len);
-    if (rv >= 0){
-        *n = (size_t)rv;
-        return IoResult::OK;
+
+    // plaintext
+    if (!c->ssl){
+        ssize_t rv = write(c->fd, buf, len);
+        if (rv >= 0){ *n = (size_t)rv; return IoResult::OK; }
+        if (errno == EAGAIN || errno == EINTR){
+            c->tr_want_write = true;
+            return IoResult::WANT_WRITE;
+        }
+        return IoResult::ERR;
     }
-    if (errno == EAGAIN || errno == EINTR){
-        c->tr_want_write = true;
-        return IoResult::WANT_WRITE;
-    }
+    
+    // TLS, SSL_MODE_ENABLE_PARTIAL_WRITE (set in tr_tls_init) makes short writes
+    // legal, so rv < len is fine - handle_writes consumes n and keeps want_write
+    ERR_clear_error();
+    int rv = SSL_write(c->ssl, buf, (int)len);
+    if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+    int e = SSL_get_error(c->ssl, rv);
+    if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
+    if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
+    if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; }
     return IoResult::ERR;
+}
+
+// Do we can read without another poll wake?
+bool tr_has_pending(Conn *c){
+    // plaintext: the socket is the only buffer; poll re-fires
+    if (!c->ssl){ return false; }
+    return SSL_has_pending(c->ssl) == 1;
 }
 
 IoResult tr_handshake(Conn *c){
@@ -145,7 +177,8 @@ std::string tr_tls_error(){
 
 void tr_close(Conn *c){
     if (c->ssl){
-        // future version adds better closing
+        // one-shot close-notifyl do NOT retry or wait for the peer's
+        SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
         c->ssl = nullptr;
     }

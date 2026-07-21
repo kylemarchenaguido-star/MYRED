@@ -527,30 +527,37 @@ static void handle_write(Conn *conn){
 }
 
 static void handle_read(Conn *conn){
-  uint8_t buf [64 * 1024];
-  size_t n = 0;
-  IoResult r = tr_read(conn, buf, sizeof(buf), &n);
-  if (r == IoResult::WANT_READ || r == IoResult::WANT_WRITE){ return; }
-  if (r != IoResult::OK){ 
-    conn->want_close = true;
-    return;
-  }
-  // add new data to the incoming buffer
-  buf_append(&conn->incoming, buf, n);
-
-  // a client that streams framing without ever completing a command must not grow us unbounded
-  if (buf_size(&conn->incoming) > k_max_incoming){
-    fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
-    buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
-    conn->want_close = true;
-    return;
-  }
-
-  // We set the conn to IO (stop the idle)
+  // leaving idle as soon as any byte arrives
   if (conn->timer_type == ConnTimer::IDLE){
     conn_set_timer(conn, ConnTimer::IO);
   }
-  
+
+  // Drain everything currently decryptable.
+  for (;;){
+    uint8_t buf [64 * 1024];
+    size_t n = 0;
+    IoResult r = tr_read(conn, buf, sizeof(buf), &n);    
+    if (n > 0){ buf_append(&conn->incoming, buf, n); }
+
+    // a client that streams framing without ever completing a command must not grow us unbounded
+    if (buf_size(&conn->incoming) > k_max_incoming){
+      fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
+      buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
+      conn->want_close = true;
+      return;
+    }
+
+    if (r == IoResult::OK){
+      // more buffered records, keep draining
+      if (tr_has_pending(conn)){ continue; }
+      break;
+    }
+    // poll again
+    if (r == IoResult::WANT_READ || r == IoResult::WANT_WRITE){ break; }
+    conn->want_close = true; // PEER_CLOSED OR ERR
+    return;
+  }
+
   while (try_one_request(conn)) {}
 
   if(buf_size(&conn->outgoing) > 0){
@@ -809,13 +816,11 @@ int main(int argc, char **argv){
         continue;
       }
 
-      // Connection are ready to write and read
-      if(ready & POLLIN){
-        if (conn->want_read || conn->tr_want_read){ handle_read(conn); } 
+      if (ready & (POLLIN | POLLOUT)){
+        if      (conn->want_read) { handle_read(conn); }
+        else if (conn->want_write){ handle_write(conn); }
       }
-      if(ready & POLLOUT){
-        if (conn->want_write || conn->tr_want_write){ handle_write(conn); } 
-      }
+
       //Close the socket from erros 
       if((ready & POLLERR) || conn->want_close){
         conn_destroy(conn);

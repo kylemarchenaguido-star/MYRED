@@ -57,6 +57,7 @@ import re
 import shutil
 import subprocess
 import atexit
+import ssl
 from typing import Any, Optional
 
 # ─── configuration ────────────────────────────────────────────────────────────
@@ -69,6 +70,15 @@ TIMEOUT_SEC     = 5.0
 
 # password is set from argparse in main(), shared by all connections
 G_PASSWORD: Optional[str] = None
+
+# TLS config, set from argparse in main(). G_TLS gates client-socket wrapping
+# and the redis-benchmark --tls flags; all connections share one SSLContext.
+G_TLS: bool = False
+G_TLS_INSECURE: bool = False
+G_TLS_CA: Optional[str] = None
+G_TLS_CERT: Optional[str] = None
+G_TLS_KEY: Optional[str] = None
+_G_TLS_CTX: Optional["ssl.SSLContext"] = None
 
 # ─── colors ───────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -324,15 +334,58 @@ def cmd(sock: socket.socket, *args: str) -> Any:
 
 
 
+def _tls_context() -> "ssl.SSLContext":
+    """Build (once) the shared client SSLContext from the --tls-* args."""
+    global _G_TLS_CTX
+    if _G_TLS_CTX is not None:
+        return _G_TLS_CTX
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    if G_TLS_CA:
+        ctx.load_verify_locations(G_TLS_CA)
+    if G_TLS_CERT:                        # optional client cert (mTLS)
+        ctx.load_cert_chain(G_TLS_CERT, G_TLS_KEY)
+    if G_TLS_INSECURE:                    # self-signed test certs: skip verification
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    _G_TLS_CTX = ctx
+    return ctx
+
+
+def open_socket(host: str, port: int) -> socket.socket:
+    """TCP connect, wrapped in TLS when --tls is set. Does NOT authenticate."""
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(TIMEOUT_SEC)
+    raw.connect((host, port))
+    if not G_TLS:
+        return raw
+    sni = None if G_TLS_INSECURE else host
+    return _tls_context().wrap_socket(raw, server_hostname=sni)
+
+
+def _authenticate(sock: socket.socket, *auth_args: str) -> None:
+    """AUTH, retrying past the server's BUSY throttle (k_max_auth_inflight=4).
+    Concurrent workers all AUTH at connect, so the 5th+ can bounce with BUSY;
+    a bounded retry lets the stress/concurrent phases run over an authed port."""
+    deadline = time.time() + TIMEOUT_SEC
+    delay = 0.01
+    while True:
+        send_request(sock, "auth", *auth_args)
+        try:
+            recv_response(sock)           # +OK, or raises RespError
+            return
+        except RespError as e:
+            if "BUSY" in str(e) and time.time() < deadline:
+                time.sleep(delay)
+                delay = min(delay * 2, 0.2)
+                continue
+            raise
+
+
 def make_conn(host: str, port: int) -> socket.socket:
     """Open a connection, authenticating first if a password is configured."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(TIMEOUT_SEC)
-    s.connect((host, port))
+    s = open_socket(host, port)
     if G_PASSWORD:
-        # authenticate immediately on every new connection
-        send_request(s, "auth", G_PASSWORD)
-        recv_response(s)                 # expect +OK, raises on failure
+        _authenticate(s, G_PASSWORD)      # retries past the AUTH throttle
     return s
 
 
@@ -1780,9 +1833,7 @@ def test_auth_command(r: TestRunner, host: str, port: int):
         return
 
     # wrong password should fail
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(TIMEOUT_SEC)
-    s.connect((host, port))
+    s = open_socket(host, port)
     try:
         send_request(s, "auth", "definitely_wrong_password")
         recv_response(s)
@@ -1793,9 +1844,7 @@ def test_auth_command(r: TestRunner, host: str, port: int):
         s.close()
 
     # unauthenticated command should fail
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(TIMEOUT_SEC)
-    s.connect((host, port))
+    s = open_socket(host, port)
     try:
         send_request(s, "get", "anything")
         recv_response(s)
@@ -1806,9 +1855,7 @@ def test_auth_command(r: TestRunner, host: str, port: int):
         s.close()
 
     # correct password then a real command
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(TIMEOUT_SEC)
-    s.connect((host, port))
+    s = open_socket(host, port)
     try:
         send_request(s, "auth", G_PASSWORD)
         r.check("correct password → OK", recv_response(s), "OK")
@@ -1869,9 +1916,7 @@ def test_acl_commands(r: TestRunner, sock: socket.socket, host: str, port: int):
             "OK")
 
     try:
-        restricted = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        restricted.settimeout(TIMEOUT_SEC)
-        restricted.connect((host, port))
+        restricted = open_socket(host, port)
         send_request(restricted, "auth", username, password)
         r.check("auth user password -> OK", recv_response(restricted), "OK")
 
@@ -2708,6 +2753,16 @@ def run_redis_benchmark(host: str, port: int, password: Optional[str],
         print(f"{YELLOW}redis-benchmark not found — skipping (install redis-tools){RESET}")
         return True
 
+    # redis-benchmark opens `clients` connections and AUTHs them all at once, and
+    # it does NOT retry BUSY. The server throttles concurrent AUTH to 4
+    # (k_max_auth_inflight, bounds Argon2 memory), so an authed run with >4 clients
+    # bounces. Throughput is best measured on a passwordless instance.
+    if password and clients > 4:
+        print(f"{YELLOW}note: AUTH is throttled to 4 concurrent (k_max_auth_inflight) and "
+              f"redis-benchmark won't retry BUSY across {clients} clients. For a real "
+              f"throughput number benchmark a passwordless instance, or pass "
+              f"--bench-clients 4.{RESET}")
+
     # start clean: leftover keys from an earlier run (e.g. a 100k-element mylist)
     # make every later number meaningless
     try:
@@ -2727,6 +2782,14 @@ def run_redis_benchmark(host: str, port: int, password: Optional[str],
                 "-n", str(requests), "-c", str(clients), "-P", str(pipeline), "-q"]
         if password:
             argv += ["-a", password]
+        if G_TLS:
+            argv += ["--tls"]
+            if G_TLS_INSECURE:
+                argv += ["--insecure"]
+            if G_TLS_CA and not G_TLS_INSECURE:
+                argv += ["--cacert", G_TLS_CA]
+            if G_TLS_CERT:
+                argv += ["--cert", G_TLS_CERT, "--key", G_TLS_KEY]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=per_test_timeout)
@@ -2752,13 +2815,24 @@ def run_redis_benchmark(host: str, port: int, password: Optional[str],
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global G_PASSWORD
+    global G_PASSWORD, G_TLS, G_TLS_INSECURE, G_TLS_CA, G_TLS_CERT, G_TLS_KEY
 
     ap = argparse.ArgumentParser(description="Redis server RESP stress test")
     ap.add_argument("--host",             default=DEFAULT_HOST)
     ap.add_argument("--port",             default=DEFAULT_PORT, type=int)
     ap.add_argument("--password",         default=None,
                     help="server password (if auth is enabled)")
+    ap.add_argument("--tls",              action="store_true",
+                    help="connect over TLS (wraps client sockets, passes --tls to redis-benchmark); "
+                         "point --port at the tls-port")
+    ap.add_argument("--tls-insecure",     action="store_true",
+                    help="skip server certificate verification (for self-signed test certs)")
+    ap.add_argument("--tls-ca",           default=None,
+                    help="CA cert file to verify the server (omit with --tls-insecure)")
+    ap.add_argument("--tls-cert",         default=None,
+                    help="client certificate for mTLS (requires --tls-key)")
+    ap.add_argument("--tls-key",          default=None,
+                    help="client private key for mTLS (requires --tls-cert)")
     ap.add_argument("--correctness-only", action="store_true")
     ap.add_argument("--stress-only",      action="store_true")
     ap.add_argument("--stress-threads",   default=STRESS_THREADS, type=int,
@@ -2782,6 +2856,22 @@ def main():
 
     host, port  = args.host, args.port
     G_PASSWORD  = args.password
+    G_TLS          = args.tls
+    G_TLS_INSECURE = args.tls_insecure
+    G_TLS_CA       = args.tls_ca
+    G_TLS_CERT     = args.tls_cert
+    G_TLS_KEY      = args.tls_key
+
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print(f"{RED}--tls-cert and --tls-key must be given together{RESET}")
+        sys.exit(2)
+    if (args.tls_ca or args.tls_cert or args.tls_insecure) and not args.tls:
+        print(f"{RED}--tls-* options require --tls{RESET}")
+        sys.exit(2)
+    if args.tls and not (args.tls_insecure or args.tls_ca):
+        print(f"{YELLOW}note: --tls without --tls-ca or --tls-insecure verifies against the "
+              f"system CA store and will reject a self-signed cert — use --tls-insecure "
+              f"for local test certs{RESET}")
 
     if args.stress_threads < 1 or args.stress_ops < 1 or args.metrics_top < 1:
         print(f"{RED}--stress-threads, --stress-ops, and --metrics-top must be >= 1{RESET}")
@@ -2795,6 +2885,8 @@ def main():
     print(f"{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  Redis Server RESP Stress Test{RESET}")
     print(f"  Connecting to {host}:{port}")
+    if G_TLS:
+        print(f"  Using TLS{' (insecure — cert not verified)' if G_TLS_INSECURE else ''}")
     if G_PASSWORD:
         print(f"  Using authentication")
     print(f"{'═' * 55}")

@@ -32,3 +32,7 @@ bool tr_tls_attach(Conn *c);
 IoResult tr_handshake(Conn *c);
 // last openSSL error as text, for audit event; drains the error queue
 std::string tr_tls_error();
+
+// true if the transport buffered, immediately-readble bytes the
+// next poll() won't announce. Plaintext: always false
+bool tr_has_pending(Conn *c);

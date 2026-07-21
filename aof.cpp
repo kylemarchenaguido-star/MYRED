@@ -270,6 +270,7 @@ bool aof_load(const char *path){
     size_t good_offset = 0;
     size_t replayed = 0;
     size_t replay_error = 0;
+    size_t ttl_races = 0;
     std::string first_err, first_err_cmd;
     while (buf_size(&buf)){
         std::vector<std::string> cmd;
@@ -290,16 +291,24 @@ bool aof_load(const char *path){
         do_request(cmd, &sink, &fake, nullptr, 0);
         // an error reply during replay means memory is diverging from the log
         if (buf_size(&sink) && buf_data(&sink)[0] == '-'){
-          if (replay_error == 0){
-            size_t n = buf_size(&sink);
-            if (n > 128){ n = 128; }
-            first_err.assign((const char *)buf_data(&sink), n);
-            while (!first_err.empty() && (first_err.back() == '\r' || first_err.back() == '\n')){
-              first_err.pop_back();
-            }
-            first_err_cmd = cmd.empty() ? "?" : cmd[0];
+            // only rename/renamenx can hard-error on a missing key, expected not corruption
+            bool ttl_race = (!cmd.empty() && (cmd[0] == "rename" || cmd[0] == "renamenx") &&
+                   buf_size(&sink) >= 16 &&
+                   memcmp(buf_data(&sink), "-ERR no such key", 16) == 0);
+            if (ttl_race){
+              ttl_races++;
+            } else {
+              if (replay_error == 0){
+                size_t n = buf_size(&sink);
+                if (n > 128){ n = 128; }
+                first_err.assign((const char *)buf_data(&sink), n);
+                while (!first_err.empty() && (first_err.back() == '\r' || first_err.back() == '\n')){
+                  first_err.pop_back();
+                }
+                first_err_cmd = cmd.empty() ? "?" : cmd[0];
+              }
+              replay_error++;
           }
-          replay_error++;
         }
         // we drain the replay so sink do not grow
         buf_consume(&sink, buf_size(&sink));
@@ -310,6 +319,12 @@ bool aof_load(const char *path){
     g_data.g_loading = false;
     // replay isn't "unsaved work"
     g_data.g_writes_since_save = 0;
+
+    if (ttl_races){
+      fprintf(stderr,
+        "aof_load: %zu rename/renamenx skipped - source key's TTL elapsed between "
+        "the original write and this replay (expected, not corruption)\n", ttl_races);
+    }
 
     if (replay_error){
       fprintf(stderr,

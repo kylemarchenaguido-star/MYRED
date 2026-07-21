@@ -330,7 +330,7 @@ top of a loop that spins or buffers unboundedly.
   required after the handshake (mTLS-derived identity is explicitly out of scope until
   a later step).
 
-##### V9.7.4 - Data path rules
+##### V9.7.4 - Data path rules [Done 2026-07-19]
 
 `handle_read`/`handle_write` swap `read()`/`write()` for `tr_read`/`tr_write`. Three
 OpenSSL behaviors must be encoded as rules, or they become heisenbugs:
@@ -347,20 +347,80 @@ OpenSSL behaviors must be encoded as rules, or they become heisenbugs:
 
 ##### V9.7.5 - Optimizations (strictly after correctness)
 
-- **Session resumption first** — biggest win, near-zero code:
-  `SSL_CTX_set_session_cache_mode(SSL_SESS_CACHE_SERVER)` plus default TLS 1.3
-  tickets. Reconnect-heavy tooling (`redis-benchmark` without `-k`) drops from full
-  handshakes to resumed ones.
-- **Record-sized flushes**: TLS records cap at 16 KB; the single `outgoing` Buffer
-  already batches pipelined replies into large `tr_write` calls — keep that property,
-  never introduce per-reply `SSL_write` calls.
-- **`SSL_MODE_RELEASE_BUFFERS`**: reclaims ~34 KB per idle connection.
-- **Handshake CPU**: if accept storms show up, mitigate in this order — resumption,
-  accept-rate cap per tick, and only as a last resort offload `SSL_do_handshake` to
-  the thread pool using the V9.6.2 completion channel (same conn-id liveness rule).
-- **kTLS** (`SSL_OP_ENABLE_KTLS`): measure before adopting; not planned.
-- **Cert reload without restart** (explicitly last): build a fresh `SSL_CTX`, swap the
-  global pointer; existing conns keep the old ctx alive via OpenSSL refcounting.
+Gate: do not start any item below until V9.7.1-V9.7.4 are done and the full stress
+suite + `--bench` baseline are green *over TLS specifically* (plaintext-only green is
+not sufficient). The items are ordered cheapest-and-highest-value first; implement
+in order and stop as soon as the metric you're chasing is acceptable — do not jump
+ahead to a harder item speculatively.
+
+- **Session resumption first** — biggest win, near-zero code. In `tr_tls_init`
+  (`transport.cpp:22-68`), right after `SSL_CTX_new` succeeds, add:
+  ```cpp
+  SSL_CTX_set_session_cache_mode(g_tls_ctx, SSL_SESS_CACHE_SERVER);
+  ```
+  TLS 1.3 issues session tickets automatically once server-side caching is on —
+  no separate ticket-handling code needed. Verify by running the same
+  `redis-benchmark --tls --insecure -a <pass> -t set -n 50000` invocation twice
+  back-to-back (no `-k`, so it reconnects per request) and confirming p50 latency
+  drops materially on the second run — that's resumed handshakes replacing full ones.
+
+- **Record-sized flushes — verify the existing invariant, do not add code.**
+  Confirm `handle_write` (`server.cpp:509`) still calls `tr_write` exactly once per
+  poll-ready event with the *entire* `conn->outgoing` buffer (`buf_data`/`buf_size`),
+  even for a large pipelined batch — TLS records cap at 16 KB, and OpenSSL slices a
+  big `SSL_write` into records efficiently on its own. If any later change calls
+  `tr_write`/`SSL_write` once per individual RESP reply instead of once per flush,
+  treat that as a regression in review — it pays per-record TLS overhead (header,
+  MAC, padding) on every single reply instead of amortizing it across a batch.
+
+- **`SSL_MODE_RELEASE_BUFFERS`** — one flag, same call site as the existing mode
+  flags in `tr_tls_init` (`transport.cpp:43`); OR it into that call rather than
+  adding a second `SSL_CTX_set_mode`:
+  ```cpp
+  SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE
+                             | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+                             | SSL_MODE_RELEASE_BUFFERS);
+  ```
+  Reclaims ~34 KB per idle connection by freeing each `SSL` object's internal
+  read/write buffers between requests instead of holding them for the connection's
+  whole lifetime. Verify with a script that opens a few thousand TLS connections
+  and leaves them idle (no traffic, not closed) — compare server RSS before/after
+  enabling the flag.
+
+- **Handshake CPU under an accept storm** — escalate in this exact order, and
+  re-measure accept-to-first-command latency under a connection burst after each
+  step before moving to the next:
+  1. Session resumption (above) — already reduces how many *full* handshakes occur.
+  2. Cap accepts per poll tick: change the unbounded
+     `while (handle_accept(listeners[i].fd, listeners[i].is_tls) == 0) {}`
+     (`server.cpp:789`) to a bounded loop (e.g. a `k_max_accepts_per_tick` count)
+     so one connection burst can't monopolize a tick and starve already-established
+     connections' read/write readiness.
+  3. Last resort only, and only if 1-2 don't hold up: move the `SSL_do_handshake`
+     call (`tr_handshake`, `transport.cpp:158-168`) onto `g_data.thread_pool`,
+     posting the result back through the same completion-channel pattern the
+     Argon2 auth path already uses (V9.6.2) — including its conn-id liveness
+     check, since the conn can be destroyed (client gave up, `tls-handshake-timeout`
+     fired) while the handshake CPU work is in flight on a worker thread.
+
+- **kTLS** (`SSL_OP_ENABLE_KTLS`): do not implement speculatively — requires a
+  measured before/after on MYRED's actual workload showing it matters first.
+  Not planned until that measurement exists.
+
+- **Cert reload without restart** (explicitly last, only once everything above is
+  done and stable):
+  1. Add a trigger — either a dedicated command or `CONFIG SET` support for
+     `tls-cert-file`/`tls-key-file` specifically (reversing V9.7.2's boot-only
+     decision for just these two directives).
+  2. Build a **new** `SSL_CTX` by re-running the same sequence `tr_tls_init` already
+     does (`transport.cpp:22-68`) — do not mutate `g_tls_ctx` in place, so a bad
+     cert/key can be rejected without disturbing the live context.
+  3. On success only, atomically repoint the global: `g_tls_ctx = new_ctx;` — do
+     **not** `SSL_CTX_free` the old one. OpenSSL refcounts it (every live conn's
+     `SSL*` holds a reference via `tr_tls_attach`), so it frees itself once the
+     last connection using it closes. On validation failure, keep serving on the
+     old ctx and report the error — never leave the server without a working
+     `SSL_CTX`.
 
 Tests / done criteria:
 
