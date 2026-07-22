@@ -240,8 +240,9 @@ aof.* / rdb.*      append-only-file and RDB snapshot persistence
 myred.conf         example server configuration
 scripts/           all tests: stress_test.py (primary harness), persistence,
                    auth/ACL, eviction, and diagnostic helpers
-docs/ROADMAP.md    milestone roadmap and next steps
-docs/CODE_REVIEW.md consolidated bug audit (V9.6.4: complete) + review history
+docs/planning/     ROADMAP (progress), BACKLOG (future work + open bugs),
+                   DECISIONS (design + architecture), CODE_REVIEW (bug audit)
+docs/*.md          test-run logs (bench_plain, bench_tls, stress_tls, ...)
 ```
 
 ## Status and what's next
@@ -251,7 +252,7 @@ through polish — is closed, including move-semantics and hashing perf fixes,
 O(k) `SPOP`/`SRANDMEMBER`, deterministic `SPOP` AOF propagation (as `SREM`),
 incremental eviction, and O(1) `INFO` keyspace stats.
 
-Active and upcoming (see `docs/ROADMAP.md` for detail):
+Active and upcoming (see `docs/planning/ROADMAP.md` for detail):
 
 - **V9.6.5 — General and speed test** *(active)*: restart/security/destructive
   test debt, plus a recorded `redis-benchmark` baseline that the TLS refactor

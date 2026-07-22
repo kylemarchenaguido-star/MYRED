@@ -33,6 +33,9 @@ bool tr_tls_init(std::string &err){
     g_tls_ctx = SSL_CTX_new(TLS_server_method());
     if (!g_tls_ctx){ err = tls_err_string("SSL_CTX_new"); return false; }
 
+    // Session resumption: cache sessions server-side so reconnecting is faster
+    SSL_CTX_set_session_cache_mode(g_tls_ctx, SSL_SESS_CACHE_SERVER);
+
     if (SSL_CTX_set_min_proto_version(g_tls_ctx, TLS1_2_VERSION) != 1){
         err = tls_err_string("SSL_CTX_set_min_proto_version"); return false;
     }
@@ -40,7 +43,7 @@ bool tr_tls_init(std::string &err){
     // ACCEPT_MOVING_WRITE_BUFFER: Buffer slides/reallocs between write retries
     // (buf_consume/buf_append); vanilla OpenSSL aborts a retried SSL_write whose
     // buffer address changed. PARTIAL_WRITE matches write()'s short-write contract.
-    SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS);
 
     if (SSL_CTX_use_certificate_chain_file(g_tls_ctx, g_config.tls_cert_file.c_str()) != 1){
         err = tls_err_string("loading tls-cert-file '" + g_config.tls_cert_file + "'");
