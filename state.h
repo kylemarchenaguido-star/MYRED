@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <functional>
 #include <utility>
+#include <unordered_set>
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
@@ -129,12 +130,15 @@ struct Conn {
   bool auth_pending = false; // a worker is verifyng this conn's auth; parsing is gated
   uint64_t id = 0; // monotonic, stamped at accept - completions check it
   SSL *ssl = nullptr; // non-null = TLS conn; owned by the transport, freed in tr_close
+  std::unordered_set<std::string> sub_channels; // channels this conn is SUBSCRIBEd to.
 };
 
 // global hashtable
 struct GlobalData{
   HMap db; // top level hashtable 
   std::vector<Conn *> fd2conn; 
+  // channel name -> subscribed conns. Direct lookup on PUBLISH, no scanning
+  std::unordered_map<std::string, std::unordered_set<Conn*>> channels;
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)

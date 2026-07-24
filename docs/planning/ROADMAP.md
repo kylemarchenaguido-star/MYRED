@@ -42,21 +42,92 @@ Implemented command families:
 | Config file + password hashing (Argon2id) | Implemented |
 | ACL foundation and hardening | Implemented (V9.4–V9.5) |
 | **TLS** | **Implemented (V9.7)** |
-| Pub/Sub and transactions | Not implemented (→ BACKLOG V8) |
+| Pub/Sub | In progress (V8.1 → Current Focus) |
+| Transactions | Not implemented (→ BACKLOG V8.4) |
 | Replication | Not implemented (→ BACKLOG V10) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-V9 Security is complete through TLS. No milestone is actively in progress — next
-candidate work lives in `BACKLOG.md` (V8 Pub/Sub + transactions is the natural
-next major milestone; the deferred TLS optimizations are parked there too).
+### V8 - Pub/Sub [In Progress]
 
-**Open confirmatory task:** a full TLS suite re-run after the V9.7.5 flags
+Redis Pub/Sub: a live broadcast mechanism with **no storage and no persistence** —
+a message only reaches clients subscribed *at the moment* it is published, then
+it is gone. Built in three ordered steps; each is independently testable before
+the next starts. (Transactions — `MULTI`/`EXEC`/`WATCH`, the other half of the
+old combined "V8" milestone — stay in `BACKLOG.md` as V8.4/V8.5; they share the
+number for scheduling only and are an unrelated feature.)
+
+#### V8.1 - Pub/Sub core: `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` [Next]
+
+Exact-channel-name matching only — no glob patterns yet (that's V8.2).
+
+- New registry on `GlobalData`:
+  `std::unordered_map<std::string, std::unordered_set<Conn*>> channels`
+  (channel name → subscribed conns). Direct lookup, no scanning.
+- `SUBSCRIBE channel [channel...]`: add the conn to each channel's set; reply with
+  Redis's per-channel `subscribe` confirmation array (name, running subscription count).
+- `PUBLISH channel msg`: look up `channels[channel]`, and for each subscribed
+  `Conn*`, RESP-encode a `message` push reply straight into that conn's
+  `outgoing` (same `buf_append` every command already uses) and set
+  `want_write = true`. Reply with the receiver count.
+- **This needs zero event-loop changes.** The poll loop (`server.cpp`) rebuilds
+  `poll_args` from every `Conn`'s `want_read`/`want_write` flags fresh each tick,
+  so `PUBLISH` mutating a *different* connection's buffer and flipping its
+  `want_write` flag is picked up automatically on the next `poll()` call — no
+  eventfd, no cross-thread signaling. Still one synchronous call within the same
+  event-loop iteration as any other command; `PUBLISH` just happens to touch
+  more than one `Conn`.
+- Subscribe-mode command gating: once a `Conn` has ≥1 subscription, `do_request`
+  needs to reject everything except `SUBSCRIBE`/`UNSUBSCRIBE`/`PING`/`RESET`/
+  `QUIT` (Redis's RESP2 rule) — a `size_t sub_count` on `Conn`, checked the same
+  way `do_request` already gates on `conn->user` being null, just a different
+  per-conn mode.
+- `UNSUBSCRIBE` with no arguments means "unsubscribe from everything."
+- Teardown: `conn_destroy` must remove the conn from every channel set it's in —
+  a new cleanup step alongside the idle-list/io-list detach it already does.
+- Done when: a Python test harness client can `SUBSCRIBE`, a second connection
+  `PUBLISH`es, and the first receives the message — plus subscribe-mode gating
+  rejects a plain `GET` while subscribed.
+
+#### V8.2 - Pattern subscriptions + channel ACL [Backlog]
+
+Do not start until V8.1 is solid — this only adds a second matching path on top of it.
+
+- `PSUBSCRIBE`/`PUNSUBSCRIBE`: separate registry, a list of `{pattern, subscribers}`.
+  `PUBLISH` gains a second step — glob-match the channel against every
+  registered pattern (linear scan; exact-match in V8.1 stays a direct lookup) —
+  and sends a `pmessage` (not `message`) push reply to pattern matches.
+- **Correcting a stale note that used to be here:** there is no existing
+  ACL channel-pattern field to reuse — `User` (`state.h:100-108`) only has
+  `key_patterns` for key-scoped ACL. Real channel-scoped ACL (Redis's `&pattern`
+  rule) needs a new `channel_patterns` field added to `User`, mirroring
+  `key_patterns`' shape. Until that lands, ship Pub/Sub with all channels open to
+  any user holding Pub/Sub category access — same coarse granularity most
+  commands already have.
+- Done when: `PSUBSCRIBE news.*` receives a `PUBLISH news.sports ...` as a
+  `pmessage`, and a plain `SUBSCRIBE news.sports` from V8.1 still also gets it as
+  a separate `message` — both paths fire independently off one `PUBLISH`.
+
+#### V8.3 - Keyspace notifications [Backlog]
+
+Rides entirely on top of V8.1/V8.2 — this step is wiring, not new mechanism.
+
+- One `notify_keyspace_event(class, event, key)` helper that internally calls the
+  now-existing `PUBLISH` path. Hook points are few and already identified:
+  lazy expiry (`expire_if_needed`), active expiry (`process_timers`' TTL drain),
+  eviction (`free_memory_if_needed`), and the write handlers themselves.
+  Covers Redis-compatible `K`/`E` channel semantics (`notify-keyspace-events`
+  config) without touching the dispatch path.
+- Done when: `CONFIG SET notify-keyspace-events KEA`, a `PSUBSCRIBE
+  __keyevent@0__:*`, and a plain `SET`/`EXPIRE`/eviction each produce the
+  expected event on that channel.
+
+**TLS carry-over (still open):** a full TLS suite re-run after the V9.7.5 flags
 (session resumption + `SSL_MODE_RELEASE_BUFFERS`) landed — the 555/551 gate runs
 predate those two config lines. Once green, V9.7 is fully closed. A commit
-checkpoint of the V9.7.2→.5 body is also outstanding.
+checkpoint of the V9.7.2→.5 body plus the docs reorg is also outstanding.
 
 ## Completed Milestones
 

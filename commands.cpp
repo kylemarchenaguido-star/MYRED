@@ -3266,6 +3266,31 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   return resp_err(out, "ERR Unknown ACL subcommand or wrong number of arguments");
 }
 
+// SUBSCRIBE/UNSUBSCRIBE/PUBLISH need the Conn (register/deregister, and PUBLISH
+// writes into *other* conns' buffers), so do_request special-cases them by
+// canonical name exactly like AUTH/ACL. 
+static void do_pubsub_stub(std::vector<std::string> &, Buffer *){}
+
+// one "<kind> <channel> <count>" confirmation array (kind = subscribe/unsubscribe)
+static void pubsub_confirm(Buffer *out, const char *kind, const std::string *chan, int64_t count){
+  resp_arr(out, 3);
+  resp_str(out, kind, strlen(kind));
+  if (chan){ resp_str(out, chan->data(), chan->size()); }
+  else { resp_nil(out); } // UNSUBSCRIBE with nothing subscribed
+  resp_int(out, count);
+}
+
+static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  // SUBSCRIBE channel [channel ...] (min_args = 2 already checked)
+  for (size_t i = 1; i < cmd.size(); ++i){
+    const std::string &ch = cmd[i];
+    // idempotent: set dedupes; only touch the registry on first join
+    if (conn->sub_channels.insert(ch).second){
+      
+    }
+  }
+}
+
 static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware
 
 static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {

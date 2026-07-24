@@ -24,20 +24,72 @@ Recently resolved (terse; detail in CODE_REVIEW / git):
 
 ## Next Major Milestones
 
-### V8 - Pub/Sub and Transactions
+### V8 - Transactions
 
-Planned: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, pattern subscriptions, `MULTI`,
-`EXEC`, `DISCARD`, `WATCH`.
+**Pub/Sub (V8.1–V8.3) has moved to `ROADMAP.md` → Current Focus** — it is the
+active milestone. What remains here is Transactions (`MULTI`/`EXEC`/`DISCARD` +
+`WATCH`), which shared the "V8" number for scheduling only and is an unrelated
+feature: queueing and atomically committing a batch of normal commands, no
+broadcast mechanism involved. The step numbers (V8.4, V8.5) are kept as-is so the
+Pub/Sub steps in ROADMAP (V8.1–V8.3) and these don't collide. Independent of the
+Pub/Sub work; can be built in parallel, but simpler to reason about one feature
+at a time.
 
-- Pub/Sub will make the existing ACL channel-pattern field useful.
-- Transactions need command queueing and optimistic invalidation, not just parser work.
-- Blocking or queued client state should be designed before adding blocking list commands.
-- Keyspace notifications (`notify-keyspace-events`) should ride on Pub/Sub once
-  `PUBLISH` exists. The hook points already exist and are few: lazy expiry
-  (`expire_if_needed`), active expiry (`process_timers` TTL drain), eviction
-  (`free_memory_if_needed`), and the write handlers themselves. One
-  `notify_keyspace_event(class, event, key)` helper called from those sites covers
-  Redis-compatible `K`/`E` channel semantics without touching the dispatch path.
+##### V8.4 - Transactions core: `MULTI` / `EXEC` / `DISCARD`
+
+Independent of the Pub/Sub steps; can be built in parallel if desired, but simpler
+to reason about one feature at a time.
+
+- `Conn` gains `bool in_multi`, `bool multi_dirty` (a queue-time error — unknown
+  command, bad arity — that makes `EXEC` abort without running anything, Redis's
+  `EXECABORT`), and `std::vector<std::vector<std::string>> queued_cmds`.
+- `MULTI`: error if already `in_multi`; else set it, reply `+OK`.
+- While `in_multi`, `do_request` intercepts after command/arity validation but
+  before dispatch: a command that doesn't exist or has the wrong arity sets
+  `multi_dirty` and replies the error immediately (but queuing continues for
+  anything after it); otherwise the raw `cmd` vector is pushed onto
+  `queued_cmds` and the reply is `+QUEUED` instead of actually executing.
+  `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`RESET`/`QUIT` are the commands that never queue.
+- `EXEC`: if `multi_dirty`, discard the queue and reply `-EXECABORT`. Otherwise
+  run every queued command through the normal dispatch path in order, collect
+  each individual reply, and wrap them in one multi-bulk array reply. Atomicity
+  is free — same reasoning already written down for EVAL's `redis.call`:
+  single-threaded loop, so no other connection's command can interleave between
+  queued commands.
+- `DISCARD`: clears `in_multi`/`queued_cmds`/`multi_dirty`, replies `+OK`; errors
+  if not currently in `MULTI`.
+- Design for this interaction now even though blocking commands ship later:
+  real Redis's blocking commands (`BLPOP` etc.) never actually block inside
+  `MULTI`/`EXEC` — they run non-blocking and return nil immediately if not
+  ready. Whatever "conn mode" state machine gets built here for `in_multi`
+  needs to keep that in mind from the start, or the blocking list commands
+  (Command Coverage Gaps → Lists) will need this redesigned later to fit.
+- Done when: a queued sequence of writes replies `+QUEUED` per command, `EXEC`
+  returns one array with each individual result, and a bad command mid-queue
+  produces `-EXECABORT` on `EXEC` without running anything.
+
+##### V8.5 - `WATCH` (optimistic locking)
+
+Do not start until V8.4 is solid — `WATCH` only matters relative to a working `EXEC`.
+
+- `WATCH key [key...]`: only valid *before* `MULTI` starts (Redis rejects
+  `WATCH` inside an open transaction).
+- Recommended mechanism — eager dirty-marking, not lazy generation-diffing: a
+  global `std::unordered_map<std::string, std::unordered_set<Conn*>> watchers`
+  (key name → watching conns). Any write to that key name — the *same* hook
+  points identified for keyspace notifications in V8.3, so one instrumentation
+  pass can drive both features — immediately sets every watching
+  `Conn::watch_dirty = true`. `EXEC` then just checks its own conn's flag
+  instead of re-diffing per-key state at commit time; this mirrors what real
+  Redis's `touchWatchedKey()` does, and avoids needing a per-key generation
+  counter that has to survive a key being deleted and recreated under the same name.
+- `EXEC` gains a pre-check: if `conn->watch_dirty`, abort with a nil array reply
+  instead of running the queue (distinct from `EXECABORT`, which is a queue-time
+  error — this is a commit-time invalidation).
+- Teardown: `conn_destroy` must remove the conn from every `watchers` set it's
+  in, same as the Pub/Sub cleanup in V8.1.
+- Done when: two connections `WATCH` the same key, one modifies it, and the
+  other's subsequent `EXEC` returns nil instead of running its queued commands.
 
 ### V10 - Replication and High Availability
 
@@ -137,7 +189,8 @@ Missing features, not defects:
 
 - Full Redis ACL rule-order fidelity ("last match wins") — upgrade path recorded
   in DECISIONS → ACL Model.
-- Pub/Sub channel-pattern enforcement (no-op until V8 lands).
+- Pub/Sub channel-pattern enforcement (lands in V8.2 → ROADMAP Current Focus;
+  needs a new `User::channel_patterns` field).
 - `nopass`, selectors, `sanitize-payload`, `ACL LOAD`, `ACL SAVE`.
 - `COMMAND`, `COMMAND DOCS`, `COMMAND COUNT` (`redis-cli` interactive mode probes these).
 - Full `CONFIG GET/SET` coverage (also under Server Observability and Tooling).
