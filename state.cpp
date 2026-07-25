@@ -53,6 +53,7 @@ void acl_bootstrap_default(){
   u.enable = true;
   u.allow_cats = CAT_ALL;
   u.all_keys = true;
+  u.all_channels = true;
   if (!g_config.password.empty()){
     u.pw_hashes.push_back(g_config.password);
   }

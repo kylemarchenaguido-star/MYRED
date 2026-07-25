@@ -103,9 +103,11 @@ struct User {
   std::unordered_map<std::string, bool> cmd_overrides; // explicit +cmd / -cmd
   std::vector<std::string> pw_hashes; // SHA-256 digets; AUTH matches any (rotation)
   std::vector<std::string> key_patterns; // glob patterns for reacheable keys
+  std::vector<std::string> channel_patterns; // glob patterns for reachable pub/sub channels
   std::string name;
   bool enable = true;
   bool all_keys = false; // ~* : any key
+  bool all_channels = false; // &* : any channel
  };
 
 // Connections state and buffers 
@@ -131,6 +133,7 @@ struct Conn {
   uint64_t id = 0; // monotonic, stamped at accept - completions check it
   SSL *ssl = nullptr; // non-null = TLS conn; owned by the transport, freed in tr_close
   std::unordered_set<std::string> sub_channels; // channels this conn is SUBSCRIBEd to.
+  std::unordered_set <std::string> sub_patterns; // glob patterns this conn PSUBSCRIBEd to.
 };
 
 // global hashtable
@@ -139,6 +142,9 @@ struct GlobalData{
   std::vector<Conn *> fd2conn; 
   // channel name -> subscribed conns. Direct lookup on PUBLISH, no scanning
   std::unordered_map<std::string, std::unordered_set<Conn*>> channels;
+  // pattern -> subscribed conns. PUBLISH scans these linearly
+  std::unordered_map<std::string, std::unordered_set<Conn*>> patterns;
+
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)

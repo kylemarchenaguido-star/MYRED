@@ -3092,6 +3092,10 @@ bool acl_apply_rule(User &u, const std::string &t){
     return true;
   }
 
+  if (t == "allchannels" || t == "&*"){ u.all_channels = true; u.channel_patterns.clear(); return true; }
+  if (t == "resetchannels"){ u.channel_patterns.clear(); u.all_channels = false; return true; }
+  if (t.size() > 1 && t[0] == '&'){ u.channel_patterns.push_back(t.substr(1)); return true; }
+
   if (t == "allkeys" || t == "~*"){ u.all_keys = true; u.key_patterns.clear(); return true; }
 
   if (t == "allcommands" || t == "+@all"){ u.allow_cats = CAT_ALL; u.cmd_overrides.clear(); return true; }
@@ -3149,6 +3153,9 @@ std::string acl_format_user(const std::string &name, const User &u, bool for_con
   // keys
   if (u.all_keys){ s += " ~*"; }
   else { for (const std::string &p : u.key_patterns){ s += " ~" + p; } }
+
+  if (u.all_channels){ s += " &*"; }
+  else { for (const std::string &p : u.channel_patterns){ s += " &" + p; } }
   // commands: full grant, or explicit deny-all base + the granted categories
   if (u.allow_cats == CAT_ALL){ s += " +@all"; }
   else {
@@ -3271,6 +3278,12 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 // canonical name exactly like AUTH/ACL. 
 static void do_pubsub_stub(std::vector<std::string> &, Buffer *){}
 
+// The count Redis reports in  every (p)subscribe/(p)unsubscribe confirmation is the conn's
+// TOTAL subscription count - channels + patterns (clientSubscriptionCount)
+static size_t pubsub_count(const Conn *conn){
+  return conn->sub_channels.size() + conn->sub_patterns.size();
+}
+
 // one "<kind> <channel> <count>" confirmation array (kind = subscribe/unsubscribe)
 static void pubsub_confirm(Buffer *out, const char *kind, const std::string *chan, int64_t count){
   resp_arr(out, 3);
@@ -3280,15 +3293,166 @@ static void pubsub_confirm(Buffer *out, const char *kind, const std::string *cha
   resp_int(out, count);
 }
 
+// nullptr = allowed, else a NOPERM message 
+static const char *acl_channel_check(const User *u, const std::string &chan, bool literal){
+  static const char *deny = "NOPERM no permissions to access one of the channels used as arguments";
+  if (!u){ return deny; }
+  if (u->all_channels){ return nullptr; }
+  for (const std::string &pat : u->channel_patterns){
+    if (literal ? (pat == chan)
+                : glob_match(pat.data(), pat.size(), chan.data(), chan.size())){
+      return nullptr;
+    }
+  }
+  return deny;
+}
+
 static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  // pre-scan every argument
+  for (size_t i = 1; i < cmd.size(); ++i){
+    if (const char *deny = acl_channel_check(conn->user, cmd[i], false)){
+      audit_event("acl_deny", conn, " cmd=subscribe reaseon=channel");
+      return resp_err(out, deny);
+    }
+  }
   // SUBSCRIBE channel [channel ...] (min_args = 2 already checked)
   for (size_t i = 1; i < cmd.size(); ++i){
     const std::string &ch = cmd[i];
     // idempotent: set dedupes; only touch the registry on first join
     if (conn->sub_channels.insert(ch).second){
-      
+      g_data.channels[ch].insert(conn);
+    }
+    pubsub_confirm(out, "subscribe", &ch, (int64_t)pubsub_count(conn));
+  }
+}
+
+// remove one (conn, channel) edge from the global registry, erasing the channel
+// entry once its last subscriber leaves so the map dosen't accumulate empties
+static void pubsub_unlink(const std::string &ch, Conn *conn){
+  auto it = g_data.channels.find(ch);
+  if (it == g_data.channels.end()){ return; }
+  it->second.erase(conn);
+  if (it->second.empty()){ g_data.channels.erase(it); }
+}
+
+static void do_unsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (cmd.size() == 1){
+    // no argsL unsubscribe from everything currently held
+    if (conn->sub_channels.empty()){
+      return pubsub_confirm(out, "unsubscribe", nullptr, (int64_t)pubsub_count(conn));
+    }
+    // snapshot first: we mutate sub_channels while iterating
+    std::vector<std::string> all(conn->sub_channels.begin(), conn->sub_channels.end());
+    for (const std::string &ch : all){
+      pubsub_unlink(ch, conn);
+      conn->sub_channels.erase(ch);
+      pubsub_confirm(out, "unsubscribe", &ch, (int64_t)pubsub_count(conn));
+    }
+    return;
+  }  
+  // explicit channels: reply for each arg even if we weren't subscribed (like redis ":3")
+  for (size_t i = 1; i < cmd.size(); ++i){
+    const std::string &ch = cmd[i];
+    if (conn->sub_channels.erase(ch)){ pubsub_unlink(ch, conn); }
+    pubsub_confirm(out, "unsubscribe", &ch, (int64_t)pubsub_count(conn)); 
+  }
+}
+
+static void do_psubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  // pre-scan every argument
+  for (size_t i = 1; i < cmd.size(); ++i){
+    if (const char *deny = acl_channel_check(conn->user, cmd[i], true)){
+      audit_event("acl_deny", conn, " cmd=psubscribe reaseon=channel");
+      return resp_err(out, deny);
     }
   }
+  // PSUBSCRIBE pattern [pattern ...]
+  for (size_t i = 1; i < cmd.size(); ++i){
+    const std::string &pat = cmd[i];
+    // idempotent, like SUBSCRIBE
+    if (conn->sub_patterns.insert(pat).second){
+      g_data.patterns[pat].insert(conn);
+    }
+    pubsub_confirm(out, "psubscribe", &pat, (int64_t)pubsub_count(conn));
+  }
+}
+
+// mirror of pubsub_unlink for the pattern registry
+static void pubsub_punlink(const std::string &pat, Conn *conn){
+  auto it = g_data.patterns.find(pat);
+  if (it == g_data.patterns.end()){ return; }
+  it->second.erase(conn);
+  if (it->second.empty()){ g_data.patterns.erase(it); }
+}
+
+static void do_punsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (cmd.size() == 1){
+    if (conn->sub_patterns.empty()){
+      return pubsub_confirm(out, "punsubscribe", nullptr, (int64_t)pubsub_count(conn));
+    }
+    // snapshot: we mutate sub_patterns while walking it
+    std::vector<std::string> all(conn->sub_patterns.begin(), conn->sub_patterns.end());
+    for (const std::string &pat : all){
+      pubsub_punlink(pat, conn);
+      conn->sub_patterns.erase(pat);
+      pubsub_confirm(out, "punsubscribe", &pat, (int64_t)pubsub_count(conn));
+    }
+    return;
+  }
+  for (size_t i = 1; i < cmd.size(); ++i){
+    const std::string &pat = cmd[i];
+    if (conn->sub_patterns.erase(pat)){ pubsub_punlink(pat, conn); }
+    pubsub_confirm(out, "punsubscribe", &pat, (int64_t)pubsub_count(conn));
+  }
+}
+
+static void do_publish(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (const char *deny = acl_channel_check(conn->user, cmd[1], false)){
+    audit_event("acl_deny", conn, " cmd=publish reason=channel");
+    return resp_err(out, deny);
+  }
+  const std::string &chan = cmd[1];
+  const std::string &msg = cmd[2];
+  int64_t receivers = 0;
+  // exact-channel subscribers -> 3-element 'message'
+  auto it = g_data.channels.find(chan);
+  if (it != g_data.channels.end()){
+    // we only read the set here - no invalidation
+    for (Conn *sub : it->second){
+      // push straigh into the subscriber's outgoing: *3 message <chan> <msg>
+      resp_arr(&sub->outgoing, 3);
+      resp_str(&sub->outgoing, "message", 7);
+      resp_str(&sub->outgoing, chan.data(), chan.size());
+      resp_str(&sub->outgoing,msg.data(), msg.size());
+      // poll rebuilds events from this each tick
+      sub->want_write = true; 
+      ++receivers;
+    }
+  }
+
+  // pattern subscribers -> 4-element 'pmessage'
+  for (const auto &pe : g_data.patterns){
+    const std::string &pat = pe.first;
+    if (!glob_match(pat.data(), pat.size(), chan.data(), chan.size())){ continue; }
+    for (Conn *sub : pe.second){
+      resp_arr(&sub->outgoing, 4);
+      resp_str(&sub->outgoing, "pmessage", 8);
+      resp_str(&sub->outgoing, pat.data(), pat.size());
+      resp_str(&sub->outgoing, chan.data(), chan.size());
+      resp_str(&sub->outgoing, msg.data(), msg.size());
+      sub->want_write = true;
+      ++receivers;
+    }
+  }
+  resp_int(out, receivers);
+}
+
+// teardown: called from conn_destroy so PUBLISH never dereferences a freed Conn
+void pubsub_remove_conn(Conn *conn){
+  for (const std::string &ch : conn->sub_channels){ pubsub_unlink(ch, conn); }
+  conn->sub_channels.clear(); 
+  for (const std::string &pat : conn->sub_patterns){ pubsub_punlink(pat, conn); }
+  conn->sub_patterns.clear(); 
 }
 
 static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware
@@ -3399,6 +3563,12 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"memory",       {do_memory,        2, -1}},
   {"object",       {do_object,        2, -1}},
   {"acl",          {do_acl_placeholder, 2, -1}},
+  // pubsub
+  {"subscribe",    {do_pubsub_stub,   2, -1}},
+  {"unsubscribe",  {do_pubsub_stub,   1, -1}},
+  {"publish",      {do_pubsub_stub,   3,  3}},
+  {"psubscribe",   {do_pubsub_stub,   2, -1}},
+  {"punsubscribe", {do_pubsub_stub,   1, -1}},
 };
 
 struct DispatchEntry {
@@ -3470,6 +3640,13 @@ static bool cmd_can_grow_memory(const std::string &name){
   return no_grow.count(name) == 0;
 }
 
+// commands allowed while a conn is in subscribe mode (RESP2 rule)
+static bool cmd_ok_in_subscribe(const std::string &canonical){
+  return canonical == "subscribe" || canonical == "unsubscribe" ||
+         canonical == "psubscribe"|| canonical == "punsubscribe"|| // this is for v8.2
+         canonical == "ping"      || canonical == "quit" || canonical == "reset";
+}
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const char *raw, size_t raw_len) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -3506,6 +3683,12 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return resp_err(out, "NOAUTH authentication required");
   }
 
+  // Subscribe-mode gate : once subscribed, only pub/sub + PING/QUIT/RESET run.
+  if (!(conn->sub_channels.empty() && conn->sub_patterns.empty()) && !cmd_ok_in_subscribe(canonical)){
+    return resp_err(out,
+      "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in subscribe mode");
+  }
+
   if (!found){ return resp_err(out, "ERR unknown command"); }
   const CmdSpec &spec = *specp;
 
@@ -3521,7 +3704,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     return resp_err(out, "ERR wrong number of arguments");
   }
 
-  if (canonical == "acl"){ return do_acl(cmd, out, conn); } // permission checked above; needs conn
+  if (canonical == "acl"){          return do_acl(cmd, out, conn); } // permission checked above; needs conn
+
+  if (canonical == "subscribe"){    return do_subscribe(cmd, out, conn); }
+  if (canonical == "unsubscribe"){  return do_unsubscribe(cmd, out, conn); }
+  if (canonical == "publish"){      return do_publish(cmd, out, conn); }
+  if (canonical == "psubscribe"){   return do_psubscribe(cmd, out, conn); }
+  if (canonical == "punsubscribe"){ return do_punsubscribe(cmd, out, conn); }
+  
 
   // audit sensitive commands
   if (spec.acl_cats & (CAT_ADMIN | CAT_DANGEROUS)){
@@ -3615,6 +3805,8 @@ void acl_init_categories(){
     {"sdiffstore",KeySpec::ALL_FROM_1},
     // key value key value ...
     {"mset",KeySpec::STRIDE2_FROM_1},{"msetnx",KeySpec::STRIDE2_FROM_1},
+    {"subscribe",KeySpec::NONE}, {"unsubscribe",KeySpec::NONE}, {"publish",KeySpec::NONE},
+    {"psubscribe",KeySpec::NONE}, {"punsubscribe",KeySpec::NONE},
   };
 
     // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
@@ -3632,6 +3824,8 @@ void acl_init_categories(){
     {"ping",    CAT_CONNECTION}, {"auth", CAT_CONNECTION},
     {"info",    CAT_ADMIN},     {"memory", CAT_ADMIN}, {"object", CAT_ADMIN},
     {"echo", CAT_CONNECTION},
+    {"subscribe", CAT_FAST}, {"unsubscribe", CAT_FAST}, {"publish", CAT_FAST},
+    {"psubscribe", CAT_FAST}, {"punsubscribe", CAT_FAST},
   };
 
   for (auto &kv : k_cmd_table){

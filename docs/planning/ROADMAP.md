@@ -42,7 +42,7 @@ Implemented command families:
 | Config file + password hashing (Argon2id) | Implemented |
 | ACL foundation and hardening | Implemented (V9.4–V9.5) |
 | **TLS** | **Implemented (V9.7)** |
-| Pub/Sub | In progress (V8.1 → Current Focus) |
+| Pub/Sub | V8.1 core done; V8.2 patterns in progress |
 | Transactions | Not implemented (→ BACKLOG V8.4) |
 | Replication | Not implemented (→ BACKLOG V10) |
 
@@ -59,58 +59,85 @@ the next starts. (Transactions — `MULTI`/`EXEC`/`WATCH`, the other half of the
 old combined "V8" milestone — stay in `BACKLOG.md` as V8.4/V8.5; they share the
 number for scheduling only and are an unrelated feature.)
 
-#### V8.1 - Pub/Sub core: `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` [Next]
+#### V8.1 - Pub/Sub core: `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` [Done]
 
-Exact-channel-name matching only — no glob patterns yet (that's V8.2).
+Done 2026-07-24. Exact-channel-name matching only. Verified live: `SUBSCRIBE`
+confirmation + cross-connection `PUBLISH` delivering a `message` push, the
+subscribe-mode gate rejecting `GET`, and clean teardown (`PUBLISH` after the
+subscriber disconnects returns `0`, no use-after-free).
 
-- New registry on `GlobalData`:
-  `std::unordered_map<std::string, std::unordered_set<Conn*>> channels`
-  (channel name → subscribed conns). Direct lookup, no scanning.
-- `SUBSCRIBE channel [channel...]`: add the conn to each channel's set; reply with
-  Redis's per-channel `subscribe` confirmation array (name, running subscription count).
-- `PUBLISH channel msg`: look up `channels[channel]`, and for each subscribed
-  `Conn*`, RESP-encode a `message` push reply straight into that conn's
-  `outgoing` (same `buf_append` every command already uses) and set
-  `want_write = true`. Reply with the receiver count.
-- **This needs zero event-loop changes.** The poll loop (`server.cpp`) rebuilds
-  `poll_args` from every `Conn`'s `want_read`/`want_write` flags fresh each tick,
-  so `PUBLISH` mutating a *different* connection's buffer and flipping its
-  `want_write` flag is picked up automatically on the next `poll()` call — no
-  eventfd, no cross-thread signaling. Still one synchronous call within the same
-  event-loop iteration as any other command; `PUBLISH` just happens to touch
-  more than one `Conn`.
-- Subscribe-mode command gating: once a `Conn` has ≥1 subscription, `do_request`
-  needs to reject everything except `SUBSCRIBE`/`UNSUBSCRIBE`/`PING`/`RESET`/
-  `QUIT` (Redis's RESP2 rule) — a `size_t sub_count` on `Conn`, checked the same
-  way `do_request` already gates on `conn->user` being null, just a different
-  per-conn mode.
-- `UNSUBSCRIBE` with no arguments means "unsubscribe from everything."
-- Teardown: `conn_destroy` must remove the conn from every channel set it's in —
-  a new cleanup step alongside the idle-list/io-list detach it already does.
-- Done when: a Python test harness client can `SUBSCRIBE`, a second connection
-  `PUBLISH`es, and the first receives the message — plus subscribe-mode gating
-  rejects a plain `GET` while subscribed.
+- Registry `GlobalData::channels`
+  (`unordered_map<string, unordered_set<Conn*>>`) — direct lookup, no scanning.
+- **Design change from the original plan:** the per-conn state is
+  `Conn::sub_channels` (an `unordered_set<string>` of joined channels), *not* the
+  planned `size_t sub_count`. The set is simultaneously the subscribe-mode flag,
+  the running count, and — critically — the teardown index, making
+  `conn_destroy`'s unlink O(channels joined) instead of a scan of the whole
+  registry. Since `PUBLISH` dereferences `Conn*` out of the registry, that unlink
+  is a use-after-free guard, not an optimization.
+- `PUBLISH` RESP-encodes straight into each subscriber's `outgoing` and sets
+  `want_write`. **Zero event-loop changes, as predicted** — an idle subscriber
+  sits at `want_read=true`, so poll dispatches it to `handle_read`, whose tail
+  (`server.cpp:566-570`) flushes any non-empty `outgoing`; a mid-write conn takes
+  the `handle_write` branch. Both steady states flush.
+- `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH` are dispatched conn-aware in `do_request`
+  (like `AUTH`/`ACL`) via a `do_pubsub_stub` table entry that only carries arity
+  + ACL metadata; they return before the AOF/maxmemory/audit path, since Pub/Sub
+  touches no keyspace.
+- Channels are `KeySpec::NONE` + `CAT_FAST` — a channel name is not a key, so
+  key-pattern ACL must not apply to it.
 
-#### V8.2 - Pattern subscriptions + channel ACL [Backlog]
+#### V8.2a - Pattern subscriptions [Done]
 
-Do not start until V8.1 is solid — this only adds a second matching path on top of it.
+Done 2026-07-24. `PSUBSCRIBE`/`PUNSUBSCRIBE` with a second registry
+`GlobalData::patterns` (same `map<string, set<Conn*>>` shape as `channels`, so
+unlink/teardown code stays symmetric) + `Conn::sub_patterns`. `PUBLISH` gained a
+second step: after the O(1) exact lookup it scans the *distinct patterns* and
+`glob_match`es each against the channel, emitting a 4-element `pmessage` (which
+carries the matched pattern so clients can demux). Reuses the same `glob_match`
+as key-pattern ACL. Verified: one `PUBLISH news.sports` delivered to both a
+`PSUBSCRIBE news.*` and a `SUBSCRIBE news.sports` conn, receiver count `2`.
 
-- `PSUBSCRIBE`/`PUNSUBSCRIBE`: separate registry, a list of `{pattern, subscribers}`.
-  `PUBLISH` gains a second step — glob-match the channel against every
-  registered pattern (linear scan; exact-match in V8.1 stays a direct lookup) —
-  and sends a `pmessage` (not `message`) push reply to pattern matches.
-- **Correcting a stale note that used to be here:** there is no existing
-  ACL channel-pattern field to reuse — `User` (`state.h:100-108`) only has
-  `key_patterns` for key-scoped ACL. Real channel-scoped ACL (Redis's `&pattern`
-  rule) needs a new `channel_patterns` field added to `User`, mirroring
-  `key_patterns`' shape. Until that lands, ship Pub/Sub with all channels open to
-  any user holding Pub/Sub category access — same coarse granularity most
-  commands already have.
-- Done when: `PSUBSCRIBE news.*` receives a `PUBLISH news.sports ...` as a
-  `pmessage`, and a plain `SUBSCRIBE news.sports` from V8.1 still also gets it as
-  a separate `message` — both paths fire independently off one `PUBLISH`.
+Two V8.1 semantics this step corrected: the confirmation count is now the conn's
+**total** subscriptions (channels + patterns, Redis's `clientSubscriptionsCount`)
+via `pubsub_count()`, and the subscribe-mode gate checks **both** sets — a conn
+holding only pattern subs is still in subscribe mode.
 
-#### V8.3 - Keyspace notifications [Backlog]
+Five transcription slips were caught by grep-verify, none by the compiler and
+none by the first passing test: `PUBLISH` min_args left at 2 while `do_publish`
+reads `cmd[2]` (out-of-bounds, remotely triggerable), an iterator pair spanning
+two different containers (`sub_patterns.begin()`/`sub_channels.end()` — UB that
+happened to work on libstdc++), an explicit-arg loop starting at `i=0` (treating
+the command name as a channel), `UNSUBSCRIBE` min_args 2 making the no-args
+branch dead code, and one missed `pubsub_count` call site.
+
+#### V8.2b - Channel ACL [Done]
+
+Real channel-scoped ACL (Redis's `&pattern` rule). There is no existing field to
+reuse — `User` only has `key_patterns` for key-scoped ACL — so this adds
+`channel_patterns` + `all_channels` to `User`, mirroring `key_patterns`/`all_keys`.
+
+- Rules: `&<pattern>`, `allchannels`/`&*`, `resetchannels`; round-tripped through
+  `acl_format_user` so `CONFIG REWRITE` preserves them.
+- Enforcement follows Redis exactly: `SUBSCRIBE`/`PUBLISH` **glob-match** the
+  channel against granted patterns; `PSUBSCRIBE` requires the requested pattern to
+  be **string-equal** to a granted one (you cannot widen your grant by subscribing
+  to `*`). Checked inside the conn-aware handlers, since a channel is not a key and
+  the `KeySpec` path does not apply. All-or-nothing per command.
+- `UNSUBSCRIBE`/`PUNSUBSCRIBE` are never ACL-checked — leaving is always allowed.
+- Default is restrictive (no channels) to match current Redis; the bootstrap
+  `default` user gets `allchannels` so the common no-ACL setup is unaffected.
+- Done when: a user granted `&news.*` can `SUBSCRIBE news.sports` but not `other`,
+  `PSUBSCRIBE news.*` works while `PSUBSCRIBE *` is denied, and the grant survives
+  a `CONFIG REWRITE` round-trip.
+
+Done 2026-07-24, all of the above verified. One `acl_format_user` slip found by
+grep-verify: the `all_channels` branch emitted `"&*"` without a leading space,
+fusing it onto the previous token (`~*&*`) so a reload parsed it as key-pattern
+`*&*` and dropped both grants. Untested by the live run because the `else` branch
+(explicit `&pat`) was correct and `default` is skipped by `config_rewrite`.
+
+#### V8.3 - Keyspace notifications [In Progress]
 
 Rides entirely on top of V8.1/V8.2 — this step is wiring, not new mechanism.
 
