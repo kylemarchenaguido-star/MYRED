@@ -242,28 +242,31 @@ scripts/           all tests: stress_test.py (primary harness), persistence,
                    auth/ACL, eviction, and diagnostic helpers
 docs/planning/     ROADMAP (progress), BACKLOG (future work + open bugs),
                    DECISIONS (design + architecture), CODE_REVIEW (bug audit)
+docs/TESTING.md    testing runbook: every command, TLS, benchmarks, commit gate
 docs/*.md          test-run logs (bench_plain, bench_tls, stress_tls, ...)
 ```
 
 ## Status and what's next
 
-The full V9.6.4 audit sweep is complete (2026-07-17): every filed bug — critical
-through polish — is closed, including move-semantics and hashing perf fixes,
-O(k) `SPOP`/`SRANDMEMBER`, deterministic `SPOP` AOF propagation (as `SREM`),
-incremental eviction, and O(1) `INFO` keyspace stats.
+Recently completed (see `docs/planning/ROADMAP.md` for detail):
 
-Active and upcoming (see `docs/planning/ROADMAP.md` for detail):
+- **V9 — Security and auth** *(done)*: config file, Argon2id credentials with
+  async verification, protected mode + CIDR allowlist, ACLs with key patterns,
+  command hardening + audit log, and **TLS** — a transport seam keeps OpenSSL a
+  private dependency of one translation unit, with the handshake driven as
+  connection state rather than a blocking `SSL_accept`.
+- **V8 — Pub/Sub** *(done)*: `SUBSCRIBE`/`PUBLISH`, pattern subscriptions
+  (`PSUBSCRIBE` → `pmessage`), channel-scoped ACL (`&pattern`), and
+  Redis-compatible keyspace notifications (`notify-keyspace-events`). Needed zero
+  event-loop changes — the poll loop already rebuilds its flags every tick.
 
-- **V9.6.5 — General and speed test** *(active)*: restart/security/destructive
-  test debt, plus a recorded `redis-benchmark` baseline that the TLS refactor
-  must match.
-- **V9.7 — TLS**: transport seam refactor first (zero behavior change), then
-  OpenSSL contexts/listeners, handshake as connection state, data-path rules,
-  and optimizations.
-- **Known perf debt**: `mem_reaccount` recomputes container memory in O(n) per
-  mutation (visible on large lists under `--bench`); fix is delta accounting.
-- **Backlog**: compact encodings (intset/listpack-style), pub/sub, transactions,
-  replication.
+Next up:
+
+- **No milestone is currently active** — candidates are transactions
+  (`MULTI`/`EXEC`/`WATCH`), replication, and the pick-your-adventure upgrade
+  catalog, all scoped in `docs/planning/BACKLOG.md`.
+- **One open bug**: `CONFIG REWRITE` drops `requirepass` (regression from the TLS
+  work) — filed with its fix in `BACKLOG.md` → Open Bugs.
 
 ## Acknowledgements
 

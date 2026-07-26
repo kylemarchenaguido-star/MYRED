@@ -227,6 +227,10 @@ replies → bigger TLS hit) is the expected shape.
 
 ## Testing Matrix
 
+**Full command runbook: `docs/TESTING.md`** — prerequisites, every suite, TLS,
+benchmarks, and the pre-commit gate. This section records *what is covered and
+what the baselines are*; the runbook records *how to run it*.
+
 Primary harness (`--tls`-aware since 2026-07-21):
 ```bash
 python3 scripts/stress_test.py
