@@ -42,7 +42,7 @@ Implemented command families:
 | Config file + password hashing (Argon2id) | Implemented |
 | ACL foundation and hardening | Implemented (V9.4–V9.5) |
 | **TLS** | **Implemented (V9.7)** |
-| Pub/Sub | V8.1 core done; V8.2 patterns in progress |
+| **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | Transactions | Not implemented (→ BACKLOG V8.4) |
 | Replication | Not implemented (→ BACKLOG V10) |
 
@@ -50,113 +50,79 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V8 - Pub/Sub [In Progress]
+**No milestone in progress.** V8 Pub/Sub closed 2026-07-25; the next upgrade is
+undecided — candidates live in `BACKLOG.md` (V8.4 transactions, V10 replication,
+the Upgrade Catalog menu). This is the checkpoint the next milestone measures
+itself against.
 
-Redis Pub/Sub: a live broadcast mechanism with **no storage and no persistence** —
-a message only reaches clients subscribed *at the moment* it is published, then
-it is gone. Built in three ordered steps; each is independently testable before
-the next starts. (Transactions — `MULTI`/`EXEC`/`WATCH`, the other half of the
-old combined "V8" milestone — stay in `BACKLOG.md` as V8.4/V8.5; they share the
-number for scheduling only and are an unrelated feature.)
+Open carry-overs, in priority order:
 
-#### V8.1 - Pub/Sub core: `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` [Done]
-
-Done 2026-07-24. Exact-channel-name matching only. Verified live: `SUBSCRIBE`
-confirmation + cross-connection `PUBLISH` delivering a `message` push, the
-subscribe-mode gate rejecting `GET`, and clean teardown (`PUBLISH` after the
-subscriber disconnects returns `0`, no use-after-free).
-
-- Registry `GlobalData::channels`
-  (`unordered_map<string, unordered_set<Conn*>>`) — direct lookup, no scanning.
-- **Design change from the original plan:** the per-conn state is
-  `Conn::sub_channels` (an `unordered_set<string>` of joined channels), *not* the
-  planned `size_t sub_count`. The set is simultaneously the subscribe-mode flag,
-  the running count, and — critically — the teardown index, making
-  `conn_destroy`'s unlink O(channels joined) instead of a scan of the whole
-  registry. Since `PUBLISH` dereferences `Conn*` out of the registry, that unlink
-  is a use-after-free guard, not an optimization.
-- `PUBLISH` RESP-encodes straight into each subscriber's `outgoing` and sets
-  `want_write`. **Zero event-loop changes, as predicted** — an idle subscriber
-  sits at `want_read=true`, so poll dispatches it to `handle_read`, whose tail
-  (`server.cpp:566-570`) flushes any non-empty `outgoing`; a mid-write conn takes
-  the `handle_write` branch. Both steady states flush.
-- `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH` are dispatched conn-aware in `do_request`
-  (like `AUTH`/`ACL`) via a `do_pubsub_stub` table entry that only carries arity
-  + ACL metadata; they return before the AOF/maxmemory/audit path, since Pub/Sub
-  touches no keyspace.
-- Channels are `KeySpec::NONE` + `CAT_FAST` — a channel name is not a key, so
-  key-pattern ACL must not apply to it.
-
-#### V8.2a - Pattern subscriptions [Done]
-
-Done 2026-07-24. `PSUBSCRIBE`/`PUNSUBSCRIBE` with a second registry
-`GlobalData::patterns` (same `map<string, set<Conn*>>` shape as `channels`, so
-unlink/teardown code stays symmetric) + `Conn::sub_patterns`. `PUBLISH` gained a
-second step: after the O(1) exact lookup it scans the *distinct patterns* and
-`glob_match`es each against the channel, emitting a 4-element `pmessage` (which
-carries the matched pattern so clients can demux). Reuses the same `glob_match`
-as key-pattern ACL. Verified: one `PUBLISH news.sports` delivered to both a
-`PSUBSCRIBE news.*` and a `SUBSCRIBE news.sports` conn, receiver count `2`.
-
-Two V8.1 semantics this step corrected: the confirmation count is now the conn's
-**total** subscriptions (channels + patterns, Redis's `clientSubscriptionsCount`)
-via `pubsub_count()`, and the subscribe-mode gate checks **both** sets — a conn
-holding only pattern subs is still in subscribe mode.
-
-Five transcription slips were caught by grep-verify, none by the compiler and
-none by the first passing test: `PUBLISH` min_args left at 2 while `do_publish`
-reads `cmd[2]` (out-of-bounds, remotely triggerable), an iterator pair spanning
-two different containers (`sub_patterns.begin()`/`sub_channels.end()` — UB that
-happened to work on libstdc++), an explicit-arg loop starting at `i=0` (treating
-the command name as a channel), `UNSUBSCRIBE` min_args 2 making the no-args
-branch dead code, and one missed `pubsub_count` call site.
-
-#### V8.2b - Channel ACL [Done]
-
-Real channel-scoped ACL (Redis's `&pattern` rule). There is no existing field to
-reuse — `User` only has `key_patterns` for key-scoped ACL — so this adds
-`channel_patterns` + `all_channels` to `User`, mirroring `key_patterns`/`all_keys`.
-
-- Rules: `&<pattern>`, `allchannels`/`&*`, `resetchannels`; round-tripped through
-  `acl_format_user` so `CONFIG REWRITE` preserves them.
-- Enforcement follows Redis exactly: `SUBSCRIBE`/`PUBLISH` **glob-match** the
-  channel against granted patterns; `PSUBSCRIBE` requires the requested pattern to
-  be **string-equal** to a granted one (you cannot widen your grant by subscribing
-  to `*`). Checked inside the conn-aware handlers, since a channel is not a key and
-  the `KeySpec` path does not apply. All-or-nothing per command.
-- `UNSUBSCRIBE`/`PUNSUBSCRIBE` are never ACL-checked — leaving is always allowed.
-- Default is restrictive (no channels) to match current Redis; the bootstrap
-  `default` user gets `allchannels` so the common no-ACL setup is unaffected.
-- Done when: a user granted `&news.*` can `SUBSCRIBE news.sports` but not `other`,
-  `PSUBSCRIBE news.*` works while `PSUBSCRIBE *` is denied, and the grant survives
-  a `CONFIG REWRITE` round-trip.
-
-Done 2026-07-24, all of the above verified. One `acl_format_user` slip found by
-grep-verify: the `all_channels` branch emitted `"&*"` without a leading space,
-fusing it onto the previous token (`~*&*`) so a reload parsed it as key-pattern
-`*&*` and dropped both grants. Untested by the live run because the `else` branch
-(explicit `&pat`) was correct and `default` is skipped by `config_rewrite`.
-
-#### V8.3 - Keyspace notifications [In Progress]
-
-Rides entirely on top of V8.1/V8.2 — this step is wiring, not new mechanism.
-
-- One `notify_keyspace_event(class, event, key)` helper that internally calls the
-  now-existing `PUBLISH` path. Hook points are few and already identified:
-  lazy expiry (`expire_if_needed`), active expiry (`process_timers`' TTL drain),
-  eviction (`free_memory_if_needed`), and the write handlers themselves.
-  Covers Redis-compatible `K`/`E` channel semantics (`notify-keyspace-events`
-  config) without touching the dispatch path.
-- Done when: `CONFIG SET notify-keyspace-events KEA`, a `PSUBSCRIBE
-  __keyevent@0__:*`, and a plain `SET`/`EXPIRE`/eviction each produce the
-  expected event on that channel.
-
-**TLS carry-over (still open):** a full TLS suite re-run after the V9.7.5 flags
-(session resumption + `SSL_MODE_RELEASE_BUFFERS`) landed — the 555/551 gate runs
-predate those two config lines. Once green, V9.7 is fully closed. A commit
-checkpoint of the V9.7.2→.5 body plus the docs reorg is also outstanding.
+1. 🔴 **`CONFIG REWRITE` drops `requirepass`** — a security regression from the
+   TLS commit, filed in `BACKLOG.md` → Open Bugs. Fix before anything else;
+   `test_security.py` has been red since 2026-07-19 because of it.
+2. **Commit checkpoint** — the V9.7.2→.5 TLS body, all of V8, and the docs reorg
+   are still uncommitted.
+3. **Final TLS re-run** — the 555/551 gate predates the V9.7.5 flags (session
+   resumption + `SSL_MODE_RELEASE_BUFFERS`); one green run fully closes V9.7.
+4. **Re-run `bench_plain` isolated** on a cool machine — the recorded plaintext
+   numbers were throttled (GET < SET), so the TLS ratio has no trustworthy
+   denominator.
 
 ## Completed Milestones
+
+### V8 - Pub/Sub [Done]
+
+Closed 2026-07-25. A live broadcast mechanism with **no storage and no
+persistence** — a message only reaches clients subscribed at the moment it is
+published. (Transactions — `MULTI`/`EXEC`/`WATCH` — were never part of this work;
+they keep the V8.4/V8.5 numbers in `BACKLOG.md` and are an unrelated feature.)
+
+- **V8.1 core** — `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH` over a
+  `GlobalData::channels` registry (`map<string, set<Conn*>>`), exact-name lookup.
+  Per-conn state is `Conn::sub_channels` (a *set*, not the originally planned
+  `size_t sub_count`): it doubles as the subscribe-mode flag, the running count,
+  and the teardown index, so `conn_destroy` unlinks in O(channels joined) rather
+  than scanning the registry. Because `PUBLISH` dereferences `Conn*` out of that
+  registry, the unlink is a **use-after-free guard**, not an optimization.
+- **V8.2a patterns** — `PSUBSCRIBE`/`PUNSUBSCRIBE` over a second registry of the
+  same shape, so unlink/teardown stays symmetric. `PUBLISH` scans *distinct
+  patterns* (not conns) after its O(1) exact lookup and emits a 4-element
+  `pmessage` carrying the matched pattern. Confirmation counts are the conn
+  **total** (channels + patterns), and the subscribe-mode gate checks both sets.
+- **V8.2b channel ACL** — `&pattern` / `allchannels` / `resetchannels` on a new
+  `User::channel_patterns` + `all_channels`. Enforcement mirrors Redis's
+  asymmetry: `SUBSCRIBE`/`PUBLISH` **glob-match** the channel, `PSUBSCRIBE`
+  requires **string equality** so a narrow grant can't be widened by subscribing
+  to `*`. Checked inside the conn-aware handlers (a channel is not a key, so the
+  `KeySpec` path never applies), all-or-nothing per command; leaving is never
+  ACL-checked. Restrictive by default, with `allchannels` on the bootstrap
+  `default` user so no-ACL setups are unaffected.
+- **V8.3 keyspace notifications** — `notify-keyspace-events` flag mask (Redis's
+  `K`/`E` + class chars) driving `notify_keyspace_event()` over the extracted
+  `pubsub_publish()` core. **One central hook in `do_request`** rather than ~40
+  handler edits: the existing `g_writes_since_save` dirty-counter already proves
+  a command mutated something, and the Redis event name is the canonical command
+  name, so a `CmdSpec::notify_class` stamped at boot covers the whole write
+  surface. The key is captured *before* `spec.fn` because handlers consume `cmd`.
+  Three lifecycle hooks (lazy expiry, active expiry, eviction) supply the events
+  no command can. Zero cost when disabled — the mask gate short-circuits before
+  any allocation.
+
+**Architectural claim that held:** Pub/Sub needed **zero event-loop changes**.
+`poll_args` is rebuilt from every conn's `want_read`/`want_write` each tick, so
+`PUBLISH` writing into another connection's buffer and flipping its flag is
+picked up on the next `poll()` — no eventfd, no cross-thread signalling.
+
+**Process note worth keeping:** V8 shipped seven transcription slips that neither
+the compiler nor the first passing smoke test caught — an out-of-bounds `cmd[2]`
+read from a wrong `min_args`, an iterator pair spanning two containers (UB that
+worked by luck on libstdc++), a loop starting at `i=0` that treated the command
+name as a channel, a dead no-args branch, a missed count call site, and a missing
+space that fused `~*&*` into one ACL token. Every one was found by grep-verifying
+the tree against the snippet, which is why that step is non-negotiable here.
+
+Regression coverage: `scripts/test_pubsub.py` (dedicated suite, own server) plus
+five sections in `scripts/stress_test.py`, including a concurrent fan-out test.
 
 ### V9 - Security and Auth [Done]
 
@@ -271,13 +237,19 @@ python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <pass
 python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench  # passwordless TLS bench
 ```
 
-Restart / security / eviction suites:
+Restart / security / pubsub / eviction suites:
 ```bash
 python3 scripts/test_restart_matrix.py [--destructive]   # private instance, port 12401
 python3 scripts/test_security.py       [--destructive]   # private instance, port 12402
+python3 scripts/test_pubsub.py         [--evict]         # private instance, port 12403
 scripts/test_evict_tick.sh                                # EVICT_RUNNING regression
 scripts/test_aof.sh  scripts/test_aof_rewrite.sh  scripts/test_aof_hybrid.sh
 ```
+
+`test_pubsub.py` covers all of V8 (core, patterns, channel ACL, keyspace
+notifications) against its own server, and every check tagged `[REG]` pins a bug
+that actually shipped during development. `stress_test.py` carries the same
+ground as live-server sections plus a concurrent fan-out test.
 
 **Benchmark only on a Release build** (`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release`;
 Debug runs `mem_selfcheck`'s whole-keyspace walk per command and poisons numbers).

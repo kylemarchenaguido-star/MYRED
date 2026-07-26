@@ -382,6 +382,7 @@ static void process_timers(){
     assert(node == &ent->node);
     (void)node; // assert vanishes in release (NDEBUG)
     fprintf(stderr, "key expired: %s\n", ent->key.c_str());
+    notify_keyspace_event(NOTIFY_EXPIRED, "expired", ent->key);
     entry_del(ent);
     if (nworks++ >= k_max_works){
       break;

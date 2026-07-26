@@ -48,6 +48,20 @@ constexpr uint64_t CAT_SLOW       = 1ull << 6;
 constexpr uint64_t CAT_CONNECTION = 1ull << 7;
 constexpr uint64_t CAT_ALL        = ~0ull;
 
+// Keyspace notificacion classes (Redis notify-keyspace-events flag chars)
+constexpr int NOTIFY_KEYSPACE = 1 << 0; // K: __keyspace@0__:<key> msg = event
+constexpr int NOTIFY_KEYEVENT = 1 << 1; // E: __keyevent@0__:<event> msg = key
+constexpr int NOTIFY_GENERIC  = 1 << 2; // g
+constexpr int NOTIFY_STRING   = 1 << 3; // $
+constexpr int NOTIFY_LIST     = 1 << 4; // l
+constexpr int NOTIFY_SET      = 1 << 5; // s
+constexpr int NOTIFY_HASH     = 1 << 6; // h 
+constexpr int NOTIFY_ZSET     = 1 << 7; // z
+constexpr int NOTIFY_EXPIRED  = 1 << 8; // x
+constexpr int NOTIFY_EVICTED  = 1 << 9; // e
+constexpr int NOTIFY_ALL = NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET |
+                           NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED; // A
+
 //value types 
 enum {
   T_INIT = 0,
@@ -197,6 +211,7 @@ struct Config {
   std::string tls_ca_cert_file;
   TlsAuthClients tls_auth_clients = TlsAuthClients::NO;
   int tls_handshake_timeout_ms = 10 * 1000; // boot-only, like all tls-*
+  int  notify_keyspace_events = 0; // 0 = off (default); runtinme-settable, unlike tls-*
   std::string config_path;
   std::string auditlog_path;
   std::string password = "";
@@ -333,3 +348,8 @@ void metadata_selfcheck(); // assert ACL/category invariants at boot; die() on v
 
 bool parse_int_strict(const char *s, long *out);
 bool parse_bool_strict(const std::string &s, bool *out);
+
+bool parse_notify_flags(const std::string &s, int *out);
+std::string notify_flags_string(int flags);
+// fire a keyspace/keyevent notification; no-op unless the class is enabled
+void notify_keyspace_event(int type, const char *event, const std::string &key);

@@ -6,9 +6,40 @@ for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
 
-**None open.** Every bug previously tracked here is FIXED; full root-cause
-writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
-bugs get filed here first, then folded into the CODE_REVIEW audit.
+### 🔴 `CONFIG REWRITE` silently strips `requirepass`
+
+Found 2026-07-25 by `scripts/test_pubsub.py`. **Regression introduced by commit
+`3e2d0e9` (v7.2.1, TLS plumbing)**: the new `tls-*` block in `config_rewrite`
+was pasted *over* the `requirepass` emission block instead of after it, so
+`state.cpp`'s `config_rewrite` no longer writes the password at all.
+
+Impact: after any `CONFIG REWRITE` + restart the server comes back with no
+password. `acl_bootstrap_default()` then builds a **nopass** `default` user with
+`+@all ~*`, and `acl_initial_user()` auto-authenticates every new connection —
+the auth boundary is gone. The old password answers `WRONGPASS`, so it is an
+availability bug too. The `// skip 'default': it is rebuilt from requirepass`
+comment in `config_rewrite` documents the invariant that this broke.
+
+Fix — restore the deleted block immediately before the `// TLS` section:
+```cpp
+  if (!g_config.password.empty()){
+    if (g_config.password.rfind("$argon2id$", 0) == 0){
+      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
+    } else {
+      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
+    }
+  }
+```
+
+Note: `scripts/test_security.py` asserts "admin auth survives restart" and has
+therefore been **failing since 2026-07-19** — re-run it after the fix. Both it
+and `test_pubsub.py` now pin this behaviour.
+
+---
+
+Every other bug previously tracked here is FIXED; full root-cause writeups live
+in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New bugs get
+filed here first, then folded into the CODE_REVIEW audit.
 
 Recently resolved (terse; detail in CODE_REVIEW / git):
 - `rename-command` bricks the server on AOF restart 🔴 — replay-only `k_cmd_table`

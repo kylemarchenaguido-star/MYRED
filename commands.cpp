@@ -2740,6 +2740,11 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
     if (param == "maxmemory-policy" || param == "*"){
       kv.emplace_back("maxmemory-policy", maxmemory_policy_name(g_config.maxmemory_policy));
     }
+    if (param == "*" || param == "notify-keyspace-events"){
+      kv.emplace_back("notify-keyspace-events",
+                      notify_flags_string(g_config.notify_keyspace_events));
+    }
+
     // empty array for unknown params
     resp_arr(out, (uint32_t)(kv.size() * 2));
     for (auto &p : kv){
@@ -2973,6 +2978,7 @@ static bool free_memory_if_needed(){
       aof_feed({ "del", victim->key });
     }
 
+    notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key);
     hm_delete(&g_data.db, &victim->node, &hnode_same);
     // discharges used_memory; async-frees big values
     entry_del(victim);
@@ -3013,6 +3019,7 @@ struct CmdSpec {
   uint64_t acl_cats = 0; // filled by acl_init_categories() at boot
   KeySpec keys = KeySpec::FIRST;
   KeyResolver key_resolver = nullptr; // when set overrides keys for extraction
+  int notify_class = 0; // NOTIFY_* class for keyspace events; 0 = never notifies
 };
 
 
@@ -3406,13 +3413,8 @@ static void do_punsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *co
   }
 }
 
-static void do_publish(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  if (const char *deny = acl_channel_check(conn->user, cmd[1], false)){
-    audit_event("acl_deny", conn, " cmd=publish reason=channel");
-    return resp_err(out, deny);
-  }
-  const std::string &chan = cmd[1];
-  const std::string &msg = cmd[2];
+// core fan-out shared bu PUBLISH and keyspace notifications; return receiver count 
+static int64_t pubsub_publish(const std::string &chan, const char *msg, size_t msglen){
   int64_t receivers = 0;
   // exact-channel subscribers -> 3-element 'message'
   auto it = g_data.channels.find(chan);
@@ -3423,13 +3425,12 @@ static void do_publish(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
       resp_arr(&sub->outgoing, 3);
       resp_str(&sub->outgoing, "message", 7);
       resp_str(&sub->outgoing, chan.data(), chan.size());
-      resp_str(&sub->outgoing,msg.data(), msg.size());
+      resp_str(&sub->outgoing, msg, msglen);
       // poll rebuilds events from this each tick
       sub->want_write = true; 
       ++receivers;
     }
   }
-
   // pattern subscribers -> 4-element 'pmessage'
   for (const auto &pe : g_data.patterns){
     const std::string &pat = pe.first;
@@ -3439,12 +3440,33 @@ static void do_publish(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
       resp_str(&sub->outgoing, "pmessage", 8);
       resp_str(&sub->outgoing, pat.data(), pat.size());
       resp_str(&sub->outgoing, chan.data(), chan.size());
-      resp_str(&sub->outgoing, msg.data(), msg.size());
+      resp_str(&sub->outgoing, msg, msglen);
       sub->want_write = true;
       ++receivers;
     }
   }
-  resp_int(out, receivers);
+  return receivers;
+}
+
+static void do_publish(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (const char *deny = acl_channel_check(conn->user, cmd[1], false)){
+    audit_event("acl_deny", conn, " cmd=publish reason=channel");
+    return resp_err(out, deny);
+  }
+  resp_int(out, pubsub_publish(cmd[1], cmd[2].data(), cmd[2].size()));
+}
+
+// db index is always 0, multuple logical DBs are backlog
+void notify_keyspace_event(int type, const char *event, const std::string &key){
+  const int flags = g_config.notify_keyspace_events;
+  // class disabled (flags == 0 -> always here)
+  if (!(flags & type)){ return; }
+  if (flags & NOTIFY_KEYSPACE){
+    pubsub_publish(std::string("__keyspace@0__:") + key, event, strlen(event));
+  }
+  if (flags & NOTIFY_KEYEVENT){
+    pubsub_publish(std::string("__keyevent@0__:") + event, key.data(), key.size());
+  }
 }
 
 // teardown: called from conn_destroy so PUBLISH never dereferences a freed Conn
@@ -3730,6 +3752,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
 
   uint32_t dirty_before = g_data.g_writes_since_save;
 
+  bool may_notify = spec.notify_class && g_config.notify_keyspace_events && !g_data.g_loading;
+  std::string notify_key;
+  if (may_notify && cmd.size() > 1){ notify_key = cmd[1]; }
+
   // Snapshot before running swap() handlers/ consume cmd's
   bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
@@ -3747,6 +3773,11 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
       aof_append_raw(raw, raw_len);
     }
   }
+
+  if (may_notify && !notify_key.empty() && g_data.g_writes_since_save != dirty_before){
+    notify_keyspace_event(spec.notify_class, canonical.c_str(), notify_key);
+  }
+
   #ifndef NDEBUG
   mem_selfcheck(canonical.c_str());   // prints "[mem] drift..." if any handler mis-accounted
   #endif
@@ -3828,6 +3859,24 @@ void acl_init_categories(){
     {"psubscribe", CAT_FAST}, {"punsubscribe", CAT_FAST},
   };
 
+  static const std::unordered_map<std::string_view, int> notify_cls = {
+    {"set",NOTIFY_STRING},{"setnx",NOTIFY_STRING},{"setex",NOTIFY_STRING},{"psetex",NOTIFY_STRING},
+    {"getset",NOTIFY_STRING},{"append",NOTIFY_STRING},{"setrange",NOTIFY_STRING},
+    {"incr",NOTIFY_STRING},{"decr",NOTIFY_STRING},{"incrby",NOTIFY_STRING},
+    {"decrby",NOTIFY_STRING},{"incrbyfloat",NOTIFY_STRING},{"mset",NOTIFY_STRING},{"msetnx",NOTIFY_STRING},
+    {"del",NOTIFY_GENERIC},{"unlink",NOTIFY_GENERIC},{"rename",NOTIFY_GENERIC},
+    {"renamenx",NOTIFY_GENERIC},{"getdel",NOTIFY_GENERIC},{"getex",NOTIFY_GENERIC},
+    {"expire",NOTIFY_GENERIC},{"pexpire",NOTIFY_GENERIC},{"expireat",NOTIFY_GENERIC},
+    {"pexpireat",NOTIFY_GENERIC},{"persist",NOTIFY_GENERIC},
+    {"lpush",NOTIFY_LIST},{"rpush",NOTIFY_LIST},{"lpop",NOTIFY_LIST},{"rpop",NOTIFY_LIST},
+    {"lset",NOTIFY_LIST},{"linsert",NOTIFY_LIST},{"lrem",NOTIFY_LIST},{"ltrim",NOTIFY_LIST},
+    {"sadd",NOTIFY_SET},{"srem",NOTIFY_SET},{"spop",NOTIFY_SET},{"smove",NOTIFY_SET},
+    {"sinterstore",NOTIFY_SET},{"sunionstore",NOTIFY_SET},{"sdiffstore",NOTIFY_SET},
+    {"hset",NOTIFY_HASH},{"hdel",NOTIFY_HASH},{"hsetnx",NOTIFY_HASH},{"hincrby",NOTIFY_HASH},
+    {"zadd",NOTIFY_ZSET},{"zrem",NOTIFY_ZSET},{"zpopmin",NOTIFY_ZSET},
+  };
+
+
   for (auto &kv : k_cmd_table){
     CmdSpec &s = kv.second;
     s.acl_cats = s.is_write ? CAT_WRITE : CAT_READ; // base axis
@@ -3844,5 +3893,8 @@ void acl_init_categories(){
 
     auto rit = resolvers.find(kv.first);
     s.key_resolver = (rit != resolvers.end()) ? rit->second : nullptr;
+
+    auto nit = notify_cls.find(kv.first);
+    s.notify_class = (nit != notify_cls.end()) ? nit->second : 0;
   }
 }

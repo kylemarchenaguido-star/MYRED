@@ -2743,6 +2743,363 @@ def test_info_keyspace_stats(r: TestRunner, sock: socket.socket):
     r.check("del → (0,0)",                  stats(), (0, 0))
 
 
+# ─── Pub/Sub (milestone V8) ────────────────────────────────────────────────────
+#
+# Pub/Sub replies arrive asynchronously on a connection nobody is "asking", so
+# these need a timeout-aware reader rather than the request/response `cmd()`.
+
+def _push(sock: socket.socket, timeout: float = 1.0) -> Any:
+    """One pushed reply, or None if nothing arrives before `timeout`.
+
+    A timeout always fires on the first byte of a frame, never mid-frame, so the
+    stream stays parseable afterwards.
+    """
+    old = sock.gettimeout()
+    sock.settimeout(timeout)
+    try:
+        return recv_response(sock)
+    except (socket.timeout, TimeoutError, OSError, RespError):
+        return None
+    finally:
+        try:
+            sock.settimeout(old)
+        except OSError:
+            pass
+
+
+def _drain(sock: socket.socket, timeout: float = 1.0, limit: int = 4000) -> list:
+    """Every push currently pending, stopping at the first silence."""
+    out = []
+    while len(out) < limit:
+        p = _push(sock, timeout)
+        if p is None:
+            break
+        out.append(p)
+    return out
+
+
+def _delivery(push: Any):
+    """Normalize message/pmessage to (channel, payload); None for anything else."""
+    if isinstance(push, list) and len(push) == 3 and push[0] == "message":
+        return (push[1], push[2])
+    if isinstance(push, list) and len(push) == 4 and push[0] == "pmessage":
+        return (push[2], push[3])
+    return None
+
+
+def _sub(sock: socket.socket, kind: str, *names: str) -> list:
+    """Send (P)SUBSCRIBE/(P)UNSUBSCRIBE and read one confirmation per name."""
+    send_request(sock, kind, *names)
+    return [_push(sock) for _ in names]
+
+
+def test_pubsub_commands(r: TestRunner, host: str, port: int):
+    r.section("Pub/Sub: SUBSCRIBE / UNSUBSCRIBE / PUBLISH (V8.1)")
+    sub = make_conn(host, port)
+    pub = make_conn(host, port)
+    try:
+        r.check("subscribe confirmation",   _sub(sub, "subscribe", "news")[0],
+                ["subscribe", "news", 1])
+        r.check("second subscribe → count 2", _sub(sub, "subscribe", "sports")[0],
+                ["subscribe", "sports", 2])
+
+        r.check("publish reports 1 receiver", cmd(pub, "publish", "news", "hello"), 1)
+        r.check("subscriber receives message", _push(sub), ["message", "news", "hello"])
+        r.check("publish to empty channel → 0", cmd(pub, "publish", "nobody", "x"), 0)
+        r.check("no stray push for empty channel", _push(sub, 0.3), None)
+
+        # RESP2 subscribe-mode gate
+        r.expect_error("GET refused while subscribed", sub, "get", "foo")
+        r.check("PING allowed while subscribed", cmd(sub, "ping"), "PONG")
+
+        # arity: do_publish reads cmd[2], so 2-arg PUBLISH must be rejected, not
+        # allowed through into an out-of-bounds read
+        r.expect_error("publish with no message → arity error", pub, "publish", "chan")
+        r.check("server alive after arity probe", cmd(pub, "ping"), "PONG")
+
+        r.check("unsubscribe one channel", _sub(sub, "unsubscribe", "news")[0],
+                ["unsubscribe", "news", 1])
+        send_request(sub, "unsubscribe")            # no args = leave everything
+        r.check("bare unsubscribe drains to 0", _push(sub), ["unsubscribe", "sports", 0])
+        r.check("subscribe mode ends with the last subscription",
+                cmd(sub, "set", "pubsub:post", "v"), "OK")
+
+        # teardown: a dead subscriber must be unlinked from every channel set,
+        # or PUBLISH dereferences a freed Conn*
+        ghost = make_conn(host, port)
+        _sub(ghost, "subscribe", "haunted")
+        r.check("publish reaches subscriber before close",
+                cmd(pub, "publish", "haunted", "boo"), 1)
+        ghost.close()
+        time.sleep(0.2)
+        r.check("publish after disconnect → 0 (registry unlinked)",
+                cmd(pub, "publish", "haunted", "boo"), 0)
+        r.check("server alive after teardown", cmd(pub, "ping"), "PONG")
+    finally:
+        sub.close()
+        pub.close()
+        try:
+            s = make_conn(host, port)
+            cmd(s, "del", "pubsub:post")
+            s.close()
+        except Exception:
+            pass
+
+
+def test_pubsub_patterns(r: TestRunner, host: str, port: int):
+    r.section("Pub/Sub: PSUBSCRIBE patterns (V8.2a)")
+    psub = make_conn(host, port)
+    esub = make_conn(host, port)
+    pub  = make_conn(host, port)
+    try:
+        r.check("psubscribe confirmation", _sub(psub, "psubscribe", "news.*")[0],
+                ["psubscribe", "news.*", 1])
+        r.check("exact subscribe on a covered channel",
+                _sub(esub, "subscribe", "news.sports")[0],
+                ["subscribe", "news.sports", 1])
+
+        # the headline property: one PUBLISH, two independent deliveries
+        r.check("one publish counts exact + pattern",
+                cmd(pub, "publish", "news.sports", "goal"), 2)
+        r.check("pattern subscriber gets 4-element pmessage", _push(psub),
+                ["pmessage", "news.*", "news.sports", "goal"])
+        r.check("exact subscriber gets 3-element message", _push(esub),
+                ["message", "news.sports", "goal"])
+
+        r.check("non-matching channel reaches nobody",
+                cmd(pub, "publish", "weather.today", "rain"), 0)
+        r.check("...and no stray push arrives", _push(psub, 0.3), None)
+
+        # counts are the conn TOTAL: channels + patterns
+        r.check("subscribe count includes held patterns",
+                _sub(psub, "subscribe", "extra")[0], ["subscribe", "extra", 2])
+        r.check("unsubscribe count still includes the pattern",
+                _sub(psub, "unsubscribe", "extra")[0], ["unsubscribe", "extra", 1])
+        r.expect_error("pattern-only conn is still in subscribe mode",
+                       psub, "get", "foo")
+
+        send_request(psub, "punsubscribe")
+        r.check("bare punsubscribe drains to 0", _push(psub),
+                ["punsubscribe", "news.*", 0])
+        r.check("pattern subscriber leaves subscribe mode", cmd(psub, "ping"), "PONG")
+    finally:
+        psub.close()
+        esub.close()
+        pub.close()
+
+
+def test_pubsub_channel_acl(r: TestRunner, sock: socket.socket, host: str, port: int):
+    r.section("Pub/Sub: channel ACL &pattern (V8.2b)")
+    username = "stress_chan_user"
+    password = "stress_chan_pass"
+
+    try:
+        cmd(sock, "acl", "deluser", username)
+    except RespError:
+        pass
+
+    created = False
+    try:
+        cmd(sock, "acl", "setuser", username, "on", f">{password}", "~*",
+            "+@all", "resetchannels", "&news.*")
+        created = True
+    except RespError as e:
+        r.check("acl setuser with &pattern accepted", f"error: {e}", "OK")
+
+    if not created:
+        return
+
+    c = None
+    try:
+        c = open_socket(host, port)
+        send_request(c, "auth", username, password)
+        r.check("auth as channel-restricted user → OK", recv_response(c), "OK")
+
+        r.check("granted channel allowed", _sub(c, "subscribe", "news.sports")[0],
+                ["subscribe", "news.sports", 1])
+        _sub(c, "unsubscribe", "news.sports")
+        r.expect_error("ungranted channel denied", c, "subscribe", "other")
+
+        r.check("literally-granted pattern allowed", _sub(c, "psubscribe", "news.*")[0],
+                ["psubscribe", "news.*", 1])
+        _sub(c, "punsubscribe", "news.*")
+        # a &news.* grant must not be widenable into a firehose
+        r.expect_error("psubscribe '*' denied (cannot widen the grant)",
+                       c, "psubscribe", "*")
+
+        r.check("publish to granted channel allowed",
+                cmd(c, "publish", "news.x", "hi"), 0)
+        r.expect_error("publish to ungranted channel denied",
+                       c, "publish", "other", "hi")
+
+        listing = cmd(sock, "acl", "list")
+        joined = "\n".join(listing) if isinstance(listing, list) else str(listing)
+        # acl_format_user once emitted "&*" with no leading space, fusing it onto
+        # the previous token so a reload parsed "~*&*" as one key pattern
+        r.check_true("no fused '~*&*' token in ACL LIST", "~*&*" not in joined)
+        r.check_true("channel grant rendered", "&news.*" in joined)
+    except RespError as e:
+        r.check("channel ACL enforcement", f"error: {e}", "no error")
+    finally:
+        if c is not None:
+            c.close()
+        try:
+            cmd(sock, "acl", "deluser", username)
+        except RespError:
+            pass
+
+
+def test_keyspace_notifications(r: TestRunner, host: str, port: int):
+    r.section("Pub/Sub: keyspace notifications (V8.3)")
+    admin = make_conn(host, port)
+    listener = None
+    old_flags = ""
+    try:
+        cur = cmd(admin, "config", "get", "notify-keyspace-events")
+        if not (isinstance(cur, list) and len(cur) == 2):
+            r.check("CONFIG GET notify-keyspace-events returns a pair", cur, "[name, value]")
+            return
+        old_flags = cur[1]
+        r.check("CONFIG SET notify-keyspace-events KEA",
+                cmd(admin, "config", "set", "notify-keyspace-events", "KEA"), "OK")
+
+        listener = make_conn(host, port)
+        _sub(listener, "psubscribe", "__key*@0__:*")
+
+        # K and E are independent forms of the same event
+        cmd(admin, "set", "notif:foo", "bar")
+        got = {d for d in (_delivery(p) for p in _drain(listener)) if d}
+        r.check_true("SET emits __keyspace__ form (payload = event)",
+                     ("__keyspace@0__:notif:foo", "set") in got)
+        r.check_true("SET emits __keyevent__ form (payload = key)",
+                     ("__keyevent@0__:set", "notif:foo") in got)
+
+        cmd(admin, "lpush", "notif:list", "a")
+        got = {d for d in (_delivery(p) for p in _drain(listener)) if d}
+        r.check_true("LPUSH emits the list-class event",
+                     ("__keyevent@0__:lpush", "notif:list") in got)
+
+        cmd(admin, "del", "notif:foo")
+        got = {d for d in (_delivery(p) for p in _drain(listener)) if d}
+        r.check_true("DEL emits the generic-class event",
+                     ("__keyevent@0__:del", "notif:foo") in got)
+
+        # the dirty-counter gate: a write that changed nothing stays silent
+        cmd(admin, "del", "notif:definitely-absent")
+        r.check("no-op write emits nothing", _push(listener, 0.4), None)
+
+        # per-class filtering: 'Ex' = keyevent + expired only
+        cmd(admin, "config", "set", "notify-keyspace-events", "Ex")
+        cmd(admin, "set", "notif:quiet", "v")
+        r.check("with 'Ex' a string write is filtered out", _push(listener, 0.4), None)
+
+        # TTL must outlast the silence window above or the two race
+        cmd(admin, "psetex", "notif:ttl", "1200", "v")
+        r.check("with 'Ex' PSETEX itself is filtered out", _push(listener, 0.4), None)
+        got = {d for d in (_delivery(p) for p in _drain(listener, 2.5)) if d}
+        r.check_true("expired hook fires on TTL expiry",
+                     ("__keyevent@0__:expired", "notif:ttl") in got)
+        r.check_true("with 'Ex' the __keyspace__ form is suppressed",
+                     not any(c.startswith("__keyspace@") for c, _ in got))
+
+        # off means silent
+        cmd(admin, "config", "set", "notify-keyspace-events", "")
+        cmd(admin, "set", "notif:silent", "v")
+        r.check("notifications off → nothing emitted", _push(listener, 0.4), None)
+    except RespError as e:
+        r.check("keyspace notifications", f"error: {e}", "no error")
+    finally:
+        if listener is not None:
+            listener.close()
+        try:
+            cmd(admin, "config", "set", "notify-keyspace-events", old_flags)
+            cmd(admin, "del", "notif:list", "notif:quiet", "notif:silent")
+        except Exception:
+            pass
+        admin.close()
+
+
+def test_pubsub_fanout_concurrency(r: TestRunner, host: str, port: int,
+                                   publishers: int = 4, subscribers: int = 4,
+                                   per_publisher: int = 250):
+    """Fan-out under load: every subscriber must receive every message.
+
+    This is the concurrency case Pub/Sub actually stresses — PUBLISH writes into
+    *other* connections' outgoing buffers and flips their want_write, so a lost
+    message here would mean the poll loop missed a flag flip or a buffer grew
+    incorrectly under interleaving.
+    """
+    r.section("Pub/Sub: fan-out under concurrent publishers")
+    channel = "stress:fanout"
+    expected = publishers * per_publisher
+
+    subs = []
+    try:
+        for _ in range(subscribers):
+            s = make_conn(host, port)
+            _sub(s, "subscribe", channel)
+            subs.append(s)
+    except Exception as e:
+        for s in subs:
+            s.close()
+        r.check("fan-out setup", f"error: {e}", "connected")
+        return
+
+    received = [0] * subscribers
+    errors: list = []
+
+    def reader(idx: int):
+        sock = subs[idx]
+        count = 0
+        try:
+            while count < expected:
+                p = _push(sock, 3.0)
+                if p is None:
+                    break
+                if _delivery(p) is not None:
+                    count += 1
+        except Exception as e:                     # pragma: no cover
+            errors.append(f"reader {idx}: {e}")
+        received[idx] = count
+
+    def publisher():
+        try:
+            c = make_conn(host, port)
+            for i in range(per_publisher):
+                cmd(c, "publish", channel, f"m{i}")
+            c.close()
+        except Exception as e:
+            errors.append(f"publisher: {e}")
+
+    readers = [threading.Thread(target=reader, args=(i,)) for i in range(subscribers)]
+    for t in readers:
+        t.start()
+    pubs = [threading.Thread(target=publisher) for _ in range(publishers)]
+    started = time.perf_counter()
+    for t in pubs:
+        t.start()
+    for t in pubs:
+        t.join()
+    for t in readers:
+        t.join()
+    elapsed = time.perf_counter() - started
+
+    for s in subs:
+        s.close()
+
+    r.check_true("no publisher/reader errors", not errors)
+    if errors:
+        for e in errors[:5]:
+            print(f"    {e}")
+    r.check("every subscriber received every message",
+            received, [expected] * subscribers)
+    total = expected * subscribers
+    if elapsed > 0:
+        print(f"    {publishers} publishers × {per_publisher} msgs → "
+              f"{subscribers} subscribers = {total} deliveries in {elapsed:.2f}s "
+              f"({total / elapsed:,.0f} deliveries/s)")
+
+
 def run_redis_benchmark(host: str, port: int, password: Optional[str],
                         requests: int, clients: int, pipeline: int) -> bool:
     print(f"\n{BOLD}{'═' * 55}{RESET}")
@@ -2935,6 +3292,7 @@ def main():
             test_ping_command(r,          sock)
             test_config_command(r,        sock)
             test_acl_commands(r,          sock, host, port)
+            test_pubsub_channel_acl(r,    sock, host, port)
             test_info_command(r,          sock)
             test_info_keyspace_stats(r,   sock)
             test_flushdb_command(r,       sock)
@@ -2952,6 +3310,9 @@ def main():
         try:
             test_echo_and_inline(r,       host, port)
             test_auth_command(r,          host, port)
+            test_pubsub_commands(r,       host, port)
+            test_pubsub_patterns(r,       host, port)
+            test_keyspace_notifications(r, host, port)
             test_persistence_roundtrip(r, host, port)
         except Exception as e:
             print(f"\n{RED}Unexpected error: {e}{RESET}")
@@ -2962,6 +3323,13 @@ def main():
     # ── concurrent safety ──────────────────────────────────────────────────────
     if not args.stress_only and not args.correctness_only:
         all_ok = test_concurrent_writes(host, port) and all_ok
+        rp = TestRunner(host, port)
+        try:
+            test_pubsub_fanout_concurrency(rp, host, port)
+        except Exception as e:
+            print(f"\n{RED}Unexpected error: {e}{RESET}")
+            all_ok = False
+        all_ok = rp.summary() and all_ok
 
     # ── stress ─────────────────────────────────────────────────────────────────
     if not args.correctness_only:

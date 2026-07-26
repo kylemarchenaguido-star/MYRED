@@ -108,6 +108,37 @@ bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out){
   else { return false; }
   return true;
 }
+
+bool parse_notify_flags(const std::string &s, int *out){
+  int f = 0;
+  for (char c : s){
+    switch (c){
+      case 'K': f |= NOTIFY_KEYSPACE; break;  case 'E': f |= NOTIFY_KEYEVENT; break;
+      case 'g': f |= NOTIFY_GENERIC;  break;  case '$': f |= NOTIFY_STRING;   break;
+      case 'l': f |= NOTIFY_LIST;     break;  case 's': f |= NOTIFY_SET;      break;
+      case 'h': f |= NOTIFY_HASH;     break;  case 'z': f |= NOTIFY_ZSET;     break;
+      case 'x': f |= NOTIFY_EXPIRED;  break;  case 'e': f |= NOTIFY_EVICTED;  break;
+      case 'A': f |= NOTIFY_ALL;      break;
+      default: return false; // unknown flag char
+    }
+  }
+  *out = f; // "" -> 0 -> disable
+  return true;
+}
+
+std::string notify_flags_string(int f){
+  std::string s;
+  if ((f & NOTIFY_ALL) == NOTIFY_ALL){ s += 'A'; }
+  else {
+    if (f & NOTIFY_GENERIC){ s += 'g'; }  if (f & NOTIFY_STRING){ s += '$'; }
+    if (f & NOTIFY_LIST){ s += 'l'; }     if (f & NOTIFY_SET){ s += 's'; }
+    if (f & NOTIFY_HASH){ s += 'h'; }     if (f & NOTIFY_ZSET){ s += 'z'; }
+    if (f & NOTIFY_EXPIRED){ s += 'x'; }  if (f & NOTIFY_EVICTED){ s += 'e'; }
+  }
+  if (f & NOTIFY_KEYSPACE){ s += 'K'; }   if (f & NOTIFY_KEYEVENT){ s += 'E'; }
+  return s; // class flags first, then K/E - same ordering as REDIS
+}
+
 // Tokenizer for the config file
 static std::vector<std::string> config_tokenize(const char *line){
   std::vector<std::string> out;
@@ -322,6 +353,15 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
+  if (name == "notify-keyspace-events"){
+    // empty value is legal and means "off"
+    std::string v = args.empty() ? std::string() : args[0];
+    int f = 0;
+    if (!parse_notify_flags(v, &f)) {err = "invalid notify-keyspace-events flags"; return CfgResult::BADVALUE; }
+    g_config.notify_keyspace_events = f;
+    return CfgResult::OK;
+  }
+
   // AOF persistence
   if (name == "appendonly"){
     if (!need1()){ return CfgResult::BADVALUE; }
@@ -458,6 +498,14 @@ bool config_rewrite(const char * path){
     ia.s_addr = htonl(a.first);
     fprintf(fp, "allow-ip %s/%d\n", inet_ntoa(ia), __builtin_popcount(a.second));
   }
+  if (!g_config.password.empty()){
+    if (g_config.password.rfind("$argon2id$", 0) == 0){
+      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
+    } else {
+      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
+    }
+  }
+
   // TLS 
   if (g_config.tls_port != 0){ 
     fprintf(fp, "tls-port %d\n", g_config.tls_port); 
@@ -486,6 +534,7 @@ bool config_rewrite(const char * path){
   fprintf(fp, "maxmemory %zu\n", g_config.maxmemory);
   fprintf(fp, "maxmemory-policy %s\n", maxmemory_policy_name(g_config.maxmemory_policy));
   fprintf(fp, "maxmemory-samples %d\n", g_config.maxmemory_samples);
+  fprintf(fp, "notify-keyspace-events \"%s\"\n", notify_flags_string(g_config.notify_keyspace_events).c_str());
   for (const SaveCondition &s : g_config.save_conditions){
     fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
   }
@@ -802,6 +851,7 @@ bool expire_if_needed(Entry *ent){
   if (g_data.heap[ent->heap_idx].val > get_monotonic_msec()) {    // not expired yet
     return false;
   }
+  notify_keyspace_event(NOTIFY_EXPIRED, "expired", ent->key);
   hm_delete(&g_data.db, &ent->node, &hnode_same);
   entry_del(ent);
   return true;
