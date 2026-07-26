@@ -108,10 +108,49 @@ class _Tee:
             pass    # interpreter's final flush runs after atexit closed the log
 
 
-def start_logging(path: str):
+def run_kind(args) -> str:
+    """Which phase mix this invocation runs. Precedence: bench > stress > correctness."""
+    if args.bench:
+        return "bench"
+    if args.stress_only:
+        return "stress"
+    if args.correctness_only:
+        return "correctness"
+    return "stress_results"
+
+
+def default_log_path(args) -> str:
+    """Per-run log name so a TLS run never overwrites the plaintext one.
+
+    docs/{bench,stress,correctness,stress_results}_{plain,tls}.md
+    """
+    return os.path.join("docs",
+                        f"{run_kind(args)}_{'tls' if args.tls else 'plain'}.md")
+
+
+def run_label(args, host: str, port: int) -> str:
+    """One-line human description of what this run actually covers."""
+    phases = {
+        "bench":          "correctness + concurrency + stress + redis-benchmark",
+        "stress":         "stress only",
+        "correctness":    "correctness only",
+        "stress_results": "correctness + concurrency + stress",
+    }[run_kind(args)]
+    return (f"{phases} over {'TLS' if args.tls else 'plaintext'} "
+            f"({'authenticated' if args.password else 'passwordless'}) "
+            f"→ {host}:{port}")
+
+
+def start_logging(path: str, label: str = ""):
     """Redirect stdout through a tee into `path` (markdown, fenced code block)."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     fh = open(path, "w", encoding="utf-8")
-    fh.write(f"# MYRED stress test — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n```\n")
+    fh.write(f"# MYRED stress test — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    if label:
+        fh.write(f"**Run:** {label}\n\n")
+    fh.write("```\n")
     sys.stdout = _Tee(sys.stdout, fh)
 
     def _finish():
@@ -3206,8 +3245,10 @@ def main():
                     help="parallel clients for redis-benchmark")
     ap.add_argument("--bench-pipeline",   default=16, type=int,
                     help="pipeline depth for redis-benchmark")
-    ap.add_argument("--log",              default="docs/stress_results.md",
-                    help="write a copy of all output here (ANSI stripped); "
+    ap.add_argument("--log",              default="auto",
+                    help="write a copy of all output here (ANSI stripped). "
+                         "'auto' (default) derives docs/<kind>_<plain|tls>.md so a "
+                         "TLS run never overwrites the plaintext one; "
                          "pass --log '' to disable")
     args = ap.parse_args()
 
@@ -3234,18 +3275,20 @@ def main():
         print(f"{RED}--stress-threads, --stress-ops, and --metrics-top must be >= 1{RESET}")
         sys.exit(2)
 
-    # mirror everything to a shareable markdown log
-    if args.log:
-        start_logging(args.log)
-        print(f"(logging output to {args.log})")
+    # mirror everything to a shareable markdown log, named per transport+mode
+    log_path = default_log_path(args) if args.log == "auto" else args.log
+    if log_path:
+        start_logging(log_path, run_label(args, host, port))
+        print(f"(logging output to {log_path})")
 
     print(f"{BOLD}{'═' * 55}{RESET}")
-    print(f"{BOLD}  Redis Server RESP Stress Test{RESET}")
-    print(f"  Connecting to {host}:{port}")
-    if G_TLS:
-        print(f"  Using TLS{' (insecure — cert not verified)' if G_TLS_INSECURE else ''}")
-    if G_PASSWORD:
-        print(f"  Using authentication")
+    print(f"{BOLD}  MYRED — {run_label(args, host, port)}{RESET}")
+    print(f"{'═' * 55}")
+    print(f"  Target:    {host}:{port}")
+    print(f"  Transport: {'TLS' + (' (insecure — cert not verified)' if G_TLS_INSECURE else '') if G_TLS else 'plaintext'}")
+    print(f"  Auth:      {'password' if G_PASSWORD else 'none'}")
+    if log_path:
+        print(f"  Log:       {log_path}")
     print(f"{'═' * 55}")
 
     # reachability check
@@ -3356,6 +3399,9 @@ def main():
         print(f"{BOLD}{GREEN}  ALL TESTS PASSED{RESET}")
     else:
         print(f"{BOLD}{RED}  SOME TESTS FAILED{RESET}")
+    print(f"  {run_label(args, host, port)}")
+    if log_path:
+        print(f"  {BOLD}Results saved to {log_path}{RESET}")
     print(f"{'═' * 55}\n")
     sys.exit(0 if all_ok else 1)
 

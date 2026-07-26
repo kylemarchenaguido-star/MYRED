@@ -185,7 +185,8 @@ python3 scripts/stress_test.py --password kek1234
 # correctness only
 python3 scripts/stress_test.py --password kek1234 --correctness-only
 
-# writes a shareable log (docs/stress_results.md by default)
+# writes a shareable log, named per transport+mode (docs/stress_results_plain.md,
+# docs/bench_tls.md, ...) so a TLS run never overwrites the plaintext one
 python3 scripts/stress_test.py --password kek1234 --log run.md
 
 # stress only, with a larger worker/operation count

@@ -273,7 +273,9 @@ Recorded baselines (`-n 100000 -c 50 -P 16`, ops/sec):
   ops stay high, bulk-range takes the biggest hit. (Same-session plaintext ran
   warm/throttled — re-run isolated for a clean ratio.)
 
-Full logs: `docs/stress_results.md`, `docs/bench_plain.md`, `docs/bench_tls.md`,
+Full logs are named `docs/<kind>_<plain|tls>.md` automatically (`stress_results_*`,
+`bench_*`, `stress_*`, `correctness_*`), so a TLS run never overwrites its
+plaintext counterpart: `docs/bench_plain.md`, `docs/bench_tls.md`,
 `docs/stress_tls.md` (test-result files stay in `docs/`, separate from these
 planning docs).
 
