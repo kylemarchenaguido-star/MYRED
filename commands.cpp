@@ -3075,7 +3075,8 @@ static uint64_t acl_cat_bit(const std::string &n){
   if (n == "keyspace"){ return CAT_KEYSPACE; }    if (n == "admin"){ return CAT_ADMIN; } 
   if (n == "dangerous"){ return CAT_DANGEROUS; }  if (n == "fast"){ return CAT_FAST; }
   if (n == "slow"){ return CAT_SLOW; }            if(n == "connection"){ return CAT_CONNECTION; }
-  if (n == "all"){ return CAT_ALL; }              return 0;
+  if (n == "transaction"){return CAT_TRANSACTION;}if (n == "all"){ return CAT_ALL; }              
+  return 0;
 }
 
 // apply one SETUSER modifier; false on parse error
@@ -3170,6 +3171,7 @@ std::string acl_format_user(const std::string &name, const User &u, bool for_con
     static const std::pair<uint64_t, const char *> cats[] = {
       {CAT_READ,"read"}, {CAT_WRITE,"write"}, {CAT_KEYSPACE,"keyspace"}, {CAT_ADMIN,"admin"},
       {CAT_DANGEROUS,"dangerous"}, {CAT_FAST,"fast"}, {CAT_SLOW,"slow"}, {CAT_CONNECTION,"connection"},
+      {CAT_TRANSACTION, "transaction"},
     };
     for (const auto &c : cats){ if (u.allow_cats & c.first){ s += " +@"; s += c.second; } }
   }
@@ -3193,7 +3195,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   }
 
   if (sub == "cat"){
-    static const char *cats[] = {"read", "write", "keyspace", "admin", "dangerous", "fast", "slow", "connection" };
+    static const char *cats[] = {"read", "write", "keyspace", "admin", "dangerous", "fast", "slow", "connection", "transaction"};
     resp_arr(out, (uint32_t)(sizeof(cats) / sizeof(cats[0]))); // resp array header
     for (const char *c : cats){ resp_str(out, c, strlen(c)); }
     return; 
@@ -3477,6 +3479,52 @@ void pubsub_remove_conn(Conn *conn){
   conn->sub_patterns.clear(); 
 }
 
+// MULTI/DISCARD need the conn, so do-request special-cases them by canonical name
+// place holder again
+static void do_txn_stub(std::vector<std::string> &, Buffer *) {}
+
+static void do_multi(std::vector<std::string> &, Buffer *out, Conn *conn){
+  if (conn->in_multi){ return resp_err(out, "ERR MULTI calls can not be nested"); }
+  conn->in_multi = true;
+  conn->multi_dirty = false;
+  conn->queue_cmds.clear();
+  resp_ok(out);
+}
+
+static void do_discard(std::vector<std::string> &, Buffer *out, Conn *conn){
+  if (!conn->in_multi){ return resp_err(out, "ERR DISCARD without MULTI"); }
+  conn->in_multi = false; 
+  conn->multi_dirty = false;
+  conn->queue_cmds.clear();
+  resp_ok(out);
+}
+
+static void do_exec(std::vector<std::string> &, Buffer *out, Conn *conn){
+  if (!conn->in_multi){ return resp_err(out, "ERR EXEC without MULTI"); }
+
+  // a queue time rejection aborts the whole batch - nothing runs
+  if (conn->multi_dirty){
+    conn->in_multi = false;
+    conn->multi_dirty = false;
+    conn->queue_cmds.clear();
+    return resp_err(out, "EXECABORT Transaction discarded because of prevous errors.");
+  } 
+
+  // Take the queue and leave MULTI *before* dispatching
+  std::vector<std::vector<std::string>> batch;
+  batch.swap(conn->queue_cmds);
+  conn->in_multi = false;
+  conn->multi_dirty = false;
+
+  // atomic by construction
+  conn->in_exec = true;
+  resp_arr(out, (uint32_t)batch.size());
+  for (std::vector<std::string> &c : batch){
+    do_request(c, out, conn, nullptr, 0); // nullptr raw -> AOF re-encodes
+  }
+  conn->in_exec = false;
+}
+
 static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware
 
 static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
@@ -3591,6 +3639,10 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"publish",      {do_pubsub_stub,   3,  3}},
   {"psubscribe",   {do_pubsub_stub,   2, -1}},
   {"punsubscribe", {do_pubsub_stub,   1, -1}},
+  // transactions
+  {"multi",        {do_txn_stub,      1, 1}},
+  {"discard",      {do_txn_stub,      1, 1}},
+  {"exec",      {do_txn_stub,      1, 1}},
 };
 
 struct DispatchEntry {
@@ -3669,6 +3721,19 @@ static bool cmd_ok_in_subscribe(const std::string &canonical){
          canonical == "ping"      || canonical == "quit" || canonical == "reset";
 }
 
+// commands real Redis refures to queue rather than defer. 
+static bool cmd_no_queue(const std::string &canonical){
+  return canonical == "subscribe" || canonical == "unsubscribe" ||
+         canonical == "psubscribe"|| canonical == "punsubscribe";
+}
+
+// a command rejected at queue time poisons the open transactions so EXEC aborts
+static void resp_err_txn(Buffer *out, Conn *conn, const char *msg){
+  if (conn->in_multi){ conn->multi_dirty = true; }
+  resp_err(out, msg);
+}
+
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const char *raw, size_t raw_len) {
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
@@ -3711,23 +3776,42 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
       "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in subscribe mode");
   }
 
-  if (!found){ return resp_err(out, "ERR unknown command"); }
+  if (!found){ return resp_err_txn(out, conn, "ERR unknown command"); }
   const CmdSpec &spec = *specp;
 
   // permission by canonical name
   if (const char *deny = acl_check(conn->user, canonical, spec, cmd)){
     audit_event("acl_deny", conn, " cmd=" + canonical +
                 " reason=" + (strstr(deny, "key") ? "key" : "command"));
-    return resp_err(out, deny);
+    return resp_err_txn(out, conn, deny);
   }
 
   int argc = (int)cmd.size();
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
-    return resp_err(out, "ERR wrong number of arguments");
+    return resp_err_txn(out, conn,"ERR wrong number of arguments");
   }
 
+  // transaction control: conn-aware, and never queue
+  if (canonical == "multi"){ return do_multi(cmd, out, conn); }
+  if (canonical == "discard"){ return do_discard(cmd, out, conn); }
+  if (canonical == "exec"){ return do_exec(cmd, out, conn); }
+
+  // queueing gate: inside MULTI everything else is stored, not run
+  // we follow redis semantics
+  if (conn->in_multi){
+    if (cmd_no_queue(canonical)){
+      conn->multi_dirty = true;
+      const std::string msg = "ERR " + canonical + " is not allowed in transactions";
+      return resp_err(out, msg.c_str());
+    }
+    conn->queue_cmds.push_back(cmd); // copy: handlers swap() cmd downstream
+    return resp_simple(out, "QUEUED");
+  }
+
+  // acl
   if (canonical == "acl"){          return do_acl(cmd, out, conn); } // permission checked above; needs conn
 
+  // pub/sub control
   if (canonical == "subscribe"){    return do_subscribe(cmd, out, conn); }
   if (canonical == "unsubscribe"){  return do_unsubscribe(cmd, out, conn); }
   if (canonical == "publish"){      return do_publish(cmd, out, conn); }
@@ -3759,12 +3843,14 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   // Snapshot before running swap() handlers/ consume cmd's
   bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
+  // raw == nullptr means the caller has no verbatim client bytes 
+  bool reencode = spec.aof_rewrite || renamed || !raw;
   std::vector<std::string> snapshot;
-  if (may_log && (spec.aof_rewrite || renamed)){ snapshot  = cmd; }
+  if (may_log && reencode){ snapshot  = cmd; }
   spec.fn(cmd, out);
 
   if (may_log && g_data.g_writes_since_save != dirty_before){
-    if (spec.aof_rewrite || renamed){
+    if (reencode){
       if (renamed){ snapshot[0] = canonical; }
       // rare: re-encode with absolute PEXPIREAT
       aof_feed(snapshot);
@@ -3838,6 +3924,7 @@ void acl_init_categories(){
     {"mset",KeySpec::STRIDE2_FROM_1},{"msetnx",KeySpec::STRIDE2_FROM_1},
     {"subscribe",KeySpec::NONE}, {"unsubscribe",KeySpec::NONE}, {"publish",KeySpec::NONE},
     {"psubscribe",KeySpec::NONE}, {"punsubscribe",KeySpec::NONE},
+    {"multi",KeySpec::NONE}, {"discard",KeySpec::NONE},{"exec",KeySpec::NONE},
   };
 
     // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
@@ -3857,6 +3944,8 @@ void acl_init_categories(){
     {"echo", CAT_CONNECTION},
     {"subscribe", CAT_FAST}, {"unsubscribe", CAT_FAST}, {"publish", CAT_FAST},
     {"psubscribe", CAT_FAST}, {"punsubscribe", CAT_FAST},
+    {"multi", CAT_FAST | CAT_TRANSACTION}, {"discard", CAT_FAST | CAT_TRANSACTION},
+    {"exec", CAT_SLOW | CAT_TRANSACTION},
   };
 
   static const std::unordered_map<std::string_view, int> notify_cls = {

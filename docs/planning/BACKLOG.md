@@ -6,42 +6,51 @@ for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
 
-### 🔴 `CONFIG REWRITE` silently strips `requirepass`
+- 🟠 **`ACL SETUSER` is not atomic** (found 2026-07-26 while adding `@transaction`).
+  `do_acl` binds `User &u = g_config.users[cmd[2]]` and applies modifiers straight
+  onto the live user, returning early on the first bad one — so a rejected rule
+  leaves the user half-configured, and creates it if absent even when the command
+  fails outright. Observed: `acl setuser tx on '>txpass' '-@all' '+@transaction' '~*'`
+  failed on the unparsed `+@transaction` and left `user tx on #<hash> -@all` with
+  `~*` never applied. That case failed *closed*, but ordering decides:
+  `acl setuser u on '>p' '+@all' '~bad['` leaves `u` enabled with `+@all` and no key
+  restriction. Fix: stage onto a `User` copy, run every modifier, and commit with
+  `g_config.users[cmd[2]] = std::move(staged)` only on full success — assigning
+  through `operator[]` on an existing key overwrites the node's value in place, so
+  live `Conn::user` pointers stay valid (the `// stable address` invariant holds).
+  Redis stages the same way.
+- 🟡 **`CONFIG GET` covers 3 parameters, `CONFIG SET` covers all of them.** `do_config`'s
+  get branch hand-rolls `maxmemory`, `maxmemory-policy`, `notify-keyspace-events`
+  and returns an empty array for anything else, while set routes through
+  `config_apply` and accepts the full directive set. So `CONFIG GET appendfilename`
+  (or `appendonly`, `appendfsync`, `dir`, `port`, `save`, `tls-*`…) silently
+  answers `[]`. Second time this has cost a verification cycle — `notify-keyspace-events`
+  had to be added the same way during V8.3 (2026-07-25), and V8.5's AOF durability
+  check failed on `appendfilename` (2026-07-26). Fix properly rather than adding a
+  fourth special case: drive both directions off one directive table so get/set
+  cannot drift.
+- ⚪ **Boot-time metadata cross-check** (follow-up, not a bug). V8.4's `discard`
+  outage came from a duplicated `{"multi", …}` key in the `k_cmd_table`
+  initializer list — `unordered_map` insert semantics drop the duplicate silently,
+  no warning at `-Wall`. The `ks`/`extra` maps already carried `discard` entries
+  with no command to attach to, so a reverse check at the end of
+  `acl_init_categories()` — every key in `ks`/`extra`/`notify_cls`/`resolvers`
+  must exist in `k_cmd_table` — would have caught it at boot. Same idea covers
+  the four parallel ACL-category lists (DECISIONS → ACL Category Tagging).
 
-Found 2026-07-25 by `scripts/test_pubsub.py`. **Regression introduced by commit
-`3e2d0e9` (v7.2.1, TLS plumbing)**: the new `tls-*` block in `config_rewrite`
-was pasted *over* the `requirepass` emission block instead of after it, so
-`state.cpp`'s `config_rewrite` no longer writes the password at all.
-
-Impact: after any `CONFIG REWRITE` + restart the server comes back with no
-password. `acl_bootstrap_default()` then builds a **nopass** `default` user with
-`+@all ~*`, and `acl_initial_user()` auto-authenticates every new connection —
-the auth boundary is gone. The old password answers `WRONGPASS`, so it is an
-availability bug too. The `// skip 'default': it is rebuilt from requirepass`
-comment in `config_rewrite` documents the invariant that this broke.
-
-Fix — restore the deleted block immediately before the `// TLS` section:
-```cpp
-  if (!g_config.password.empty()){
-    if (g_config.password.rfind("$argon2id$", 0) == 0){
-      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
-    } else {
-      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
-    }
-  }
-```
-
-Note: `scripts/test_security.py` asserts "admin auth survives restart" and has
-therefore been **failing since 2026-07-19** — re-run it after the fix. Both it
-and `test_pubsub.py` now pin this behaviour.
-
----
-
-Every other bug previously tracked here is FIXED; full root-cause writeups live
-in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New bugs get
-filed here first, then folded into the CODE_REVIEW audit.
+Other than the above, every bug previously tracked here is FIXED; full root-cause
+writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
+bugs get filed here first, then folded into the CODE_REVIEW audit.
 
 Recently resolved (terse; detail in CODE_REVIEW / git):
+- `CONFIG REWRITE` silently strips `requirepass` 🔴 — regression from `3e2d0e9`
+  (v7.2.1 TLS plumbing) which pasted the `tls-*` block *over* the requirepass
+  emission in `config_rewrite`, so a rewrite+restart came back passwordless with a
+  nopass `+@all ~*` default user (and the old password answering `WRONGPASS`).
+  Emission block restored before the `// TLS` section, both branches intact —
+  `$argon2id$` verbatim, legacy SHA-256 re-prefixed with `#`, because an unprefixed
+  hash would be re-hashed as plaintext on reload. Found by `test_pubsub.py`; it and
+  `test_security.py` (red since 2026-07-19) both pin it now (2026-07-25).
 - `rename-command` bricks the server on AOF restart 🔴 — replay-only `k_cmd_table`
   fallback in `do_request` under `g_loading`; `test_restart_matrix.py` green (2026-07-17).
 - `nopass` breaks the ACL config round-trip 🟠 — accept `nopass` in `acl_apply_rule`
@@ -55,72 +64,12 @@ Recently resolved (terse; detail in CODE_REVIEW / git):
 
 ## Next Major Milestones
 
-### V8 - Transactions
+### V8 - Transactions → moved to `ROADMAP.md`
 
-**Pub/Sub (V8.1–V8.3) has moved to `ROADMAP.md` → Current Focus** — it is the
-active milestone. What remains here is Transactions (`MULTI`/`EXEC`/`DISCARD` +
-`WATCH`), which shared the "V8" number for scheduling only and is an unrelated
-feature: queueing and atomically committing a batch of normal commands, no
-broadcast mechanism involved. The step numbers (V8.4, V8.5) are kept as-is so the
-Pub/Sub steps in ROADMAP (V8.1–V8.3) and these don't collide. Independent of the
-Pub/Sub work; can be built in parallel, but simpler to reason about one feature
-at a time.
-
-##### V8.4 - Transactions core: `MULTI` / `EXEC` / `DISCARD`
-
-Independent of the Pub/Sub steps; can be built in parallel if desired, but simpler
-to reason about one feature at a time.
-
-- `Conn` gains `bool in_multi`, `bool multi_dirty` (a queue-time error — unknown
-  command, bad arity — that makes `EXEC` abort without running anything, Redis's
-  `EXECABORT`), and `std::vector<std::vector<std::string>> queued_cmds`.
-- `MULTI`: error if already `in_multi`; else set it, reply `+OK`.
-- While `in_multi`, `do_request` intercepts after command/arity validation but
-  before dispatch: a command that doesn't exist or has the wrong arity sets
-  `multi_dirty` and replies the error immediately (but queuing continues for
-  anything after it); otherwise the raw `cmd` vector is pushed onto
-  `queued_cmds` and the reply is `+QUEUED` instead of actually executing.
-  `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`RESET`/`QUIT` are the commands that never queue.
-- `EXEC`: if `multi_dirty`, discard the queue and reply `-EXECABORT`. Otherwise
-  run every queued command through the normal dispatch path in order, collect
-  each individual reply, and wrap them in one multi-bulk array reply. Atomicity
-  is free — same reasoning already written down for EVAL's `redis.call`:
-  single-threaded loop, so no other connection's command can interleave between
-  queued commands.
-- `DISCARD`: clears `in_multi`/`queued_cmds`/`multi_dirty`, replies `+OK`; errors
-  if not currently in `MULTI`.
-- Design for this interaction now even though blocking commands ship later:
-  real Redis's blocking commands (`BLPOP` etc.) never actually block inside
-  `MULTI`/`EXEC` — they run non-blocking and return nil immediately if not
-  ready. Whatever "conn mode" state machine gets built here for `in_multi`
-  needs to keep that in mind from the start, or the blocking list commands
-  (Command Coverage Gaps → Lists) will need this redesigned later to fit.
-- Done when: a queued sequence of writes replies `+QUEUED` per command, `EXEC`
-  returns one array with each individual result, and a bad command mid-queue
-  produces `-EXECABORT` on `EXEC` without running anything.
-
-##### V8.5 - `WATCH` (optimistic locking)
-
-Do not start until V8.4 is solid — `WATCH` only matters relative to a working `EXEC`.
-
-- `WATCH key [key...]`: only valid *before* `MULTI` starts (Redis rejects
-  `WATCH` inside an open transaction).
-- Recommended mechanism — eager dirty-marking, not lazy generation-diffing: a
-  global `std::unordered_map<std::string, std::unordered_set<Conn*>> watchers`
-  (key name → watching conns). Any write to that key name — the *same* hook
-  points identified for keyspace notifications in V8.3, so one instrumentation
-  pass can drive both features — immediately sets every watching
-  `Conn::watch_dirty = true`. `EXEC` then just checks its own conn's flag
-  instead of re-diffing per-key state at commit time; this mirrors what real
-  Redis's `touchWatchedKey()` does, and avoids needing a per-key generation
-  counter that has to survive a key being deleted and recreated under the same name.
-- `EXEC` gains a pre-check: if `conn->watch_dirty`, abort with a nil array reply
-  instead of running the queue (distinct from `EXECABORT`, which is a queue-time
-  error — this is a commit-time invalidation).
-- Teardown: `conn_destroy` must remove the conn from every `watchers` set it's
-  in, same as the Pub/Sub cleanup in V8.1.
-- Done when: two connections `WATCH` the same key, one modifies it, and the
-  other's subsequent `EXEC` returns nil instead of running its queued commands.
+Transactions are the **active milestone** — full scope lives in `ROADMAP.md` →
+Current Focus. `MULTI`/`DISCARD` + queueing (V8.4) shipped 2026-07-26; `EXEC` is
+V8.5, `WATCH` is V8.6–V8.7. Pub/Sub (V8.1–V8.3) shipped 2026-07-25 and is in
+ROADMAP → Completed Milestones.
 
 ### V10 - Replication and High Availability
 
@@ -131,6 +80,50 @@ cluster mode or hash-slot sharding.
 - Dependency: AOF canonicalization for renamed commands should land before
   replication, because replication must propagate canonical command intent, not
   client aliases.
+
+### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security (post-1.0)
+
+Gate: do not start until V10 (Replication and High Availability) ships. This is
+explicitly a "first real version is done" milestone. Scheduling choice, not a
+hard technical dependency — nothing below actually needs replication to exist;
+auth, ACL, TLS, and transactions are the real attack surface this is aimed at.
+Bundled into one milestone number the same way Pub/Sub and Transactions shared
+V8 — for scheduling convenience, not because the pieces depend on each other.
+
+Structured, not "point an agent at the live server and see what happens" — that
+finds less than the combination below, because an LLM-driven agent is strong at
+reasoning about logic bugs and weak at raw byte-level crash-finding compared to
+a real fuzzer.
+
+- **Differential harness**: drive the same randomized operation stream through
+  redis-py against both a real `redis-server` and MYRED, diff replies, with a
+  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
+  rule). Catches semantics drift of the "SET should discard TTL" class that
+  hand-written assertions miss.
+- **libFuzzer/AFL harnesses** for `parse_resp_request` and `rdb_load_buffer` —
+  both pure functions over byte buffers, so harnesses are ~20 lines each. Corpus
+  seeds: real AOF/RDB files from the test scripts. Extend the same harness
+  toward adversarial protocol fuzzing specifically (malformed bulk lengths,
+  negative sizes, truncated frames) rather than building a second one.
+- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI lane
+  that runs `stress_test.py --correctness-only` under it. The `container_of`
+  pattern and manual `Buffer` management are exactly where sanitizers pay off —
+  and it's the same build anything found during the adversarial pass below
+  should be reproduced under, for a real stack trace instead of "the server died."
+- **Static/code-level security review** — no live server needed. Auth, ACL
+  logic, RESP parsing bounds, the TLS handshake state machine, and AOF/RDB
+  loading from untrusted files: bounds issues, integer overflow on size fields,
+  logic bypasses.
+- **Targeted logic-level attacks** — the part an agent is actually good at:
+  hypothesize specific abuse cases (case-aliasing around ACL deny, subscribe-mode
+  gate bypass, key names containing RESP control bytes, TLS handshake state
+  confusion, races around the `fork()`-based BGSAVE) and write concrete Python
+  repro scripts against the real server for each one.
+- **One running document** (e.g. `docs/SECURITY_TESTING.md`) logging every
+  attempt, outcome, and repro steps — same evidence-preservation habit as the
+  rest of the test suite.
+- Run the adversarial/live-server pieces against a disposable local instance
+  only, never anything that matters if it crashes or hangs.
 
 ## Deferred TLS Optimizations (V9.7.5 tail)
 
@@ -354,20 +347,6 @@ Everything logs via bare `fprintf(stderr, ...)` today. Before the audit log
 - `daemonize yes` + `pidfile`; optional syslog. Makes protected mode, audit
   events, and `MISCONF` states operationally visible instead of lost on a detached
   stderr.
-
-## Differential and Fuzz Testing
-
-- Differential harness: drive the same randomized operation stream through
-  redis-py against both a real `redis-server` and MYRED, diff replies, with a
-  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
-  rule). Catches semantics drift of the "SET should discard TTL" class that
-  hand-written assertions miss.
-- libFuzzer/AFL harnesses for `parse_resp_request` and `rdb_load_buffer` — both
-  pure functions over byte buffers, so harnesses are ~20 lines each. Corpus seeds:
-  real AOF/RDB files from the test scripts.
-- An ASan/UBSan CMake build type (`-fsanitize=address,undefined`) and a CI lane
-  that runs `stress_test.py --correctness-only` under it. The `container_of`
-  pattern and manual `Buffer` management are exactly where sanitizers pay off.
 
 ## Eviction Batch-Exhaustion False OOM
 

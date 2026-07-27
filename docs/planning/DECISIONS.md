@@ -109,6 +109,20 @@ Divergence from Redis (deliberate): `@read` no longer implies `KEYS`/`CONFIG`,
 `@write` no longer implies `FLUSHALL`. Grant explicitly (`+keys`, `+flushall`) to
 restore.
 
+`@transaction` (`CAT_TRANSACTION`, bit 8) was added with V8.4 for
+`MULTI`/`DISCARD` (and later `EXEC`/`WATCH`/`UNWATCH`). Unlike the admin/dangerous
+rule above, it does **not** strip the `CAT_READ` base bit — a read-only user
+should still be able to open a transaction — and the commands keep `CAT_FAST` so
+`+@fast` users don't lose access, matching Redis's `@fast @transaction` tagging.
+
+Adding a category means editing **four hand-maintained parallel lists**: the
+constant in `state.h`, `acl_cat_bit()` (parse), `acl_format_user()`'s `cats[]`
+(emit), and `ACL CAT`'s array (advertise). Parse and emit are a *matched pair*:
+emit-without-parse writes a `+@category` into the config that the next boot
+rejects — the same silent grant-dropping shape as the `~*&*` bug. V8.4 shipped
+with exactly that split for one round-trip, caught by `ACL SETUSER` before any
+`CONFIG REWRITE` ran. Collapsing the four lists into one table is a filed follow-up.
+
 `AUTH` is intentionally not a `k_cmd_table` command (its handler needs `conn`); it
 is matched by literal name before dispatch and can never be renamed or disabled,
 so no config can lock out every client by aliasing it away.

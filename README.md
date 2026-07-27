@@ -263,11 +263,12 @@ Recently completed (see `docs/planning/ROADMAP.md` for detail):
 
 Next up:
 
-- **No milestone is currently active** — candidates are transactions
-  (`MULTI`/`EXEC`/`WATCH`), replication, and the pick-your-adventure upgrade
-  catalog, all scoped in `docs/planning/BACKLOG.md`.
-- **One open bug**: `CONFIG REWRITE` drops `requirepass` (regression from the TLS
-  work) — filed with its fix in `BACKLOG.md` → Open Bugs.
+- **V8.4 — Transactions** *(active)*: `MULTI`/`EXEC`/`DISCARD`, then `WATCH`
+  (V8.5) for optimistic locking. Atomicity comes free from the single-threaded
+  event loop, so the work is the per-connection state machine and reply framing.
+- Further out: replication, and the pick-your-adventure upgrade catalog — both
+  scoped in `docs/planning/BACKLOG.md`.
+- **No open bugs.**
 
 ## Acknowledgements
 

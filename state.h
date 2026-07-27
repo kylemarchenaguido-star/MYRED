@@ -46,6 +46,7 @@ constexpr uint64_t CAT_DANGEROUS  = 1ull << 4;
 constexpr uint64_t CAT_FAST       = 1ull << 5;
 constexpr uint64_t CAT_SLOW       = 1ull << 6;
 constexpr uint64_t CAT_CONNECTION = 1ull << 7;
+constexpr uint64_t CAT_TRANSACTION= 1ull << 8;
 constexpr uint64_t CAT_ALL        = ~0ull;
 
 // Keyspace notificacion classes (Redis notify-keyspace-events flag chars)
@@ -148,6 +149,12 @@ struct Conn {
   SSL *ssl = nullptr; // non-null = TLS conn; owned by the transport, freed in tr_close
   std::unordered_set<std::string> sub_channels; // channels this conn is SUBSCRIBEd to.
   std::unordered_set <std::string> sub_patterns; // glob patterns this conn PSUBSCRIBEd to.
+  bool in_multi = false; // MULTI is open: ordinary commands queue instead of running
+  bool multi_dirty = false; // a command was rejected at queue time
+  bool in_exec = false; // inside EXEC's dispatch loop; blocking cmds must not block
+  bool watch_dirty = false; // a watched key changed -> exec aborts
+  std::unordered_set<std::string> watched_keys; // keys WATCHed; also the teardown index
+  std::vector<std::vector<std::string>> queue_cmds; // stored as TYPED (not canonicalized)
 };
 
 // global hashtable
