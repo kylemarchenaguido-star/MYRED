@@ -2108,6 +2108,37 @@ static bool cb_collect_entry(HNode *node, void *arg){
   return true;
 }
 
+// Watch registry, a write marks every watcher of that key immediately
+
+// mark every conn watching this key
+static void watch_touch(const std::string &key){
+  auto it = g_data.watchers.find(key);
+  if (it == g_data.watchers.end()){ return; }
+  for (Conn *c : it->second){ c->watch_dirty = true; }
+}
+
+// FLUSHALL/FLUSHDB destroy every key at oince and name none of them
+static void watch_touch_all(){
+  for (auto &kv : g_data.watchers){
+    for (Conn *c : kv.second){c->watch_dirty = true; }
+  }
+}
+
+// symmetric with pubsub_unlink: drop the empty bucket so the map can't grow
+static void watch_unlink(const std::string &key, Conn *conn){
+  auto it = g_data.watchers.find(key);
+  if (it == g_data.watchers.end()){ return; }
+  it->second.erase(conn);
+  if (it->second.empty()){ g_data.watchers.erase(it); }
+}
+
+// teardown: called from conn_destroy so watch_touch never derefs a freed conn
+void watch_clear_conn(Conn *conn){
+  for (const std::string &k : conn->watched_keys){ watch_unlink(k, conn); }
+  conn->watched_keys.clear();
+  conn->watch_dirty = false;
+}
+
 static void do_flushall(std::vector<std::string> &cmd, Buffer *out){
   (void)cmd;
   std::vector<Entry *> ents;
@@ -3030,6 +3061,23 @@ static bool acl_key_allowed(const User *u, const std::string_view &key){
   return false;
 }
 
+// Enumerate a command's key arguments from its spec. Shared by acl_check
+static void cmd_collect_keys(const CmdSpec &spec, const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
+  if (spec.key_resolver){ return spec.key_resolver(cmd, keys); }
+  switch (spec.keys){
+      case KeySpec::NONE: break;
+      case KeySpec::FIRST:
+        if (cmd.size() > 1){ keys.emplace_back(cmd[1]); }
+        break;
+      case KeySpec::ALL_FROM_1: 
+        for (size_t i = 1; i < cmd.size(); ++i){ keys.emplace_back(cmd[i]); }
+        break;
+      case KeySpec::STRIDE2_FROM_1:
+        for (size_t i = 1; i < cmd.size(); i += 2){ keys.emplace_back(cmd[i]); }
+        break;
+  }
+}
+
 // nullptr = allowed, otherwise a NOPERM message
 static const char *acl_check(const User *u, const std::string &name, 
                              const CmdSpec &spec, const std::vector<std::string> &cmd){
@@ -3044,28 +3092,9 @@ static const char *acl_check(const User *u, const std::string &name,
   // (b) key patterns (skipped for all_keys users and no key commands)
   if (!u->all_keys){
     const char *kdeny = "NOPERM no permissions to access one of the keys used as arguments";
-    if (spec.key_resolver){
-      std::vector<std::string_view> keys;
-      spec.key_resolver(cmd, keys);
-      for (std::string_view k : keys){ if (!acl_key_allowed(u, k)){ return kdeny; } }
-    } else { 
-      switch (spec.keys){
-        case KeySpec::NONE: break;
-        case KeySpec::FIRST: 
-          if (cmd.size() > 1 && !acl_key_allowed(u, cmd[1])){ return kdeny; }
-          break;
-        case KeySpec::ALL_FROM_1:
-          for (size_t i = 1; i < cmd.size(); ++i){
-            if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
-          }
-          break;
-        case KeySpec::STRIDE2_FROM_1:
-          for (size_t i = 1; i < cmd.size(); i += 2){
-            if (!acl_key_allowed(u, cmd[i])){ return kdeny; }
-          }
-          break;
-      }
-    }
+    std::vector<std::string_view> keys;
+    cmd_collect_keys(spec, cmd, keys);
+    for (std::string_view k : keys){ if (!acl_key_allowed(u, k)){ return kdeny; } }
   }
   return nullptr; 
 }
@@ -3523,6 +3552,11 @@ static void do_exec(std::vector<std::string> &, Buffer *out, Conn *conn){
     do_request(c, out, conn, nullptr, 0); // nullptr raw -> AOF re-encodes
   }
   conn->in_exec = false;
+}
+
+static void do_watch(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  // Redis rejects WATCH inside a transaction, and does NOT poison it
+  if (conn->in_multi){ return resp_err(out, "ERR WATCH inside MULTI is not allowed"); }
 }
 
 static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware

@@ -165,7 +165,8 @@ struct GlobalData{
   std::unordered_map<std::string, std::unordered_set<Conn*>> channels;
   // pattern -> subscribed conns. PUBLISH scans these linearly
   std::unordered_map<std::string, std::unordered_set<Conn*>> patterns;
-
+  // watched key -> conns watching it. Same chape as above
+  std::unordered_map<std::string, std::unordered_set<Conn*>> watchers;
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)
