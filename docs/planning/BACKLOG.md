@@ -6,30 +6,7 @@ for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
 
-- 🟠 **`ACL SETUSER` is not atomic** (found 2026-07-26 while adding `@transaction`).
-  `do_acl` binds `User &u = g_config.users[cmd[2]]` and applies modifiers straight
-  onto the live user, returning early on the first bad one — so a rejected rule
-  leaves the user half-configured, and creates it if absent even when the command
-  fails outright. Observed: `acl setuser tx on '>txpass' '-@all' '+@transaction' '~*'`
-  failed on the unparsed `+@transaction` and left `user tx on #<hash> -@all` with
-  `~*` never applied. That case failed *closed*, but ordering decides:
-  `acl setuser u on '>p' '+@all' '~bad['` leaves `u` enabled with `+@all` and no key
-  restriction. Fix: stage onto a `User` copy, run every modifier, and commit with
-  `g_config.users[cmd[2]] = std::move(staged)` only on full success — assigning
-  through `operator[]` on an existing key overwrites the node's value in place, so
-  live `Conn::user` pointers stay valid (the `// stable address` invariant holds).
-  Redis stages the same way.
-- 🟡 **`CONFIG GET` covers 3 parameters, `CONFIG SET` covers all of them.** `do_config`'s
-  get branch hand-rolls `maxmemory`, `maxmemory-policy`, `notify-keyspace-events`
-  and returns an empty array for anything else, while set routes through
-  `config_apply` and accepts the full directive set. So `CONFIG GET appendfilename`
-  (or `appendonly`, `appendfsync`, `dir`, `port`, `save`, `tls-*`…) silently
-  answers `[]`. Second time this has cost a verification cycle — `notify-keyspace-events`
-  had to be added the same way during V8.3 (2026-07-25), and V8.5's AOF durability
-  check failed on `appendfilename` (2026-07-26). Fix properly rather than adding a
-  fourth special case: drive both directions off one directive table so get/set
-  cannot drift.
-- ⚪ **Boot-time metadata cross-check** (follow-up, not a bug). V8.4's `discard`
+- ⚪ **Boot-time metadata cross-check for `k_cmd_table`** (follow-up, not a bug). V8.4's `discard`
   outage came from a duplicated `{"multi", …}` key in the `k_cmd_table`
   initializer list — `unordered_map` insert semantics drop the duplicate silently,
   no warning at `-Wall`. The `ks`/`extra` maps already carried `discard` entries
@@ -38,11 +15,25 @@ for design rationale.
   must exist in `k_cmd_table` — would have caught it at boot. Same idea covers
   the four parallel ACL-category lists (DECISIONS → ACL Category Tagging).
 
-Other than the above, every bug previously tracked here is FIXED; full root-cause
+**No open bugs.** The one item above is a hardening follow-up, not a defect.
+V8.8 shipped the equivalent check for config directives, and it caught six real
+violations on its first build — the same idea applied to `k_cmd_table` is still
+worth doing.
+
+Every bug previously tracked here is FIXED; full root-cause
 writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
 bugs get filed here first, then folded into the CODE_REVIEW audit.
 
 Recently resolved (terse; detail in CODE_REVIEW / git):
+- `ACL SETUSER` was not atomic 🟠 — applied modifiers onto the live user and
+  returned early on the first bad one, leaving a half-configured (or newly created)
+  user; ordering decided whether that failed closed or open. Now stages onto a
+  `User` copy and commits only on full success (V8.8, 2026-07-26).
+- `CONFIG GET` answered for 3 of 23 directives 🟡 — replaced with
+  `config_get_value()` + `config_all_names()` beside `config_rewrite`, plus glob
+  matching and a boot selfcheck. Had cost a verification cycle twice
+  (`notify-keyspace-events` V8.3, `appendfilename` V8.5). The deeper get/set/rewrite
+  drift is now **V9.8** in ROADMAP, not a bug (V8.8, 2026-07-26).
 - `CONFIG REWRITE` silently strips `requirepass` 🔴 — regression from `3e2d0e9`
   (v7.2.1 TLS plumbing) which pasted the `tls-*` block *over* the requirepass
   emission in `config_rewrite`, so a rewrite+restart came back passwordless with a
@@ -62,14 +53,37 @@ Recently resolved (terse; detail in CODE_REVIEW / git):
 - SPOP nondeterministic but AOF-logged verbatim — `CmdSpec::aof_self` + `do_spop`
   feeds synthetic `SREM` of popped members via `aof_feed` (2026-07-16).
 
+## Open Decisions
+
+Not bugs and not scheduled work — deliberate choices worth revisiting if the
+reasoning changes.
+
+- **Should `CONFIG GET requirepass` return the real value?** V8.8 masks it
+  (`<set>` when set, empty when not). Rationale: what we store is an Argon2id hash,
+  and a hash is a *verifier* — whoever holds it can test candidates offline at
+  their own speed, with no round trip, no `k_max_auth_inflight` throttle, no audit
+  entry and no lockout. Argon2id's 76MiB memory bound makes each attempt expensive,
+  but that buys time proportional to password strength, not immunity; the legacy
+  `#<64 hex>` SHA-256 form is far weaker (unsalted, GPU-fast). The exposure is not
+  merely admin-reads-own-secret: an ACL user holding `+config|get` or `+@admin` but
+  not `default`'s password could walk away with `default`'s credential material,
+  and hashes leak onward through dashboards, support bundles and screenshots.
+  Masking also matches the existing invariant — `acl_format_user`'s `for_config`
+  flag already makes `ACL LIST` emit `#<hash>`, so real material goes only into the
+  config file on disk, never over the wire. Redis returns the value because Redis
+  historically stored plaintext.
+  - Alternatives if revisited: (a) return the real value to match Redis exactly —
+    then drop the `ACL LIST` redaction too, so the policy is consistent in one
+    direction; (b) keep masking but align the marker with the neighbouring
+    convention (`#<hash>` instead of `<set>`).
+
 ## Next Major Milestones
 
 ### V8 - Transactions → moved to `ROADMAP.md`
 
-Transactions are the **active milestone** — full scope lives in `ROADMAP.md` →
-Current Focus. `MULTI`/`DISCARD` + queueing (V8.4) shipped 2026-07-26; `EXEC` is
-V8.5, `WATCH` is V8.6–V8.7. Pub/Sub (V8.1–V8.3) shipped 2026-07-25 and is in
-ROADMAP → Completed Milestones.
+Both halves of V8 are **done** and live in `ROADMAP.md` → Completed Milestones:
+Pub/Sub (V8.1–V8.3) 2026-07-25, Transactions (V8.4–V8.7) 2026-07-26. The two open
+bugs above are now **V8.8**, the active milestone in ROADMAP → Current Focus.
 
 ### V10 - Replication and High Availability
 

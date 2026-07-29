@@ -123,9 +123,52 @@ rejects — the same silent grant-dropping shape as the `~*&*` bug. V8.4 shipped
 with exactly that split for one round-trip, caught by `ACL SETUSER` before any
 `CONFIG REWRITE` ran. Collapsing the four lists into one table is a filed follow-up.
 
+**Credential material never crosses the wire** (invariant, formalised V8.8).
+`acl_format_user`'s `for_config` flag is the mechanism: `true` writes real hashes
+into the config file on disk, `false` emits `#<hash>`, and `ACL LIST` passes
+`false`. `CONFIG GET requirepass` follows the same rule and returns `<set>` rather
+than the stored Argon2id hash — a hash is a *verifier*, so leaking it converts an
+online attack (rate-limited by `k_max_auth_inflight`, audited, lockable) into an
+offline one at the attacker's own speed. Redis returns the value because Redis
+historically stored plaintext. Revisit notes in BACKLOG → Open Decisions.
+
 `AUTH` is intentionally not a `k_cmd_table` command (its handler needs `conn`); it
 is matched by literal name before dispatch and can never be renamed or disabled,
 so no config can lock out every client by aliasing it away.
+
+### Transactions (V8.4–V8.7)
+
+Atomicity is free: the event loop is single-threaded, so nothing can interleave
+between `EXEC`'s queued dispatches. The work was state machine and reply framing.
+
+`raw == nullptr` in `do_request` is a **contract**, not an accident: it means the
+caller has no verbatim client bytes and the AOF entry must be re-encoded from the
+`cmd` vector. `EXEC` relies on it (the parser consumed the bytes at queue time);
+`aof.cpp`'s replay loop was already passing it. Without this, transactional writes
+succeed, reply `+OK`, and vanish on restart.
+
+Queued commands are stored **as typed**, never canonicalized, because
+`dispatch_build()` erases the old name from `g_dispatch` when `rename-command`
+applies — storing the canonical name would let `EXEC` resurrect a command that was
+deliberately renamed away.
+
+We do **not** wrap the batch in `MULTI`/`EXEC` in the AOF the way Redis does; each
+queued write is logged individually as it runs. This is load-bearing: `aof.cpp`'s
+replay `Conn fake{}` has an `in_multi` field, so a `MULTI` appearing in the log
+would make replay queue the rest of the file into `queue_cmds` and silently drop
+it. Revisit only alongside replication.
+
+`WATCH` uses eager dirty-marking (a write marks watchers immediately) rather than
+lazy generation-diffing, so `EXEC` checks one bool. Marking is conservative —
+`dirty_before` proves a command wrote *something*, not which key — and false
+aborts are safe under optimistic locking while missed aborts are not. Natural
+expiry deliberately does not invalidate a watch (modern Redis behaves the same;
+TTL churn otherwise causes constant spurious aborts), but eviction does.
+
+Divergence from Redis (deliberate): `UNWATCH` inside `MULTI` executes immediately
+instead of queueing, consistent with the other four transaction commands, which
+all dispatch above the queueing gate. `AUTH` likewise runs immediately inside
+`MULTI` — it short-circuits before the gate, and our AUTH is async.
 
 ### Transport Seam (TLS)
 

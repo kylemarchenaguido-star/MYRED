@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-07-26 16:39:17
+# MYRED stress test — 2026-07-28 21:05:49
 
 **Run:** correctness only over plaintext (passwordless) → 127.0.0.1:1234
 
@@ -163,17 +163,17 @@
   ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'kc', 'mylist', 'foo']
+  ✓ keys returns list → ['kb', 'ka', 'persist_zset', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 5000
+  ✓ pttl returns int → 4999
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 5000ms
+  ℹ  remaining TTL: 4999ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -508,7 +508,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['maxmemory', '0', 'maxmemory-policy', 'noeviction', 'notify-keyspace-events', '']
+  ✓ config get * -> array → ['port', '1234', 'bind', '0.0.0.0', 'protected-mode', 'yes', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '3600 1 300 100 60 10000', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'auditlog', '']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -523,9 +523,9 @@
 
 ── ACL: users, auth, key patterns ────────────────────
   ✓ acl whoami -> default
-  ✓ acl users -> array → ['tx', 'default']
+  ✓ acl users -> array → ['probe', 'default']
   ✓ acl users contains default
-  ✓ acl list -> array → ['user tx on #<hash> ~* -@all +@transaction', 'user default on nopass ~* &* +@all']
+  ✓ acl list -> array → ['user probe on #<hash> ~good:* -@all', 'user default on nopass ~* &* +@all']
   ✓ acl list includes default
   ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*']
   ✓ acl getuser exposes flags
@@ -555,7 +555,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:87\r\nuptime_minutes:1\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:9\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:106287104\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2750\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:4918\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:130\r\nuptime_minutes:2\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:17\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:67493888\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2756\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:8483\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -579,28 +579,28 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:87
-    uptime_minutes:1
+    uptime_seconds:130
+    uptime_minutes:2
     uptime_hours:0
     # Clients
     connected_clients:1
-    total_connections:9
+    total_connections:17
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:106287104
+    used_memory_rss:67493888
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
     evicted_keys:0
     # Stats
-    total_commands:2750
+    total_commands:2756
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:4918
+    rdb_last_save_time:8483
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -638,9 +638,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 3.0ms: 'Background saving started'
+  ℹ  bgsave returned in 2.8ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 14.8ms
+  ℹ  100 ops during save took 15.5ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -692,7 +692,7 @@
 
 ── Memory: incremental eviction (EVICT_RUNNING semantics) 
   ✓ write admitted during overshoot
-  ✓ idle drain under cap (2268000 -> 523908 <= 524288)
+  ✓ idle drain under cap (2268000 -> 524090 <= 524288)
 
 ── ECHO + inline protocol ────────────────────────────
   ✓ echo roundtrip
@@ -754,6 +754,50 @@
   ✓ with 'Ex' the __keyspace__ form is suppressed
   ✓ notifications off → nothing emitted
 
+── Transactions: MULTI / QUEUED / DISCARD / EXEC (V8.4-V8.5) 
+  ✓ MULTI opens a transaction
+  ✓ queued write replies QUEUED
+  ✓ queued read replies QUEUED
+  ✓ nested MULTI is refused
+  ✓ a refused nested MULTI leaves the transaction open
+  ✓ queued commands have not run
+  ✓ DISCARD closes the transaction
+  ✓ DISCARD ran nothing
+  ✓ DISCARD without MULTI is an error
+  ✓ connection still usable after DISCARD
+  ✓ unknown command is rejected at queue time
+  ✓ bad arity is rejected at queue time
+  ✓ SUBSCRIBE inside MULTI is rejected
+  ✓ queuing continues after a rejection
+  ✓ EXEC on a poisoned transaction aborts
+  ✓ EXECABORT ran nothing
+  ✓ EXEC without MULTI is an error
+  ✓ empty transaction commits as an empty array
+  ✓ EXEC returns one array of results, in order
+  ✓ EXEC applied the writes
+  ✓ EXEC header counts every queued command
+  ✓ a failing element is an inline error
+  ✓ commands after a failing one still run
+  ✓ no rollback: the later write is visible
+
+── Transactions: WATCH / UNWATCH (V8.6-V8.7) ─────────
+  ✓ WATCH replies OK
+  ✓ EXEC aborts with a null array after a watched write
+  ✓ the aborted transaction ran nothing
+  ✓ a fresh transaction commits, watches cleared by EXEC
+  ✓ ...and its write landed
+  ✓ EXEC commits when the watched key was never touched
+  ✓ UNWATCH replies OK
+  ✓ EXEC commits after UNWATCH despite the outside write
+  ✓ DISCARD cleared the watch
+  ✓ a multi-key write dirties a watcher of its last key
+  ✓ writing a key named 'watch' does not abort a transaction
+  ✓ WATCH inside MULTI is refused
+  ✓ a refused WATCH did not poison the transaction
+  ✓ a watched key expiring on its own does not abort
+  ✓ write to a dead watcher's key is safe
+  ✓ server alive after watcher teardown
+
 ── Persistence Round-trip (in-memory) ────────────────
   ✓ save → OK
   ✓ string still readable
@@ -763,53 +807,53 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 599/599 passed
-Runtime: 14.00s (42.8 assertions/sec)
+Results: 639/639 passed
+Runtime: 15.20s (42.0 assertions/sec)
 All tests passed!
 Slowest sections:
   7.91s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  1.11s  16/16  Transactions: WATCH / UNWATCH (V8.6-V8.7)
+  0.75s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
   0.72s  9/9  UNLINK Command (async delete)
-  0.72s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
   0.60s  10/10  TTL Commands: PEXPIRE / PTTL
+  0.58s  9/9  Memory: maxmemory eviction + OOM
   0.53s  7/7  BGSAVE (fork-based background save)
   0.51s  6/6  Persistence Round-trip (in-memory)
-  0.51s  4/4  SAVE / RDB Persistence
-  0.51s  9/9  Memory: maxmemory eviction + OOM
 ═══════════════════════════════════════════════════════
 
 -- Command Metrics -------------------------------------
-  Commands observed: 11649
-  RESP errors:       111 (expected negative tests included)
+  Commands observed: 11752
+  RESP errors:       119 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.13ms
-  Latency p50/p95/p99: 0.12/0.17/0.27ms
-  Latency max:       29.44ms
+  Latency avg:       0.14ms
+  Latency p50/p95/p99: 0.13/0.18/0.27ms
+  Latency max:       24.82ms
   Most used commands:
-    set              8312 calls
+    set              8333 calls
     zadd             1634 calls
-    del               342 calls
+    del               365 calls
     srandmember       256 calls
-    rpush             206 calls
-    get               196 calls
+    rpush             207 calls
+    get               202 calls
     sadd              123 calls
     hset              108 calls
     info               34 calls
     config             28 calls
     acl                16 calls
-    flushall           13 calls
+    multi              16 calls
   Slowest commands by average latency:
-    save              11.48ms avg over 2 calls
-    acl                3.42ms avg over 16 calls
-    bgsave             2.83ms avg over 2 calls
-    keys               0.35ms avg over 1 calls
-    zrevquery          0.27ms avg over 2 calls
-    incr               0.26ms avg over 7 calls
-    subscribe          0.26ms avg over 1 calls
-    psubscribe         0.25ms avg over 1 calls
-    sunion             0.24ms avg over 1 calls
-    hscan              0.24ms avg over 4 calls
-    hvals              0.23ms avg over 1 calls
-    incrby             0.23ms avg over 4 calls
+    save              11.73ms avg over 2 calls
+    acl                3.19ms avg over 16 calls
+    bgsave             2.53ms avg over 2 calls
+    scan               0.39ms avg over 3 calls
+    zrevquery          0.28ms avg over 2 calls
+    zquery             0.27ms avg over 6 calls
+    setrange           0.27ms avg over 6 calls
+    setex              0.25ms avg over 4 calls
+    hscan              0.25ms avg over 4 calls
+    psubscribe         0.24ms avg over 1 calls
+    flushall           0.23ms avg over 13 calls
+    zpopmin            0.23ms avg over 5 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

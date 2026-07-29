@@ -94,6 +94,11 @@ void resp_nil(Buffer *out){
   buf_append(out, "$-1\r\n", sizeof("$-1\r\n") - 1);
 }
 
+// null response distinc from the null bulk string (use by exec) and is resp2 null array 
+void resp_nil_arr(Buffer *out){
+  buf_append(out, "*-1\r\n", sizeof("*-1\r\n") - 1);
+}
+
 // OK response
 void resp_ok(Buffer *out){
   buf_append(out, "+OK\r\n", sizeof("+OK\r\n") - 1);

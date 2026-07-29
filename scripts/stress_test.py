@@ -3139,6 +3139,203 @@ def test_pubsub_fanout_concurrency(r: TestRunner, host: str, port: int,
               f"({total / elapsed:,.0f} deliveries/s)")
 
 
+# ---------------------------------------------------------------------------
+# Transactions (V8.4 - V8.7)
+# ---------------------------------------------------------------------------
+
+def _raw_reply(sock: socket.socket, *args: str) -> str:
+    """Send a command and return its first raw RESP line, prefix included.
+
+    recv_response() collapses both `$-1` and `*-1` to None, so a null array is
+    indistinguishable from a null bulk string at the Python level. EXEC's
+    watch-invalidation reply must be a null ARRAY, so this pins the wire bytes.
+    Only safe for replies that are exactly one line.
+    """
+    send_request(sock, *args)
+    return _recv_line(sock).decode(errors="replace")
+
+
+def test_transactions(r: TestRunner, host: str, port: int):
+    r.section("Transactions: MULTI / QUEUED / DISCARD / EXEC (V8.4-V8.5)")
+    c     = make_conn(host, port)      # runs the transactions
+    other = make_conn(host, port)      # observes from outside
+    keys  = ("tx:a", "tx:b", "tx:list", "tx:str", "tx:after")
+    try:
+        for k in keys:
+            cmd(other, "del", k)
+
+        # --- V8.4: queueing -------------------------------------------------
+        r.check("MULTI opens a transaction",   cmd(c, "multi"), "OK")
+        r.check("queued write replies QUEUED", cmd(c, "set", "tx:a", "v1"), "QUEUED")
+        r.check("queued read replies QUEUED",  cmd(c, "get", "tx:a"), "QUEUED")
+        r.expect_error("nested MULTI is refused", c, "multi")
+        r.check("a refused nested MULTI leaves the transaction open",
+                cmd(c, "incr", "tx:b"), "QUEUED")
+        r.check("queued commands have not run", cmd(other, "exists", "tx:a"), 0)
+
+        r.check("DISCARD closes the transaction", cmd(c, "discard"), "OK")
+        r.check("DISCARD ran nothing",            cmd(other, "exists", "tx:a"), 0)
+        r.expect_error("DISCARD without MULTI is an error", c, "discard")
+        r.check("connection still usable after DISCARD", cmd(c, "ping"), "PONG")
+
+        # --- V8.4: queue-time rejection poisons the batch --------------------
+        cmd(c, "multi")
+        r.expect_error("unknown command is rejected at queue time",
+                       c, "definitely_not_a_command")
+        r.expect_error("bad arity is rejected at queue time", c, "set")
+        # [REG] mode switches are rejected outright, never deferred to EXEC
+        r.expect_error("SUBSCRIBE inside MULTI is rejected",
+                       c, "subscribe", "tx:chan")
+        r.check("queuing continues after a rejection",
+                cmd(c, "set", "tx:a", "late"), "QUEUED")
+        r.expect_error("EXEC on a poisoned transaction aborts", c, "exec")
+        r.check("EXECABORT ran nothing", cmd(other, "exists", "tx:a"), 0)
+
+        # --- V8.5: EXEC -------------------------------------------------------
+        r.expect_error("EXEC without MULTI is an error", c, "exec")
+        cmd(c, "multi")
+        r.check("empty transaction commits as an empty array", cmd(c, "exec"), [])
+
+        cmd(c, "multi")
+        cmd(c, "set",   "tx:a", "v1")
+        cmd(c, "incr",  "tx:b")
+        cmd(c, "rpush", "tx:list", "x")
+        cmd(c, "get",   "tx:a")
+        r.check("EXEC returns one array of results, in order",
+                cmd(c, "exec"), ["OK", 1, 1, "v1"])
+        r.check("EXEC applied the writes", cmd(other, "get", "tx:a"), "v1")
+
+        # A command that queues cleanly but fails at runtime: Redis does NOT roll
+        # back. The error is one element of the array and later commands still run.
+        # Read raw because recv_response() raises on a '-' element mid-array.
+        cmd(other, "set", "tx:str", "abc")
+        cmd(c, "multi")
+        cmd(c, "incr", "tx:str")             # runtime error: not an integer
+        cmd(c, "set",  "tx:after", "ran")
+        send_request(c, "exec")
+        lines = [_recv_line(c).decode(errors="replace") for _ in range(3)]
+        r.check("EXEC header counts every queued command", lines[0], "*2")
+        r.check("a failing element is an inline error",    lines[1][:1], "-")
+        r.check("commands after a failing one still run",  lines[2], "+OK")
+        r.check("no rollback: the later write is visible",
+                cmd(other, "get", "tx:after"), "ran")
+    finally:
+        try:
+            for k in keys:
+                cmd(other, "del", k)
+        except Exception:
+            pass
+        c.close()
+        other.close()
+
+
+def test_transaction_watch(r: TestRunner, host: str, port: int):
+    r.section("Transactions: WATCH / UNWATCH (V8.6-V8.7)")
+    a = make_conn(host, port)          # the watcher
+    b = make_conn(host, port)          # the interfering writer
+    # "watch" is deliberately the literal command name - see the [REG] below
+    keys = ("tx:wk", "tx:wk2", "tx:wk3", "tx:ttl", "tx:ghost", "watch")
+    try:
+        for k in keys:
+            cmd(b, "del", k)
+        cmd(b, "set", "tx:wk", "original")
+
+        # --- V8.7: commit-time invalidation ----------------------------------
+        r.check("WATCH replies OK", cmd(a, "watch", "tx:wk"), "OK")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA")
+        cmd(b, "set", "tx:wk", "fromB")          # a DIFFERENT conn dirties it
+        # [REG] null ARRAY (*-1), not a null bulk ($-1) - both parse as None
+        r.check("EXEC aborts with a null array after a watched write",
+                _raw_reply(a, "exec"), "*-1")
+        r.check("the aborted transaction ran nothing",
+                cmd(b, "get", "tx:wk"), "fromB")
+
+        # --- watches are cleared by EXEC (else every later txn would fail) ----
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA2")
+        r.check("a fresh transaction commits, watches cleared by EXEC",
+                cmd(a, "exec"), ["OK"])
+        r.check("...and its write landed", cmd(b, "get", "tx:wk"), "fromA2")
+
+        # --- an untouched watch commits normally ------------------------------
+        cmd(a, "watch", "tx:wk")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA3")
+        r.check("EXEC commits when the watched key was never touched",
+                cmd(a, "exec"), ["OK"])
+
+        # --- UNWATCH ----------------------------------------------------------
+        cmd(a, "watch", "tx:wk")
+        r.check("UNWATCH replies OK", cmd(a, "unwatch"), "OK")
+        cmd(b, "set", "tx:wk", "fromB2")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA4")
+        r.check("EXEC commits after UNWATCH despite the outside write",
+                cmd(a, "exec"), ["OK"])
+
+        # --- DISCARD clears watches too ---------------------------------------
+        cmd(a, "watch", "tx:wk")
+        cmd(a, "multi")
+        cmd(a, "discard")
+        cmd(b, "set", "tx:wk", "fromB3")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA5")
+        r.check("DISCARD cleared the watch", cmd(a, "exec"), ["OK"])
+
+        # [REG] multi-key writes must dirty EVERY key they touch, not just cmd[1]
+        # - this is what cmd_collect_keys() exists for
+        cmd(b, "mset", "tx:wk2", "1", "tx:wk3", "1")
+        cmd(a, "watch", "tx:wk3")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk3", "fromA")
+        cmd(b, "del", "tx:wk2", "tx:wk3")        # tx:wk3 is the LAST argument
+        r.check("a multi-key write dirties a watcher of its last key",
+                _raw_reply(a, "exec"), "*-1")
+
+        # [REG] do_watch must skip cmd[0]; looping from 0 watched a key named
+        # "watch" and any write to it aborted unrelated transactions
+        cmd(a, "watch", "tx:wk")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "fromA6")
+        cmd(b, "set", "watch", "notakey")        # the literal command name
+        r.check("writing a key named 'watch' does not abort a transaction",
+                cmd(a, "exec"), ["OK"])
+
+        # --- WATCH inside MULTI is refused, and must NOT poison ---------------
+        cmd(a, "multi")
+        r.expect_error("WATCH inside MULTI is refused", a, "watch", "tx:wk")
+        cmd(a, "set", "tx:wk", "fromA7")
+        r.check("a refused WATCH did not poison the transaction",
+                cmd(a, "exec"), ["OK"])
+
+        # --- natural expiry does NOT invalidate (deliberate divergence) -------
+        cmd(b, "psetex", "tx:ttl", "400", "gone")
+        cmd(a, "watch", "tx:ttl")
+        cmd(a, "multi")
+        cmd(a, "set", "tx:wk", "after-expiry")
+        time.sleep(0.9)                          # comfortably past the TTL
+        r.check("a watched key expiring on its own does not abort",
+                cmd(a, "exec"), ["OK"])
+
+        # --- teardown: watchers holds raw Conn*, so a dead watcher must unlink -
+        ghost = make_conn(host, port)
+        cmd(ghost, "watch", "tx:ghost")
+        ghost.close()
+        time.sleep(0.2)
+        r.check("write to a dead watcher's key is safe",
+                cmd(b, "set", "tx:ghost", "v"), "OK")
+        r.check("server alive after watcher teardown", cmd(b, "ping"), "PONG")
+    finally:
+        try:
+            for k in keys:
+                cmd(b, "del", k)
+        except Exception:
+            pass
+        a.close()
+        b.close()
+
+
 def run_redis_benchmark(host: str, port: int, password: Optional[str],
                         requests: int, clients: int, pipeline: int) -> bool:
     print(f"\n{BOLD}{'═' * 55}{RESET}")
@@ -3356,6 +3553,8 @@ def main():
             test_pubsub_commands(r,       host, port)
             test_pubsub_patterns(r,       host, port)
             test_keyspace_notifications(r, host, port)
+            test_transactions(r,          host, port)
+            test_transaction_watch(r,     host, port)
             test_persistence_roundtrip(r, host, port)
         except Exception as e:
             print(f"\n{RED}Unexpected error: {e}{RESET}")

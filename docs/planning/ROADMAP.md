@@ -13,7 +13,7 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-07-21.
+Date: 2026-07-26.
 
 Primary commands:
 ```bash
@@ -43,224 +43,180 @@ Implemented command families:
 | ACL foundation and hardening | Implemented (V9.4–V9.5) |
 | **TLS** | **Implemented (V9.7)** |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
-| Transactions | **In progress — V8.4 `MULTI`/`DISCARD` done, V8.5 `EXEC` next** |
+| **Transactions** | **Implemented (V8.4–V8.7)** |
 | Replication | Not implemented (→ BACKLOG V10) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V8 - Transactions [Next]
+### V9.8 - Config refactor: one directive table [Next]
 
-`MULTI`/`EXEC`/`DISCARD` + `WATCH`: queueing a batch of ordinary commands and
-committing them atomically. Shares the "V8" number with Pub/Sub for scheduling
-only — unrelated feature, no broadcast mechanism involved. Step numbers continue
-from the Pub/Sub steps so they never collide.
+`config_apply` (parse/validate/assign), `config_rewrite` (format/write) and
+`config_get_value` (format/return) each hand-enumerate the same ~23 directives.
+One truth, three lists — adding or changing a directive means editing three
+places, and **forgetting one is silent**: no compiler error, no warning, no
+failing test unless that exact path is exercised. Four incidents so far, all the
+same bug: the `requirepass` emission pasted over in `config_rewrite` (`3e2d0e9`,
+undetected 6 days, came back passwordless), `notify-keyspace-events` missing from
+get (V8.3), `appendfilename` missing from get (V8.5), and four directives plus two
+string-literal typos in the new getter (V8.8, caught at boot by its own selfcheck).
 
-**Atomicity is free here.** The event loop is single-threaded, so no other
-connection's command can interleave between queued commands — the same reasoning
-already recorded for EVAL's `redis.call`. The work is the conn state machine and
-the reply framing, not concurrency control.
+#### V9.8.1 - Share the formatter for unconditional scalars [Next]
 
-#### V8.4 - Transaction mode: `MULTI`, queueing, `DISCARD` [Done] 2026-07-26
+Small, safe, and it kills the drift that has actually bitten. Make
+`config_rewrite` call `config_get_value` for the ~12 directives it emits
+unconditionally: `port`, `protected-mode`, `dbfilename`, `appendonly`,
+`appendfilename`, `appendfsync`, `maxmemory`, `maxmemory-policy`,
+`maxmemory-samples`, `notify-keyspace-events`, `auto-aof-rewrite-percentage`,
+`auto-aof-rewrite-min-size`. After this, GET and REWRITE are structurally
+incapable of disagreeing about them, in a diff of about a dozen lines.
 
-Just the state machine and the queueing gate — no execution yet. `EXEC` itself
-is V8.5, so this step is done as soon as a client can open a transaction, see
-`+QUEUED` for each command, and close it with `DISCARD` without anything ever
-actually running.
+- **The trap, and it is exactly the bug class that already cost a password:**
+  `requirepass` must NEVER flow through the shared formatter — `config_get_value`
+  deliberately masks it, so routing it through would write `requirepass <set>` to
+  disk and the next boot would hash the literal string `<set>` as the password.
+  Same exclusion for the multi-line directives (`bind`, `allow-ip`, `save`,
+  `rename-command`, `user`) and the conditionally-emitted `tls-*` family. Scope is
+  unconditional scalars only, and the boot selfcheck must assert `requirepass` is
+  not in that set.
+- Done when: the 12 scalars are emitted from one formatter, `CONFIG REWRITE` +
+  restart round-trips unchanged (diff the file before/after), `requirepass`
+  survives the round-trip with its hash intact, and the full suite is green.
 
-- `Conn` gains `bool in_multi`, `bool multi_dirty` (a queue-time error — unknown
-  command, bad arity — that makes `EXEC` abort without running anything, Redis's
-  `EXECABORT`), and `std::vector<std::vector<std::string>> queued_cmds`.
-- `MULTI`: error ("MULTI calls can not be nested") if already `in_multi`; else
-  set it, reply `+OK`.
-- While `in_multi`, `do_request` intercepts after command/arity validation but
-  before dispatch: a command that doesn't exist or has the wrong arity sets
-  `multi_dirty` and replies the error immediately (but queuing continues for
-  anything after it); otherwise the raw `cmd` vector is pushed onto
-  `queued_cmds` and the reply is `+QUEUED` instead of actually executing.
-  `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`RESET`/`QUIT` are the commands that never queue.
-- **Resolving the mode-composition question this section used to leave open**:
-  `SUBSCRIBE`/`PSUBSCRIBE`/`UNSUBSCRIBE`/`PUNSUBSCRIBE` must *not* be queueable —
-  real Redis explicitly rejects them inside `MULTI` ("... is not allowed in
-  transactions") as a queue-time error, the same way a bad-arity command sets
-  `multi_dirty`, rather than deferring the subscribe until `EXEC`. The reverse
-  direction already takes care of itself: `cmd_ok_in_subscribe`'s whitelist
-  (commands.cpp:3540ish) doesn't include `MULTI`, so a connection with any
-  `sub_channels`/`sub_patterns` already can't open a transaction in the first
-  place — the two modes are mutually exclusive by construction, not by new code.
-- `DISCARD`: clears `in_multi`/`queued_cmds`/`multi_dirty`, replies `+OK`; errors
-  if not currently in `MULTI`.
-- **Precedent from V8.1**: Pub/Sub added its own per-conn mode with a gate in
-  `do_request` (`sub_channels`/`sub_patterns` non-empty ⇒ only a whitelist runs).
-  `in_multi` is a second such mode, and (per above) the two don't need to compose
-  at all — reuse the conn-aware dispatch shape (`AUTH`/`ACL`/pubsub) for
-  `MULTI`/`EXEC`/`DISCARD`/`WATCH` rather than routing them through
-  `k_cmd_table`'s `CmdFn`, since they need `Conn`.
-- Done when: `MULTI` replies `+OK`, a nested `MULTI` errors without disturbing
-  the open transaction, ordinary commands reply `+QUEUED` and land in
-  `queued_cmds` in order, an unknown/bad-arity command sets `multi_dirty` but
-  queuing continues afterward, and `DISCARD` clears all three fields and
-  replies `+OK`.
+#### V9.8.2 - Full directive table [Backlog]
 
-**Shipped 2026-07-26** — all done-criteria verified live. Notes that differ from
-the plan above, or that V8.5 depends on:
+The real milestone. One array of descriptors owning name, arity, boot-only flag,
+an `apply` function and a `format` function; all three call sites become table
+walks, and a new directive becomes one row that will not compile if incomplete.
 
-- The conn field is named **`queue_cmds`** (not `queued_cmds`).
-- **Queued commands are stored AS TYPED, never canonicalized.** `dispatch_build()`
-  *erases* the old name from `g_dispatch` when `rename-command` applies, so
-  storing the canonical name would let `EXEC` resurrect a command that was
-  deliberately renamed away. The stored vector re-resolves through the identical
-  lookup path at exec time — same rename, same ACL, same `renamed` flag for the
-  AOF re-encode. `cmd[0]` is already lowercased in place before the gate.
-- **Poisoning is centralised in `resp_err_txn(out, conn, msg)`**, which sets
-  `multi_dirty` when `in_multi` and then forwards to `resp_err`. Wired into the
-  three pre-dispatch rejections: unknown command, ACL deny, wrong arity. Putting
-  the queue gate *after* the ACL check is what makes a NOPERM poison the
-  transaction, matching Redis's `flagTransaction`.
-- `cmd_no_queue()` rejects the four pub/sub mode switches at queue time. V8.5's
-  `exec`/`watch`/`unwatch` must dispatch **above** the gate, never through this list.
-- **New ACL category `@transaction`** (`CAT_TRANSACTION = 1ull << 8`), added
-  alongside — see DECISIONS → ACL Category Tagging. `multi`/`discard` are
-  `CAT_FAST | CAT_TRANSACTION`, keeping the `CAT_READ` base bit so a read-only
-  user can still open a transaction. `CAT_ALL` is `~0ull`, so existing `+@all`
-  users needed no migration.
-- **Deliberate deviation**: `AUTH` executes immediately inside `MULTI` instead of
-  queueing — it short-circuits at the top of `do_request` before the gate, and
-  our AUTH is async (`auth_pending` gates parsing), so queueing it would be a mess.
-- **Known limitation, not fixed**: `queue_cmds` is unbounded, so an authenticated
-  client can queue until the process dies. Real Redis is the same. A cap belongs
-  with V8.5 hardening.
-- No `conn_destroy` hook is needed — nothing outside the `Conn` points at this
-  state, so the member destructors cover it. `WATCH` (V8.6) *will* need one.
-- Three transcription slips again reached a running server, none caught by the
-  compiler: a duplicated `{"multi", …}` table key that silently dropped `discard`
-  (`unordered_map` init-lists use insert semantics — first wins, no warning), a
-  missing space producing `-ERRsubscribe is not allowed…`, and `acl_cat_bit`
-  left unedited so `ACL CAT` advertised `transaction` while `SETUSER` rejected
-  `+@transaction`. See BACKLOG → the metadata-selfcheck follow-up.
-
-#### V8.5 - `EXEC`: atomic dispatch + reply assembly [Done] 2026-07-26
-
-Do not start until V8.4 is solid — this step only has something real to run
-once queueing works.
-
-- If `multi_dirty`, discard the queue and reply `-EXECABORT`, running nothing.
-- Otherwise: `resp_arr(out, queued_cmds.size())` up front, then dispatch each
-  queued command in order straight into `out` — RESP array elements are just
-  concatenated encoded values, so no per-command scratch buffer is needed, the
-  replies naturally land back-to-back inside the one array.
-- **The trap to design around from the start**: dispatching a queued command
-  must not re-enter the V8.4 queueing gate, or `EXEC` would push its own queued
-  commands right back onto `queued_cmds` instead of running them. Clear
-  `in_multi` (or dispatch through a separate "now executing" path) before
-  running the queue, and restore/clear it once `EXEC` finishes.
-- Design for this interaction now even though blocking commands ship later:
-  real Redis's blocking commands (`BLPOP` etc.) never actually block inside
-  `MULTI`/`EXEC` — they run non-blocking and return nil immediately if not
-  ready. Whatever state `EXEC`'s dispatch loop checks for "am I inside a
-  transaction commit" needs to be visible to those commands later, or the
-  blocking list commands (BACKLOG → Command Coverage Gaps → Lists) will need
-  this redesigned.
-- Done when: a queued sequence of writes replies `+QUEUED` per command, `EXEC`
-  returns one array with each individual result in order, and a bad command
-  mid-queue produces `-EXECABORT` on `EXEC` without running anything.
-
-**Shipped 2026-07-26** — all done-criteria verified live, plus one 🔴 the plan
-above did not anticipate:
-
-- **`EXEC` would have silently lost every transactional write from the AOF.** A
-  queued command has no verbatim client bytes (the parser consumed them at queue
-  time), so `do_request`'s `aof_append_raw(raw, raw_len)` branch appended nothing:
-  `SET` succeeded, client saw `+OK`, key gone after restart. Fixed by making
-  **`raw == nullptr` a documented contract meaning "re-encode the log entry from
-  the vector"** — `bool reencode = spec.aof_rewrite || renamed || !raw;` drives
-  both the snapshot copy and the `aof_feed` branch. `aof_feed` ends in a verbatim
-  `aof_encode(frame, cmd)` fallback, so it is always correct, just slower than the
-  memcpy. Costs one bool test on the hot path. Note `aof.cpp`'s replay loop was
-  *already* calling `do_request(..., nullptr, 0)`; it was safe only because
-  `may_log` is false under `g_loading`. The contract is now explicit for both.
-  Proof it works: an *inline* `nc` command came back out of the AOF as a proper
-  RESP array, which only the re-encode path can produce.
-- `do_exec` swaps the queue into a local `batch` and clears `in_multi` **before**
-  dispatching, so queued commands can't re-enter the queueing gate. `EXEC`/`MULTI`/
-  `DISCARD` dispatch above that gate and are therefore never queueable, which is
-  what makes the recursion safe without a depth guard.
-- `Conn::in_exec` is set around the dispatch loop. Write-only today — it exists so
-  blocking commands (`BLPOP`) can see "inside a transaction commit" when they ship.
-- **We deliberately do NOT wrap the batch in `MULTI`/`EXEC` in the AOF** the way
-  Redis does; each queued write is logged individually as it runs. This is
-  load-bearing: `aof.cpp`'s replay `Conn fake{}` now has an `in_multi` field, so a
-  `MULTI` appearing in the log would make replay queue the rest of the file into
-  `queue_cmds` and silently drop it. Revisit only alongside replay support.
-- `CONFIG GET` exposes only 3 parameters while `CONFIG SET` accepts the full
-  directive set — filed in BACKLOG; it wasted a verification cycle here.
-
-#### V8.6 - `WATCH`: registry + eager dirty-marking [Backlog]
-
-Do not start until V8.5 is solid — `WATCH` only matters relative to a working
-`EXEC`. This step is just the tracking mechanism; `EXEC` actually honoring it
-is V8.7.
-
-- `WATCH key [key...]`: only valid *before* `MULTI` starts (Redis rejects `WATCH`
-  inside an open transaction). Repeated calls accumulate more watched keys
-  rather than replacing the set.
-- Recommended mechanism — eager dirty-marking, not lazy generation-diffing: a
-  global `std::unordered_map<std::string, std::unordered_set<Conn*>> watchers`
-  (key name → watching conns). Any write to that key immediately sets every
-  watching `Conn::watch_dirty = true`; `EXEC` then checks one flag instead of
-  re-diffing per-key state at commit time. Mirrors Redis's `touchWatchedKey()`,
-  and avoids a per-key generation counter that would have to survive a key being
-  deleted and recreated under the same name.
-- **The write hooks already exist.** V8.3's keyspace notifications instrumented
-  exactly these points (the central `do_request` hook keyed off the
-  `g_writes_since_save` dirty counter, plus lazy expiry, active expiry, and
-  eviction). `WATCH` should ride the same instrumentation rather than adding a
-  second parallel set.
-- Teardown: `conn_destroy` must remove the conn from every `watchers` set —
-  identical to `pubsub_remove_conn`, and load-bearing for the same reason (a
-  freed `Conn*` left in the registry is a use-after-free).
-- Done when: `WATCH` registers the conn in `watchers` for each key argument
-  (verify directly — grep the registry state or log it), and a write to a
-  watched key flips `watch_dirty` on every watching conn. `EXEC` doesn't need
-  to honor it yet; that's V8.7.
-
-#### V8.7 - `EXEC`/`DISCARD` integration + `UNWATCH` [Backlog]
-
-Do not start until V8.6 is solid.
-
-- `EXEC` gains a pre-check: if `conn->watch_dirty`, abort with a **nil array**
-  reply instead of running the queue — distinct from `EXECABORT`, which is a
-  queue-time error; this is a commit-time invalidation.
-- **Filling a gap in the original design note**: watches must be cleared, not
-  just checked. Real Redis clears a connection's entire watched-key set (and
-  removes it from every `watchers` entry) after `EXEC` runs — whether it
-  committed or aborted on `watch_dirty` — and after `DISCARD`, since a `WATCH`
-  is only meant to guard the *next* transaction attempt, not persist forever.
-  One shared "clear my watches" helper, called from all three sites, mirrors
-  the existing `pubsub_remove_conn` teardown shape.
-- `UNWATCH`: a standalone command (no `MULTI` required) that calls the same
-  clear-my-watches helper and replies `+OK` — this command was missing from
-  the original `WATCH` note entirely but is required for a client to abandon
-  watches without committing a transaction.
-- Done when: two connections `WATCH` the same key, one modifies it, and the
-  other's subsequent `EXEC` returns a nil array instead of running its queued
-  commands; a fresh `EXEC` right after that (watches now cleared) runs
-  normally; and a standalone `UNWATCH` clears watches without needing `EXEC`
-  at all.
+- The prize is what the boot selfcheck can then assert — the same role
+  `metadata_selfcheck()` already plays for `k_cmd_table`: every entry has both
+  operations, and every entry **round-trips** (`format` → `apply` → `format`
+  yields the same string). That check would have caught the `requirepass`
+  regression at boot instead of six days later.
+- Four complications to design around, in increasing order of annoyance:
+  (1) `bind`/`allow-ip`/`save`/`rename-command`/`user` are accumulating multi-line
+  directives — apply appends rather than assigns, rewrite emits N lines, so the
+  table needs a repeated/format-to-lines concept; (2) `config_rewrite` is not a
+  dump — it has deliberate ordering, conditional emission (`requirepass` only if
+  set, `tls-handshake-timeout` only if ≠ 10s) and inconsistent quoting, so a naive
+  table walk normalizes the shape of every existing config file; (3) `user` stays
+  special (it comes from `acl_format_user`, and `default` is skipped because it is
+  rebuilt from `requirepass` at boot); (4) it is a large hand-applied diff in
+  security-adjacent code, which given this project's transcription-slip rate is
+  the highest-risk change available — it needs a green suite either side.
+- Worth landing before V10 Replication, which will add more config surface.
 
 **Carry-overs: all clear.** V9.7 TLS closed 2026-07-25 (603/603 both transports),
-the trustworthy plaintext↔TLS baseline is recorded in the Testing Matrix, the
-`requirepass` regression is fixed, and the tree is committed through `c7912e0`.
+V8 Pub/Sub, V8 Transactions and V8.8 all closed, no open bugs. The tree is
+committed through `c7912e0`; everything from V8.4 onward is uncommitted.
 
 ## Completed Milestones
+
+### V8.8 - Follow-up fixes [Done]
+
+Closed 2026-07-26. Two defects filed during V8.4–V8.7, both in security-adjacent
+code, cleared to restore the "no open bugs" invariant.
+
+- **🟠 `ACL SETUSER` was not atomic.** It bound `User &u = g_config.users[cmd[2]]`
+  and applied modifiers onto the live user, returning early on the first bad one —
+  leaving a half-configured user, and creating one even when the command failed
+  outright. Ordering decided whether that failed closed or open:
+  `acl setuser u on '>p' '+@all' '~bad['` left `u` enabled with `+@all` and no key
+  restriction. Now stages onto a `User` copy and commits with `std::move` only on
+  full success. The `// stable address` invariant holds — assigning through
+  `operator[]` on an existing key overwrites the node's value in place, so live
+  `Conn::user` pointers stay valid.
+- **🟡 `CONFIG GET` answered for 3 directives while `CONFIG SET` accepted all of
+  them.** Replaced the hand-rolled list with `config_get_value()` +
+  `config_all_names()` in `state.cpp` (deliberately beside `config_rewrite`, since
+  the two format the same values), covering all 23 gettable directives. `do_config`
+  now glob-matches like Redis, so `CONFIG GET maxmemory*` and `CONFIG GET *` both
+  work. `user` and `rename-command` stay out — structural multi-line directives
+  that Redis does not expose through CONFIG either (`ACL LIST` covers users).
+- **`requirepass` is masked** (`<set>` / empty), not returned. What is stored is an
+  Argon2id hash, and a hash is a *verifier*: whoever holds it can test candidates
+  offline at their own speed — no round trip, no `k_max_auth_inflight` throttle, no
+  audit entry, no lockout. This is not a new policy but the existing one applied to
+  the one path about to violate it: `acl_format_user`'s `for_config` flag already
+  makes `ACL LIST` emit `#<hash>`, so real credential material goes only into the
+  config file on disk, never over the wire. See BACKLOG → Open Decisions for the
+  alternative.
+- A boot selfcheck in `metadata_selfcheck()` asserts every advertised directive is
+  actually gettable. It earned its place immediately — the first build died on six
+  violations (four missing directives, plus `"Mmaxmemory-samples"` and
+  `"notify_keyspace-events"` typos). Without it the server would have started fine
+  and `CONFIG GET appendfilename` would have silently returned `[]` again: the
+  exact bug V8.8 existed to fix, reintroduced while fixing it. Note the limit — it
+  catches a name listed but not gettable, **not** a directive added to
+  `config_apply` and forgotten in both lists. That direction needs V9.8.
+
+### V8 - Transactions [Done]
+
+Closed 2026-07-26. `MULTI`/`DISCARD`/`EXEC`/`WATCH`/`UNWATCH` — queue a batch of
+ordinary commands and commit it as one uninterruptible unit. **Atomicity was free:**
+the event loop is single-threaded, so no other connection can interleave between
+queued dispatches. The work was the per-conn state machine and the reply framing.
+
+- **V8.4 transaction mode + queueing** — `Conn` gains `in_multi`, `multi_dirty`,
+  `queue_cmds`. All five transaction commands dispatch conn-aware **above** the
+  queueing gate (the `AUTH`/`ACL`/pub-sub shape), which is what makes them
+  unqueueable and `EXEC`'s recursion safe without a depth guard. The gate sits
+  *after* the found/ACL/arity checks on purpose, so all three rejections poison the
+  batch through `resp_err_txn` — Redis's `flagTransaction`/`EXECABORT` semantics
+  for free. Queued commands are stored **as typed, never canonicalized**:
+  `dispatch_build()` erases the old name from `g_dispatch` under `rename-command`,
+  so canonical storage would let `EXEC` resurrect a command deliberately renamed
+  away. Pub/Sub mode switches are rejected at queue time, never deferred. New ACL
+  category `@transaction` (bit 8) — four parallel lists, of which parse and emit
+  are a matched pair.
+- **V8.5 `EXEC`** — swap the queue into a local batch, leave `in_multi`, emit
+  `resp_arr(n)` and dispatch straight into `out`; RESP array elements are just
+  concatenated encoded values, so no per-command scratch buffer is needed.
+  **Caught a 🔴 the plan had missed**: a queued command has no verbatim client
+  bytes, so `do_request`'s AOF branch appended nothing — transactional writes
+  replied `+OK` and vanished on restart. Fixed by making **`raw == nullptr` a
+  contract** meaning "re-encode the log entry from the vector".
+- **V8.6 `WATCH` registry** — eager dirty-marking over `GlobalData::watchers`
+  (key → conns), so `EXEC` checks one bool instead of re-diffing at commit time.
+  It could *not* ride V8.3's notify hook: that hook is gated on notifications being
+  enabled and captures only `cmd[1]`, which is a tolerable miss for an event but a
+  correctness bug for `WATCH`. `cmd_collect_keys()` was extracted from `acl_check`
+  as the single source of truth for a command's keys. Marking is conservative
+  (false aborts are safe under optimistic locking, missed ones are not); natural
+  expiry deliberately does not invalidate, eviction does; `watch_clear_conn` in
+  `conn_destroy` is a use-after-free guard.
+- **V8.7 integration + `UNWATCH`** — the invalidation reply is a null **array**
+  (`*-1`, new `resp_nil_arr`), not the null bulk `resp_nil` writes; both render as
+  `(nil)`, so it is pinned at wire level. Watches clear at all three `EXEC` exits
+  and at `DISCARD`, and **before** the dispatch loop — otherwise the batch's own
+  writes re-dirty its conn and break every *later* transaction, a delayed failure
+  that would be miserable to trace.
+
+**Deliberate divergences from Redis:** each queued write is logged to the AOF
+individually rather than wrapped in `MULTI`/`EXEC` (replay's `Conn fake{}` now has
+an `in_multi` field, so a `MULTI` in the log would queue the rest of the file into
+`queue_cmds` and silently drop it); `UNWATCH` and `AUTH` execute immediately inside
+`MULTI` instead of queueing.
+
+**Process note:** four more silent transcription slips — a duplicated `{"multi",…}`
+key that dropped `discard` entirely (`unordered_map` initializer lists keep the
+first duplicate, no `-Wall` warning), `"ERR"` missing its trailing space,
+`acl_cat_bit` left unedited so `ACL CAT` advertised a category `SETUSER` rejected,
+and a fourth loop-from-zero (`do_watch` registering a phantom watcher on a key
+literally named `watch`). None caught by the compiler, all by grep-verify.
+
+Regression coverage: `test_transactions` + `test_transaction_watch` in
+`scripts/stress_test.py`, with `[REG]` checks for the wire-level `*-1`, multi-key
+invalidation, and the `watch` key-name slip.
 
 ### V8 - Pub/Sub [Done]
 
 Closed 2026-07-25. A live broadcast mechanism with **no storage and no
 persistence** — a message only reaches clients subscribed at the moment it is
-published. (Transactions — `MULTI`/`EXEC`/`WATCH` — were never part of this work;
-they keep the V8.4/V8.5 numbers and are now the active milestone in Current Focus.)
+published. (Transactions share the V8 number for scheduling only — unrelated
+feature, no broadcast mechanism involved. They took the V8.4–V8.7 steps.)
 
 - **V8.1 core** — `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH` over a
   `GlobalData::channels` registry (`map<string, set<Conn*>>`), exact-name lookup.

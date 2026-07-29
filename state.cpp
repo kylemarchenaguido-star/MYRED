@@ -481,6 +481,97 @@ bool config_load_file(const char *path){
   return ok;
 }
 
+// Every directive config_apply() accepts must appear here AND in
+// config_all_names(), or CONFIG GET silently answers [].
+bool config_get_value(const std::string &name, std::string &out){
+  char buf[64];
+  if (name == "port"){ snprintf(buf, sizeof(buf), "%d", g_config.port); out = buf; return true; }
+  if (name == "bind"){
+    out.clear();
+    for (const std::string &b : g_config.binds){ if (!out.empty()){ out += ' '; } out += b; }
+    return true;
+  }
+  if (name == "protected-mode"){ out = g_config.protected_mode ? "yes" : "no"; return true; }
+  if (name == "allow-ip"){
+    out.clear();
+    for (const auto &a : g_config.allowlist){
+      struct in_addr ia; 
+      ia.s_addr = htonl(a.first);
+      if (!out.empty()){ out += ' '; }
+      out += inet_ntoa(ia);
+      snprintf(buf, sizeof(buf), "/%d", __builtin_popcount(a.second));
+      out += buf;
+    }
+    return true;
+  }
+  // Deliberately masked: what we store is a password HASH, and CONFIG GET is
+  // reachable by any @admin user. Redis returns the value because Redis stores
+  // plaintext. Use ACL LIST / ACL GETUSER for credential state.
+  if (name == "requirepass"){ out = g_config.password.empty() ? "" : "<set>"; return true; }
+  if (name == "tls-port"){ snprintf(buf, sizeof(buf), "%d", g_config.tls_port); out = buf; return true; }
+  if (name == "tls-cert-file"){ out = g_config.tls_cert_file; return true; }
+  if (name == "tls-key-file"){ out = g_config.tls_key_file; return true; }
+  if (name == "tls-ca-cert-file"){ out = g_config.tls_ca_cert_file; return true; }
+  if (name == "tls-auth-clients"){
+    out = g_config.tls_auth_clients == TlsAuthClients::YES ? "yes"
+        : g_config.tls_auth_clients == TlsAuthClients::NO  ? "no" : "optional";
+    return true;
+  }
+  if (name == "tls-handshake-timeout"){
+    snprintf(buf, sizeof(buf), "%d", g_config.tls_handshake_timeout_ms / 1000);
+    out = buf;
+    return true;
+  }
+  if (name == "dbfilename"){     out = g_config.dump_path; return true; }
+  if (name == "appendonly"){     out = g_config.aof_enable ? "yes" : "no"; return true; }
+  if (name == "appendfilename"){ out = g_config.aof_path;  return true; }
+  if (name == "appendfsync"){
+    out = g_config.aof_fysnc == Aoffsync::ALWAYS ? "always"
+        : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec";
+    return true;
+  }
+  if (name == "maxmemory"){ snprintf(buf, sizeof(buf), "%zu", g_config.maxmemory); out = buf; return true; }
+  if (name == "maxmemory-policy"){ out = maxmemory_policy_name(g_config.maxmemory_policy); return true; }
+  if (name == "maxmemory-samples"){
+    snprintf(buf, sizeof(buf), "%d", g_config.maxmemory_samples); out = buf; return true;
+  }
+  if (name == "notify-keyspace-events"){
+    out = notify_flags_string(g_config.notify_keyspace_events); return true;
+  }
+
+  if (name == "auto-aof-rewrite-percentage"){
+    snprintf(buf, sizeof(buf), "%d",g_config.aof_rewrite_perc); out = buf; return true;
+  }
+  if (name == "auto-aof-rewrite-min-size"){
+    snprintf(buf, sizeof(buf), "%zu", g_config.aof_rewrite_min_size); out = buf; return true;
+  }
+  if (name == "save"){
+    out.clear();
+    for (const SaveCondition &s : g_config.save_conditions){
+      if (!out.empty()){ out += ' '; }
+     snprintf(buf, sizeof(buf), "%llu %u", (unsigned long long)s.seconds, s.changes); 
+     out += buf;
+    }
+    return true;
+  }
+  if (name == "auditlog"){ out = g_config.auditlog_path; return true; }
+  return false;
+}
+
+// Config-file order. CONFIG GET walks this and glob-matches the requested name.
+void config_all_names(std::vector<std::string> &out){
+  static const char *names[] = {
+    "port", "bind", "protected-mode", "allow-ip", "requirepass",
+    "tls-port", "tls-cert-file", "tls-key-file", "tls-ca-cert-file",
+    "tls-auth-clients", "tls-handshake-timeout",
+    "dbfilename", "appendonly", "appendfilename", "appendfsync",
+    "maxmemory", "maxmemory-policy", "maxmemory-samples",
+    "notify-keyspace-events", "save",
+    "auto-aof-rewrite-percentage", "auto-aof-rewrite-min-size", "auditlog",
+  };
+  for (const char *n : names){ out.emplace_back(n); }
+}
+
 // serialize live config back
 bool config_rewrite(const char * path){
   std::string tmp = std::string(path) + ".tmp";

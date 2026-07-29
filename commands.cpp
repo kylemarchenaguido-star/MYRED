@@ -2149,6 +2149,7 @@ static void do_flushall(std::vector<std::string> &cmd, Buffer *out){
   // free each entry (per-type + TTL heap)
   for (Entry *e : ents){ entry_del(e); }
   g_data.g_writes_since_save++;
+  watch_touch_all(); // KeySpec::NONE, so the central hook sees no keys to touch
   return resp_ok(out);
 }
 
@@ -2763,17 +2764,14 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
     std::string param = cmd[2];
     for (char &c : param){ c = (char)tolower((unsigned char)c); }
 
-    // collect (name, value) for the params we actually support; '*' = all
+    // glob, an exact name matches itself, * matches everything
+    std::vector<std::string> names;
+    config_all_names(names);
     std::vector<std::pair<std::string , std::string>> kv;
-    if (param == "maxmemory" || param == "*"){
-      kv.emplace_back("maxmemory", std::to_string(g_config.maxmemory));
-    }
-    if (param == "maxmemory-policy" || param == "*"){
-      kv.emplace_back("maxmemory-policy", maxmemory_policy_name(g_config.maxmemory_policy));
-    }
-    if (param == "*" || param == "notify-keyspace-events"){
-      kv.emplace_back("notify-keyspace-events",
-                      notify_flags_string(g_config.notify_keyspace_events));
+    for (std::string &n : names){
+      if (!glob_match(param.data(), param.size(), n.data(),n.size())){ continue; }
+      std::string v;
+      if (config_get_value(n, v)){ kv.emplace_back(std::move(n), std::move(v)); }
     }
 
     // empty array for unknown params
@@ -3010,6 +3008,7 @@ static bool free_memory_if_needed(){
     }
 
     notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key);
+    watch_touch(victim->key);
     hm_delete(&g_data.db, &victim->node, &hnode_same);
     // discharges used_memory; async-frees big values
     entry_del(victim);
@@ -3249,16 +3248,20 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
   if (sub == "setuser"){
     if (cmd.size() < 3){ return resp_err(out, "ERR wrong number of arguments for 'acl|setuser'"); }
-    // create if absent, stable address
-    User &u = g_config.users[cmd[2]];
+    // Stage onto a copy: a rejected modifier must not leave a half-configured
+    // user behind, and must not create one at all if the command fails.
+    auto it = g_config.users.find(cmd[2]);
+    User staged = (it != g_config.users.end()) ? it->second : User();
     // new user. disable, no perms, no keys
-    if (u.name.empty()){ u.name = cmd[2]; }
+    if (staged.name.empty()){ staged.name = cmd[2]; }
     for (size_t i = 3; i < cmd.size(); ++i){
-      if (!acl_apply_rule(u, cmd[i])){
+      if (!acl_apply_rule(staged, cmd[i])){
         return resp_err(out, ("ERR Error in ACL SETUSER modificer '" + cmd[i] + "'").c_str());
       }
     }
-    if (u.name.empty()){ u.name = cmd[2]; }
+    if (staged.name.empty()){ staged.name = cmd[2]; } // ACL "reset" clears it
+    // atomic
+    g_config.users[cmd[2]] = std::move(staged);
     audit_event("acl_change", conn, " sub=setuser target=" + cmd[2] +
                 " rules=" + std::to_string(cmd.size() - 3) + " result=ok"); // we count the rules, do not show
     return resp_ok(out);
@@ -3525,6 +3528,7 @@ static void do_discard(std::vector<std::string> &, Buffer *out, Conn *conn){
   conn->in_multi = false; 
   conn->multi_dirty = false;
   conn->queue_cmds.clear();
+  watch_clear_conn(conn); // a watch guards the next attempt only 
   resp_ok(out);
 }
 
@@ -3539,11 +3543,22 @@ static void do_exec(std::vector<std::string> &, Buffer *out, Conn *conn){
     return resp_err(out, "EXECABORT Transaction discarded because of prevous errors.");
   } 
 
+  // commit-time invalidation
+  if (conn->watch_dirty){
+    conn->in_multi = false;
+    conn->queue_cmds.clear();
+    watch_clear_conn(conn); // also resets watch_dirty
+    return resp_nil_arr(out);
+  }
+
   // Take the queue and leave MULTI *before* dispatching
   std::vector<std::vector<std::string>> batch;
   batch.swap(conn->queue_cmds);
   conn->in_multi = false;
   conn->multi_dirty = false;
+
+  // clear watches BEFORE running, not after
+  watch_clear_conn(conn);
 
   // atomic by construction
   conn->in_exec = true;
@@ -3557,6 +3572,19 @@ static void do_exec(std::vector<std::string> &, Buffer *out, Conn *conn){
 static void do_watch(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   // Redis rejects WATCH inside a transaction, and does NOT poison it
   if (conn->in_multi){ return resp_err(out, "ERR WATCH inside MULTI is not allowed"); }
+  // WATCH key [key ...] accumulates across calls, never replaces
+  for (size_t i = 1; i < cmd.size(); ++i){
+    if (conn->watched_keys.insert(cmd[i]).second){
+      g_data.watchers[cmd[i]].insert(conn);
+    }
+  }
+  resp_ok(out);
+}
+
+static void do_unwatch(std::vector<std::string> &, Buffer *out, Conn *conn){
+  // valid with or without an open MULTI
+  watch_clear_conn(conn);
+  resp_ok(out);
 }
 
 static void do_acl_placeholder(std::vector<std::string> &, Buffer *){} // real dispact is conn-aware
@@ -3676,7 +3704,9 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   // transactions
   {"multi",        {do_txn_stub,      1, 1}},
   {"discard",      {do_txn_stub,      1, 1}},
-  {"exec",      {do_txn_stub,      1, 1}},
+  {"exec",         {do_txn_stub,      1, 1}},
+  {"watch",        {do_txn_stub,      2,-1}},
+  {"unwatch",        {do_txn_stub,      1, 1}},
 };
 
 struct DispatchEntry {
@@ -3728,6 +3758,18 @@ void metadata_selfcheck(){
       problems++;
     }
   }
+  // every advertised directive must actually be gettable
+  std::vector<std::string> cfg_names;
+  config_all_names(cfg_names);
+  for (const std::string &n : cfg_names){
+    std::string v;
+    if (!config_get_value(n, v)){
+      fprintf(stderr, "selfcheck: config '%s' is listed but not gettable\n", n.c_str());
+      problems++;
+    }
+  }
+
+
   if (problems){
     fprintf(stderr, "selfcheck: %d command-metadata problem(s)\n", problems);
     die("command metadata self-check failed");
@@ -3829,6 +3871,8 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   if (canonical == "multi"){ return do_multi(cmd, out, conn); }
   if (canonical == "discard"){ return do_discard(cmd, out, conn); }
   if (canonical == "exec"){ return do_exec(cmd, out, conn); }
+  if (canonical == "watch"){ return do_watch(cmd, out, conn); }
+  if (canonical == "unwatch"){ return do_unwatch(cmd, out, conn); }
 
   // queueing gate: inside MULTI everything else is stored, not run
   // we follow redis semantics
@@ -3874,6 +3918,16 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   std::string notify_key;
   if (may_notify && cmd.size() > 1){ notify_key = cmd[1]; }
 
+  // capture watched key names before spec.fn (it consumes the cmd)
+  bool may_watch = spec.is_write && !g_data.watchers.empty() && !g_data.g_loading;
+  std::vector<std::string> watch_keys;
+  if (may_watch){
+    std::vector<std::string_view> kv;
+    cmd_collect_keys(spec, cmd, kv);
+    watch_keys.reserve(kv.size());
+    for (std::string_view k : kv){ watch_keys.emplace_back(k); } // copy: cmd gets comsumed
+  }
+
   // Snapshot before running swap() handlers/ consume cmd's
   bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
@@ -3882,6 +3936,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   std::vector<std::string> snapshot;
   if (may_log && reencode){ snapshot  = cmd; }
   spec.fn(cmd, out);
+
+  if (may_watch && g_data.g_writes_since_save != dirty_before){
+    for (const std::string &k : watch_keys){ watch_touch(k); }
+  }
 
   if (may_log && g_data.g_writes_since_save != dirty_before){
     if (reencode){
@@ -3959,6 +4017,7 @@ void acl_init_categories(){
     {"subscribe",KeySpec::NONE}, {"unsubscribe",KeySpec::NONE}, {"publish",KeySpec::NONE},
     {"psubscribe",KeySpec::NONE}, {"punsubscribe",KeySpec::NONE},
     {"multi",KeySpec::NONE}, {"discard",KeySpec::NONE},{"exec",KeySpec::NONE},
+    {"watch",KeySpec::ALL_FROM_1},{"unwatch",KeySpec::NONE},
   };
 
     // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
@@ -3979,7 +4038,8 @@ void acl_init_categories(){
     {"subscribe", CAT_FAST}, {"unsubscribe", CAT_FAST}, {"publish", CAT_FAST},
     {"psubscribe", CAT_FAST}, {"punsubscribe", CAT_FAST},
     {"multi", CAT_FAST | CAT_TRANSACTION}, {"discard", CAT_FAST | CAT_TRANSACTION},
-    {"exec", CAT_SLOW | CAT_TRANSACTION},
+    {"exec", CAT_SLOW | CAT_TRANSACTION},{"watch", CAT_FAST | CAT_TRANSACTION},
+    {"unwatch", CAT_FAST | CAT_TRANSACTION},
   };
 
   static const std::unordered_map<std::string_view, int> notify_cls = {

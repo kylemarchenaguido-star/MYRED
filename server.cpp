@@ -96,7 +96,8 @@ static void fd_set_nb(int fd){
 
 static void conn_destroy(Conn *conn){
   tr_close(conn);
-  pubsub_remove_conn(conn); // drop from evert channel before the Conn dies
+  pubsub_remove_conn(conn); // drop from every channel before the Conn dies
+  watch_clear_conn(conn);
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
   delete conn;
