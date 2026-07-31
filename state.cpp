@@ -162,6 +162,130 @@ static std::vector<std::string> config_tokenize(const char *line){
   return out;
 }
 
+// One row per directive, owning its name, arity, parse/assign and CONFIG GET
+// form. The dispatcher checks arity before calling apply(), so apply() may index
+// args freely — that is why the per-branch need1() calls disappear.
+struct ConfigDirective {
+  const char * name;
+  int min_args; // inclusive
+  int max_args; // inlucisve. -1 = unbounded
+  CfgResult (*apply)(const std::vector<std::string> &args, std::string &err);
+  bool (*get)(std::string &out);
+  bool boot_only; // Cconfig set refuses it 
+  bool masked; // get() answers a placeholder, never the stored value 
+};
+
+static const ConfigDirective k_config_table[] = {
+  { "port", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long p = 0;
+      if (!parse_int_strict(a[0].c_str(), &p) || p < 1 || p > 65535){
+        e = "invalid port"; return CfgResult::BADVALUE;
+      }
+      g_config.port = (int)p; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.port); return true; } },
+
+  { "protected-mode", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      bool b = false;
+      if (!parse_bool_strict(a[0], &b)){ e = "expected yes/no"; return CfgResult::BADVALUE; }
+      g_config.protected_mode = b; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.protected_mode ? "yes" : "no"; return true; } },
+
+  { "dbfilename", 1, 1, 
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.dump_path = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.dump_path; return true; } },
+
+  { "appendonly", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      bool b = false;
+      if (!parse_bool_strict(a[0], &b)){ e = "expected yes/no"; return CfgResult::BADVALUE; }
+      g_config.aof_enable = b; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.protected_mode ? "yes" : "no"; return true; } },
+
+    { "appendfilename", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.aof_path = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.aof_path; return true; } },
+
+  { "appendfsync", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if      (a[0] == "always")  { g_config.aof_fysnc = Aoffsync::ALWAYS; }
+      else if (a[0] == "no")      { g_config.aof_fysnc = Aoffsync::NO; }
+      else if (a[0] == "everysec"){ g_config.aof_fysnc = Aoffsync::EVERYSEC; }
+      else { e = "invalid appendfsync"; return CfgResult::BADVALUE; }
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      o = g_config.aof_fysnc == Aoffsync::ALWAYS ? "always"
+        : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec";
+      return true;
+    } },
+
+  { "maxmemory", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      size_t b = 0;
+      if (!parse_memory_size(a[0], &b)){ e = "invalid maxmemory"; return CfgResult::BADVALUE; }
+      g_config.maxmemory = b; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory); return true; } },
+
+  { "maxmemory-policy", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      MaxmemoryPolicy pol;
+      if (!parse_maxmemory_policy(a[0], &pol)){ e = "invalid policy"; return CfgResult::BADVALUE; }
+      g_config.maxmemory_policy = pol; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = maxmemory_policy_name(g_config.maxmemory_policy); return true; } },
+
+  { "maxmemory-samples", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long p = 0;
+      if (!parse_int_strict(a[0].c_str(), &p) || p < 1){
+        e = "invalid memory samples"; return CfgResult::BADVALUE;
+      }
+      g_config.maxmemory_samples = (int)p; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory_samples); return true; } },
+
+  // 0 args is legal here and means "off" — the one directive whose empty value is
+  // meaningful, which is also why config_write_scalar() must quote it.
+  { "notify-keyspace-events", 0, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      std::string v = a.empty() ? std::string() : a[0];
+      int f = 0;
+      if (!parse_notify_flags(v, &f)){
+        e = "invalid notify-keyspace-events flags"; return CfgResult::BADVALUE;
+      }
+      g_config.notify_keyspace_events = f; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = notify_flags_string(g_config.notify_keyspace_events); return true; } },
+
+  { "auto-aof-rewrite-percentage", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long p = 0;
+      if (!parse_int_strict(a[0].c_str(), &p) || p < 0){ e = "invalid"; return CfgResult::BADVALUE; }
+      g_config.aof_rewrite_perc = (int)p; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_perc); return true; } },
+
+  { "auto-aof-rewrite-min-size", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      size_t b = 0;
+      if (!parse_memory_size(a[0], &b)){ e = "invalid"; return CfgResult::BADVALUE; }
+      g_config.aof_rewrite_min_size = b; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_min_size); return true; } },
+};
+
+// Hoisted out of the table so the legacy underscore sppelings can
+
 CfgResult config_apply(const std::string &name_in, const std::vector<std::string> &args, std::string &err){
   std::string name = name_in;
   for (char &c : name){ c = (char)tolower((unsigned char)c); }
@@ -173,6 +297,16 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     } 
     return true; 
   };
+  // table first, if-chain below for directives not yet migrated.
+  for (const ConfigDirective &d : k_config_table){
+    if (name != d.name){ continue; }
+    if ((int)args.size() < d.min_args ||
+        (d.max_args >= 0 && (int)args.size() > d.max_args)){
+      err = "wrong number of args for '" + name + "'";
+      return CfgResult::BADVALUE;
+    }
+    return d.apply(args, err);
+  }
 
   // auth - network
   if (name == "requirepass"){ 
@@ -240,17 +374,6 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
-  if (name == "port"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    long p = 0;
-    if (!parse_int_strict(args[0].c_str(), &p) || p < 1 || p > 65535){
-      err = "invalid port";
-      return CfgResult::BADVALUE;  
-    }
-    g_config.port = (int)p;
-    return CfgResult::OK;
-  }
-
   if (name == "tls-port"){
     if (!need1()){ return CfgResult::BADVALUE; }
     long p = 0;
@@ -275,9 +398,9 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     std::string v = args[0];
     for (char &c : v){ c = (char)tolower((unsigned char)c); }
     if      (v == "yes")     {g_config.tls_auth_clients = TlsAuthClients::YES; }
-    else if (v == "nos")     {g_config.tls_auth_clients = TlsAuthClients::NO; }
+    else if (v == "no")     {g_config.tls_auth_clients = TlsAuthClients::NO; }
     else if (v == "optional"){g_config.tls_auth_clients = TlsAuthClients::OPTIONAL; }
-    else { err = "tls-auth-clients mus be yes, no, or optional"; return CfgResult::BADVALUE; }
+    else { err = "tls-auth-clients must be yes, no, or optional"; return CfgResult::BADVALUE; }
     return CfgResult::OK;
   }
   if (name == "tls-handshake-timeout"){
@@ -297,17 +420,6 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
-  if (name == "protected-mode"){
-    if(!need1()){ return CfgResult::BADVALUE; }
-    bool b = false;
-    if (!parse_bool_strict(args[0], &b)){
-      err= "expected yes/no";
-      return CfgResult::BADVALUE; 
-    }
-    g_config.protected_mode = b;
-    return CfgResult::OK;
-  }
-
   if (name == "allow-ip"){ 
     if (!need1()){ return CfgResult::BADVALUE; }
     uint32_t net, mask;
@@ -319,110 +431,6 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     return CfgResult::OK;
   }
 
-  // memory / eviction
-  if (name == "maxmemory"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    size_t b = 0;
-    if (!parse_memory_size(args[0], &b)){
-      err = "invalid maxmemory";
-      return CfgResult::BADVALUE;
-    }
-    g_config.maxmemory = b;
-    return CfgResult::OK;
-  }
-
-  if (name == "maxmemory-policy"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    MaxmemoryPolicy pol;
-    if (!parse_maxmemory_policy(args[0], &pol)){
-      err = "invalid policy";
-      return CfgResult::BADVALUE;
-    }
-    g_config.maxmemory_policy = pol;
-    return CfgResult::OK;
-  }
-
-  if (name == "maxmemory-samples"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    long p = 0;
-    if (!parse_int_strict(args[0].c_str(), &p) || p < 1){
-      err = "invalid memory samples";
-      return CfgResult::BADVALUE;
-    }
-    g_config.maxmemory_samples = (int)p;
-    return CfgResult::OK;
-  }
-
-  if (name == "notify-keyspace-events"){
-    // empty value is legal and means "off"
-    std::string v = args.empty() ? std::string() : args[0];
-    int f = 0;
-    if (!parse_notify_flags(v, &f)) {err = "invalid notify-keyspace-events flags"; return CfgResult::BADVALUE; }
-    g_config.notify_keyspace_events = f;
-    return CfgResult::OK;
-  }
-
-  // AOF persistence
-  if (name == "appendonly"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    bool b = false;
-    if (!parse_bool_strict(args[0], &b)){
-      err = "expected yes/no";
-      return CfgResult::BADVALUE;
-    }
-    g_config.aof_enable = b;
-    return CfgResult::OK;
-  }
-
-  if (name == "appendfsync"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    if (args[0] == "always"){
-      g_config.aof_fysnc = Aoffsync::ALWAYS;
-    } else if (args[0] == "no"){
-      g_config.aof_fysnc = Aoffsync::NO;
-    } else if (args[0] == "everysec"){
-      g_config.aof_fysnc = Aoffsync::EVERYSEC;
-    } else {
-      err = "invalid appendfsync";
-      return CfgResult::BADVALUE;
-    }
-    return CfgResult::OK;
-  }
-
-  if (name == "appendfilename"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    g_config.aof_path = args[0];
-    return CfgResult::OK;
-  }
-
-  if (name == "auto-aof-rewrite-percentage" || name == "auto_aof_rewrite-percentage"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    long p = 0;
-    if (!parse_int_strict(args[0].c_str(), &p) || p < 0){
-      err = "invalid";
-      return CfgResult::BADVALUE;
-    }
-    g_config.aof_rewrite_perc = (int)p;
-    return CfgResult::OK;
-  }
-
-  if (name == "auto-aof-rewrite-min-size" || name == "auto_aof_rewrite-min-size"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    size_t b = 0;
-    if (!parse_memory_size(args[0], &b)){
-      err = "invalid";
-      return CfgResult::BADVALUE;
-    }
-    g_config.aof_rewrite_min_size = b;
-    return CfgResult::OK;
-  }
-
-  // RDB persistence
-  if (name == "dbfilename"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    g_config.dump_path = args[0];
-    return CfgResult::OK;
-  }
 
   if (name == "save"){
     // save '' -> disable all save conditions 
@@ -485,13 +493,14 @@ bool config_load_file(const char *path){
 // config_all_names(), or CONFIG GET silently answers [].
 bool config_get_value(const std::string &name, std::string &out){
   char buf[64];
-  if (name == "port"){ snprintf(buf, sizeof(buf), "%d", g_config.port); out = buf; return true; }
+  for (const ConfigDirective &d : k_config_table){
+    if (name == d.name){ return d.get(out); }
+  }
   if (name == "bind"){
     out.clear();
     for (const std::string &b : g_config.binds){ if (!out.empty()){ out += ' '; } out += b; }
     return true;
   }
-  if (name == "protected-mode"){ out = g_config.protected_mode ? "yes" : "no"; return true; }
   if (name == "allow-ip"){
     out.clear();
     for (const auto &a : g_config.allowlist){
@@ -522,29 +531,7 @@ bool config_get_value(const std::string &name, std::string &out){
     out = buf;
     return true;
   }
-  if (name == "dbfilename"){     out = g_config.dump_path; return true; }
-  if (name == "appendonly"){     out = g_config.aof_enable ? "yes" : "no"; return true; }
-  if (name == "appendfilename"){ out = g_config.aof_path;  return true; }
-  if (name == "appendfsync"){
-    out = g_config.aof_fysnc == Aoffsync::ALWAYS ? "always"
-        : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec";
-    return true;
-  }
-  if (name == "maxmemory"){ snprintf(buf, sizeof(buf), "%zu", g_config.maxmemory); out = buf; return true; }
-  if (name == "maxmemory-policy"){ out = maxmemory_policy_name(g_config.maxmemory_policy); return true; }
-  if (name == "maxmemory-samples"){
-    snprintf(buf, sizeof(buf), "%d", g_config.maxmemory_samples); out = buf; return true;
-  }
-  if (name == "notify-keyspace-events"){
-    out = notify_flags_string(g_config.notify_keyspace_events); return true;
-  }
-
-  if (name == "auto-aof-rewrite-percentage"){
-    snprintf(buf, sizeof(buf), "%d",g_config.aof_rewrite_perc); out = buf; return true;
-  }
-  if (name == "auto-aof-rewrite-min-size"){
-    snprintf(buf, sizeof(buf), "%zu", g_config.aof_rewrite_min_size); out = buf; return true;
-  }
+  
   if (name == "save"){
     out.clear();
     for (const SaveCondition &s : g_config.save_conditions){
@@ -572,18 +559,65 @@ void config_all_names(std::vector<std::string> &out){
   for (const char *n : names){ out.emplace_back(n); }
 }
 
+// directives whose disk form is exactly "name config_get_vaule()".
+static const char *k_scalars_net[] = {"port", "protected-mode"};
+
+static const char *k_scalars_data[] = {
+  "dbfilename", "appendonly", "appendfilename", "appendfsync",
+  "maxmemory", "maxmemory-policy", "maxmemory-samples",
+  "notify-keyspace-events",
+};
+
+static const char *k_scalars_aof[] = {
+  "auto-aof-rewrite-percentage", "auto-aof-rewrite-min-size",
+};
+
+void config_rewrite_scalars(std::vector<std::string> &out){
+  for (const char *n : k_scalars_net) { out.emplace_back(n); }
+  for (const char *n : k_scalars_data){ out.emplace_back(n); }
+  for (const char *n : k_scalars_aof) { out.emplace_back(n); }
+}
+
+// The one place a scalar directive reaches disk. Values comes from
+// config_get_value(), so CONFIG GET and CONFIG REWRITE cannot drift apart
+static bool config_write_scalar(FILE *fp, const std::string &name){
+  if (name == "requirepass"){ return false; }
+  std::string v;
+  if (!config_get_value(name, v)){ return false; }
+  // Quote only what config_tokenize() would otherwise mangle: an empty value
+  // tokenizes to zero args (need1() rejects it at the next boot), whitespace
+  // splits it in two, '#' starts a comment, and '"'/'\' are the escape chars.
+  // Everything else stays bare, so `port 1234` keeps reading like a config file.
+  bool quote = v.empty();
+  for (char c : v){
+    if (isspace((unsigned char)c) || c == '"' || c == '\\' || c == '#'){ quote = true; break; }
+  }
+  if (!quote){
+    fprintf(fp, "%s %s\n", name.c_str(), v.c_str());
+    return true;
+  }
+  std::string esc;
+  for (char c : v){
+    if (c == '"' || c == '\\'){ esc += '\\'; }
+    esc += c;
+  }
+  fprintf(fp, "%s \"%s\"\n", name.c_str(), esc.c_str());
+  return true;
+}
+
 // serialize live config back
 bool config_rewrite(const char * path){
   std::string tmp = std::string(path) + ".tmp";
   FILE *fp = fopen(tmp.c_str() ,"w");
   if (!fp){ return false; }
-  fprintf(fp, "port %d\n", g_config.port);
+
+  bool ok = true;
+  for (const char *n : k_scalars_net){ ok = config_write_scalar(fp, n) && ok; }
   if (!g_config.binds.empty()){
     fprintf(fp, "bind");
     for (const std::string &b : g_config.binds){ fprintf(fp, " %s", b.c_str()); }
     fprintf(fp, "\n");
   }
-  fprintf(fp, "protected-mode %s\n", g_config.protected_mode ? "yes" : "no");
   for (const auto &a : g_config.allowlist){
     struct in_addr ia;
     ia.s_addr = htonl(a.first);
@@ -617,21 +651,12 @@ bool config_rewrite(const char * path){
   if (g_config.tls_handshake_timeout_ms != 10 * 1000){
     fprintf(fp, "tls-handshake-timeout %d\n", g_config.tls_handshake_timeout_ms / 1000);
   }
-  fprintf(fp, "dbfilename %s\n", g_config.dump_path.c_str());
-  fprintf(fp, "appendonly %s\n", g_config.aof_enable ? "yes" : "no");
-  fprintf(fp, "appendfilename %s\n", g_config.aof_path.c_str());
-  fprintf(fp, "appendfsync %s\n",  g_config.aof_fysnc == Aoffsync::ALWAYS ? "always" 
-                                : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec");
-  fprintf(fp, "maxmemory %zu\n", g_config.maxmemory);
-  fprintf(fp, "maxmemory-policy %s\n", maxmemory_policy_name(g_config.maxmemory_policy));
-  fprintf(fp, "maxmemory-samples %d\n", g_config.maxmemory_samples);
-  fprintf(fp, "notify-keyspace-events \"%s\"\n", notify_flags_string(g_config.notify_keyspace_events).c_str());
+  for (const char *n : k_scalars_data){ ok = config_write_scalar(fp, n) && ok; }
   for (const SaveCondition &s : g_config.save_conditions){
     fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
   }
 
-  fprintf(fp, "auto-aof-rewrite-percentage %d\n", g_config.aof_rewrite_perc);
-  fprintf(fp, "auto-aof-rewrite-min-size %zu\n", g_config.aof_rewrite_min_size);
+  for (const char *n : k_scalars_aof){ ok = config_write_scalar(fp, n) && ok; }
 
   // ACL users - skip 'default': it is rebuilt from requirepass + acl_bootstrap_default() at boot
   for (const auto &kv : g_config.users){
@@ -647,7 +672,7 @@ bool config_rewrite(const char * path){
 
   if (!g_config.auditlog_path.empty()){ fprintf(fp, "auditlog \"%s\"\n", g_config.auditlog_path.c_str()); }
 
-  if (fflush(fp) != 0 || fsync(fileno(fp)) != 0){
+  if (!ok || fflush(fp) != 0 || fsync(fileno(fp)) != 0){
     fclose(fp);
     unlink(tmp.c_str());
     return false;

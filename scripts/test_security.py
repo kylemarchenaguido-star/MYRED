@@ -163,14 +163,26 @@ def main():
         sm.close()
 
         # --- 5. ACL CAT framing ---------------------------------------------
-        print("\n[5] ACL CAT is a well-formed array of the 8 categories")
+        # ACL CAT (advertise) and acl_cat_bit() (parse) are a matched pair: a
+        # category emitted but not parsed writes a +@cat into the config that the
+        # next boot rejects, silently dropping the grant. V8.4 shipped with that
+        # split for one round-trip. Adding a category means updating this list.
+        print("\n[5] ACL CAT is a well-formed array of the 9 categories")
         cats = cmd(admin, "ACL", "CAT")
         check("ACL CAT returns a list", isinstance(cats, list))
-        check("ACL CAT lists exactly the 8 categories",
+        check("ACL CAT lists exactly the 9 categories",
               sorted(cats or []) == sorted(["read", "write", "keyspace", "admin",
                                             "dangerous", "fast", "slow",
-                                            "connection"]),
+                                            "connection", "transaction"]),
               f"got {cats}")
+        # 'off' first: User::enable defaults to true, so a bare SETUSER would
+        # leave an enabled +@admin +@dangerous user behind. Deleted right after
+        # so it never reaches the CONFIG REWRITE in [6].
+        check("[REG] every advertised category is also parseable",
+              all(cmd(admin, "ACL", "SETUSER", "cattest", "off", f"+@{c}") == "OK"
+                  for c in (cats or [])),
+              f"got {cats}")
+        cmd(admin, "ACL", "DELUSER", "cattest")
 
         # --- 6. config round-trip across a restart --------------------------
         print("\n[6] CONFIG REWRITE -> restart -> users and rules survive")

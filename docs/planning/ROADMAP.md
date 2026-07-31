@@ -50,7 +50,7 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V9.8 - Config refactor: one directive table [Next]
+### V9.8 - Config refactor: one directive table [In Progress]
 
 `config_apply` (parse/validate/assign), `config_rewrite` (format/write) and
 `config_get_value` (format/return) each hand-enumerate the same ~23 directives.
@@ -62,29 +62,10 @@ undetected 6 days, came back passwordless), `notify-keyspace-events` missing fro
 get (V8.3), `appendfilename` missing from get (V8.5), and four directives plus two
 string-literal typos in the new getter (V8.8, caught at boot by its own selfcheck).
 
-#### V9.8.1 - Share the formatter for unconditional scalars [Next]
+**V9.8.1 is done** (2026-07-30) — see Completed Milestones. The 12 unconditional
+scalars now share one formatter; `config_rewrite` no longer hand-formats them.
 
-Small, safe, and it kills the drift that has actually bitten. Make
-`config_rewrite` call `config_get_value` for the ~12 directives it emits
-unconditionally: `port`, `protected-mode`, `dbfilename`, `appendonly`,
-`appendfilename`, `appendfsync`, `maxmemory`, `maxmemory-policy`,
-`maxmemory-samples`, `notify-keyspace-events`, `auto-aof-rewrite-percentage`,
-`auto-aof-rewrite-min-size`. After this, GET and REWRITE are structurally
-incapable of disagreeing about them, in a diff of about a dozen lines.
-
-- **The trap, and it is exactly the bug class that already cost a password:**
-  `requirepass` must NEVER flow through the shared formatter — `config_get_value`
-  deliberately masks it, so routing it through would write `requirepass <set>` to
-  disk and the next boot would hash the literal string `<set>` as the password.
-  Same exclusion for the multi-line directives (`bind`, `allow-ip`, `save`,
-  `rename-command`, `user`) and the conditionally-emitted `tls-*` family. Scope is
-  unconditional scalars only, and the boot selfcheck must assert `requirepass` is
-  not in that set.
-- Done when: the 12 scalars are emitted from one formatter, `CONFIG REWRITE` +
-  restart round-trips unchanged (diff the file before/after), `requirepass`
-  survives the round-trip with its hash intact, and the full suite is green.
-
-#### V9.8.2 - Full directive table [Backlog]
+#### V9.8.2 - Full directive table [Next]
 
 The real milestone. One array of descriptors owning name, arity, boot-only flag,
 an `apply` function and a `format` function; all three call sites become table
@@ -113,6 +94,40 @@ V8 Pub/Sub, V8 Transactions and V8.8 all closed, no open bugs. The tree is
 committed through `c7912e0`; everything from V8.4 onward is uncommitted.
 
 ## Completed Milestones
+
+### V9.8.1 - Shared formatter for unconditional scalars [Done]
+
+Closed 2026-07-30. `config_rewrite` now emits 12 directives via
+`config_write_scalar()`, which reads the value from `config_get_value()` — so
+`CONFIG GET` and `CONFIG REWRITE` are structurally incapable of disagreeing about
+`port`, `protected-mode`, `dbfilename`, `appendonly`, `appendfilename`,
+`appendfsync`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`,
+`notify-keyspace-events` and the two `auto-aof-rewrite-*`. Names live in three
+arrays (`k_scalars_net/data/aof`) rather than one, because the hand-written
+multi-line directives sit between them in file order; `port`/`protected-mode`
+moved above `bind` to make the first run contiguous, which is safe since all four
+are plain assignments in `config_apply`.
+
+- **`requirepass` is blocked twice, deliberately.** `config_write_scalar` returns
+  false for it at the choke point (aborting the whole rewrite, leaving the live
+  file untouched via the existing `unlink(tmp)` path), *and* `metadata_selfcheck`
+  fails the boot if it ever appears in `config_rewrite_scalars()`. The masked
+  `<set>` value reaching disk would make the next boot hash that literal string as
+  the password — a rerun of `3e2d0e9`.
+- **Quote on demand, not always.** The first cut quoted every value and broke
+  `test_security.py`'s `port {port}` grep. Only an empty value or one containing
+  whitespace / `#` / `"` / `\` needs quoting; everything else stays bare. Keeps
+  11 of 12 byte-identical to the old output, and fixes the latent bug where an
+  unquoted `dbfilename /path/with space` made the *next boot* fail `need1()`.
+- Verified: two consecutive `CONFIG REWRITE`s diff clean (idempotent), the
+  password round-tripped as a real `$argon2id$` line, `dbfilename "my dump.rdb"`
+  emitted quoted beside a bare `appendfilename appendonly.aof`, and a restart on
+  the rewritten file came back up and answered `my dump.rdb`. Nothing in `scripts/`
+  covers rewrite idempotence — that check is manual, on a throwaway conf.
+- Also fixed here: `test_security.py`'s `ACL CAT` assertion still expected 8
+  categories after `@transaction` made it 9 in V8.4, and gained a `[REG]` check
+  that feeds every advertised category back through `ACL SETUSER` so the
+  emit/parse pair cannot silently split again.
 
 ### V8.8 - Follow-up fixes [Done]
 

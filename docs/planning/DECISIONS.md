@@ -170,6 +170,28 @@ instead of queueing, consistent with the other four transaction commands, which
 all dispatch above the queueing gate. `AUTH` likewise runs immediately inside
 `MULTI` — it short-circuits before the gate, and our AUTH is async.
 
+### Config Formatting (V9.8.1)
+
+A directive's disk form comes from `config_write_scalar()`, which reads the value
+from `config_get_value()` — one formatter, so `CONFIG GET` and `CONFIG REWRITE`
+cannot drift. Only unconditional scalars qualify; multi-line accumulating
+directives (`bind`, `allow-ip`, `save`, `rename-command`, `user`) and conditionally
+emitted ones (`tls-*`, `requirepass`) stay hand-written until V9.8.2.
+
+Quoting is **on demand, not always**. The tokenizer splits on whitespace, treats
+`#` as a comment, and uses `"`/`\` as its own escapes, so a value is quoted only
+when it is empty or contains one of those. Quoting everything was tried first and
+rejected: it gains nothing for `port 1234`, normalizes the shape of every existing
+config file, and broke a test that greps for a bare directive. The empty case is
+not cosmetic — an unquoted empty value tokenizes to zero args, which `need1()`
+then rejects at the *next boot*, so `notify-keyspace-events` off must be `""`.
+
+`requirepass` is excluded twice over: `config_write_scalar` refuses it at the
+choke point, and `metadata_selfcheck` fails the boot if it appears in
+`config_rewrite_scalars()`. One guard is the invariant, the other is the alarm —
+its masked `<set>` value reaching disk would make the next boot hash that literal
+string as the password.
+
 ### Transport Seam (TLS)
 
 All per-connection socket I/O routes through `transport.h/.cpp`

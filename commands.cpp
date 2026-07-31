@@ -3768,7 +3768,20 @@ void metadata_selfcheck(){
       problems++;
     }
   }
-
+  std::vector<std::string> scalars;
+  config_rewrite_scalars(scalars);
+  for (const std::string &n : scalars){
+    if (n == "requirepass"){
+      fprintf(stderr, "selfcheck: 'requirepass' is in the shared rewwrite set"
+                      "(CONFIG REWRITE would write the masked value to disk)\n");
+      problems++;
+    }
+    std::string v;
+    if (!config_get_value(n, v)){
+      fprintf(stderr, "selfcheck: rewrite scalar '%s' is not gettable\n", n.c_str());
+      problems++;
+    }
+  }
 
   if (problems){
     fprintf(stderr, "selfcheck: %d command-metadata problem(s)\n", problems);

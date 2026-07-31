@@ -330,6 +330,7 @@ bool config_load_file(const char *path);
 bool config_rewrite(const char *path);
 bool config_get_value(const std::string &name, std::string &out); // false = unknown directive
 void config_all_names(std::vector<std::string> &out); // every gettable directive
+void config_rewrite_scalars(std::vector<std::string> &out); // directives emitted  via the shared format
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
