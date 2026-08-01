@@ -356,20 +356,4 @@ performance-and-polish list and the Testing-debt items.
   were hardened during the project-wide review.
 
 
-## Misc
-1. Authed full suite over TLS — proves the whole command surface including auth + ACL works through the tunnel (retry absorbs the throttle):
-
-./build/server myred.conf                     # TLS 1235, requirepass
-python3 scripts/stress_test.py --tls --tls-insecure --port 1235 \
-        --password s3cret --log docs/stress_tls.md
-
-2. TLS throughput baseline — passwordless, so -c 50 doesn't storm:
-
-./build/server bench.conf                      # plaintext 1336 + TLS 1337, no password
-python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench \
-        --log docs/bench_tls.md
-
-3. Plaintext baseline for the comparison — same running bench.conf instance, plain port:
-python3 scripts/stress_test.py --port 1336 --bench --log docs/bench_plain.md
-
 

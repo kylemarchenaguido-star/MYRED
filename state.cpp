@@ -173,6 +173,7 @@ struct ConfigDirective {
   bool (*get)(std::string &out);
   bool boot_only; // Cconfig set refuses it 
   bool masked; // get() answers a placeholder, never the stored value 
+  void (*emit) (FILE *fp);
 };
 
 static const ConfigDirective k_config_table[] = {
@@ -184,7 +185,8 @@ static const ConfigDirective k_config_table[] = {
       }
       g_config.port = (int)p; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = std::to_string(g_config.port); return true; } },
+    [](std::string &o) -> bool { o = std::to_string(g_config.port); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "protected-mode", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -192,13 +194,190 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_bool_strict(a[0], &b)){ e = "expected yes/no"; return CfgResult::BADVALUE; }
       g_config.protected_mode = b; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = g_config.protected_mode ? "yes" : "no"; return true; } },
+    [](std::string &o) -> bool { o = g_config.protected_mode ? "yes" : "no"; return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+  { "bind", 1, -1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.binds = a; return CfgResult::OK;   // assigns; arity guarantees non-empty
+    },
+    [](std::string &o) -> bool {
+      o.clear();
+      for (const std::string &b : g_config.binds){ if (!o.empty()){ o += ' '; } o += b; }
+      return true;
+    },
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (g_config.binds.empty()){ return; }
+      fprintf(fp, "bind");
+      for (const std::string &b : g_config.binds){ fprintf(fp, " %s", b.c_str()); }
+      fprintf(fp, "\n");
+    } },
+
+  { "allow-ip", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      uint32_t net, mask;
+      if (!parse_cidr(a[0], &net, &mask)){ e = "invalid CIDR '" + a[0] + "'"; return CfgResult::BADVALUE; }
+      g_config.allowlist.push_back({ net, mask });
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      char b[64];
+      o.clear();
+      for (const auto &a : g_config.allowlist){
+        struct in_addr ia;
+        ia.s_addr = htonl(a.first);
+        if (!o.empty()){ o += ' '; }
+        o += inet_ntoa(ia);
+        snprintf(b, sizeof(b), "/%d", __builtin_popcount(a.second));
+        o += b;
+      }
+      return true;
+    },
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      for (const auto &a : g_config.allowlist){
+        struct in_addr ia;
+        ia.s_addr = htonl(a.first);
+        fprintf(fp, "allow-ip %s/%d\n", inet_ntoa(ia), __builtin_popcount(a.second));
+      }
+    } },
+    
+  { "requirepass", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (a[0].empty()){
+        g_config.password.clear();
+      } else if (a[0].size() == 65 && a[0][0] == '#'){
+        g_config.password = a[0].substr(1);
+      } else if (a[0].rfind("$argon2id$", 0) == 0){
+        g_config.password = a[0];
+      } else {
+        g_config.password = cred_hash_new(a[0]);   // plaintext: current policy
+        if (g_config.password.empty()){ e = "password hashing failed"; return CfgResult::BADVALUE; }
+      }
+      // default's hash list mirrors requirepass. acl_bootstrap_default() rebuilds
+      // it at boot; this keeps them in step on a live CONFIG SET too.
+      auto du = g_config.users.find("default");
+      if (du != g_config.users.end()){
+        du->second.pw_hashes.clear();
+        if (!g_config.password.empty()){ du->second.pw_hashes.push_back(g_config.password); }
+      }
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.password.empty() ? "" : "<set>"; return true; },
+    /*boot_only*/ false, /*masked*/ true,
+    /*emit*/ [](FILE *fp){
+      if (g_config.password.empty()){ return; }
+      if (g_config.password.rfind("$argon2id$", 0) == 0){
+        fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
+      } else {
+        fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
+      }
+    } },
+
+  { "tls-port", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long p = 0;
+      if (!parse_int_strict(a[0].c_str(), &p) || p < 0 || p > 65535){
+        e = "invalid tls-port"; return CfgResult::BADVALUE;
+      }
+      g_config.tls_port = (int)p; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.tls_port); return true; },
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (g_config.tls_port != 0){ fprintf(fp, "tls-port %d\n", g_config.tls_port); }
+    } },
+
+  { "tls-cert-file", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.tls_cert_file = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.tls_cert_file; return true; },
+    // tls-cert-file
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (!g_config.tls_cert_file.empty()){
+        fprintf(fp, "tls-cert-file \"%s\"\n", g_config.tls_cert_file.c_str());
+      }
+    } },
+
+  { "tls-key-file", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.tls_key_file = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.tls_key_file; return true; },
+    // tls-key-file
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (!g_config.tls_key_file.empty()){
+        fprintf(fp, "tls-key-file \"%s\"\n", g_config.tls_key_file.c_str());
+      }
+    } },
+
+  { "tls-ca-cert-file", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.tls_ca_cert_file = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.tls_ca_cert_file; return true; },
+    // tls-ca-cert-file
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (!g_config.tls_ca_cert_file.empty()){
+        fprintf(fp, "tls-ca-cert-file \"%s\"\n", g_config.tls_ca_cert_file.c_str());
+      }
+    } },
+
+
+  { "tls-auth-clients", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      std::string v = a[0];
+      for (char &c : v){ c = (char)tolower((unsigned char)c); }
+      if      (v == "yes")     { g_config.tls_auth_clients = TlsAuthClients::YES; }
+      else if (v == "no")      { g_config.tls_auth_clients = TlsAuthClients::NO; }
+      else if (v == "optional"){ g_config.tls_auth_clients = TlsAuthClients::OPTIONAL; }
+      else { e = "tls-auth-clients must be yes, no, or optional"; return CfgResult::BADVALUE; }
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      o = g_config.tls_auth_clients == TlsAuthClients::YES ? "yes"
+        : g_config.tls_auth_clients == TlsAuthClients::NO  ? "no" : "optional";
+      return true;
+    },
+    // tls-auth-clients
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (g_config.tls_auth_clients != TlsAuthClients::NO){
+        fprintf(fp, "tls-auth-clients %s\n",
+                g_config.tls_auth_clients == TlsAuthClients::YES ? "yes" : "optional");
+      }
+    } },
+
+  { "tls-handshake-timeout", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long s = 0;
+      if (!parse_int_strict(a[0].c_str(), &s) || s < 1 || s > 3600){
+        e = "invalid tls-handshake-timeout (seconds, 1-3600)"; return CfgResult::BADVALUE;
+      }
+      g_config.tls_handshake_timeout_ms = (int)s * 1000; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.tls_handshake_timeout_ms / 1000); return true; },
+    // tls-handshake-timeout
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (g_config.tls_handshake_timeout_ms != 10 * 1000){
+        fprintf(fp, "tls-handshake-timeout %d\n", g_config.tls_handshake_timeout_ms / 1000);
+      }
+    } },
+
+
 
   { "dbfilename", 1, 1, 
     [](const std::vector<std::string> &a, std::string &) -> CfgResult {
       g_config.dump_path = a[0]; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = g_config.dump_path; return true; } },
+    [](std::string &o) -> bool { o = g_config.dump_path; return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "appendonly", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -206,13 +385,15 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_bool_strict(a[0], &b)){ e = "expected yes/no"; return CfgResult::BADVALUE; }
       g_config.aof_enable = b; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = g_config.protected_mode ? "yes" : "no"; return true; } },
+    [](std::string &o) -> bool { o = g_config.aof_enable ? "yes" : "no"; return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
     { "appendfilename", 1, 1,
     [](const std::vector<std::string> &a, std::string &) -> CfgResult {
       g_config.aof_path = a[0]; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = g_config.aof_path; return true; } },
+    [](std::string &o) -> bool { o = g_config.aof_path; return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "appendfsync", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -226,7 +407,8 @@ static const ConfigDirective k_config_table[] = {
       o = g_config.aof_fysnc == Aoffsync::ALWAYS ? "always"
         : g_config.aof_fysnc == Aoffsync::NO     ? "no" : "everysec";
       return true;
-    } },
+    },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "maxmemory", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -234,7 +416,8 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_memory_size(a[0], &b)){ e = "invalid maxmemory"; return CfgResult::BADVALUE; }
       g_config.maxmemory = b; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory); return true; } },
+    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "maxmemory-policy", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -242,7 +425,8 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_maxmemory_policy(a[0], &pol)){ e = "invalid policy"; return CfgResult::BADVALUE; }
       g_config.maxmemory_policy = pol; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = maxmemory_policy_name(g_config.maxmemory_policy); return true; } },
+    [](std::string &o) -> bool { o = maxmemory_policy_name(g_config.maxmemory_policy); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "maxmemory-samples", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -252,7 +436,8 @@ static const ConfigDirective k_config_table[] = {
       }
       g_config.maxmemory_samples = (int)p; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory_samples); return true; } },
+    [](std::string &o) -> bool { o = std::to_string(g_config.maxmemory_samples); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   // 0 args is legal here and means "off" — the one directive whose empty value is
   // meaningful, which is also why config_write_scalar() must quote it.
@@ -265,7 +450,37 @@ static const ConfigDirective k_config_table[] = {
       }
       g_config.notify_keyspace_events = f; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = notify_flags_string(g_config.notify_keyspace_events); return true; } },
+    [](std::string &o) -> bool { o = notify_flags_string(g_config.notify_keyspace_events); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+    { "save", 1, 2,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (a.size() == 1 && a[0].empty()){        // save '' disables all conditions
+        g_config.save_conditions.clear(); return CfgResult::OK;
+      }
+      if (a.size() != 2){ e = "save needs <seconds> <changes>"; return CfgResult::BADVALUE; }
+      g_config.save_conditions.push_back({
+        strtoull(a[0].c_str(), nullptr, 10),
+        (uint32_t)strtoul(a[1].c_str(), nullptr, 10)
+      });
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      char b[64];
+      o.clear();
+      for (const SaveCondition &s : g_config.save_conditions){
+        if (!o.empty()){ o += ' '; }
+        snprintf(b, sizeof(b), "%llu %u", (unsigned long long)s.seconds, s.changes);
+        o += b;
+      }
+      return true;
+    },
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      for (const SaveCondition &s : g_config.save_conditions){
+        fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
+      }
+    } },
 
   { "auto-aof-rewrite-percentage", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -273,7 +488,8 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_int_strict(a[0].c_str(), &p) || p < 0){ e = "invalid"; return CfgResult::BADVALUE; }
       g_config.aof_rewrite_perc = (int)p; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_perc); return true; } },
+    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_perc); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "auto-aof-rewrite-min-size", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -281,8 +497,141 @@ static const ConfigDirective k_config_table[] = {
       if (!parse_memory_size(a[0], &b)){ e = "invalid"; return CfgResult::BADVALUE; }
       g_config.aof_rewrite_min_size = b; return CfgResult::OK;
     },
-    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_min_size); return true; } },
+    [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_min_size); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+    // Not exposed by CONFIG GET (get == nullptr): both are write-only config-file
+  // constructs with no single-value form.
+  { "user", 1, -1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      User &u = g_config.users[a[0]];
+      if (u.name.empty()){ u.name = a[0]; }
+      for (size_t i = 1; i < a.size(); ++i){
+        if (!acl_apply_rule(u, a[i])){
+          e = "Invalid ACL rule '" + a[i] + "' for user '" + a[0] + "'";
+          return CfgResult::BADVALUE;
+        }
+      }
+      if (u.name.empty()){ u.name = a[0]; }   // a reset token wipes name mid-line
+      return CfgResult::OK;
+    },
+    nullptr,
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      // 'default' is skipped: rebuilt from requirepass + acl_bootstrap_default() at boot
+      for (const auto &kv : g_config.users){
+        if (kv.first == "default"){ continue; }
+        std::string line = acl_format_user(kv.first, kv.second, true);  // real hashes, quoted
+        fprintf(fp, "%s\n", line.c_str());
+      }
+    } },
+
+  { "rename-command", 2, 2,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      std::string oldn = a[0], neu = a[1];
+      for (char &c : oldn){ c = (char)tolower((unsigned char)c); }
+      for (char &c : neu){ c = (char)tolower((unsigned char)c); }
+
+      if (oldn.empty()){ e = "rename-command OLD is empty"; return CfgResult::BADVALUE; }
+      if (!command_is_known(oldn)){ e = "rename-command: unknown command '" + oldn + "'"; return CfgResult::BADVALUE; }
+      for (auto &r : g_config.renames){
+        if (r.first == oldn){ e = "rename-command: '" + oldn + "' renamed twice"; return CfgResult::BADVALUE; }
+      }
+      if (!neu.empty()){
+        for (unsigned char c : neu){
+          if (c < 0x20 || c == 0x7f){ e = "rename-command: NEW has control chars"; return CfgResult::BADVALUE; }
+        }
+        if (command_is_known(neu)){ e = "rename-command: NEW '" + neu + "' collides with a command"; return CfgResult::BADVALUE; }
+        for (auto &r : g_config.renames){
+          if (r.second == neu){ e = "rename-command: NEW '" + neu + "' already used"; return CfgResult::BADVALUE; }
+        }
+      } else if (oldn == "auth" && !g_config.password.empty()){
+        e = "refusing to disable AUTH while a password is set (would lock out clients)";
+        return CfgResult::BADVALUE;
+      }
+      g_config.renames.emplace_back(oldn, neu);
+      return CfgResult::OK;
+    },
+    nullptr,
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      for (const auto &r : g_config.renames){
+        if (r.second.empty()){ fprintf(fp, "rename-command %s \"\"\n", r.first.c_str()); }
+        else { fprintf(fp, "rename-command %s %s\n", r.first.c_str(), r.second.c_str()); }
+      }
+    } },
+
+  { "auditlog", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.auditlog_path = a[0];   // "" disables, "stderr", or a path
+      audit_open(g_config.auditlog_path);
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.auditlog_path; return true; },
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (!g_config.auditlog_path.empty()){
+        fprintf(fp, "auditlog \"%s\"\n", g_config.auditlog_path.c_str());
+      }
+    } },
+
 };
+
+// Structural invariasnt of k_config_table. Returns the number of problems/
+// Structural invariants of k_config_table. Returns the number of problems.
+int config_selfcheck(){
+  int problems = 0;
+  for (const ConfigDirective &d : k_config_table){
+    if (!d.apply){
+      fprintf(stderr, "selfcheck: config '%s' has no apply()\n", d.name);
+      problems++;
+    }
+    if (d.masked && !d.emit){
+      fprintf(stderr, "selfcheck: masked config '%s' has no emit() — CONFIG REWRITE "
+                      "would write its placeholder to disk\n", d.name);
+      problems++;
+    }
+    if (d.max_args >= 0 && d.max_args < d.min_args){
+      fprintf(stderr, "selfcheck: config '%s' has an impossible arity\n", d.name);
+      problems++;
+    }
+  }
+  for (const ConfigDirective &d : k_config_table){
+    if (d.emit || !d.get){ continue; }
+    std::string v1, v2, err;
+    if (!d.get(v1)){ continue; }
+    std::vector<std::string> args;
+    if (!v1.empty()){ args.push_back(v1); }
+    if ((int)args.size() < d.min_args){ continue; }   // e.g. auditlog unset
+    if (d.apply(args, err) != CfgResult::OK){
+      fprintf(stderr, "selfcheck: config '%s' emits \"%s\", which its own apply() rejects: %s\n",
+              d.name, v1.c_str(), err.c_str());
+      problems++;
+      continue;
+    }
+    if (!d.get(v2) || v1 != v2){
+      fprintf(stderr, "selfcheck: config '%s' does not round-trip: \"%s\" -> \"%s\"\n",
+              d.name, v1.c_str(), v2.c_str());
+      problems++;
+    }
+  }
+  return problems;
+}
+
+
+bool config_is_boot_only(const std::string &name){
+  for (const ConfigDirective &d : k_config_table){
+    if (name == d.name){ return d.boot_only; } 
+  }
+  return false; 
+}
+
+bool config_is_masked(const std::string &name){
+  for (const ConfigDirective &d : k_config_table){
+    if (name == d.name){ return d.masked; } 
+  }
+  return false; 
+}
 
 // Hoisted out of the table so the legacy underscore sppelings can
 
@@ -290,14 +639,6 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
   std::string name = name_in;
   for (char &c : name){ c = (char)tolower((unsigned char)c); }
 
-  // Lambda function for checking number of args
-  auto need1 = [&](void) -> bool { if (args.size() != 1){ 
-      err = "wrong number of args for '" + name + "'";
-      return false; 
-    } 
-    return true; 
-  };
-  // table first, if-chain below for directives not yet migrated.
   for (const ConfigDirective &d : k_config_table){
     if (name != d.name){ continue; }
     if ((int)args.size() < d.min_args ||
@@ -307,161 +648,10 @@ CfgResult config_apply(const std::string &name_in, const std::vector<std::string
     }
     return d.apply(args, err);
   }
-
-  // auth - network
-  if (name == "requirepass"){ 
-    if (!need1()){ return CfgResult::BADVALUE; }
-    // no auth 
-    if (args[0].empty()){ 
-      g_config.password.clear(); 
-      
-    } else if (args[0].size() == 65 && args[0][0] == '#'){
-      g_config.password = args[0].substr(1);
-    } else if (args[0].rfind("$argon2id$", 0) == 0){
-      // hash plaintext
-      g_config.password =args[0];
-    } else {
-      // plaint text, current policy
-      g_config.password = cred_hash_new(args[0]);
-      if (g_config.password.empty()){ err = "password hashing failed"; return CfgResult::BADVALUE; }
-    }
-
-    auto du = g_config.users.find("default");
-    if (du != g_config.users.end()){
-      du->second.pw_hashes.clear();
-      if (!g_config.password.empty()){ du->second.pw_hashes.push_back(g_config.password); }
-    }
-    return CfgResult::OK;
-  }
-
-  if (name == "rename-command"){
-    if (args.size() != 2){ err = "rename-command needs OLD and NEW"; return CfgResult::BADVALUE; }
-    std::string oldn = args[0], neu = args[1];
-
-    for (char &c : oldn){ c = (char)tolower((unsigned char)c); }
-    for (char &c : neu){ c = (char)tolower((unsigned char)c); }
-
-    if (oldn.empty()){ err = "rename_command OLD is empty"; return CfgResult::BADVALUE; }
-    if (!command_is_known(oldn)){ err = "rename-command: unknown command '" + oldn + "'"; return CfgResult::BADVALUE; } 
-    for (auto &r : g_config.renames){ if (r.first == oldn){ err = "rename-command: '" + oldn + "' renamed twice"; return CfgResult::BADVALUE; } }
-
-    if (!neu.empty()){
-      for (unsigned char c : neu){ if (c < 0x20 || c == 0x7f){ err = "rename-command: NEW has control chars"; return CfgResult::BADVALUE; } }
-      if (command_is_known(neu)){ err = "rename-command: NEW '" + neu + "' collides with a command"; return CfgResult::BADVALUE; }
-      for (auto &r : g_config.renames){ if (r.second == neu){ err = "rename-command: New '" + neu + "' already use"; return CfgResult::BADVALUE; } }      
-    } else if (oldn == "auth" && !g_config.password.empty()){
-      err = "refusing to disable AUTH while a password is set (would lock out clients)";
-      return CfgResult::BADVALUE;
-    }
-    g_config.renames.emplace_back(oldn, neu);
-    return CfgResult::OK;
-  }
-
-  // ACL user definition 
-  if (name == "user"){
-    if (args.empty()){ err = "User directive requires a username"; return CfgResult::BADVALUE; }
-    // Create or update
-    User &u = g_config.users[args[0]]; 
-    if (u.name.empty()){ u.name = args[0]; }
-    for (size_t i = 1; i < args.size(); ++i){
-      if (!acl_apply_rule(u, args[i])){ 
-        err = "Invalid ACL rule '" + args[i] + "' for user '" + args[0] + "'";
-        return CfgResult::BADVALUE;
-      }
-    }
-    // a reset token wipes name mid-line
-    if (u.name.empty()){ u.name = args[0]; }
-    return CfgResult::OK;
-  }
-
-  if (name == "tls-port"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    long p = 0;
-    if (!parse_int_strict(args[0].c_str(), &p) || p < 0 || p > 65535){
-      err = "invalid tls-port";
-      return CfgResult::BADVALUE;
-    }
-    g_config.tls_port = (int)p;
-    return CfgResult::OK;
-  }
-
-  if (name == "tls-cert-file" || name == "tls-key-file" || name == "tls-ca-cert-file"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    if      (name == "tls-cert-file") { g_config.tls_cert_file = args[0]; }
-    else if (name == "tls-key-file")  { g_config.tls_key_file = args[0]; }
-    else                              { g_config.tls_ca_cert_file = args[0]; }
-    return CfgResult::OK;
-  }
-
-  if (name == "tls-auth-clients"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    std::string v = args[0];
-    for (char &c : v){ c = (char)tolower((unsigned char)c); }
-    if      (v == "yes")     {g_config.tls_auth_clients = TlsAuthClients::YES; }
-    else if (v == "no")     {g_config.tls_auth_clients = TlsAuthClients::NO; }
-    else if (v == "optional"){g_config.tls_auth_clients = TlsAuthClients::OPTIONAL; }
-    else { err = "tls-auth-clients must be yes, no, or optional"; return CfgResult::BADVALUE; }
-    return CfgResult::OK;
-  }
-  if (name == "tls-handshake-timeout"){
-    if (!need1()){ return CfgResult::BADVALUE; }
-    long s = 0;
-    if (!parse_int_strict(args[0].c_str(), &s) || s < 1 || s > 3600){
-      err = "invalid tls-handshake-timeout (seconds, 1-3600)";
-      return CfgResult::BADVALUE;
-    }
-    g_config.tls_handshake_timeout_ms = (int)s * 1000;
-    return CfgResult::OK;
-  }
-
-  if (name == "bind"){
-    if (args.empty()){ err = "bind needs at least one address"; return CfgResult::BADVALUE; }
-    g_config.binds = args;
-    return CfgResult::OK;
-  }
-
-  if (name == "allow-ip"){ 
-    if (!need1()){ return CfgResult::BADVALUE; }
-    uint32_t net, mask;
-    if (!parse_cidr(args[0], &net, &mask)){
-      err = "invalid CIDR '" + args[0] + "'";
-      return CfgResult::BADVALUE;
-    }
-    g_config.allowlist.push_back({ net, mask });
-    return CfgResult::OK;
-  }
-
-
-  if (name == "save"){
-    // save '' -> disable all save conditions 
-    if (args.size() == 1 && args[0].empty()){
-      g_config.save_conditions.clear();
-      return CfgResult::OK;
-    }
-    if (args.size() != 2){
-      err = "save needs <seconds> <changes>";
-      return CfgResult::BADVALUE;
-    }
-    g_config.save_conditions.push_back({
-      strtoull(args[0].c_str(), nullptr, 10),
-      (uint32_t)strtoul(args[1].c_str(), nullptr, 10)
-    });
-    return CfgResult::OK;
-  }
-
-  if (name == "auditlog"){ 
-    // "" disables, "stderr", or a path
-    if (!need1()){ return CfgResult::BADVALUE; }
-    g_config.auditlog_path = args[0];
-    audit_open(g_config.auditlog_path); // opens the file-load and on config set
-    return CfgResult::OK;
-  }
-
-  // Unknown directive
   err = "unknown directive '" + name + "'";
   return CfgResult::UNKNOWN;
-
 }
+
 
 bool config_load_file(const char *path){
   FILE *fp = fopen(path, "r");
@@ -492,96 +682,25 @@ bool config_load_file(const char *path){
 // Every directive config_apply() accepts must appear here AND in
 // config_all_names(), or CONFIG GET silently answers [].
 bool config_get_value(const std::string &name, std::string &out){
-  char buf[64];
   for (const ConfigDirective &d : k_config_table){
-    if (name == d.name){ return d.get(out); }
+    if (name == d.name){ return d.get ? d.get(out) : false; }
   }
-  if (name == "bind"){
-    out.clear();
-    for (const std::string &b : g_config.binds){ if (!out.empty()){ out += ' '; } out += b; }
-    return true;
-  }
-  if (name == "allow-ip"){
-    out.clear();
-    for (const auto &a : g_config.allowlist){
-      struct in_addr ia; 
-      ia.s_addr = htonl(a.first);
-      if (!out.empty()){ out += ' '; }
-      out += inet_ntoa(ia);
-      snprintf(buf, sizeof(buf), "/%d", __builtin_popcount(a.second));
-      out += buf;
-    }
-    return true;
-  }
-  // Deliberately masked: what we store is a password HASH, and CONFIG GET is
-  // reachable by any @admin user. Redis returns the value because Redis stores
-  // plaintext. Use ACL LIST / ACL GETUSER for credential state.
-  if (name == "requirepass"){ out = g_config.password.empty() ? "" : "<set>"; return true; }
-  if (name == "tls-port"){ snprintf(buf, sizeof(buf), "%d", g_config.tls_port); out = buf; return true; }
-  if (name == "tls-cert-file"){ out = g_config.tls_cert_file; return true; }
-  if (name == "tls-key-file"){ out = g_config.tls_key_file; return true; }
-  if (name == "tls-ca-cert-file"){ out = g_config.tls_ca_cert_file; return true; }
-  if (name == "tls-auth-clients"){
-    out = g_config.tls_auth_clients == TlsAuthClients::YES ? "yes"
-        : g_config.tls_auth_clients == TlsAuthClients::NO  ? "no" : "optional";
-    return true;
-  }
-  if (name == "tls-handshake-timeout"){
-    snprintf(buf, sizeof(buf), "%d", g_config.tls_handshake_timeout_ms / 1000);
-    out = buf;
-    return true;
-  }
-  
-  if (name == "save"){
-    out.clear();
-    for (const SaveCondition &s : g_config.save_conditions){
-      if (!out.empty()){ out += ' '; }
-     snprintf(buf, sizeof(buf), "%llu %u", (unsigned long long)s.seconds, s.changes); 
-     out += buf;
-    }
-    return true;
-  }
-  if (name == "auditlog"){ out = g_config.auditlog_path; return true; }
   return false;
 }
 
+
 // Config-file order. CONFIG GET walks this and glob-matches the requested name.
+// Table order is config-file order. CONFIG GET walks this and glob-matches.
 void config_all_names(std::vector<std::string> &out){
-  static const char *names[] = {
-    "port", "bind", "protected-mode", "allow-ip", "requirepass",
-    "tls-port", "tls-cert-file", "tls-key-file", "tls-ca-cert-file",
-    "tls-auth-clients", "tls-handshake-timeout",
-    "dbfilename", "appendonly", "appendfilename", "appendfsync",
-    "maxmemory", "maxmemory-policy", "maxmemory-samples",
-    "notify-keyspace-events", "save",
-    "auto-aof-rewrite-percentage", "auto-aof-rewrite-min-size", "auditlog",
-  };
-  for (const char *n : names){ out.emplace_back(n); }
-}
-
-// directives whose disk form is exactly "name config_get_vaule()".
-static const char *k_scalars_net[] = {"port", "protected-mode"};
-
-static const char *k_scalars_data[] = {
-  "dbfilename", "appendonly", "appendfilename", "appendfsync",
-  "maxmemory", "maxmemory-policy", "maxmemory-samples",
-  "notify-keyspace-events",
-};
-
-static const char *k_scalars_aof[] = {
-  "auto-aof-rewrite-percentage", "auto-aof-rewrite-min-size",
-};
-
-void config_rewrite_scalars(std::vector<std::string> &out){
-  for (const char *n : k_scalars_net) { out.emplace_back(n); }
-  for (const char *n : k_scalars_data){ out.emplace_back(n); }
-  for (const char *n : k_scalars_aof) { out.emplace_back(n); }
+  for (const ConfigDirective &d : k_config_table){
+    if (d.get){ out.emplace_back(d.name); }
+  }
 }
 
 // The one place a scalar directive reaches disk. Values comes from
 // config_get_value(), so CONFIG GET and CONFIG REWRITE cannot drift apart
 static bool config_write_scalar(FILE *fp, const std::string &name){
-  if (name == "requirepass"){ return false; }
+  if (config_is_masked(name)){ return false; }
   std::string v;
   if (!config_get_value(name, v)){ return false; }
   // Quote only what config_tokenize() would otherwise mangle: an empty value
@@ -612,65 +731,10 @@ bool config_rewrite(const char * path){
   if (!fp){ return false; }
 
   bool ok = true;
-  for (const char *n : k_scalars_net){ ok = config_write_scalar(fp, n) && ok; }
-  if (!g_config.binds.empty()){
-    fprintf(fp, "bind");
-    for (const std::string &b : g_config.binds){ fprintf(fp, " %s", b.c_str()); }
-    fprintf(fp, "\n");
+  for (const ConfigDirective &d : k_config_table){
+    if (d.emit){ d.emit(fp); continue; }
+    ok = config_write_scalar(fp, d.name) && ok;
   }
-  for (const auto &a : g_config.allowlist){
-    struct in_addr ia;
-    ia.s_addr = htonl(a.first);
-    fprintf(fp, "allow-ip %s/%d\n", inet_ntoa(ia), __builtin_popcount(a.second));
-  }
-  if (!g_config.password.empty()){
-    if (g_config.password.rfind("$argon2id$", 0) == 0){
-      fprintf(fp, "requirepass \"%s\"\n", g_config.password.c_str());
-    } else {
-      fprintf(fp, "requirepass \"#%s\"\n", g_config.password.c_str());
-    }
-  }
-
-  // TLS 
-  if (g_config.tls_port != 0){ 
-    fprintf(fp, "tls-port %d\n", g_config.tls_port); 
-  }
-  if (!g_config.tls_cert_file.empty()){ 
-    fprintf(fp, "tls-cert-file \"%s\"\n", g_config.tls_cert_file.c_str());
-   }
-  if (!g_config.tls_key_file.empty()){ 
-    fprintf(fp, "tls-key-file \"%s\"\n", g_config.tls_key_file.c_str());
-   }
-  if (!g_config.tls_ca_cert_file.empty()){ 
-    fprintf(fp, "tls-ca-cert-file \"%s\"\n", g_config.tls_ca_cert_file.c_str());
-   }
-  if (g_config.tls_auth_clients != TlsAuthClients::NO){
-    fprintf(fp, "tls-auth-clients %s\n",
-      g_config.tls_auth_clients == TlsAuthClients::YES ? "yes" : "optional");
-  }
-  if (g_config.tls_handshake_timeout_ms != 10 * 1000){
-    fprintf(fp, "tls-handshake-timeout %d\n", g_config.tls_handshake_timeout_ms / 1000);
-  }
-  for (const char *n : k_scalars_data){ ok = config_write_scalar(fp, n) && ok; }
-  for (const SaveCondition &s : g_config.save_conditions){
-    fprintf(fp, "save %llu %u\n", (unsigned long long)s.seconds, s.changes);
-  }
-
-  for (const char *n : k_scalars_aof){ ok = config_write_scalar(fp, n) && ok; }
-
-  // ACL users - skip 'default': it is rebuilt from requirepass + acl_bootstrap_default() at boot
-  for (const auto &kv : g_config.users){
-    if (kv.first == "default"){ continue; }
-    std::string line = acl_format_user(kv.first, kv.second, true);      // real hashes, quoted
-    fprintf(fp, "%s\n", line.c_str());
-  }
-  
-  for (const auto &r : g_config.renames){
-    if (r.second.empty()){ fprintf(fp, "rename-command %s \"\"\n", r.first.c_str()); }
-    else { fprintf(fp, "rename-command %s %s\n", r.first.c_str(), r.second.c_str()); }
-  }
-
-  if (!g_config.auditlog_path.empty()){ fprintf(fp, "auditlog \"%s\"\n", g_config.auditlog_path.c_str()); }
 
   if (!ok || fflush(fp) != 0 || fsync(fileno(fp)) != 0){
     fclose(fp);

@@ -2268,8 +2268,9 @@ def stress_worker(host: str, port: int, ops: int,
                 cmd(sock, "getex", k, "PX", "5000")
 
             stats.record(op_name, (time.perf_counter() - t0) * 1000)
-        except Exception:
+        except Exception as e:
             stats.record_error(op_name)
+            print(f"  {RED}op={op_name} failed: {e!r}{RESET}")
 
     try:
         cmd(sock, "del", zset)
@@ -2475,6 +2476,69 @@ def test_config_command(r: TestRunner, sock: socket.socket):
         r.check_true("config set unknown parameter rejected", True)
     r.check("config resetstat -> OK", cmd(sock, "config", "resetstat"), "OK")
     r.expect_error("config bad subcommand -> error", sock, "config", "frobnicate")
+
+    _config_setget_probe(r, sock)
+
+
+# [REG] V9.8.2 shipped k_config_table with the `appendonly` row's getter reading
+# g_config.protected_mode instead of g_config.aof_enable. Since V9.8.1 routes
+# CONFIG REWRITE through the getter, that is a persistence bug, not a display
+# one: a rewrite writes `appendonly <protected-mode's value>`, so a server with
+# protected-mode yes + appendonly no silently gains AOF, and the reverse silently
+# loses it on the next restart. It passed every suite because myred.conf happens
+# to set both to yes.
+#
+# A format->apply->format round-trip cannot catch this -- reading the wrong field
+# is perfectly self-consistent. Only writing a value and reading it back does, so
+# each probe below sets a value DISTINCT from the current one. Originals are
+# restored afterwards.
+CONFIG_PROBES = [
+    ("maxmemory-samples", "7"),
+    ("maxmemory-policy", "allkeys-random"),
+    ("maxmemory", "12345678"),
+    ("appendfsync", "always"),
+    ("appendfilename", "probe-only.aof"),
+    ("dbfilename", "probe-only.rdb"),
+    ("auto-aof-rewrite-percentage", "77"),
+    ("auto-aof-rewrite-min-size", "12345678"),
+    ("notify-keyspace-events", "AKE"),
+]
+
+
+def _config_get1(sock: socket.socket, name: str):
+    res = cmd(sock, "config", "get", name)
+    return res[1] if isinstance(res, list) and len(res) == 2 else None
+
+
+def _config_setget_probe(r: TestRunner, sock: socket.socket):
+    """Every directive must read back exactly what was written to it."""
+    for name, probe in CONFIG_PROBES:
+        original = _config_get1(sock, name)
+        if original is None:
+            r.check_true(f"[REG] {name} is gettable", False, f"CONFIG GET {name} -> not a pair")
+            continue
+        try:
+            cmd(sock, "config", "set", name, probe)
+            r.check(f"[REG] {name} reads back what was set", _config_get1(sock, name), probe)
+        finally:
+            cmd(sock, "config", "set", name, original)
+
+    # appendonly and protected-mode are probed as a pair, opposed, because the
+    # bug that motivated this test is invisible whenever the two agree.
+    orig_ao = _config_get1(sock, "appendonly")
+    orig_pm = _config_get1(sock, "protected-mode")
+    try:
+        cmd(sock, "config", "set", "protected-mode", "yes")
+        cmd(sock, "config", "set", "appendonly", "no")
+        r.check("[REG] appendonly no while protected-mode yes",
+                _config_get1(sock, "appendonly"), "no")
+        cmd(sock, "config", "set", "protected-mode", "no")
+        cmd(sock, "config", "set", "appendonly", "yes")
+        r.check("[REG] appendonly yes while protected-mode no",
+                _config_get1(sock, "appendonly"), "yes")
+    finally:
+        if orig_ao is not None: cmd(sock, "config", "set", "appendonly", orig_ao)
+        if orig_pm is not None: cmd(sock, "config", "set", "protected-mode", orig_pm)
 
 
 def test_bgrewriteaof_command(r: TestRunner, sock: socket.socket):

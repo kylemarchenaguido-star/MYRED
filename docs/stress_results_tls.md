@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-07-25 20:22:46
+# MYRED stress test — 2026-07-31 17:40:24
 
 **Run:** correctness + concurrency + stress over TLS (authenticated) → 127.0.0.1:1235
 
@@ -392,7 +392,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.1ms
+  ℹ  returned in 0.2ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -508,7 +508,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['maxmemory', '0', 'maxmemory-policy', 'noeviction', 'notify-keyspace-events', '']
+  ✓ config get * -> array → ['port', '1234', 'bind', '0.0.0.0', 'protected-mode', 'yes', 'allow-ip', '10.0.0.0/32', 'requirepass', '<set>', 'tls-port', '1235', 'tls-cert-file', 'tls/cert.pem', 'tls-key-file', 'tls/key.pem', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'yes', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '3600 1 300 100', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'auditlog', '/tmp/myred-audit.log']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -555,7 +555,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:41\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:50\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:198062080\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:4227\r\n\r\n# Stats\r\ntotal_commands:21769\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:2090\r\nrdb_changes_since_save:4922\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:115\r\naof_enabled:1\r\naof_current_size:3830927\r\naof_base_size:10076\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:1142\r\nuptime_minutes:19\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:55\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:196108288\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:4226\r\n\r\n# Stats\r\ntotal_commands:21846\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:9352\r\nrdb_changes_since_save:1893\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:45\r\naof_enabled:1\r\naof_current_size:3829730\r\naof_base_size:5485\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -579,34 +579,34 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:41
-    uptime_minutes:0
+    uptime_seconds:1142
+    uptime_minutes:19
     uptime_hours:0
     # Clients
     connected_clients:1
-    total_connections:50
+    total_connections:55
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:198062080
+    used_memory_rss:196108288
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
-    evicted_keys:4227
+    evicted_keys:4226
     # Stats
-    total_commands:21769
+    total_commands:21846
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:2090
-    rdb_changes_since_save:4922
+    rdb_last_save_time:9352
+    rdb_changes_since_save:1893
     rdb_last_save_ok:1
-    rdb_last_save_size_bytes:115
+    rdb_last_save_size_bytes:45
     aof_enabled:1
-    aof_current_size:3830927
-    aof_base_size:10076
+    aof_current_size:3829730
+    aof_base_size:5485
     aof_pending_rewrite:0
     aof_last_write_status:ok
     aof_last_bgrewrite_status:ok
@@ -638,9 +638,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 2.1ms: 'Background saving started'
+  ℹ  bgsave returned in 4.1ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 4.2ms
+  ℹ  100 ops during save took 19.9ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -666,7 +666,7 @@
   ✓ MEMORY USAGE (uppercase) → int → 182
   ✓ memory doctor → string → "Can't find any memory problem. used_memory=1666 matches a full sweep."
   ✓ memory doctor reports no drift
-  ✓ memory stats → array → ['used_memory', 1666, 'keys.count', 6, 'maxmemory', 0, 'maxmemory.policy', 'noeviction', 'evicted.keys', 4227]
+  ✓ memory stats → array → ['used_memory', 1666, 'keys.count', 6, 'maxmemory', 0, 'maxmemory.policy', 'noeviction', 'evicted.keys', 4226]
   ✓ object encoding o:str → raw
   ✓ object encoding o:int → int
   ✓ object encoding o:list → deque
@@ -756,6 +756,50 @@
   ✓ with 'Ex' the __keyspace__ form is suppressed
   ✓ notifications off → nothing emitted
 
+── Transactions: MULTI / QUEUED / DISCARD / EXEC (V8.4-V8.5) 
+  ✓ MULTI opens a transaction
+  ✓ queued write replies QUEUED
+  ✓ queued read replies QUEUED
+  ✓ nested MULTI is refused
+  ✓ a refused nested MULTI leaves the transaction open
+  ✓ queued commands have not run
+  ✓ DISCARD closes the transaction
+  ✓ DISCARD ran nothing
+  ✓ DISCARD without MULTI is an error
+  ✓ connection still usable after DISCARD
+  ✓ unknown command is rejected at queue time
+  ✓ bad arity is rejected at queue time
+  ✓ SUBSCRIBE inside MULTI is rejected
+  ✓ queuing continues after a rejection
+  ✓ EXEC on a poisoned transaction aborts
+  ✓ EXECABORT ran nothing
+  ✓ EXEC without MULTI is an error
+  ✓ empty transaction commits as an empty array
+  ✓ EXEC returns one array of results, in order
+  ✓ EXEC applied the writes
+  ✓ EXEC header counts every queued command
+  ✓ a failing element is an inline error
+  ✓ commands after a failing one still run
+  ✓ no rollback: the later write is visible
+
+── Transactions: WATCH / UNWATCH (V8.6-V8.7) ─────────
+  ✓ WATCH replies OK
+  ✓ EXEC aborts with a null array after a watched write
+  ✓ the aborted transaction ran nothing
+  ✓ a fresh transaction commits, watches cleared by EXEC
+  ✓ ...and its write landed
+  ✓ EXEC commits when the watched key was never touched
+  ✓ UNWATCH replies OK
+  ✓ EXEC commits after UNWATCH despite the outside write
+  ✓ DISCARD cleared the watch
+  ✓ a multi-key write dirties a watcher of its last key
+  ✓ writing a key named 'watch' does not abort a transaction
+  ✓ WATCH inside MULTI is refused
+  ✓ a refused WATCH did not poison the transaction
+  ✓ a watched key expiring on its own does not abort
+  ✓ write to a dead watcher's key is safe
+  ✓ server alive after watcher teardown
+
 ── Persistence Round-trip (in-memory) ────────────────
   ✓ save → OK
   ✓ string still readable
@@ -765,18 +809,18 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 603/603 passed
-Runtime: 13.20s (45.7 assertions/sec)
+Results: 643/643 passed
+Runtime: 17.07s (37.7 assertions/sec)
 All tests passed!
 Slowest sections:
-  7.97s  11/11  Pub/Sub: keyspace notifications (V8.3)
-  0.65s  16/16  Pub/Sub: SUBSCRIBE / UNSUBSCRIBE / PUBLISH (V8.1)
-  0.60s  10/10  TTL Commands: PEXPIRE / PTTL
-  0.55s  9/9  UNLINK Command (async delete)
-  0.54s  6/6  Persistence Round-trip (in-memory)
-  0.52s  7/7  BGSAVE (fork-based background save)
-  0.51s  4/4  SAVE / RDB Persistence
-  0.41s  42/42  String Variants: SETNX / SETEX / PSETEX / GETSET / GETEX / GETDEL
+  8.03s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  1.39s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
+  1.21s  16/16  Transactions: WATCH / UNWATCH (V8.6-V8.7)
+  0.85s  9/9  Memory: maxmemory eviction + OOM
+  0.80s  9/9  UNLINK Command (async delete)
+  0.66s  16/16  Pub/Sub: SUBSCRIBE / UNSUBSCRIBE / PUBLISH (V8.1)
+  0.61s  10/10  TTL Commands: PEXPIRE / PTTL
+  0.55s  7/7  BGSAVE (fork-based background save)
 ═══════════════════════════════════════════════════════
 
 ── Concurrent Write Safety ─────────────────────────────
@@ -785,14 +829,14 @@ Slowest sections:
 ── Pub/Sub: fan-out under concurrent publishers ──────
   ✓ no publisher/reader errors
   ✓ every subscriber received every message
-    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.26s (15,107 deliveries/s)
+    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 2.99s (1,340 deliveries/s)
 
 ═══════════════════════════════════════════════════════
 Results: 2/2 passed
-Runtime: 0.37s (5.5 assertions/sec)
+Runtime: 3.10s (0.6 assertions/sec)
 All tests passed!
 Slowest sections:
-  0.37s  2/2  Pub/Sub: fan-out under concurrent publishers
+  3.10s  2/2  Pub/Sub: fan-out under concurrent publishers
 ═══════════════════════════════════════════════════════
 
 ── Stress Test ────────────────────────────────────────
@@ -800,78 +844,78 @@ Slowest sections:
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    0.70s
-  Throughput: 5748 ops/sec
+  Elapsed:    10.69s
+  Throughput: 374 ops/sec
   Total ops:   4000
   Errors:      0
-  Latency avg: 1.16ms
-  Latency min: 0.03ms
-  Latency max: 24.38ms
-  Latency p50: 0.27ms
-  Latency p95: 2.76ms
-  Latency p99: 21.12ms
+  Latency avg: 27.24ms
+  Latency min: 0.19ms
+  Latency max: 584.64ms
+  Latency p50: 4.48ms
+  Latency p95: 216.08ms
+  Latency p99: 462.58ms
   No errors!
   Operation mix:
-    srem                  125 ok     0 errors
-    sismember             121 ok     0 errors
-    info                  119 ok     0 errors
-    zrank                 117 ok     0 errors
-    strlen                116 ok     0 errors
-    getdel                115 ok     0 errors
-    list_pop_trim         114 ok     0 errors
-    rpush                 112 ok     0 errors
-    zscore                111 ok     0 errors
-    mget                  110 ok     0 errors
-    memory_usage          108 ok     0 errors
-    setnx                 108 ok     0 errors
+    list_pop_trim         120 ok     0 errors
+    smembers              120 ok     0 errors
+    strlen                117 ok     0 errors
+    sadd                  117 ok     0 errors
+    memory_usage          116 ok     0 errors
+    srandmember           116 ok     0 errors
+    zscore                116 ok     0 errors
+    config_get            114 ok     0 errors
+    zrank                 111 ok     0 errors
+    sscan                 111 ok     0 errors
+    keyspace_scan         111 ok     0 errors
+    zpopmin               110 ok     0 errors
   Slowest operations by average latency:
-    keys                  17.26ms avg over 108 ops
-    keyspace_scan         11.88ms avg over 100 ops
-    hscan                  1.70ms avg over 98 ops
-    hgetall                1.46ms avg over 105 ops
-    sscan                  1.37ms avg over 89 ops
-    smembers               1.10ms avg over 87 ops
-    zrevquery              0.74ms avg over 95 ops
-    ttl_triplet            0.68ms avg over 99 ops
-    list_pop_trim          0.61ms avg over 114 ops
-    zquery                 0.58ms avg over 83 ops
-    lrange                 0.53ms avg over 102 ops
-    zpopmin                0.47ms avg over 98 ops
-  ℹ  cleaned 161 leftover keys
+    keys                 409.71ms avg over 109 ops
+    keyspace_scan        302.71ms avg over 111 ops
+    hscan                 33.24ms avg over 97 ops
+    sscan                 31.97ms avg over 111 ops
+    smembers              26.53ms avg over 120 ops
+    hgetall               26.18ms avg over 94 ops
+    zrevquery             17.80ms avg over 99 ops
+    zquery                14.86ms avg over 86 ops
+    list_pop_trim         10.43ms avg over 120 ops
+    zpopmin               10.01ms avg over 110 ops
+    ttl_triplet           10.00ms avg over 102 ops
+    lrange                 9.98ms avg over 89 ops
+  ℹ  cleaned 157 leftover keys
 
 -- Command Metrics -------------------------------------
-  Commands observed: 18934
-  RESP errors:       111 (expected negative tests included)
+  Commands observed: 19080
+  RESP errors:       119 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.28ms
-  Latency p50/p95/p99: 0.03/0.48/4.40ms
-  Latency max:       24.37ms
+  Latency avg:       6.22ms
+  Latency p50/p95/p99: 0.27/9.74/235.18ms
+  Latency max:       584.62ms
   Most used commands:
-    set              9312 calls
-    zadd             1802 calls
+    set              9350 calls
+    zadd             1816 calls
     publish          1009 calls
     get               802 calls
-    del               687 calls
-    srandmember       350 calls
-    rpush             326 calls
-    sadd              238 calls
-    hset              222 calls
-    info              153 calls
-    srem              130 calls
-    config            127 calls
+    del               691 calls
+    srandmember       372 calls
+    rpush             318 calls
+    sadd              248 calls
+    hset              211 calls
+    config            142 calls
+    info              136 calls
+    zscore            128 calls
   Slowest commands by average latency:
-    keys              16.95ms avg over 110 calls
-    scan              10.04ms avg over 112 calls
-    save               8.55ms avg over 2 calls
-    acl                2.99ms avg over 16 calls
-    bgsave             2.21ms avg over 2 calls
-    hscan              1.63ms avg over 102 calls
-    hgetall            1.43ms avg over 107 calls
-    sscan              1.31ms avg over 93 calls
-    smembers           1.02ms avg over 94 calls
-    zrevquery          0.72ms avg over 97 calls
-    zquery             0.54ms avg over 89 calls
-    lrange             0.48ms avg over 113 calls
+    keys             402.32ms avg over 111 calls
+    scan             262.70ms avg over 123 calls
+    hscan             31.92ms avg over 101 calls
+    sscan             30.86ms avg over 115 calls
+    hgetall           25.62ms avg over 96 calls
+    smembers          25.07ms avg over 127 calls
+    zrevquery         17.44ms avg over 101 calls
+    zquery            13.89ms avg over 92 calls
+    zpopmin            9.58ms avg over 115 calls
+    lrange             8.90ms avg over 100 calls
+    mget               8.87ms avg over 101 calls
+    save               8.02ms avg over 2 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

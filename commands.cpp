@@ -2790,7 +2790,7 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out){
     if (p == "rename-command"){
       return resp_err(out, "ERR 'rename-command' can only be set in the config file");
     }
-    if (p.rfind("tls-", 0) == 0){
+    if (config_is_boot_only(p)){
       return resp_err(out, "ERR TLS parameters can only be set in the config file");
     }
     CfgResult res = config_apply(cmd[2], { cmd[3] }, err);
@@ -3758,30 +3758,8 @@ void metadata_selfcheck(){
       problems++;
     }
   }
-  // every advertised directive must actually be gettable
-  std::vector<std::string> cfg_names;
-  config_all_names(cfg_names);
-  for (const std::string &n : cfg_names){
-    std::string v;
-    if (!config_get_value(n, v)){
-      fprintf(stderr, "selfcheck: config '%s' is listed but not gettable\n", n.c_str());
-      problems++;
-    }
-  }
-  std::vector<std::string> scalars;
-  config_rewrite_scalars(scalars);
-  for (const std::string &n : scalars){
-    if (n == "requirepass"){
-      fprintf(stderr, "selfcheck: 'requirepass' is in the shared rewwrite set"
-                      "(CONFIG REWRITE would write the masked value to disk)\n");
-      problems++;
-    }
-    std::string v;
-    if (!config_get_value(n, v)){
-      fprintf(stderr, "selfcheck: rewrite scalar '%s' is not gettable\n", n.c_str());
-      problems++;
-    }
-  }
+
+  problems += config_selfcheck();
 
   if (problems){
     fprintf(stderr, "selfcheck: %d command-metadata problem(s)\n", problems);
