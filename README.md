@@ -30,8 +30,19 @@ than using the STL containers.
   blocks on a hash
 - **Security hardening:** protected mode, multi-address `bind` + IP allowlist,
   audit log, `rename-command`/disable, control-plane category gating
+- **TLS** — optional `tls-port` alongside the plaintext port, with OpenSSL kept a
+  private dependency of a single transport translation unit and the handshake
+  driven as connection state rather than a blocking `SSL_accept`
+- **Pub/Sub:** `SUBSCRIBE`/`PUBLISH`, pattern subscriptions (`PSUBSCRIBE` →
+  `pmessage`), channel-scoped ACL (`&pattern`), and Redis-compatible keyspace
+  notifications (`notify-keyspace-events`)
+- **Transactions:** `MULTI`/`EXEC`/`DISCARD` with error poisoning (`EXECABORT`),
+  plus `WATCH`/`UNWATCH` optimistic locking backed by an eager dirty-marking
+  watcher registry
 - **Runtime configuration:** config file, selected environment overrides,
-  `CONFIG GET`/`CONFIG SET`, and `CONFIG REWRITE`
+  `CONFIG GET`/`CONFIG SET`, and `CONFIG REWRITE` — every directive is one row in
+  a single table owning its arity, parser, getter and on-disk form, checked for
+  self-consistency at boot
 - **Memory management:** approximate memory accounting, `maxmemory` policies with
   **incremental eviction** (bounded batches continued across event-loop ticks —
   Redis `EVICT_RUNNING` semantics, so an overshoot never spuriously OOMs writes),
@@ -161,6 +172,12 @@ REDIS_PASSWORD=kek1234 ./build/client                  # interactive REPL
 ### Sorted sets
 `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZQUERY`, `ZREVQUERY`, `ZPOPMIN`
 
+### Pub/Sub
+`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
+
+### Transactions
+`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
+
 ### Admin / connection
 `AUTH`, `ACL`, `PING`, `ECHO`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
 `SAVE`, `BGSAVE`, `BGREWRITEAOF`
@@ -261,13 +278,22 @@ Recently completed (see `docs/planning/ROADMAP.md` for detail):
   Redis-compatible keyspace notifications (`notify-keyspace-events`). Needed zero
   event-loop changes — the poll loop already rebuilds its flags every tick.
 
+- **V8 — Transactions** *(done)*: `MULTI`/`EXEC`/`DISCARD` plus `WATCH`/`UNWATCH`.
+  Atomicity came free from the single-threaded event loop, so the work was the
+  per-connection state machine and reply framing. All five commands dispatch
+  *above* the queueing gate, which is what makes them unqueueable and `EXEC`'s
+  recursion safe without a depth guard.
+- **V9.8 — Config directive table** *(done)*: `config_apply`, `config_get_value`
+  and `config_rewrite` used to hand-enumerate the same ~23 directives, and four
+  separate incidents came from editing one list and forgetting another — including
+  a `CONFIG REWRITE` that dropped `requirepass` and brought the server back
+  passwordless. All three are now walks over one table, with a boot self-check on
+  its shape.
+
 Next up:
 
-- **V8.4 — Transactions** *(active)*: `MULTI`/`EXEC`/`DISCARD`, then `WATCH`
-  (V8.5) for optimistic locking. Atomicity comes free from the single-threaded
-  event loop, so the work is the per-connection state machine and reply framing.
-- Further out: replication, and the pick-your-adventure upgrade catalog — both
-  scoped in `docs/planning/BACKLOG.md`.
+- **Replication**, and the pick-your-adventure upgrade catalog — both scoped in
+  `docs/planning/BACKLOG.md`.
 - **No open bugs.**
 
 ## Acknowledgements

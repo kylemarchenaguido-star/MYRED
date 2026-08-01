@@ -50,50 +50,66 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V9.8 - Config refactor: one directive table [In Progress]
-
-`config_apply` (parse/validate/assign), `config_rewrite` (format/write) and
-`config_get_value` (format/return) each hand-enumerate the same ~23 directives.
-One truth, three lists — adding or changing a directive means editing three
-places, and **forgetting one is silent**: no compiler error, no warning, no
-failing test unless that exact path is exercised. Four incidents so far, all the
-same bug: the `requirepass` emission pasted over in `config_rewrite` (`3e2d0e9`,
-undetected 6 days, came back passwordless), `notify-keyspace-events` missing from
-get (V8.3), `appendfilename` missing from get (V8.5), and four directives plus two
-string-literal typos in the new getter (V8.8, caught at boot by its own selfcheck).
-
-**V9.8.1 is done** (2026-07-30) — see Completed Milestones. The 12 unconditional
-scalars now share one formatter; `config_rewrite` no longer hand-formats them.
-
-#### V9.8.2 - Full directive table [Next]
-
-The real milestone. One array of descriptors owning name, arity, boot-only flag,
-an `apply` function and a `format` function; all three call sites become table
-walks, and a new directive becomes one row that will not compile if incomplete.
-
-- The prize is what the boot selfcheck can then assert — the same role
-  `metadata_selfcheck()` already plays for `k_cmd_table`: every entry has both
-  operations, and every entry **round-trips** (`format` → `apply` → `format`
-  yields the same string). That check would have caught the `requirepass`
-  regression at boot instead of six days later.
-- Four complications to design around, in increasing order of annoyance:
-  (1) `bind`/`allow-ip`/`save`/`rename-command`/`user` are accumulating multi-line
-  directives — apply appends rather than assigns, rewrite emits N lines, so the
-  table needs a repeated/format-to-lines concept; (2) `config_rewrite` is not a
-  dump — it has deliberate ordering, conditional emission (`requirepass` only if
-  set, `tls-handshake-timeout` only if ≠ 10s) and inconsistent quoting, so a naive
-  table walk normalizes the shape of every existing config file; (3) `user` stays
-  special (it comes from `acl_format_user`, and `default` is skipped because it is
-  rebuilt from `requirepass` at boot); (4) it is a large hand-applied diff in
-  security-adjacent code, which given this project's transcription-slip rate is
-  the highest-risk change available — it needs a green suite either side.
-- Worth landing before V10 Replication, which will add more config surface.
+**Nothing active.** V9.8 closed 2026-07-30, which clears the last item that was
+blocking replication. The next milestone is **V10 - Replication**, scoped in
+`BACKLOG.md`; it was deliberately sequenced after the config refactor because it
+adds config surface, and adding it to three hand-maintained lists was the risk
+V9.8 removed.
 
 **Carry-overs: all clear.** V9.7 TLS closed 2026-07-25 (603/603 both transports),
-V8 Pub/Sub, V8 Transactions and V8.8 all closed, no open bugs. The tree is
-committed through `c7912e0`; everything from V8.4 onward is uncommitted.
+V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed, no open bugs.
 
 ## Completed Milestones
+
+### V9.8 - Config refactor: one directive table [Done]
+
+Closed 2026-07-30. `config_apply` (parse/validate/assign), `config_get_value`
+(format/return) and `config_rewrite` (format/write) each hand-enumerated the same
+~23 directives. One truth, three lists — and **forgetting one was silent**: no
+compiler error, no warning, no failing test unless that exact path ran. Four
+incidents came from it: the `requirepass` emission pasted over in `config_rewrite`
+(`3e2d0e9`, undetected 6 days, server came back passwordless),
+`notify-keyspace-events` missing from get (V8.3), `appendfilename` missing from
+get (V8.5), and four directives plus two string-literal typos in the new getter
+(V8.8). All three functions are now walks over `k_config_table`; `config_apply`
+went from ~290 lines to 15 and `config_get_value` from ~60 to 5.
+
+**Shipped in three stages** (V9.8.1 has its own entry below; V9.8.2 was split into
+a hybrid migration where the table was consulted first and the old if-chain stayed
+as fallback, so directives moved in batches and each batch was verifiable — chosen
+over a flag-day rewrite because of this project's transcription-slip rate).
+
+- **One row owns everything about a directive**: name, arity, `apply`, `get`,
+  `boot_only`, `masked`, `emit`. Table order *is* config-file order, so
+  `config_rewrite` is a walk with no ordering logic of its own.
+- **`emit == nullptr` is the load-bearing marker.** It means "plain scalar":
+  single-valued, unmasked, assign-not-append. That one property is what makes both
+  the shared formatter and the boot round-trip check safe on a row, so it does
+  double duty and no separate `multi` flag was needed. Anything conditional
+  (`tls-*`, `auditlog`, `requirepass`), multi-line (`bind`, `allow-ip`, `save`) or
+  accumulating (`user`, `rename-command`) supplies its own `emit`.
+- **`masked` rows must supply an `emit`**, asserted at boot. `requirepass`'s getter
+  answers `<set>`; its `emit` reaches past the getter to the stored hash. Without
+  that split the shared formatter would write the placeholder to disk and the next
+  boot would hash the literal string `<set>` as the password.
+- **The round-trip check skips masked rows for the same reason** — re-applying
+  `requirepass`'s own getter output would hash `<set>` at *every* boot. The trap
+  reappears inside the check designed to prevent it.
+- **`boot_only` replaced a string-prefix hack.** `do_config` matched
+  `p.rfind("tls-", 0) == 0` to decide what `CONFIG SET` may not touch; it now asks
+  the table.
+- `user` and `rename-command` carry `get == nullptr` — write-only config-file
+  constructs with no single-value form, which is why they were never in
+  `config_all_names`.
+
+**Two pre-existing bugs surfaced by the migration**, both invisible until a
+directive's parse and format sat next to each other — see `CODE_REVIEW.md`:
+`tls-auth-clients` rejected the value `no`, and the `appendonly` getter read
+`protected_mode`. The second was live for one stage and is the sharpest lesson
+here: a `format → apply → format` round-trip **cannot** catch a getter wired to
+the wrong field, because reading the wrong field is perfectly self-consistent.
+Only writing a distinct value and reading it back catches it, which is what the
+`[REG]` probe block in `stress_test.py`'s CONFIG section now does.
 
 ### V9.8.1 - Shared formatter for unconditional scalars [Done]
 

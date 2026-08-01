@@ -313,6 +313,23 @@ performance-and-polish list and the Testing-debt items.
 
 ### Config and Auth
 
+- **`appendonly`'s getter read `g_config.protected_mode`** (V9.8.2, fixed
+  2026-07-30). Introduced while migrating the directive into `k_config_table`, and
+  a persistence bug rather than a display one: V9.8.1 had already routed
+  `CONFIG REWRITE` through the getter, so a rewrite wrote
+  `appendonly <protected-mode's value>` to disk. A server with `protected-mode yes`
+  + `appendonly no` silently gained AOF; the reverse silently lost durability on
+  the next restart. Every suite passed because `myred.conf` sets both to `yes`.
+  **The generalisable lesson:** a `format → apply → format` round-trip cannot
+  detect a getter bound to the wrong field — it is self-consistent. Only a probe
+  that writes a *distinct* value and reads it back can, which is now the `[REG]`
+  block in `stress_test.py`'s CONFIG section.
+- **`tls-auth-clients` rejected `no`** (pre-existing, fixed 2026-07-30 during the
+  same migration). The branch read `else if (v == "nos")`, so the documented value
+  `no` fell through to the error path — and since an invalid directive is fatal at
+  boot, writing it explicitly made the server refuse to start. It survived because
+  the default is already `NO` and `config_rewrite` only emits the directive when it
+  differs, so the value never round-tripped. Message typo `mus be` fixed alongside.
 - A leftover hardcoded `password = kek1234` clobbered config-loaded passwords.
 - `config_tokenize()` had a pre-increment bug that dropped each token's first char.
 - `#<hash>` ACL/config tokens must be quoted in config rewrite because `#` starts a

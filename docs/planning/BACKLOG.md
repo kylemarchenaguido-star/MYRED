@@ -25,6 +25,15 @@ writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. 
 bugs get filed here first, then folded into the CODE_REVIEW audit.
 
 Recently resolved (terse; detail in CODE_REVIEW / git):
+- `appendonly`'s getter read `protected_mode` 🔴 — introduced and fixed inside
+  V9.8.2. Because V9.8.1 emits through the getter, `CONFIG REWRITE` wrote
+  `appendonly <protected-mode's value>`, silently flipping AOF on or off across a
+  restart. Invisible to a `format`→`apply`→`format` round-trip; caught by reading
+  the table, and now pinned by a set-then-read-back probe (2026-07-30).
+- `tls-auth-clients` rejected the value `no` 🟠 — branch read `v == "nos"`, and an
+  invalid directive is fatal at boot, so writing it explicitly made the server
+  refuse to start. Latent because the default is already `NO` and the rewrite only
+  emits the directive when it differs (2026-07-30).
 - `ACL SETUSER` was not atomic 🟠 — applied modifiers onto the live user and
   returned early on the first bad one, leaving a half-configured (or newly created)
   user; ordering decided whether that failed closed or open. Now stages onto a

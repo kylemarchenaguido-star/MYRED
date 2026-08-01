@@ -170,13 +170,46 @@ instead of queueing, consistent with the other four transaction commands, which
 all dispatch above the queueing gate. `AUTH` likewise runs immediately inside
 `MULTI` — it short-circuits before the gate, and our AUTH is async.
 
-### Config Formatting (V9.8.1)
+### Config Directive Table (V9.8)
 
-A directive's disk form comes from `config_write_scalar()`, which reads the value
-from `config_get_value()` — one formatter, so `CONFIG GET` and `CONFIG REWRITE`
-cannot drift. Only unconditional scalars qualify; multi-line accumulating
-directives (`bind`, `allow-ip`, `save`, `rename-command`, `user`) and conditionally
-emitted ones (`tls-*`, `requirepass`) stay hand-written until V9.8.2.
+One row per directive in `k_config_table` (state.cpp), owning name, arity,
+`apply`, `get`, `boot_only`, `masked` and `emit`. `config_apply`,
+`config_get_value`, `config_all_names` and `config_rewrite` are all walks over it,
+so the three hand-maintained lists that caused four silent-drift incidents are
+gone. **Table order is config-file order** — `config_rewrite` has no ordering
+logic of its own, so moving a row moves the line.
+
+Adding a directive is one row. The dispatcher validates arity before calling
+`apply`, so `apply` may index `args` freely.
+
+`emit == nullptr` is the load-bearing marker: it means *plain scalar* —
+single-valued, unmasked, assign-not-append. That single property is what makes a
+row safe both for the shared formatter and for the boot round-trip check, which is
+why there is no separate `multi` flag. Anything conditional (`tls-*`, `auditlog`,
+`requirepass`), multi-line (`bind`, `allow-ip`, `save`) or accumulating (`user`,
+`rename-command`) supplies its own `emit` and is excluded from both.
+
+Quoting is **on demand, not always**. `config_write_scalar` quotes only when the
+value is empty or contains whitespace / `#` / `"` / `\` — the things
+`config_tokenize` would otherwise mangle. Quoting everything was tried and
+rejected: it gains nothing for `port 1234` and renormalizes every existing config
+file. The empty case is not cosmetic — an unquoted empty value tokenizes to zero
+args, which the arity check then rejects at the *next boot*, so
+`notify-keyspace-events` off must be `""`.
+
+`masked` rows must supply an `emit`, asserted at boot by `config_selfcheck()`.
+`requirepass`'s getter answers `<set>`; its `emit` reaches past the getter to the
+stored hash. Route it through the shared formatter and `CONFIG REWRITE` writes the
+placeholder, after which the next boot hashes the literal string `<set>` as the
+password — a rerun of `3e2d0e9`. The boot round-trip check skips masked rows for
+exactly the same reason: re-applying that getter's output would hash `<set>` on
+*every* boot.
+
+**A round-trip check cannot catch a getter bound to the wrong field.** `format` →
+`apply` → `format` is self-consistent even when `get` reads an unrelated variable,
+which is how `appendonly` came to report `protected_mode` and survive a full suite
+run. Only writing a *distinct* value and reading it back detects that class; the
+`[REG]` probe block in `stress_test.py`'s CONFIG section is where it lives.
 
 Quoting is **on demand, not always**. The tokenizer splits on whitespace, treats
 `#` as a comment, and uses `"`/`\` as its own escapes, so a value is quoted only
