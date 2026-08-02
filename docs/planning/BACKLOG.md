@@ -94,15 +94,147 @@ Both halves of V8 are **done** and live in `ROADMAP.md` → Completed Milestones
 Pub/Sub (V8.1–V8.3) 2026-07-25, Transactions (V8.4–V8.7) 2026-07-26. The two open
 bugs above are now **V8.8**, the active milestone in ROADMAP → Current Focus.
 
-### V10 - Replication and High Availability
+### V10 - Replication and High Availability → active in `ROADMAP.md`
 
-Planned: master-replica mode, `PSYNC`, replication backlog, partial resync,
-replica propagation for writes/evictions/expirations, sentinel-style failover,
-cluster mode or hash-slot sharding.
+**V10 is the active milestone.** Its preamble (why this codebase is already set
+up for replication, and why the AOF stream *is* the replication stream) and the
+active step **V10.1** live in `ROADMAP.md` → Current Focus. The not-yet-started
+sub-steps stay here.
 
-- Dependency: AOF canonicalization for renamed commands should land before
-  replication, because replication must propagate canonical command intent, not
-  client aliases.
+##### V10.2 - REPLCONF / PSYNC handshake + full resync [Backlog]
+
+Gated on V10.1. First real networking; still only the full-resync path —
+partial resync is V10.4, deliberately later.
+
+- New commands: `REPLCONF listening-port <port>` / `REPLCONF capa <...>` (both
+  effectively no-ops that just ack `+OK`, kept for wire compatibility),
+  `REPLCONF ACK <offset>` (V10.5 needs it; safe to accept-and-ignore here),
+  `PSYNC <replid> <offset>`, and `REPLICAOF host port` / `REPLICAOF NO ONE`
+  (`SLAVEOF` as an alias — same `rename-command`-style aliasing already used
+  elsewhere, not a special case). These need `Conn`, so they're conn-aware
+  special-cases in `do_request` exactly like `AUTH`/`ACL`/pub-sub/transactions
+  — do not route them through `k_cmd_table`'s two-argument `CmdFn`.
+- **Master side**, on `PSYNC ? -1` (replica has no history — the only case this
+  step handles): mark the `Conn` with a new `bool is_replica` flag, reply
+  `+FULLRESYNC <repl_id> <master_repl_offset>\r\n`, then send an RDB payload,
+  then transition this `Conn` into the same "just keep pushing bytes into
+  `outgoing`" mode V8.1 built for Pub/Sub — every subsequent write's
+  `repl_backlog` bytes (from V10.1) also get written into every `Conn` with
+  `is_replica == true`.
+- **Pragmatic first cut for generating that RDB payload**: reuse
+  `rdb_save_background`'s existing fork path to write a snapshot to a *distinct
+  temp file* (not `g_config.dump_path` — do not collide with a concurrent
+  user-triggered `BGSAVE`), then have the parent stream that file's bytes to
+  the replica once the child exits, the same way `handle_read`/`handle_write`
+  already stream any other buffered response. A "serialize the RDB directly
+  into a live socket while the parent keeps serving other clients" path is a
+  real future optimization (backpressure on a slow replica while forking is a
+  legitimately hard problem) but is explicitly **not** this step — correctness
+  first, exactly the same ordering already used for TLS (V9.7.1-4 before
+  V9.7.5's optimizations).
+- **Replica side**: `REPLICAOF host port` opens a normal outbound connection
+  (just another fd in the same `poll()` loop — no new threading model needed,
+  this is the payoff of the single-threaded design) to the master, sends the
+  handshake, receives `+FULLRESYNC`, buffers the RDB bytes, and calls the
+  already-existing `rdb_load_buffer` on them directly — zero new parsing code.
+  From that point, every RESP frame arriving on the master connection is fed
+  through the normal `do_request` dispatch (so every command gets the exact
+  same handler a real client would trigger — no second implementation of
+  `SET`/`ZADD`/etc.), but originating from a privileged pseudo-`Conn` that
+  bypasses `NOAUTH`/ACL checks, mirroring exactly how AOF replay already
+  bypasses them via `g_data.g_loading`.
+- Done when: two MYRED instances, `REPLICAOF <master-host> <master-port>` on
+  the second, the replica's dataset matches the master's at the moment of
+  resync, and a `SET` issued on the master appears on the replica shortly
+  after with no further manual action.
+
+##### V10.3 - Read-only replica mode + command gating [Backlog]
+
+Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts
+writes from ordinary clients too, silently diverging from the master.
+
+- A **server-wide** mode flag (`g_data.is_replica` — not per-`Conn`; this is
+  unlike the `sub_channels`/`in_multi` per-connection modes, since the whole
+  server is read-only, not just one connection). Gate placement in
+  `do_request`: alongside the existing `NOAUTH` check, before ACL — a write
+  command from an ordinary client on a replica replies `-READONLY You can't
+  write against a read only replica.` and never reaches dispatch.
+- The exception that must not go through this gate at all: the replication
+  stream itself, applied via the privileged pseudo-`Conn` from V10.2. Route it
+  around the `is_replica` check the same way it already bypasses `NOAUTH` —
+  one bypass flag, not two.
+- `REPLICAOF NO ONE` clears `is_replica`, closes the master connection, and
+  **generates a fresh `repl_id`** — from this point the replica's write
+  history has diverged from its old master's, so it must not claim continuity
+  with the old `repl_id` (this is what makes V10.4's partial-resync validation
+  safe later: a `repl_id` mismatch always means "don't trust this offset,
+  fall back to full resync").
+- Done when: a plain client connected directly to a replica gets `READONLY` on
+  `SET` but correct data on `GET`; the replication stream itself still applies
+  fine; `REPLICAOF NO ONE` makes the instance writable again with a new
+  `repl_id`.
+
+##### V10.4 - Partial resync via the backlog [Backlog]
+
+Gated on V10.1 (backlog must exist) and V10.2 (basic full resync must be
+solid) — this step is purely an optimization on top of both, never a
+correctness requirement, so do not start it until full resync is trustworthy
+enough to be the safe fallback.
+
+- On `PSYNC <replid> <offset>` where `replid` is non-`?`: if it equals the
+  master's own `repl_id` **and** `offset` still falls inside the live
+  `repl_backlog` window, reply `+CONTINUE <repl_id>\r\n` and stream only the
+  missing tail from the backlog — no RDB transfer.
+- Any mismatch (different `repl_id`, or `offset` older than what the backlog
+  still retains) falls back to V10.2's full-resync path unconditionally. This
+  is the one piece of this whole milestone where "when in doubt, do the
+  expensive-but-correct thing" is the right default — an incorrect partial
+  resync is silent data divergence, which is much worse than an unnecessary
+  full RDB transfer.
+- Done when: a replica's connection is dropped and reconnected (or the network
+  is briefly interrupted) while writes continue on the master; reconnecting
+  with a gap small enough to still be in the backlog produces a `+CONTINUE`
+  (verify via a log line or `INFO replication`, not just "it still has the
+  right data" — a full resync would also leave it with the right data, so the
+  test must distinguish the two paths); a gap larger than
+  `repl-backlog-size` correctly falls back to full resync instead of failing.
+
+##### V10.5 - Replica ACK tracking + `WAIT` [Backlog]
+
+Gated on V10.2. Independent of V10.4 — can be built in either order once
+basic streaming replication works.
+
+- Replica sends `REPLCONF ACK <offset>` back to the master on a timer (every
+  ~1s, matching Redis's cadence) reporting how far it has applied. This needs
+  a new timer type alongside the existing idle/IO/TLS-handshake ones
+  (`ConnTimer` in state.h) or a simple periodic check in the same tick loop
+  that already drives `process_timers()` — reuse that dispatch point rather
+  than adding a second timer sweep.
+- Master tracks a per-replica-`Conn` "last acked offset," surfaced in `INFO
+  replication` per connected replica (address, acked offset, lag).
+- `WAIT <numreplicas> <timeout>`: block the *requesting client's* reply (not
+  the event loop) until at least `numreplicas` have acked an offset ≥ the
+  master's offset at the moment `WAIT` was issued, or `timeout` elapses. This
+  is the same "can't literally block a single-threaded loop" family as the
+  still-not-implemented `BLPOP`/blocking-list commands already flagged in
+  ROADMAP's V8.4/V8.5 history — needs a per-conn "pending, resumed by a
+  matching event or a timer" state, not a blocking wait. Do not invent a new
+  pattern for this; if `BLPOP` lands first, copy its resume mechanism, don't
+  design a second one.
+- Done when: `WAIT 1 1000` against one healthy, caught-up replica returns
+  quickly; against a replica that's stopped acking, it returns after
+  `timeout` with a count less than requested, and the requesting connection
+  stays otherwise responsive the whole time it was "waiting."
+
+##### V10.6 - Sentinel-style failover, cluster/hash-slot sharding [Backlog, unscoped]
+
+Deliberately left as a stub, not fleshed into steps yet. Both are separate,
+much larger problems (leader election and split-brain avoidance for failover;
+key-space partitioning and cross-node command routing for cluster) that
+deserve their own design pass once V10.1-V10.5 are running and have survived
+real testing — scoping them now, before basic replication even exists, would
+be designing against guesses instead of an actual working system's real
+failure modes. Revisit this section specifically once V10.5 is done.
 
 ### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security (post-1.0)
 

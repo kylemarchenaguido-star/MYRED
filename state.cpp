@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 GlobalData g_data;
 Config g_config;
@@ -579,7 +580,7 @@ static const ConfigDirective k_config_table[] = {
 
 // Structural invariasnt of k_config_table. Returns the number of problems/
 // Structural invariants of k_config_table. Returns the number of problems.
-int config_selfcheck(){
+int config_selfcheck(){ 
   int problems = 0;
   for (const ConfigDirective &d : k_config_table){
     if (!d.apply){
@@ -1035,4 +1036,45 @@ bool expire_if_needed(Entry *ent){
   hm_delete(&g_data.db, &ent->node, &hnode_same);
   entry_del(ent);
   return true;
+}
+
+// Replication
+// 40 hex chars, the shape redis uses. not a secret - it is published in INFO 
+// and exists only so a reconnecting replica can tell "same master history"
+// from "a different one "
+static std::string repl_gen_id(){
+  static const char hx[] = "0123456789abcdef";
+  std::string s;
+  s.reserve(40);
+  for (int i = 0; i < 40; ++i){ s += hx[rand_idx(16)]; }
+  return s;
+}
+
+void repl_init(){
+  g_data.repl_id = repl_gen_id();
+  g_data.repl_backlog.assign(g_config.repl_backlog_size, '\0');
+  g_data.repl_backlog_pos = 0;
+  g_data.repl_backlog_histlen = 0;
+}
+
+// Stream offset of the oldest byte the backlog can still server
+uint64_t repl_backlog_start_offset(){
+  return g_data.repl_backlog_histlen
+         ? g_data.master_repl_offset - g_data.repl_backlog_histlen + 1
+         : 0;
+}
+
+// Every byte of the write stream passes through here.
+void repl_backlog_feed(const char *bytes, size_t len){
+  if (len == 0){ return; }
+  g_data.master_repl_offset += len;
+
+  const size_t cap = g_data.repl_backlog.size();
+  if (cap == 0){ return; }
+
+  // a write larger than the ring can only leave its last cap bytes behind
+  if (len >= cap){
+    bytes += len - cap;
+    len = cap;
+  }
 }

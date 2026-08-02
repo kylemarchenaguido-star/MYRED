@@ -13,7 +13,7 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-07-26.
+Date: 2026-07-31.
 
 Primary commands:
 ```bash
@@ -44,17 +44,119 @@ Implemented command families:
 | **TLS** | **Implemented (V9.7)** |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | **Transactions** | **Implemented (V8.4–V8.7)** |
-| Replication | Not implemented (→ BACKLOG V10) |
+| Replication | In progress (V10.1 — bookkeeping only, no networking) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-**Nothing active.** V9.8 closed 2026-07-30, which clears the last item that was
-blocking replication. The next milestone is **V10 - Replication**, scoped in
-`BACKLOG.md`; it was deliberately sequenced after the config refactor because it
-adds config surface, and adding it to three hand-maintained lists was the risk
-V9.8 removed.
+### V10 - Replication and High Availability [In Progress]
+
+Master-replica mode, `PSYNC`, a replication backlog, partial resync, replica
+propagation for writes, and read-only replica enforcement. Split into gated
+sub-steps, same shape as V9.7/V8's sub-milestones, because "replication" is
+really four separable systems (bookkeeping, handshake/full-resync, write-mode
+enforcement, partial resync) that fail independently and should be tested
+independently. **V10.1 is active below; V10.2–V10.6 stay in `BACKLOG.md`.**
+
+Sequenced deliberately after V9.8: replication adds config surface, and adding
+it to three hand-maintained lists was exactly the risk the config table removed.
+
+**The dependency this milestone used to list — AOF canonicalization for renamed
+commands — is already satisfied**, not still pending. `do_request`
+(commands.cpp) already computes `bool renamed = (cmd[0] != canonical)` and, on a
+write, feeds a snapshot with `snapshot[0]` rewritten to the canonical name;
+replay already resolves through `k_cmd_table` under `g_data.g_loading`
+(`rename-command bricks the server on AOF restart`, fixed 2026-07-17). The
+stream AOF already produces — canonical command names,
+absolute-`PEXPIREAT`-reencoded TTLs, verbatim raw bytes for everything else —
+**is** a valid replication stream. V10 does not need to invent a wire format; it
+needs to fan those exact bytes out to replica connections instead of (or in
+addition to) the AOF file.
+
+**Why this codebase is unusually well set up for this**, worth internalizing
+before writing any of it:
+- The single-threaded `poll()` loop means "propagate to N replicas" has the
+  same free-atomicity property already used for Transactions/EVAL — no
+  interleaving to reason about, no locking.
+- V8.1 Pub/Sub already proved the exact mechanism a replica connection needs:
+  `do_publish` (commands.cpp) writes a RESP-encoded payload directly into
+  *another* `Conn`'s `outgoing` buffer and sets `want_write = true`; the poll
+  loop picks it up on the next tick with zero event-loop changes. A replica
+  connection is a subscriber that never unsubscribes.
+- `rdb_load_buffer(const uint8_t *data, size_t size)` (rdb.h/rdb.cpp) already
+  exists and is already proven: `aof_load` (aof.cpp) calls it today to parse the
+  RDB preamble embedded in the hybrid AOF format. A replica receiving a
+  full-resync RDB payload over its socket calls this exact function on the
+  buffered bytes — no new parser.
+- `rdb_save_background` (rdb.cpp) already does fork-based, non-blocking snapshot
+  generation. Full resync's RDB payload can be produced by the same path rather
+  than a new one (see V10.2's note on the pragmatic first cut).
+
+#### V10.1 - Replication identity, offset, and backlog (bookkeeping only, no networking) [In Progress]
+
+Pure data structures and accounting. No replica can connect yet in this step —
+it exists so the wire protocol in V10.2 has something real to report, and so the
+byte-accounting is provably correct before anything depends on it over a socket.
+
+- `GlobalData` gains `repl_id` (40 hex, regenerated every boot — reuse the
+  `rand_idx()` source `ACL GENPASS` already uses, don't add a second one),
+  `master_repl_offset`, and a ring buffer `repl_backlog` + `repl_backlog_pos` +
+  `repl_backlog_histlen`, sized by a new `repl-backlog-size` directive (default
+  1 MB, matching Redis). **`repl_backlog_off` is derived, never stored**
+  (`master_repl_offset - histlen + 1`): a second counter is a second thing to
+  drift.
+- One new `k_config_table` row for `repl-backlog-size` (`masterauth` /
+  `repl-timeout` come with V10.2) — through the V9.8 table, not an ad-hoc path.
+  `boot_only` for the first cut: resizing a live backlog without losing
+  in-flight partial-resync eligibility is a real design question, deferred
+  rather than guessed at. `emit == nullptr`, so it is a plain scalar and gets
+  the shared formatter plus the boot round-trip check for free.
+
+**Placement decision — the propagation choke point is *not* a sibling block in
+`do_request`.** This step's original plan called for one, reasoning that AOF and
+replication are independent gates on the same byte stream. The *reasoning* is
+right; the *location* is wrong, and would have shipped a diverging replica three
+ways:
+
+  1. **`SPOP` would replicate nondeterministically.** It sets `CmdSpec::aof_self`
+     precisely so `do_request` does *not* log it, and feeds a synthetic
+     deterministic `SREM` of the actually-popped members from inside the handler.
+     A `do_request` sibling either misses that frame or ships the raw `SPOP`, and
+     master and replica pop different members.
+  2. **Evictions would resurrect on the replica.** `free_memory_if_needed()`
+     feeds its synthetic `DEL` directly; it never passes through `do_request`'s
+     logging block at all. The existing comment there already says "so AOF replay
+     / replicas don't resurrect the key" — it was written for this.
+  3. **TTLs would replicate as relative times.** The `EXPIRE` → `PEXPIREAT`
+     re-encode lives *inside* `aof_feed`, so a sibling block encoding `snapshot`
+     ships `EXPIRE key 100`, which the replica applies 100 ms later against its
+     own clock. This is the same bug AOF already fixed once.
+
+  The correct choke point is where the AOF bytes are actually produced — the tail
+  of `aof_feed`/`aof_append_raw` — so the two sinks are fed from one call by
+  construction and *cannot* describe different histories. Same argument the V9.8
+  config table made: don't create a second list that has to be kept in sync by
+  hand. What moves is the **gate**, not the hook: the `g_config.aof_enable`
+  checks at the three call sites become one `propagate_enabled()` predicate
+  (`!g_loading && (aof_enable || backlog armed)`), and each sink carries its own
+  gate inside `propagate()`. Callers then decide only *whether a command produced
+  stream bytes at all* — which is the independence the original note was after.
+
+- Renames that follow, since the functions no longer serve only the AOF (no
+  aliases kept): `aof_feed` → `propagate_cmd`, `aof_append_raw` → `propagate`.
+- `INFO`'s `# Replication` stub (`do_info`) gains `master_replid`,
+  `master_repl_offset`, `repl_backlog_active`, `repl_backlog_size`,
+  `repl_backlog_first_byte_offset` and `repl_backlog_histlen` — the last four are
+  what make the ring's wrap observable from `redis-cli`, so this step needs no
+  new test script. `connected_slaves` is deliberately **not** added yet: a
+  hardcoded `0` is a field nobody remembers to make real in V10.2, which is this
+  project's most-repeated bug shape.
+- Done when: `master_repl_offset` advances by exactly the byte length of the
+  frames AOF would have logged (`SET foo bar` = 31 bytes over RESP), `SPOP` and
+  an eviction both advance it, `repl_backlog_histlen` saturates at
+  `repl-backlog-size` and `repl_backlog_first_byte_offset` starts advancing once
+  it does, and `CONFIG SET repl-backlog-size` is refused as boot-only.
 
 **Carry-overs: all clear.** V9.7 TLS closed 2026-07-25 (603/603 both transports),
 V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed, no open bugs.

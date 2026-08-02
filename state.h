@@ -35,6 +35,8 @@ static constexpr size_t NO_TTL = (size_t)-1;
 static constexpr uint32_t LRU_CLOCK_MAX = (1u << 24) - 1; // maximun of a 24 bit number 
 // New keys start here
 static constexpr uint8_t LFU_INIT_VAL = 5;
+// Redis's floor, Below this a backlog cannot span the round-trip a partial resync needs.
+constexpr size_t k_repl_backlog_min = 16 * 1024;
 
 
 // ACL command categories. BItflags shared by User::allow_cats
@@ -202,6 +204,15 @@ struct GlobalData{
   bool g_loading = false; // true when replaying
   bool g_aof_write_err = false; // last AOF flush failed -> refuse rewrties until recovery
   bool g_aof_last_rewrite_ok = true; // For do_info
+  // Replication, the backlog is a ring: repl_backlog_pos is the write
+  // cursor, repl_backlog_histlen how much of the ring is valid. The offset of
+  // the first byte still held is DERIVED, never stored — a second counter is a
+  // second thing to drift.
+  std::string repl_id; // 40 hex, regenerated every boot
+  uint64_t master_repl_offset = 0; // total bytes ever propagated; never resets
+  std::vector<char> repl_backlog; // sized once at boot; empty == disabled
+  size_t repl_backlog_pos = 0;
+  size_t repl_backlog_histlen = 0;
 };
 
 struct SaveCondition {
@@ -229,6 +240,8 @@ struct Config {
   Aoffsync aof_fysnc = Aoffsync::EVERYSEC;
   size_t  aof_rewrite_min_size = 64 * 1024 * 1024; // never auto_rewrite below 64MB
   int aof_rewrite_perc = 100; // ... or until it has doubled
+  // replication
+  size_t repl_backlog_size = 1024 * 1024; // 0 disables the backlog
   int maxmemory_samples = 10; // eviction sample size (best-of-n)
   int lfu_log_factor = 10; // LFU: higher = counter saturates slower
   int lfu_decay_time = 1; // LFU: minutes of idleness per counter decrement
@@ -332,7 +345,12 @@ bool config_get_value(const std::string &name, std::string &out); // false = unk
 void config_all_names(std::vector<std::string> &out); // every gettable directive
 bool config_is_boot_only(const std::string &name); // CONFIG SET must refuse it
 bool config_is_masked(const std::string &name); // getter answers a placeholder
-int config_selfcheck();
+int  config_selfcheck();
+
+// Replication bookkeping
+void repl_init(); // call once at boot
+void repl_backlog_feed(const char *bytes,  size_t len); 
+uint64_t repl_backlog_start_offset(); // derived, for info
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
