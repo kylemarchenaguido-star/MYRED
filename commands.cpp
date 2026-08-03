@@ -2475,8 +2475,26 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
   hm_foreach(&entry_set(ent), cb_members_emit, out);
 }
 
+// the one place the write stream reaches its sinks
+static void propagate(const char *bytes, size_t len){
+  if (g_config.aof_enable){
+    g_data.g_aof_buf.append(bytes, len);
+    if (g_aof_child_pid != -1){ // dual write while a rewrite is forked 
+      g_data.g_aof_rewrite_buf.append(bytes, len);
+    }
+  }
+  repl_backlog_feed(bytes, len);
+}
+
 // forward declaration just for this function
-static void aof_feed(const std::vector<std::string> &cmd);
+static void propagate_cmd(const std::vector<std::string> &cmd);
+
+// A command's bytes are worth encoding only if some sink will consume them
+// Replay never propagates: it is replaying the stream, not extending it
+static inline bool propagate_enabled(){
+  return !g_data.g_loading && 
+         (g_config.aof_enable || !g_data.repl_backlog.empty());
+}
 
 // SPOP key [count]
 static void do_spop(std::vector<std::string> &cmd, Buffer *out){
@@ -2964,19 +2982,9 @@ static void aof_feed(const std::vector<std::string> &cmd){
   }
   else { aof_encode(frame, cmd); }               // verbatim fallback
 
-  g_data.g_aof_buf += frame;
-  if (g_aof_child_pid != -1){                    // FIXED
-    g_data.g_aof_rewrite_buf += frame;
-  }
+  propagate(frame.data(), frame.size());
 }
 
-static void aof_append_raw(const char *raw, size_t len){
-  g_data.g_aof_buf.append(raw, len);
-  // Dual write during a rewrite
-  if (g_aof_child_pid != -1){
-    g_data.g_aof_rewrite_buf.append(raw, len);
-  }
-}
 
 // Evict keys unitl we're back under maxmemory. Returns false if we can't get under
 // (noeviction, or a volatile-* policy with nothing evictable) -> caller return -OOM.

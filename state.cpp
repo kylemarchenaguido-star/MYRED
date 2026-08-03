@@ -502,6 +502,20 @@ static const ConfigDirective k_config_table[] = {
     /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
     // Not exposed by CONFIG GET (get == nullptr): both are write-only config-file
+
+  { "repl-backlog-size", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      size_t b = 0;
+      if (!parse_memory_size(a[0], &b)){ e = "invalid repl-backlog-size"; return CfgResult::BADVALUE; }
+      if (b != 0 && b < k_repl_backlog_min){
+          e = "repl-backlog-size must be 0 or at least " + std::to_string(k_repl_backlog_min);
+          return CfgResult::BADVALUE;
+      }
+      g_config.repl_backlog_size = b; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.repl_backlog_size); return true; },
+    /*boot_only*/ true, /*masked*/ false, /*emit*/ nullptr},
+
   // constructs with no single-value form.
   { "user", 1, -1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -1077,4 +1091,13 @@ void repl_backlog_feed(const char *bytes, size_t len){
     bytes += len - cap;
     len = cap;
   }
+
+  // at most two memcpys: up to the end of the ring, then the wrapped tail.
+  const size_t first = std::min(len, cap - g_data.repl_backlog_pos);
+  memcpy(g_data.repl_backlog.data() + g_data.repl_backlog_pos, bytes, first);
+  if (len > first){
+    memcpy(g_data.repl_backlog.data(), bytes + first, len - first);
+  }
+  g_data.repl_backlog_pos = (g_data.repl_backlog_pos + len) % cap;
+  g_data.repl_backlog_histlen = std::min(g_data.repl_backlog_histlen + len, cap);
 }
