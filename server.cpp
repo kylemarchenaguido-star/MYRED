@@ -654,6 +654,7 @@ int main(int argc, char **argv){
   acl_init_categories(); 
   metadata_selfcheck();    
   dispatch_build();
+  repl_init(); // it sizes the backlog from repl_backlog_size
 
   // AOF takes priority over RDB
   bool aof_exists = (access(g_config.aof_path.c_str(), F_OK) == 0);

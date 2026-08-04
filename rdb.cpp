@@ -310,6 +310,14 @@ static void rdb_serialize(Buffer *buf, RDBStats *stats){
   fprintf(stderr, "rdb_serialize: %zu bytes, %u entries, crc=0x%08x\n", stats->bytes, stats->entries, crc);
 }
 
+// The bare image: what BGREWRITEAOF frames with MYAOFRDB, and what a full
+// resync sends as its bulk payload. One serializer, two consumers.
+void rdb_build_image(Buffer *out){
+  RDBStats stats = {};
+  rdb_serialize(out, stats);
+}
+
+
 // BUild [marker][len][RDB image] into 'out'
 void rdb_build_aof_preamble(Buffer *out){
   Buffer rdb = buf_create(64 * 1024);

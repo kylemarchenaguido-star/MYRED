@@ -1298,8 +1298,14 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "aof_last_bgrewrite_status:%s\r\n"
     "\r\n"
     "# Replication\r\n"
-    "role:master\r\n",
-    //server
+    "role:master\r\n"
+    "master_replid:%s\r\n"
+    "master_repl_offset:%llu\r\n"
+    "repl_backlog_active:%d\r\n"
+    "repl_backlog_size:%zu\r\n"
+    "repl_backlog_first_byte_offset:%llu\r\n"
+    "repl_backlog_histlen:%zu\r\n",
+    //server 
     (unsigned long long)uptime_s,
     (unsigned long long)uptime_s / 60,
     (unsigned long long)uptime_s / 3600,
@@ -1336,7 +1342,16 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     g_data.g_aof_base_size,
     (int)(g_aof_child_pid != -1),
     g_data.g_aof_write_err ? "err" : "ok",
-    g_data.g_aof_last_rewrite_ok ? "ok" : "err"
+    g_data.g_aof_last_rewrite_ok ? "ok" : "err",
+
+    // replication
+    g_data.repl_id.c_str(),
+    (unsigned long long)g_data.master_repl_offset,
+    (int)!g_data.repl_backlog.empty(),
+    g_data.repl_backlog.size(),
+    (unsigned long long)repl_backlog_start_offset(),
+    g_data.repl_backlog_histlen
+
   );
   if (len < 0){ return resp_err(out, "ERR info formatting"); }
   // clamp, never over read
@@ -2509,7 +2524,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
     return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
   }
 
-  bool feed = g_config.aof_enable && !g_data.g_loading;
+  bool feed = propagate_enabled();
   std::vector<std::string> synth;
   if (feed){ synth = { "srem", cmd[1] }; }
 
@@ -2538,7 +2553,7 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out){
       delete sn;
     }
   }
-  if (feed){ aof_feed(synth); }
+  if (feed){ propagate_cmd(synth); }
   if (hm_size(&entry_set(ent)) == 0){
     hm_delete(&g_data.db, &ent->node, &hnode_same);
     entry_del(ent);
@@ -2935,7 +2950,7 @@ static void do_object(std::vector<std::string> &cmd, Buffer *out){
 }
 
 // Append cmd to the aof buffer, rewriting relative TTls to absolute PEXPIREAT
-static void aof_feed(const std::vector<std::string> &cmd){
+static void propagate_cmd(const std::vector<std::string> &cmd){
   std::string frame;
   const std::string &name = cmd[0];              // already lower-cased
   int64_t now = (int64_t)get_wall_msec();
@@ -3010,9 +3025,9 @@ static bool free_memory_if_needed(){
 
     // CRITICAL: log an explicit DEL so AOF replay / replicas don't resurrect the key.
     // aof_feed already handles the rewrite dual-buffer; gate on aof_eanble + not loading.
-    if (g_config.aof_enable && !g_data.g_loading){
+    if (propagate_enabled()){
       // copy key before we free the entry
-      aof_feed({ "del", victim->key });
+      propagate_cmd({ "del", victim->key });
     }
 
     notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key);
@@ -3928,7 +3943,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   }
 
   // Snapshot before running swap() handlers/ consume cmd's
-  bool may_log = g_config.aof_enable && spec.is_write && !g_data.g_loading && !spec.aof_self;
+  bool may_log = propagate_enabled() && spec.is_write && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
   // raw == nullptr means the caller has no verbatim client bytes 
   bool reencode = spec.aof_rewrite || renamed || !raw;
@@ -3944,10 +3959,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
     if (reencode){
       if (renamed){ snapshot[0] = canonical; }
       // rare: re-encode with absolute PEXPIREAT
-      aof_feed(snapshot);
+      propagate_cmd(snapshot);
     } else {
       // common: verbatim memcpy, no copy/re-encode
-      aof_append_raw(raw, raw_len);
+      propagate(raw, raw_len);
     }
   }
 

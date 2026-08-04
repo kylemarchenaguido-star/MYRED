@@ -14,4 +14,4 @@ void rdb_check_background_save();
 void rdb_on_save_complete(const char *filename);
 void rdb_build_aof_preamble(Buffer *out);
 bool rdb_load_buffer(const uint8_t *data, size_t size);
-
+void rdb_build_image(Buffer *out); // bare self-contained RDB image (CRC over itself)

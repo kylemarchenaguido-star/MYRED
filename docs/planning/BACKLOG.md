@@ -6,6 +6,32 @@ for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
 
+- 🟡 **`ACL GENPASS` generates passwords from a non-cryptographic PRNG.**
+  **Scheduled: after V10 ships.** `rand_idx()` (`common.h`) is
+  `std::mt19937_64` seeded once from `std::random_device`, and `do_acl`'s
+  `genpass` branch builds its hex string with `hx[rand_idx(16)]`. Mersenne
+  Twister is fully reconstructible from its output — 624 observed 32-bit words
+  recover the internal state, and every past *and* future draw with it. So an
+  attacker who obtains any one `ACL GENPASS` result (a password handed out in a
+  chat log, a ticket, a shell history) can in principle derive every other
+  password the same process ever generated, including ones already set on other
+  users. This is a *generator* weakness, not a storage one: Argon2id still
+  protects the stored hash, so the exposure is confined to secrets minted by
+  this command.
+  - Fix shape: read from a real CSPRNG for credential material specifically —
+    `getrandom(2)` (glibc 2.25+, no fd to manage, `GRND_NONBLOCK` plus a
+    `/dev/urandom` fallback), used *only* by `genpass`. Do **not** repoint
+    `rand_idx()` itself: eviction sampling, `RANDOMKEY`, `SPOP` and
+    `hm_random` call it on hot paths and want a fast PRNG, not syscall-backed
+    entropy. Two generators with clearly separated jobs, one of them named for
+    the job (e.g. `secure_random_bytes()`).
+  - Deliberately **not** in scope: `g_data.repl_id` (V10.1) keeps using
+    `rand_idx()`. A replication ID is a public identifier published in `INFO`,
+    not a secret — predicting it grants nothing.
+  - Note when fixing: this is the same "a verifier is not a display value"
+    family as the `requirepass` masking decision in Open Decisions — worth
+    re-reading that entry first, since the two share a threat model.
+
 - ⚪ **Boot-time metadata cross-check for `k_cmd_table`** (follow-up, not a bug). V8.4's `discard`
   outage came from a duplicated `{"multi", …}` key in the `k_cmd_table`
   initializer list — `unordered_map` insert semantics drop the duplicate silently,
@@ -15,10 +41,12 @@ for design rationale.
   must exist in `k_cmd_table` — would have caught it at boot. Same idea covers
   the four parallel ACL-category lists (DECISIONS → ACL Category Tagging).
 
-**No open bugs.** The one item above is a hardening follow-up, not a defect.
-V8.8 shipped the equivalent check for config directives, and it caught six real
-violations on its first build — the same idea applied to `k_cmd_table` is still
-worth doing.
+**No open bugs in the data path.** Of the two items above, the `k_cmd_table`
+cross-check is a hardening follow-up rather than a defect — V8.8 shipped the
+equivalent check for config directives and it caught six real violations on its
+first build, so the same idea applied to `k_cmd_table` is still worth doing. The
+`ACL GENPASS` entry is a genuine weakness but a contained one, deferred by
+decision (2026-08-03) until V10 ships rather than left unnoticed.
 
 Every bug previously tracked here is FIXED; full root-cause
 writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
@@ -94,147 +122,12 @@ Both halves of V8 are **done** and live in `ROADMAP.md` → Completed Milestones
 Pub/Sub (V8.1–V8.3) 2026-07-25, Transactions (V8.4–V8.7) 2026-07-26. The two open
 bugs above are now **V8.8**, the active milestone in ROADMAP → Current Focus.
 
-### V10 - Replication and High Availability → active in `ROADMAP.md`
+### V10 - Replication and High Availability → moved to `ROADMAP.md`
 
-**V10 is the active milestone.** Its preamble (why this codebase is already set
-up for replication, and why the AOF stream *is* the replication stream) and the
-active step **V10.1** live in `ROADMAP.md` → Current Focus. The not-yet-started
-sub-steps stay here.
-
-##### V10.2 - REPLCONF / PSYNC handshake + full resync [Backlog]
-
-Gated on V10.1. First real networking; still only the full-resync path —
-partial resync is V10.4, deliberately later.
-
-- New commands: `REPLCONF listening-port <port>` / `REPLCONF capa <...>` (both
-  effectively no-ops that just ack `+OK`, kept for wire compatibility),
-  `REPLCONF ACK <offset>` (V10.5 needs it; safe to accept-and-ignore here),
-  `PSYNC <replid> <offset>`, and `REPLICAOF host port` / `REPLICAOF NO ONE`
-  (`SLAVEOF` as an alias — same `rename-command`-style aliasing already used
-  elsewhere, not a special case). These need `Conn`, so they're conn-aware
-  special-cases in `do_request` exactly like `AUTH`/`ACL`/pub-sub/transactions
-  — do not route them through `k_cmd_table`'s two-argument `CmdFn`.
-- **Master side**, on `PSYNC ? -1` (replica has no history — the only case this
-  step handles): mark the `Conn` with a new `bool is_replica` flag, reply
-  `+FULLRESYNC <repl_id> <master_repl_offset>\r\n`, then send an RDB payload,
-  then transition this `Conn` into the same "just keep pushing bytes into
-  `outgoing`" mode V8.1 built for Pub/Sub — every subsequent write's
-  `repl_backlog` bytes (from V10.1) also get written into every `Conn` with
-  `is_replica == true`.
-- **Pragmatic first cut for generating that RDB payload**: reuse
-  `rdb_save_background`'s existing fork path to write a snapshot to a *distinct
-  temp file* (not `g_config.dump_path` — do not collide with a concurrent
-  user-triggered `BGSAVE`), then have the parent stream that file's bytes to
-  the replica once the child exits, the same way `handle_read`/`handle_write`
-  already stream any other buffered response. A "serialize the RDB directly
-  into a live socket while the parent keeps serving other clients" path is a
-  real future optimization (backpressure on a slow replica while forking is a
-  legitimately hard problem) but is explicitly **not** this step — correctness
-  first, exactly the same ordering already used for TLS (V9.7.1-4 before
-  V9.7.5's optimizations).
-- **Replica side**: `REPLICAOF host port` opens a normal outbound connection
-  (just another fd in the same `poll()` loop — no new threading model needed,
-  this is the payoff of the single-threaded design) to the master, sends the
-  handshake, receives `+FULLRESYNC`, buffers the RDB bytes, and calls the
-  already-existing `rdb_load_buffer` on them directly — zero new parsing code.
-  From that point, every RESP frame arriving on the master connection is fed
-  through the normal `do_request` dispatch (so every command gets the exact
-  same handler a real client would trigger — no second implementation of
-  `SET`/`ZADD`/etc.), but originating from a privileged pseudo-`Conn` that
-  bypasses `NOAUTH`/ACL checks, mirroring exactly how AOF replay already
-  bypasses them via `g_data.g_loading`.
-- Done when: two MYRED instances, `REPLICAOF <master-host> <master-port>` on
-  the second, the replica's dataset matches the master's at the moment of
-  resync, and a `SET` issued on the master appears on the replica shortly
-  after with no further manual action.
-
-##### V10.3 - Read-only replica mode + command gating [Backlog]
-
-Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts
-writes from ordinary clients too, silently diverging from the master.
-
-- A **server-wide** mode flag (`g_data.is_replica` — not per-`Conn`; this is
-  unlike the `sub_channels`/`in_multi` per-connection modes, since the whole
-  server is read-only, not just one connection). Gate placement in
-  `do_request`: alongside the existing `NOAUTH` check, before ACL — a write
-  command from an ordinary client on a replica replies `-READONLY You can't
-  write against a read only replica.` and never reaches dispatch.
-- The exception that must not go through this gate at all: the replication
-  stream itself, applied via the privileged pseudo-`Conn` from V10.2. Route it
-  around the `is_replica` check the same way it already bypasses `NOAUTH` —
-  one bypass flag, not two.
-- `REPLICAOF NO ONE` clears `is_replica`, closes the master connection, and
-  **generates a fresh `repl_id`** — from this point the replica's write
-  history has diverged from its old master's, so it must not claim continuity
-  with the old `repl_id` (this is what makes V10.4's partial-resync validation
-  safe later: a `repl_id` mismatch always means "don't trust this offset,
-  fall back to full resync").
-- Done when: a plain client connected directly to a replica gets `READONLY` on
-  `SET` but correct data on `GET`; the replication stream itself still applies
-  fine; `REPLICAOF NO ONE` makes the instance writable again with a new
-  `repl_id`.
-
-##### V10.4 - Partial resync via the backlog [Backlog]
-
-Gated on V10.1 (backlog must exist) and V10.2 (basic full resync must be
-solid) — this step is purely an optimization on top of both, never a
-correctness requirement, so do not start it until full resync is trustworthy
-enough to be the safe fallback.
-
-- On `PSYNC <replid> <offset>` where `replid` is non-`?`: if it equals the
-  master's own `repl_id` **and** `offset` still falls inside the live
-  `repl_backlog` window, reply `+CONTINUE <repl_id>\r\n` and stream only the
-  missing tail from the backlog — no RDB transfer.
-- Any mismatch (different `repl_id`, or `offset` older than what the backlog
-  still retains) falls back to V10.2's full-resync path unconditionally. This
-  is the one piece of this whole milestone where "when in doubt, do the
-  expensive-but-correct thing" is the right default — an incorrect partial
-  resync is silent data divergence, which is much worse than an unnecessary
-  full RDB transfer.
-- Done when: a replica's connection is dropped and reconnected (or the network
-  is briefly interrupted) while writes continue on the master; reconnecting
-  with a gap small enough to still be in the backlog produces a `+CONTINUE`
-  (verify via a log line or `INFO replication`, not just "it still has the
-  right data" — a full resync would also leave it with the right data, so the
-  test must distinguish the two paths); a gap larger than
-  `repl-backlog-size` correctly falls back to full resync instead of failing.
-
-##### V10.5 - Replica ACK tracking + `WAIT` [Backlog]
-
-Gated on V10.2. Independent of V10.4 — can be built in either order once
-basic streaming replication works.
-
-- Replica sends `REPLCONF ACK <offset>` back to the master on a timer (every
-  ~1s, matching Redis's cadence) reporting how far it has applied. This needs
-  a new timer type alongside the existing idle/IO/TLS-handshake ones
-  (`ConnTimer` in state.h) or a simple periodic check in the same tick loop
-  that already drives `process_timers()` — reuse that dispatch point rather
-  than adding a second timer sweep.
-- Master tracks a per-replica-`Conn` "last acked offset," surfaced in `INFO
-  replication` per connected replica (address, acked offset, lag).
-- `WAIT <numreplicas> <timeout>`: block the *requesting client's* reply (not
-  the event loop) until at least `numreplicas` have acked an offset ≥ the
-  master's offset at the moment `WAIT` was issued, or `timeout` elapses. This
-  is the same "can't literally block a single-threaded loop" family as the
-  still-not-implemented `BLPOP`/blocking-list commands already flagged in
-  ROADMAP's V8.4/V8.5 history — needs a per-conn "pending, resumed by a
-  matching event or a timer" state, not a blocking wait. Do not invent a new
-  pattern for this; if `BLPOP` lands first, copy its resume mechanism, don't
-  design a second one.
-- Done when: `WAIT 1 1000` against one healthy, caught-up replica returns
-  quickly; against a replica that's stopped acking, it returns after
-  `timeout` with a count less than requested, and the requesting connection
-  stays otherwise responsive the whole time it was "waiting."
-
-##### V10.6 - Sentinel-style failover, cluster/hash-slot sharding [Backlog, unscoped]
-
-Deliberately left as a stub, not fleshed into steps yet. Both are separate,
-much larger problems (leader election and split-brain avoidance for failover;
-key-space partitioning and cross-node command routing for cluster) that
-deserve their own design pass once V10.1-V10.5 are running and have survived
-real testing — scoping them now, before basic replication even exists, would
-be designing against guesses instead of an actual working system's real
-failure modes. Revisit this section specifically once V10.5 is done.
+**V10 is the active milestone and all of it now lives in `ROADMAP.md` → Current
+Focus**: the preamble (why this codebase is already set up for replication, and
+why the AOF stream *is* the replication stream), completed **V10.1**, active
+**V10.2**, and the remaining steps V10.3–V10.6. Nothing V10 is left here.
 
 ### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security (post-1.0)
 
@@ -608,8 +501,39 @@ scratches.
 - **Model-based testing** — drive random operations through MYRED and a trivial
   Python reference model (a `dict` + a sorted TTL list) in lockstep, diffing
   state after every op. Different technique from the differential-against-real-Redis
-  and libFuzzer items already listed under Differential and Fuzz Testing —
-  this checks internal consistency, not Redis-compatibility.
+  and libFuzzer items already listed under V11 — this checks internal
+  consistency, not Redis-compatibility.
+- **A C++ test layer — new tests, not a rewrite of the existing suite.** The
+  654+ Python assertions in `scripts/` stay exactly as they are: they exercise
+  MYRED the way a real client does, over a real socket, speaking real RESP —
+  that's a feature of black-box testing, not a limitation to fix, and rewriting
+  working, battle-tested assertions into C++ for no functional gain would be
+  pure churn. What C++ actually buys, that Python structurally can't:
+  - **Unit tests for internal pure functions**, which today have zero direct
+    coverage — every one of them is only ever exercised indirectly through a
+    full command dispatch over a socket. `glob_match` (commands.cpp),
+    `parse_notify_flags`/`notify_flags_string` (state.cpp), and
+    `rdb_load_buffer` (rdb.cpp) are natural first candidates: small, pure,
+    already isolated enough to link against directly from a `.cpp` test file
+    with no server/event-loop bootstrapping required.
+  - **This is also just V11's fuzzing work, one step earlier.** V11 already
+    plans libFuzzer/AFL harnesses for `parse_resp_request` and
+    `rdb_load_buffer` — those *are* C++ test code, and are the natural first
+    real example of this rather than a separate effort. Building a plain unit
+    test for a function is most of the work of building a fuzz harness for the
+    same function; doing the unit test first de-risks the fuzz target.
+  - **A real load-generator client**, separate purpose from the unit tests
+    above: the benchmark-methodology lesson already recorded in ROADMAP's
+    Testing Matrix (Python stress throughput is client-bound and unusable for
+    transport comparisons — proven via the pub/sub-inversion argument, not
+    asserted) is a Python *interpreter-speed* ceiling, not something fixable
+    in Python at all. A small C++ client using the same raw-socket RESP
+    encoding `redis-benchmark` uses would let concurrency/throughput testing
+    actually saturate the server instead of measuring the test harness.
+  - Keep the two purposes separate: correctness/unit coverage of internal
+    functions is not the same project as a throughput-capable load generator,
+    even though both happen to require C++. Don't let "convert tests to C++"
+    become one undifferentiated pile.
 - **Chaos harness** — inject random `SIGKILL` mid-fsync, simulated disk-full
   (`ENOSPC` via a small `LD_PRELOAD` shim), or latency/partition on the loopback
   interface (`tc netem`), then assert the AOF/RDB recovery guarantees actually
