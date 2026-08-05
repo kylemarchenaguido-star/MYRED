@@ -157,6 +157,7 @@ struct Conn {
   bool watch_dirty = false; // a watched key changed -> exec aborts
   std::unordered_set<std::string> watched_keys; // keys WATCHed; also the teardown index
   std::vector<std::vector<std::string>> queue_cmds; // stored as TYPED (not canonicalized)
+  bool is_replica = false; /// PSYNC, propagate() streams the write log to it
 };
 
 // global hashtable
@@ -169,6 +170,8 @@ struct GlobalData{
   std::unordered_map<std::string, std::unordered_set<Conn*>> patterns;
   // watched key -> conns watching it. Same chape as above
   std::unordered_map<std::string, std::unordered_set<Conn*>> watchers;
+  // PSYNC replica conns, propagate() dereferences these on every write.
+  std::unordered_set<Conn *> replicas;
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)

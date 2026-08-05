@@ -314,23 +314,19 @@ static void rdb_serialize(Buffer *buf, RDBStats *stats){
 // resync sends as its bulk payload. One serializer, two consumers.
 void rdb_build_image(Buffer *out){
   RDBStats stats = {};
-  rdb_serialize(out, stats);
+  rdb_serialize(out, &stats);
 }
 
-
-// BUild [marker][len][RDB image] into 'out'
 void rdb_build_aof_preamble(Buffer *out){
-  Buffer rdb = buf_create(64 * 1024);
-  RDBStats stats = {};
-  // Self contained image, CRC over itself
-  rdb_serialize(&rdb, &stats);
+  Buffer rdb = buf_create(1024 * 64);
+  rdb_build_image(&rdb);
 
   buf_append(out, (const uint8_t *)"MYAOFRDB", 8);
   uint64_t rdb_len = (uint64_t)buf_size(&rdb);
   buf_append(out, (const uint8_t *)&rdb_len, 8);
   buf_append(out, rdb.data_begin, buf_size(&rdb));
   buf_destroy(&rdb);
-} 
+}
 
 void rdb_on_save_complete(const char *filename){
   struct stat st;

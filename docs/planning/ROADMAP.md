@@ -171,10 +171,16 @@ V9.8's hybrid migration: this project's transcription-slip rate makes one large
 application worse than two verifiable ones, and the two halves fail in
 completely different ways):
 
-- **V10.2a - master side.** Accept a replica, answer `PSYNC ? -1` with
-  `+FULLRESYNC` + an RDB payload, register the connection, fan the propagated
-  stream out to it. Independently verifiable with a raw socket — no second
-  MYRED instance needed.
+- **V10.2a - master side. [Done]** Closed 2026-08-03, verified with a raw
+  socket standing in for a replica: `+FULLRESYNC <replid> <offset>` matching
+  `INFO`, a correctly framed `$<len>` image with the `MYRED` magic, and live
+  `SET`/`SADD` frames arriving with no event-loop change. Two slips caught by
+  that probe rather than by the compiler — a missing `\r` in the `+FULLRESYNC`
+  terminator, and (pre-existing, see BACKLOG) `SPOP`'s synthetic `SREM` carrying
+  an empty key because `lookup_entry` had already swapped `cmd[1]` out. **The
+  second one had been corrupting the AOF since V9.6.4 and no suite noticed** —
+  the first thing replication bought this project was a way to *watch* the write
+  stream instead of trusting it.
 - **V10.2b - replica side.** `REPLICAOF host port`, the outbound connection as
   a state machine in the same `poll()` loop, consuming `+FULLRESYNC` + RDB via
   `rdb_load_buffer`, then applying the stream through `do_request`.

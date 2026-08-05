@@ -1300,6 +1300,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "# Replication\r\n"
     "role:master\r\n"
     "master_replid:%s\r\n"
+    "connected_slaves:%zu\r\n"
     "master_repl_offset:%llu\r\n"
     "repl_backlog_active:%d\r\n"
     "repl_backlog_size:%zu\r\n"
@@ -1346,6 +1347,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
 
     // replication
     g_data.repl_id.c_str(),
+    g_data.replicas.size(),
     (unsigned long long)g_data.master_repl_offset,
     (int)!g_data.repl_backlog.empty(),
     g_data.repl_backlog.size(),
@@ -2490,6 +2492,22 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out){
   hm_foreach(&entry_set(ent), cb_members_emit, out);
 }
 
+// teardown: called from conn_destroy so propagate() never dereferemces a freed conn.
+void repl_remove_conn(Conn *conn){
+  if (!conn->is_replica){ return; }
+  g_data.replicas.erase(conn);
+  conn->is_replica = false;
+  fprintf(stderr, "replication: replica %s detached\n", conn->peer.c_str());
+}
+
+// Third sink of the write stream. A replica is a subsacriber that never unsubscribes, same as PUBLISH
+static void repl_feed_replicas(const char *bytes, size_t len){
+  for (Conn *r : g_data.replicas){
+    buf_append(&r->outgoing, bytes, len);
+    r->want_write = true;
+  }
+}
+
 // the one place the write stream reaches its sinks
 static void propagate(const char *bytes, size_t len){
   if (g_config.aof_enable){
@@ -2499,6 +2517,47 @@ static void propagate(const char *bytes, size_t len){
     }
   }
   repl_backlog_feed(bytes, len);
+  if (!g_data.replicas.empty()){ repl_feed_replicas(bytes, len); }
+}
+
+static bool arg_ieq(const std::string &s, const char *lit);
+
+// REPLCONF <option> <value> ... - the wire-compatibility handshake. Every option is accept-and-ack
+static void do_replconf(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  (void)conn;
+   // ACK is one option that must NOT be answered
+   if (cmd.size() >= 2 && arg_ieq(cmd[1], "ack")){ return; }
+   resp_ok(out);
+}
+
+// PSYNC <replid> <offset>
+static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  (void)cmd;
+  // A replay Conn lives on the stack in aof_load; registering it would dangle
+  if (g_data.g_loading){ return resp_err(out, "ERR PSYNC is not valid during loading"); }
+  if (conn->is_replica){ return resp_err(out, "ERR this connections is already a replica"); }
+
+  // The offset must be sampled before the image is serialized, with nothing propagating between
+  const uint64_t start_offset = g_data.master_repl_offset;
+
+  char hdr[128];
+  int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu\r\n",
+                   g_data.repl_id.c_str(), (unsigned long long)start_offset);
+  buf_append(out, hdr, (size_t)n);
+
+  Buffer img = buf_create(64 * 1024);
+  rdb_build_image(&img);
+  const size_t img_len = buf_size(&img);
+  // replica reads exactly len bytes and hands them straight to rdb_load_buffer.
+  n = snprintf(hdr, sizeof(hdr), "$%zu\r\n", img_len);
+  buf_append(out, hdr, (size_t)n);
+  buf_append(out, img.data_begin, img_len);
+  buf_destroy(&img);
+
+  conn->is_replica = true;
+  g_data.replicas.insert(conn);
+  fprintf(stderr, "replication: replica %s attached at offset %llu (%zu byte image)\n", 
+           conn->peer.c_str(), (unsigned long long)start_offset, img_len);
 }
 
 // forward declaration just for this function
@@ -2507,9 +2566,10 @@ static void propagate_cmd(const std::vector<std::string> &cmd);
 // A command's bytes are worth encoding only if some sink will consume them
 // Replay never propagates: it is replaying the stream, not extending it
 static inline bool propagate_enabled(){
-  return !g_data.g_loading && 
-         (g_config.aof_enable || !g_data.repl_backlog.empty());
+  return !g_data.g_loading &&
+         (g_config.aof_enable || !g_data.repl_backlog.empty() || !g_data.replicas.empty());
 }
+
 
 // SPOP key [count]
 static void do_spop(std::vector<std::string> &cmd, Buffer *out){
@@ -3337,6 +3397,16 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   return resp_err(out, "ERR Unknown ACL subcommand or wrong number of arguments");
 }
 
+
+// case insensitive subcommand compare againts a lowercase literal (was only use for the acls)
+static bool arg_ieq(const std::string &s, const char *lit){
+  // cmd[1] is not lowercase
+  size_t n = strlen(lit);
+  if (s.size() != n){ return false; }
+  for (size_t i = 0; i < n; ++i){ if (tolower((unsigned char)s[i]) != lit[i]){ return false; } }
+  return true;
+}
+
 // SUBSCRIBE/UNSUBSCRIBE/PUBLISH need the Conn (register/deregister, and PUBLISH
 // writes into *other* conns' buffers), so do_request special-cases them by
 // canonical name exactly like AUTH/ACL. 
@@ -3730,6 +3800,9 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"exec",         {do_txn_stub,      1, 1}},
   {"watch",        {do_txn_stub,      2,-1}},
   {"unwatch",        {do_txn_stub,      1, 1}},
+  // replication
+  {"replconf",     {do_pubsub_stub,   1, -1}},
+  {"psync",        {do_pubsub_stub,   3,  3}},
 };
 
 struct DispatchEntry {
@@ -3909,6 +3982,9 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   if (canonical == "publish"){      return do_publish(cmd, out, conn); }
   if (canonical == "psubscribe"){   return do_psubscribe(cmd, out, conn); }
   if (canonical == "punsubscribe"){ return do_punsubscribe(cmd, out, conn); }
+  if (canonical == "replconf"){     return do_replconf(cmd, out, conn); }
+  if (canonical == "psync"){        return do_psync(cmd, out, conn); }
+
   
 
   // audit sensitive commands
@@ -3975,15 +4051,6 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   #endif
 }
 
-// case insensitive subcommand compare
-static bool acl_sub_is(const std::string &s, const char *lit){
-  // cmd[1] is not lowercase
-  size_t n = strlen(lit);
-  if (s.size() != n){ return false; }
-  for (size_t i = 0; i < n; ++i){ if (tolower((unsigned char)s[i]) != lit[i]){ return false; } }
-  return true;
-}
-
 static void kr_smove(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
   if (cmd.size() > 1){ keys.emplace_back(cmd[1]); } // source
   if (cmd.size() > 2){ keys.emplace_back(cmd[2]); } // destination - cmd[3] is a member not a key
@@ -3991,15 +4058,15 @@ static void kr_smove(const std::vector<std::string> &cmd, std::vector<std::strin
 
 static void kr_object(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
   // OBJECT ENCODING|REFCOUNT|IDLETIME|FREQ key -> key at cmd[2];  HELP/STATS -> no key
-  if (cmd.size() > 2 && (acl_sub_is(cmd[1],"encoding") || acl_sub_is(cmd[1],"refcount")
-                      || acl_sub_is(cmd[1],"idletime") || acl_sub_is(cmd[1],"freq"))){
+  if (cmd.size() > 2 && (arg_ieq(cmd[1],"encoding") || arg_ieq(cmd[1],"refcount")
+                      || arg_ieq(cmd[1],"idletime") || arg_ieq(cmd[1],"freq"))){
     keys.emplace_back(cmd[2]);
   }
 }
 
 static void kr_memory(const std::vector<std::string> &cmd, std::vector<std::string_view> &keys){
   // MEMORY USAGE key [samples n] -> key at cmd[2]; DOCTOR/STATS -> no key
-  if (cmd.size() > 2 && acl_sub_is(cmd[1], "usage")){
+  if (cmd.size() > 2 && arg_ieq(cmd[1], "usage")){
     keys.emplace_back(cmd[2]);
   }
 }
@@ -4032,6 +4099,7 @@ void acl_init_categories(){
     {"psubscribe",KeySpec::NONE}, {"punsubscribe",KeySpec::NONE},
     {"multi",KeySpec::NONE}, {"discard",KeySpec::NONE},{"exec",KeySpec::NONE},
     {"watch",KeySpec::ALL_FROM_1},{"unwatch",KeySpec::NONE},
+    {"replconf",KeySpec::NONE}, {"psync",KeySpec::NONE},
   };
 
     // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
@@ -4054,6 +4122,7 @@ void acl_init_categories(){
     {"multi", CAT_FAST | CAT_TRANSACTION}, {"discard", CAT_FAST | CAT_TRANSACTION},
     {"exec", CAT_SLOW | CAT_TRANSACTION},{"watch", CAT_FAST | CAT_TRANSACTION},
     {"unwatch", CAT_FAST | CAT_TRANSACTION},
+    {"replconf", CAT_ADMIN | CAT_DANGEROUS}, {"psync", CAT_ADMIN | CAT_DANGEROUS},
   };
 
   static const std::unordered_map<std::string_view, int> notify_cls = {

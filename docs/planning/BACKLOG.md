@@ -6,6 +6,22 @@ for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
 
+- 🔴 **`SPOP`'s synthetic `SREM` frame carries an empty key** — every popped
+  member resurrects on restart. `lookup_entry()` takes `std::string &keystr` and
+  **swaps it out** (`key.key.swap(keystr)`, commands.cpp), so `do_spop` reading
+  `cmd[1]` *after* its own lookup builds `SREM "" <member>`, which replays as a
+  no-op. Live since V9.6.4 (2026-07-16), when `CmdSpec::aof_self` + the
+  synthetic frame landed. Fix: `synth = { "srem", ent->key }` — the entry's own
+  key, which is where `lookup_entry` swapped the string *to*; no copy on the
+  non-feed path and it cannot drift from the entry being modified.
+  - **Found 2026-08-03 by watching the V10.2a replication stream**, not by any
+    suite: `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction
+    `DEL`/renamed-command frames but never `SPOP`, and `stress_test.py` does not
+    restart. Add a `SPOP`-then-restart case when next touching that suite.
+  - Generalisable: a handler must not read `cmd[N]` after passing it to
+    `lookup_entry`. A scan of every `do_*` found this as the only instance —
+    worth re-running that check after any handler that builds its own AOF frame.
+
 - 🟡 **`ACL GENPASS` generates passwords from a non-cryptographic PRNG.**
   **Scheduled: after V10 ships.** `rand_idx()` (`common.h`) is
   `std::mt19937_64` seeded once from `std::random_device`, and `do_acl`'s
