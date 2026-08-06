@@ -128,6 +128,88 @@ static void loop_drain(){
   for (auto &fn : jobs){ fn(); }
 }
 
+// Replication side (putting this here beacause a lot of code goes in here)
+
+// Privileged identity for applying the replication stream. same as aof replay user
+static User *reply_apply_user(){
+  // we build this onece under concurrent calls
+  static User u = []{
+    User x;
+    x.name = "__replication__";
+    x.enable = true;
+    x.allow_cats = CAT_ALL;
+    x.all_keys = true;
+    x.all_channels = true;
+    return x;
+  }();
+  return &u;
+}
+
+void repl_stop(){
+  if (g_data.master_link){
+    Conn *c = g_data.master_link;
+    c->is_master_link = false;
+    conn_destroy(c);
+  }
+  g_data.repl_state = ReplState::NONE;
+  g_data.master_host.clear();
+  g_data.master_port = 0;
+  g_data.repl_rdb_left = 0;
+  g_data.repl_rdb_buf.clear();
+  g_data.repl_rdb_buf.shrink_to_fit();
+}
+
+bool repl_start(const std::string &host, int port, std::string &err){
+  repl_stop();  
+
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0){ err = std::string("Socket (): ") + strerror(errno); return false; } 
+
+  struct sockaddr_in a = {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1){
+    close(fd); err = "invalid master address '" + host + "'"; return false;
+  }
+  int val = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+  fd_set_nb(fd);
+
+  if (connect(fd, (const struct sockaddr *)&a, sizeof(a)) != 0 && errno != EINPROGRESS){
+    err = std::string("connect(): ") + strerror(errno); close(fd); return false;
+  }
+
+  Conn *c = new Conn();
+  c->fd = fd;
+  c->id = g_data.next_conn_id++;
+  c->is_master_link = true;
+  c->incoming = buf_create(64 * 1024);
+  c->outgoing = buf_create(64 * 1024); 
+  c->want_read = true;
+  c->want_write = true;
+  // Deliberately in NO timer list: an idle master link is healthy, and the
+  // io/idle sweeps would reap it after 30s. dlist_init keeps conn_destroy's
+  // detach safe on a node that was never inserted anywhere.
+
+  dlist_init(&c->idle_node);
+
+  if (g_data.fd2conn.size() <= (size_t)fd){ g_data.fd2conn.resize(fd + 1); }
+  assert(!g_data.fd2conn[fd]);
+  g_data.fd2conn[fd] = c;
+  g_data.connected_clients++; // balances conn_Destroy's unconditional decrement
+
+  // Queue the whole handshake at once, we control both ends and the replies 
+  // are consumed in order by the state machine below
+  std::string hs;
+  std::string myport = std::to_string(g_config.port);
+  if (!g_config.masterauth.empty()){
+    aof_encode(hs, { "AUTH", std::string_view(g_config.masterauth) });
+  }
+  aof_encode(hs, { "REPLCONF", "listening-port", std::string_view(myport) });
+  aof_encode(hs, { "PSYNC", "?", "-1" });
+  buf_append(&c->outgoing, hs.data(), hs.size());
+}
+
 // callback when the socket is ready
 static int32_t handle_accept(int fd, bool is_tls){
   // accept logic

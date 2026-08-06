@@ -516,6 +516,22 @@ static const ConfigDirective k_config_table[] = {
     [](std::string &o) -> bool { o = std::to_string(g_config.repl_backlog_size); return true; },
     /*boot_only*/ true, /*masked*/ false, /*emit*/ nullptr},
 
+  { "masterauth", 1, 1,
+    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+      g_config.masterauth = a[0]; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = g_config.masterauth.empty() ? "" : "<set>"; return true; },
+    /*boot_only*/ false, /*masked*/ true,
+    /*emit*/ [](FILE *fp){
+      if (g_config.masterauth.empty()){ return; }
+      std::string esc;
+      for (char c : g_config.masterauth){
+        if (c == '"' || c == '\\'){ esc += '\\'; }
+        esc += c;
+      }
+      fprintf(fp, "masterauth \"%s\"\n", esc.c_str());   // always quoted: it is a password
+    } },
+
   // constructs with no single-value form.
   { "user", 1, -1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {

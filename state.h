@@ -113,7 +113,16 @@ enum class TlsAuthClients {
   OPTIONAL
 };
 
-typedef struct ssl_st SSL; // OpenSSL's own typedef; we keep openss/ss.h out of this header
+// Lifecycle of the outbound link to our master
+enum class ReplState : uint8_t {
+  NONE,       // not a replica
+  HANDSHAKE,  // handshake sent, waiting for +FULLRESYNC
+  RDB_LEN,    // waiting for the $<len> header
+  RDB_BODY,   // reading len bytes of image
+  STREAMING,  // applying the command stream
+};
+
+typedef struct ssl_st SSL; // OpenSSL's own typedef; we keep openssl/ss.h out of this header
 
 struct User {
   uint64_t allow_cats = 0; // granted category bits
@@ -157,7 +166,8 @@ struct Conn {
   bool watch_dirty = false; // a watched key changed -> exec aborts
   std::unordered_set<std::string> watched_keys; // keys WATCHed; also the teardown index
   std::vector<std::vector<std::string>> queue_cmds; // stored as TYPED (not canonicalized)
-  bool is_replica = false; /// PSYNC, propagate() streams the write log to it
+  bool is_replica = false; // PSYNC, propagate() streams the write log to it
+  bool is_master_link = false; // outbound link to our master; read path is the repl state machine
 };
 
 // global hashtable
@@ -207,6 +217,7 @@ struct GlobalData{
   bool g_loading = false; // true when replaying
   bool g_aof_write_err = false; // last AOF flush failed -> refuse rewrties until recovery
   bool g_aof_last_rewrite_ok = true; // For do_info
+
   // Replication, the backlog is a ring: repl_backlog_pos is the write
   // cursor, repl_backlog_histlen how much of the ring is valid. The offset of
   // the first byte still held is DERIVED, never stored — a second counter is a
@@ -216,6 +227,12 @@ struct GlobalData{
   std::vector<char> repl_backlog; // sized once at boot; empty == disabled
   size_t repl_backlog_pos = 0;
   size_t repl_backlog_histlen = 0;
+  ReplState repl_state = ReplState::NONE;
+  Conn *master_link = nullptr; // nullptr = this server is master
+  std::string master_host;
+  int master_port = 0;
+  uint64_t repl_rdb_left = 0; // bytes of the resync image still to read
+  std::string repl_rdb_buf; // acumulates it
 };
 
 struct SaveCondition {
@@ -245,6 +262,7 @@ struct Config {
   int aof_rewrite_perc = 100; // ... or until it has doubled
   // replication
   size_t repl_backlog_size = 1024 * 1024; // 0 disables the backlog
+  std::string masterauth; // plaintext; we must present it to the master.
   int maxmemory_samples = 10; // eviction sample size (best-of-n)
   int lfu_log_factor = 10; // LFU: higher = counter saturates slower
   int lfu_decay_time = 1; // LFU: minutes of idleness per counter decrement
@@ -354,6 +372,8 @@ int  config_selfcheck();
 void repl_init(); // call once at boot
 void repl_backlog_feed(const char *bytes,  size_t len); 
 uint64_t repl_backlog_start_offset(); // derived, for info
+bool repl_start(const std::string &host, int port, std::string &err);
+void repl_stop();
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
