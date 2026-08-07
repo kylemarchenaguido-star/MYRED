@@ -48,6 +48,9 @@ struct Listener {
 // Forward declaration to use it in handle_accept
 static void conn_set_timer(Conn *conn, ConnTimer type);
 
+// Forward declaration to use it in conn_destroy
+static void repl_link_lost(Conn *conn);
+
 // worker constant 
 static int g_loop_efd = -1;
 static pthread_mutex_t g_loop_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -99,6 +102,7 @@ static void conn_destroy(Conn *conn){
   pubsub_remove_conn(conn); // drop from every channel before the Conn dies
   watch_clear_conn(conn);
   repl_remove_conn(conn);
+  repl_link_lost(conn);
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
   delete conn;
@@ -145,10 +149,26 @@ static User *reply_apply_user(){
   return &u;
 }
 
+// The master closed the link, or it errored. 
+static void repl_link_lost(Conn *conn){
+  if (!conn->is_master_link){ return; }
+  fprintf(stderr, "replication: lost link to master %s:%d\n",
+           g_data.master_host.c_str(), g_data.master_port);
+  conn->is_master_link = false;
+  g_data.master_link = nullptr;
+  g_data.repl_state = ReplState::NONE; // no auto-reconnect yet
+  g_data.master_host.clear();
+  g_data.master_port = 0;
+  g_data.repl_rdb_left = 0;
+  g_data.repl_rdb_buf.clear();
+  g_data.repl_rdb_buf.shrink_to_fit();
+}
+
 void repl_stop(){
   if (g_data.master_link){
     Conn *c = g_data.master_link;
     c->is_master_link = false;
+    g_data.master_link = nullptr;
     conn_destroy(c);
   }
   g_data.repl_state = ReplState::NONE;
@@ -182,6 +202,8 @@ bool repl_start(const std::string &host, int port, std::string &err){
   Conn *c = new Conn();
   c->fd = fd;
   c->id = g_data.next_conn_id++;
+  c->peer = host + ":" + std::to_string(port);
+  c->user = reply_apply_user();
   c->is_master_link = true;
   c->incoming = buf_create(64 * 1024);
   c->outgoing = buf_create(64 * 1024); 
@@ -246,7 +268,107 @@ static void repl_apply(std::vector<std::string> &cmd){
 // The replica's read path, replacing try_one_request for the master link
 static void repl_master_data(Conn *c){
   for (;;){
-    
+    switch (g_data.repl_state){
+
+      case ReplState::NONE:
+        return; // link torn down mid-drain
+
+      case ReplState::HANDSHAKE: {
+        std::string line;
+        if (!repl_take_line(c, line)){ return; }
+        if (line.empty()){ break; }
+        if (line[0] == '-'){
+          fprintf(stderr, "replication: master rejected the handshake: %s\n", line.c_str() + 1);
+          c->want_close = true;
+          return;
+        }
+        // the +OK acks for AUTH / REPLCONF arrive first and carry nothing we need
+        if (line.compare(0, 12, "+FULLRESYNC") != 0){ break; }
+
+        const size_t sp = line.find(' ', 12);
+        if (sp == std::string::npos){
+          fprintf(stderr, "replication: malformed '%s'\n", line.c_str());
+          c->want_close =true;
+          return;
+        }
+        // adopt the master's history: from here our won past writes are irrevelant, we are its copy
+        g_data.repl_id = line.substr(12, sp - 12);
+        g_data.master_repl_offset = strtoull(line.c_str() + sp + 1, nullptr, 10);
+        g_data.repl_state = ReplState::RDB_LEN;
+        fprintf(stderr, "replication: full resync from %s at offset %llu\n",
+                 g_data.repl_id.c_str(), (unsigned long long)g_data.master_repl_offset);
+        break;
+      }
+
+      case ReplState::RDB_LEN: {
+        std::string line;
+        if (!repl_take_line(c, line)){ return; }
+        if (line.empty() || line[0] != '$'){
+          fprintf(stderr, "replication: expected the RDB bulk header, got '%s'\n", line.c_str());
+          c->want_close = true;
+          return;
+        }
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long len = strtoull(line.c_str() + 1, &end, 10);
+        if (errno || end == line.c_str() + 1 || *end != '\0'){
+          fprintf(stderr, "replication: bad RDB length '%s'\n", line.c_str());
+          c->want_close = true;
+          return;
+        }
+        g_data.repl_rdb_left = len;
+        g_data.repl_rdb_buf.clear();
+        // the reserve is capped for absurd values that can come
+        g_data.repl_rdb_buf.reserve((size_t)std::min<uint64_t>(len, k_repl_backlog_min));
+        g_data.repl_state = ReplState::RDB_BODY;
+        break;
+      }
+
+      case ReplState ::RDB_BODY: {
+        if (g_data.repl_rdb_left){
+          const size_t have = buf_size(&c->incoming);
+          if (have == 0){ return; }
+          const size_t take = (size_t)std::min<uint64_t>(g_data.repl_rdb_left, have) ;
+          g_data.repl_rdb_buf.append((const char *)buf_data(&c->incoming), take);
+          buf_consume(&c->incoming, take);
+          g_data.repl_rdb_left -= take;
+          if (g_data.repl_rdb_left){ return; } // image stil arriving
+        }
+
+        // Tha master's image REPLACES our dataset 
+        std::vector<std::string> wipe = { "flushall" };
+        repl_apply(wipe);
+
+        const size_t img = g_data.repl_rdb_buf.size();
+        const bool ok = rdb_load_buffer((const uint8_t *)g_data.repl_rdb_buf.data(), img);
+        g_data.repl_rdb_buf.clear();
+        g_data.repl_rdb_buf.shrink_to_fit(); // a resync image must not stay resident
+        if (!ok){
+          fprintf(stderr, "replication: RDB image failed to load, dropping the link\n");
+          c->want_close = true;
+          return;
+        }
+        g_data.repl_state = ReplState::STREAMING;
+        fprintf(stderr, "replication: loaded %zu byte image, streaming from master\n", img);
+        break;
+      }
+
+      case ReplState::STREAMING: {
+        std::vector<std::string> cmd;
+        const int32_t consumed = parse_resp_request(&c->incoming, cmd);
+        if (consumed == 0){ return; } // partial frame, wait for the rest
+        if (consumed < 0){
+          fprintf(stderr, "replication: malformed frame from the master, dropping the link\n");
+          c->want_close = true;
+          return;
+        }
+        buf_consume(&c->incoming, (size_t)consumed);
+        // our offset is the MASTER's: count the bytes we accepted
+        g_data.master_repl_offset += (size_t)consumed;
+        if (!cmd.empty()){ repl_apply(cmd); }
+        break;
+      }
+    }
   }
 }
 
@@ -560,6 +682,8 @@ static void process_timers(){
 }
 
 static void conn_set_timer(Conn *conn, ConnTimer type){
+  // the master link is never reaped: an idle master is a healthy master
+  if (conn->is_master_link){ return; }
   dlist_detach(&conn->idle_node);
 
   // record when it joined the new list
@@ -670,10 +794,15 @@ static void handle_read(Conn *conn){
 
     // a client that streams framing without ever completing a command must not grow us unbounded
     if (buf_size(&conn->incoming) > k_max_incoming){
-      fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
-      buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
-      conn->want_close = true;
-      return;
+      if (conn->is_master_link){
+        if (n > 0){ repl_master_data(conn); }
+        if (conn->want_close){ return; }
+      } else if (buf_size(&conn->incoming) > k_max_incoming){
+        fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
+        buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
+        conn->want_close = true;
+        return;
+      }
     }
 
     if (r == IoResult::OK){
@@ -686,8 +815,8 @@ static void handle_read(Conn *conn){
     conn->want_close = true; // PEER_CLOSED OR ERR
     return;
   }
-
-  while (try_one_request(conn)) {}
+  
+  if (!conn->is_master_link){ while (try_one_request(conn)) {} }
 
   if(buf_size(&conn->outgoing) > 0){
     conn->want_read = false;

@@ -20,6 +20,7 @@
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
+constexpr size_t k_repl_rdb_reserve_cap = 16u << 20; // 16 mib 
 static constexpr size_t k_max_incoming = 2 * k_max_msg; // generous pipeline room
 constexpr size_t k_max_args = 65536;
 // secondes * miliseconds (5s -> 5000ms)

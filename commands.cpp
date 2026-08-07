@@ -1298,7 +1298,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     "aof_last_bgrewrite_status:%s\r\n"
     "\r\n"
     "# Replication\r\n"
-    "role:master\r\n"
+    "role:%s\r\n"
     "master_replid:%s\r\n"
     "connected_slaves:%zu\r\n"
     "master_repl_offset:%llu\r\n"
@@ -1346,6 +1346,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
     g_data.g_aof_last_rewrite_ok ? "ok" : "err",
 
     // replication
+    g_data.repl_state != ReplState::NONE ? "slave" : "master",
     g_data.repl_id.c_str(),
     g_data.replicas.size(),
     (unsigned long long)g_data.master_repl_offset,
@@ -1357,6 +1358,15 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out){
   );
   if (len < 0){ return resp_err(out, "ERR info formatting"); }
   // clamp, never over read
+  // replica only fields: appended rather than folded into the format above
+  if (g_data.repl_state != ReplState::NONE && len < (int)sizeof(buf)){
+    len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+      "master_host:%s\r\n"
+      "master_port:%d\r\n"
+      "master_link_status:%s\r\n",
+      g_data.master_host.c_str(), g_data.master_port,
+      g_data.repl_state == ReplState::STREAMING ? "up" : "down");
+  }
   if (len >= (int)sizeof(buf)){ len = sizeof(buf) - 1; }
   resp_str(out, buf, (size_t)len);         
 }
@@ -2558,6 +2568,27 @@ static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   g_data.replicas.insert(conn);
   fprintf(stderr, "replication: replica %s attached at offset %llu (%zu byte image)\n", 
            conn->peer.c_str(), (unsigned long long)start_offset, img_len);
+}
+
+// REPLICAOF <host> <port> | REPLICAOF NO ONE. 
+static void do_replicaof(std::vector<std::string> &cmd, Buffer *out){
+  if (arg_ieq(cmd[1], "no") && arg_ieq(cmd[2], "one")){
+    if (g_data.repl_state != ReplState::NONE){
+      repl_stop();
+      fprintf(stderr, "replication: REPLICAOF NO ONE - this intance is a master again\n");
+    }
+    return resp_ok(out);
+  }
+  long port = 0;
+  if (!parse_int_strict(cmd[2].c_str(), &port) || port <= 0 || port > 65535){
+    return resp_err(out, "ERR invalid master port");
+  }
+  std::string err;
+  if (!repl_start(cmd[1], (int)port, err)){
+    const std::string msg = "ERR" + err;
+    return resp_err(out, msg.c_str());
+  }
+  resp_ok(out);
 }
 
 // forward declaration just for this function
@@ -3799,10 +3830,14 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"discard",      {do_txn_stub,      1, 1}},
   {"exec",         {do_txn_stub,      1, 1}},
   {"watch",        {do_txn_stub,      2,-1}},
-  {"unwatch",        {do_txn_stub,      1, 1}},
+  {"unwatch",      {do_txn_stub,      1, 1}},
   // replication
   {"replconf",     {do_pubsub_stub,   1, -1}},
   {"psync",        {do_pubsub_stub,   3,  3}},
+  {"replconf",     {do_pubsub_stub,   1, -1}},
+  {"psync",        {do_pubsub_stub,   3,  3}},
+  {"replicaof",    {do_replicaof,     3,  3}},
+  {"slaveof",      {do_replicaof,     3,  3}},
 };
 
 struct DispatchEntry {
@@ -4100,6 +4135,9 @@ void acl_init_categories(){
     {"multi",KeySpec::NONE}, {"discard",KeySpec::NONE},{"exec",KeySpec::NONE},
     {"watch",KeySpec::ALL_FROM_1},{"unwatch",KeySpec::NONE},
     {"replconf",KeySpec::NONE}, {"psync",KeySpec::NONE},
+    {"replconf",KeySpec::NONE}, {"psync",KeySpec::NONE},
+    {"replicaof",KeySpec::NONE}, {"slaveof",KeySpec::NONE},
+
   };
 
     // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line lives)
@@ -4123,6 +4161,9 @@ void acl_init_categories(){
     {"exec", CAT_SLOW | CAT_TRANSACTION},{"watch", CAT_FAST | CAT_TRANSACTION},
     {"unwatch", CAT_FAST | CAT_TRANSACTION},
     {"replconf", CAT_ADMIN | CAT_DANGEROUS}, {"psync", CAT_ADMIN | CAT_DANGEROUS},
+    {"replconf", CAT_ADMIN | CAT_DANGEROUS}, {"psync", CAT_ADMIN | CAT_DANGEROUS},
+    {"replicaof", CAT_ADMIN | CAT_DANGEROUS}, {"slaveof", CAT_ADMIN | CAT_DANGEROUS},
+
   };
 
   static const std::unordered_map<std::string_view, int> notify_cls = {
