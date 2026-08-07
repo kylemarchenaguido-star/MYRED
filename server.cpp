@@ -208,6 +208,46 @@ bool repl_start(const std::string &host, int port, std::string &err){
   aof_encode(hs, { "REPLCONF", "listening-port", std::string_view(myport) });
   aof_encode(hs, { "PSYNC", "?", "-1" });
   buf_append(&c->outgoing, hs.data(), hs.size());
+
+  g_data.master_host = host;
+  g_data.master_port = port;
+  g_data.repl_state = ReplState::HANDSHAKE;
+  g_data.master_link = c;
+  fprintf(stderr, "replication: connecting to master %s\n", c->peer.c_str());
+  return true;
+}
+
+// one CRLF-terminated line out of the incoming; false = need more bytes
+static bool repl_take_line(Conn *c, std::string &line){
+  const char *p = (const char *)buf_data(&c->incoming);
+  size_t n = buf_size(&c->incoming);
+  for (size_t i = 0; i + 1 < n; ++i){
+    if (p[i] == '\r' && p[i + 1] == '\n') {
+      line.assign(p, i);  
+      buf_consume(&c->incoming, i + 2);
+      return true;
+    }
+  }
+  return false; 
+}
+
+// Applies one command from the master through the ordinary dispatch
+static void repl_apply(std::vector<std::string> &cmd){
+  Buffer sink = buf_create(256);
+  Conn fake{};
+  fake.user = reply_apply_user();
+  bool was_loading = g_data.g_loading;
+  g_data.g_loading = true; // supress re_propagation, exactly as aof_load does
+  do_request(cmd, &sink, &fake, nullptr, 0);
+  g_data.g_loading = was_loading;
+  buf_destroy(&sink);
+}
+
+// The replica's read path, replacing try_one_request for the master link
+static void repl_master_data(Conn *c){
+  for (;;){
+    
+  }
 }
 
 // callback when the socket is ready

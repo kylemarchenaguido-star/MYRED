@@ -5,7 +5,6 @@ and feature gaps. See `ROADMAP.md` for current/completed work and `DECISIONS.md`
 for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
-
 - 🔴 **`SPOP`'s synthetic `SREM` frame carries an empty key** — every popped
   member resurrects on restart. `lookup_entry()` takes `std::string &keystr` and
   **swaps it out** (`key.key.swap(keystr)`, commands.cpp), so `do_spop` reading
