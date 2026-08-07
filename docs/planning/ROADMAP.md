@@ -234,6 +234,62 @@ completely different ways):
   resync, and a `SET` issued on the master appears on the replica shortly
   after with no further manual action.
 
+#### V10.2.1 - Optional-dependency build [Done] *(detour, not replication work)*
+
+Closed 2026-08-07. A **detour taken mid-V10.2b**, filed here to keep the V10.2
+block contiguous — it is build-system work, not replication work, and changes no
+runtime behaviour on a fully-provisioned machine.
+
+Trigger: on a dev machine with neither `libssl-dev` nor `libargon2-dev`,
+`find_package(OpenSSL REQUIRED)` failed at **configure** time, so the tree could
+not be built at all — not a degraded build, no build. Argon2 was already optional
+(CMake + `cred.cpp` guards, since V9.6); OpenSSL was the only hard blocker.
+
+- **OpenSSL is now optional**, mirroring the `MYRED_ARGON2` pattern already in the
+  file: `option(MYRED_TLS ... ON)` + a non-`REQUIRED` `find_package`, setting
+  `MYRED_HAVE_TLS` only on success. `OpenSSL::SSL`/`OpenSSL::Crypto` moved out of
+  the unconditional `target_link_libraries` into that branch.
+- **The V9.7.1 transport seam paid for itself a second time.** Because OpenSSL was
+  already confined to `transport.cpp`, and `Conn::ssl` is a forward-declared
+  `struct ssl_st *` in `state.h`, making TLS optional touched exactly one `.cpp`
+  and no header. The seam's first payoff was keeping `server.cpp` OpenSSL-free;
+  this is the second.
+- **`tr_read`/`tr_write` had to be *inverted*, not just `#ifdef`-wrapped.** Both
+  read `if (!c->ssl){ ...plaintext, all paths return... }` then fell through to a
+  TLS tail. Wrapping only that tail leaves the no-TLS build a path with no return
+  — `-Wreturn-type` under the project's `-Wall -Wextra -Wshadow`. The TLS block now
+  comes first, inside the guard, with an early return; plaintext is the
+  unconditional tail. The two `rv` declarations are not `-Wshadow` hits: the inner
+  scope closes before the outer one is declared.
+- **Fail loud, never downgrade.** A no-TLS `tr_tls_init` returns `false` when
+  `tls_port != 0` rather than ignoring the directive, so `fatal_exit` names the
+  missing package. Silently serving cleartext on a port an operator configured for
+  TLS is the worst available outcome. Consequence to know: **`myred.conf` and
+  `bench.conf` do not boot on a no-TLS build as shipped** — both set `tls-port`.
+- **The Argon2 fallback has a sharp edge now that it is reachable.** A build
+  without libargon2 cannot *verify* existing `$argon2id$` credentials — `cred.cpp`
+  returns `false` for the PHC branch — so a correct password answers `WRONGPASS`.
+  Not new code, but previously unreachable in practice; documented in README.
+- **zlib stays required, deliberately.** Compression is part of the on-disk RDB
+  format, so a build without it could not read snapshots written by a build with
+  it. Only its error message improved (names `zlib1g-dev`).
+- CMake prints a `MYRED build: TLS=... Argon2id=...` summary at configure time, so
+  a silently-absent optional dep is visible then rather than at runtime.
+
+Verified: both configurations build warning-free (the four `repl_*` unused-function
+warnings are V10.2b's half-written replica side, pre-existing); `--correctness-only`
+**652/652** green on the TLS-enabled build; the no-TLS build refuses a `tls-port`
+config with the actionable message.
+
+**Process note — a misspelled `#ifdef` is silent.** Hand-application slipped
+`MYRED_HAEV_TLS` for `MYRED_HAVE_TLS`. That is not a compile error in either
+direction: it takes the `#else` branch *forever*, so the build would have compiled
+and linked and run with TLS quietly stripped out **even on a machine with OpenSSL
+installed** — discoverable only by noticing `tls-port` had stopped working. Same
+family as the duplicated `{"multi", …}` key (V8.4) and the four parallel ACL lists:
+a name that is never checked against anything. Grep the guard spellings against
+the CMake definition after any edit to a `#ifdef` region.
+
 #### V10.3 - Read-only replica mode + command gating [Backlog]
 
 Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts

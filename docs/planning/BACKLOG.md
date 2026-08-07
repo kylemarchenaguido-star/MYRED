@@ -253,22 +253,146 @@ Escalate only when a metric demands it.
 
 ## Hand-Tuned Hot Paths (Assembly / Intrinsics)
 
-Purely opportunistic/educational track — not on the critical path of any active
-milestone.
+Educational track with a real payoff. **Not scheduled** — promote to a milestone
+when picked. Gate: nothing here blocks V10.
 
-- Candidate: `str_hash` (`common.h`, FNV-1a) — called on essentially every keyed
-  command. Gate any work here on profiling first (`perf record`/`perf report`
-  against a `redis-benchmark` run) — don't assume it's hot without measuring.
-- FNV-1a's byte-at-a-time serial dependency chain means a line-for-line asm port
-  of the same algorithm won't beat `-O2`'s output. A real win needs a different
-  algorithm alongside the low-level rewrite — e.g. hardware CRC32 via
-  `_mm_crc32_u64`, or xxHash — not "asm-ify FNV as written."
-- Preference order if pursued: compiler intrinsics (`<immintrin.h>`, `__builtin_*`)
-  first — compiler still owns register allocation/ABI; a standalone `.s`
-  translation unit (own CMake `enable_language(ASM)` target, `extern "C"` linkage)
-  only if intrinsics can't express what's needed; inline `asm volatile` inside a
-  `.cpp` last, since it's hardest to keep clobber-list correct and ties the code to
-  one compiler's dialect.
+### The target is `crc32_compute`, not `str_hash`
+
+Measured 2026-08-07 (i7-1165G7, `-O2`, 64 MiB random buffer):
+
+| | throughput | note |
+|---|---|---|
+| `crc32_compute` (rdb.cpp, byte-at-a-time table) | **0.22 GB/s** | current |
+| zlib `crc32()` — same polynomial, hardware-accelerated | **2.10 GB/s** | **9.8x**, bit-identical output |
+| `str_hash` (FNV-1a) | 7.0 ns @ 8B key · 16.6 ns @ 16B · 34.9 ns @ 32B | |
+
+`str_hash` is **demoted to a footnote** (kept below). At the recorded 2.2M SET/s
+baseline with realistic ~16-byte keys, hashing costs ~37 ms per core-second —
+low single-digit percent of total work, and a *fraction* of that is the most any
+rewrite could recover. The previous entry's instinct to profile first was right,
+and profiling says no. `crc32_compute` is
+where the headroom actually is, and it is a better teaching target on every axis:
+
+- **9.8x of measured, already-proven headroom** — not a guess. zlib's number is
+  the same algorithm on the same machine, so the gap is purely implementation.
+- **A perfect correctness oracle.** The existing scalar function must be matched
+  *bit-exactly*, and zlib is an independent third check. Compare that to
+  `str_hash`, where any output is "correct" and there is nothing to verify against.
+- **It runs over MB-scale buffers**, which is the only regime where SIMD wins.
+  `str_hash` runs over 8–32 byte keys, where vector setup costs more than it saves.
+- **It sits on a stall that matters right now.** `crc32_compute` →
+  `rdb_serialize` → `rdb_build_image` → `do_psync` (commands.cpp:2549), which
+  V10.2a runs **synchronously in the event loop** by deliberate design. Also
+  `rdb_build_aof_preamble` (BGREWRITEAOF), `SAVE`, and both load paths
+  (rdb.cpp:777, 861) at boot. At 0.22 GB/s every 100 MB of RDB is ~450 ms of pure
+  checksum time — on full resync, that is 450 ms the loop serves nobody.
+- **It is a pure function over a byte buffer**, so it needs no server, no event
+  loop, and no socket to test — the same property that makes V11's
+  `rdb_load_buffer` fuzz harness cheap.
+
+### 🔴 Trap: `_mm_crc32_u64` is the WRONG instruction here
+
+The previous version of this entry suggested it. It would corrupt the on-disk
+format. SSE4.2's `CRC32` instruction computes **CRC-32C** (Castagnoli, poly
+`0x1EDC6F41`). `crc32_compute` uses `0xEDB88320` — reflected ISO-HDLC, the
+zlib/Ethernet polynomial. Different polynomial, different checksum: **every
+existing RDB and hybrid-AOF file would fail its CRC check and refuse to load**,
+and files written by the new build would be unreadable by the old one.
+
+The correct hardware path for this polynomial is **`PCLMULQDQ`** (carry-less
+multiply) doing polynomial folding — Intel's *"Fast CRC Computation for Generic
+Polynomials Using PCLMULQDQ"* whitepaper is the reference implementation. The CPU
+reports `pclmulqdq`, so this is available.
+
+`_mm_crc32_u64` remains fine for a *new* checksum with no on-disk history. It is
+only wrong for this one, and only because the format already shipped.
+
+### How assembly enters this codebase
+
+The infrastructure question, answered once so every later kernel reuses it.
+
+**1. A seam, not a rewrite.** Same shape as the V9.7.1 transport seam and the
+V10.2.1 TLS guard — the project has done this twice now and it works. One header
+declares the operation; one TU per implementation:
+
+- `crc32.h` — declares `crc32_compute` (unchanged signature; every existing caller
+  keeps compiling).
+- `crc32_scalar.cpp` — today's table version, moved out of rdb.cpp. **Always
+  compiled, never deleted.** It is the portable fallback *and* the oracle.
+- `crc32_pclmul.cpp` — the accelerated one, compiled only when the toolchain can
+  target it.
+
+**2. Runtime dispatch — the part that is easy to get dangerously wrong.** Do
+**not** add `-mpclmul -msse4.2` to the global flags. That licenses the compiler to
+emit those instructions *anywhere* it auto-vectorizes, so the binary dies with
+`SIGILL` on an older CPU at some unrelated line, nowhere near this code. Two safe
+options:
+
+  - **Per-TU flags** — `set_source_files_properties(crc32_pclmul.cpp PROPERTIES
+    COMPILE_OPTIONS "-mpclmul;-msse4.2")`. Only that file may emit them.
+  - **Function multiversioning** — `__attribute__((target("pclmul,sse4.2")))` on
+    the function itself, in a normally-compiled TU. No CMake change at all.
+
+  Then pick once at boot with `__builtin_cpu_supports("pclmul")` and store a
+  function pointer. Resolve it beside `metadata_selfcheck()`, where boot-time
+  invariant setup already lives. One indirect call **per buffer**, not per byte —
+  unmeasurable against a multi-MB checksum.
+
+**3. Escalation ladder — stop at whichever rung stops paying.**
+
+  - **Stage 0 — harness first, before any optimization.** A differential test
+    (candidate vs scalar over random buffers at **every** length 0–4096, plus
+    MB-scale) and a micro-benchmark. Plus a fixed-vector regression pinning the
+    current constant, so any future change that alters the polynomial fails at
+    build time instead of at a customer's RDB. Writing this first is what makes
+    every later stage safe to attempt.
+  - **Stage 1 — slicing-by-8, pure C, no intrinsics.** Eight lookup tables (8 KB),
+    8 bytes per iteration. Typically 3–4x over byte-at-a-time, fully portable,
+    zero dispatch machinery. **Do this before touching intrinsics**, because it
+    teaches the real lesson — most of the 9.8x is *algorithmic*, not
+    instruction-level — and it sets the honest baseline. Beating byte-at-a-time
+    proves nothing; beating slicing-by-8 is a genuine result.
+  - **Stage 2 — PCLMULQDQ intrinsics.** `_mm_clmulepi64_si128`, fold 128-bit
+    lanes, Barrett reduction at the tail. Compiler still owns registers and ABI.
+    This is where the remaining win lives.
+  - **Stage 3 — standalone `.s`, only if Stage 2 measurably leaves something.**
+    `enable_language(ASM)`, `extern "C"`, System V AMD64 ABI. Real educational
+    payoff; usually a small delta over intrinsics. Gate on a measurement.
+  - **Never inline `asm volatile` in a `.cpp` for this.** A subtly wrong clobber
+    list produces corruption that appears only under optimization — inside a
+    checksum, which is the worst possible place for a heisenbug.
+
+**4. The honesty check — the rule that keeps this from shipping a toy.** zlib is
+*already linked* and its `crc32()` is bit-identical and hardware-accelerated. So
+zlib's number is the bar, not the byte-at-a-time version. If the hand-written
+kernel cannot match it, the shippable decision is to call `zlib`'s `crc32()` and
+keep the hand-written one behind a build flag as a learning artifact. The
+educational track does not get to ship a slower checksum because it was fun to
+write. (Noted deliberately: "just call zlib" is available *today* as a ~3-line
+change if the 9.8x is ever wanted without the learning detour.)
+
+**5. Verification, beyond the unit tests.**
+  - Every length 0–4096 against scalar. Tail handling is the **#1 SIMD bug class**
+    — a correct vectorized main loop with a wrong <16-byte remainder.
+  - Cross-check against zlib on the same buffers.
+  - Round-trip both directions: write an RDB with the accelerated build and load
+    it with a scalar-only build, and vice versa. This is the check that would
+    actually catch the `_mm_crc32_u64` polynomial trap.
+  - This becomes the project's **first real C++ test file** — see the "C++ test
+    layer" entry in the Upgrade Catalog, whose first named candidate this now is —
+    and the natural precursor to V11's `rdb_load_buffer` fuzz harness, which
+    exercises the same function over the same kind of buffer.
+
+### Footnote: `str_hash`, kept but demoted
+
+Not worth doing on the measurements above; recorded so it is not re-litigated.
+FNV-1a's byte-at-a-time serial dependency chain also means a line-for-line asm
+port cannot beat `-O2` — a win needs a *different algorithm* (CRC-32C via
+`_mm_crc32_u64`, which **is** appropriate here, or xxHash), not "asm-ify FNV as
+written." Worth knowing if it is ever revisited: swapping the hash function is
+**safe with respect to persistence** — `hcode` is recomputed on every load
+(rdb.cpp:490, 539, 605, 659, 706) and never written to disk — so this is a pure
+in-memory change with no format consequences, unlike the RDB CRC.
 
 ## ACL and Command-Surface Feature Gaps
 
@@ -475,9 +599,15 @@ scratches.
   channel worker threads use to post results back to the main loop) is a small,
   contained, single-producer-friendly spot to try a lock-free MPSC ring buffer
   without threatening the single-writer discipline everywhere else in `g_data`.
-- **SIMD RESP parsing** — vectorized `\r\n` scanning in `parse_resp_request`
-  (the simdjson trick: compare 16/32 bytes at once, build a bitmask of matches)
-  instead of a byte-at-a-time scan. Profile first, same rule as `str_hash`.
+- ~~**SIMD RESP parsing**~~ — **checked and dropped 2026-08-07.** The premise was
+  wrong: `parse_resp_request`'s byte-at-a-time scans (resp.cpp:46, 68) only walk
+  the *digits of a length prefix* — 1–7 bytes — and the bulk payload is never
+  scanned at all, since `str_len` indexes straight past it. There is no MB-scale
+  scan to vectorize. The only unbounded scan is the inline-command path
+  (resp.cpp:19), which is a `redis-cli --pipe` compatibility path, not a hot one.
+  The simdjson trick needs a parser that scans its whole input; RESP is
+  length-prefixed precisely so it doesn't have to. See Hand-Tuned Hot Paths for
+  the target that *did* survive measurement.
 - **Write your own RDB compressor** — a small LZ77/LZ4-style codec replacing the
   `zlib` dependency. Real compression-algorithm learning with a natural
   correctness check (round-trip against every existing RDB test fixture).
@@ -531,6 +661,9 @@ scratches.
     `rdb_load_buffer` (rdb.cpp) are natural first candidates: small, pure,
     already isolated enough to link against directly from a `.cpp` test file
     with no server/event-loop bootstrapping required.
+    - **`crc32_compute` is now the concrete first one** — Hand-Tuned Hot Paths
+      needs exactly this file as its Stage 0, with a real oracle to diff
+      against, so that entry and this one are the same first step.
   - **This is also just V11's fuzzing work, one step earlier.** V11 already
     plans libFuzzer/AFL harnesses for `parse_resp_request` and
     `rdb_load_buffer` — those *are* C++ test code, and are the natural first

@@ -4203,5 +4203,5 @@ void acl_init_categories(){
 
     auto nit = notify_cls.find(kv.first);
     s.notify_class = (nit != notify_cls.end()) ? nit->second : 0;
-  }
+    }
 }
