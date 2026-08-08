@@ -157,8 +157,6 @@ static void repl_link_lost(Conn *conn){
   conn->is_master_link = false;
   g_data.master_link = nullptr;
   g_data.repl_state = ReplState::NONE; // no auto-reconnect yet
-  g_data.master_host.clear();
-  g_data.master_port = 0;
   g_data.repl_rdb_left = 0;
   g_data.repl_rdb_buf.clear();
   g_data.repl_rdb_buf.shrink_to_fit();
@@ -171,6 +169,7 @@ void repl_stop(){
     g_data.master_link = nullptr;
     conn_destroy(c);
   }
+  g_data.replica_mode = false;
   g_data.repl_state = ReplState::NONE;
   g_data.master_host.clear();
   g_data.master_port = 0;
@@ -233,6 +232,7 @@ bool repl_start(const std::string &host, int port, std::string &err){
 
   g_data.master_host = host;
   g_data.master_port = port;
+  g_data.replica_mode = true; // role 
   g_data.repl_state = ReplState::HANDSHAKE;
   g_data.master_link = c;
   fprintf(stderr, "replication: connecting to master %s\n", c->peer.c_str());
@@ -283,7 +283,7 @@ static void repl_master_data(Conn *c){
           return;
         }
         // the +OK acks for AUTH / REPLCONF arrive first and carry nothing we need
-        if (line.compare(0, 12, "+FULLRESYNC") != 0){ break; }
+        if (line.compare(0, 12, "+FULLRESYNC ") != 0){ break; }
 
         const size_t sp = line.find(' ', 12);
         if (sp == std::string::npos){
@@ -319,7 +319,7 @@ static void repl_master_data(Conn *c){
         g_data.repl_rdb_left = len;
         g_data.repl_rdb_buf.clear();
         // the reserve is capped for absurd values that can come
-        g_data.repl_rdb_buf.reserve((size_t)std::min<uint64_t>(len, k_repl_backlog_min));
+        g_data.repl_rdb_buf.reserve((size_t)std::min<uint64_t>(len, k_repl_rdb_reserve_max));
         g_data.repl_state = ReplState::RDB_BODY;
         break;
       }
@@ -683,7 +683,12 @@ static void process_timers(){
 
 static void conn_set_timer(Conn *conn, ConnTimer type){
   // the master link is never reaped: an idle master is a healthy master
-  if (conn->is_master_link){ return; }
+  if (conn->is_master_link || conn->is_replica){
+    dlist_detach(&conn->idle_node);
+    dlist_init(&conn->idle_node);
+    return;
+  }
+
   dlist_detach(&conn->idle_node);
 
   // record when it joined the new list
@@ -792,17 +797,16 @@ static void handle_read(Conn *conn){
     IoResult r = tr_read(conn, buf, sizeof(buf), &n);    
     if (n > 0){ buf_append(&conn->incoming, buf, n); }
 
-    // a client that streams framing without ever completing a command must not grow us unbounded
-    if (buf_size(&conn->incoming) > k_max_incoming){
-      if (conn->is_master_link){
-        if (n > 0){ repl_master_data(conn); }
-        if (conn->want_close){ return; }
-      } else if (buf_size(&conn->incoming) > k_max_incoming){
-        fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
-        buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
-        conn->want_close = true;
-        return;
-      }
+    // The master link drains per chunk: a full-resync image is unbounded, so it
+    // must never accumulate in `incoming`
+    if (conn->is_master_link){
+      if (n > 0){ repl_master_data(conn); }
+      if (conn->want_close){ return; }
+    } else if (buf_size(&conn->incoming) > k_max_incoming){
+      fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);
+      buf_append(&conn->outgoing, "-ERR Protocol error: input buffer exceeded\r\n", 44);
+      conn->want_close = true;
+      return;
     }
 
     if (r == IoResult::OK){

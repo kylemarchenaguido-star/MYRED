@@ -1080,8 +1080,12 @@ static std::string repl_gen_id(){
   return s;
 }
 
-void repl_init(){
+void repl_new_id(){
   g_data.repl_id = repl_gen_id();
+}
+
+void repl_init(){
+  repl_new_id();
   g_data.repl_backlog.assign(g_config.repl_backlog_size, '\0');
   g_data.repl_backlog_pos = 0;
   g_data.repl_backlog_histlen = 0;

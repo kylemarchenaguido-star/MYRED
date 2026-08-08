@@ -25,6 +25,7 @@
 #include <utility>
 #include <ctime>
 #include <cerrno>
+#include <cstdarg>
 
 static constexpr const char *MSG_WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value";
 static constexpr const char *MSG_NOT_INT   = "ERR value is not an integer or out of range";
@@ -1247,128 +1248,149 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out){
   return resp_int(out, 1);
 }
 
-static void do_info(std::vector<std::string> &cmd, Buffer *out){
-  (void)cmd;
+static bool arg_ieq(const std::string &s, const char *lit);
 
-  uint64_t now_ms = get_monotonic_msec();
-  uint64_t uptime_s = (now_ms - g_data.g_server_start_ms) / 1000;
-  KeyStats keystats = get_keys_stats();
-  size_t memory = get_memory_usage();
+// INFO section
 
-  // build the info string 
-  char buf[4096];
-  int len = snprintf(buf, sizeof(buf),
-    "# Server\r\n"
-    "version:1.0.0\r\n"
-    "uptime_seconds:%llu\r\n"
-    "uptime_minutes:%llu\r\n"
-    "uptime_hours:%llu\r\n"
-    "\r\n"
-    "# Clients\r\n"
-    "connected_clients:%u\r\n"
-    "total_connections:%llu\r\n"
-    "\r\n"
-    "# Memory\r\n"
-    "used_memory:%zu\r\n"
-    "used_memory_human:%.2fM\r\n"
-    "used_memory_rss:%zu\r\n"
-    "mem_fragmentation_ratio:%.2f\r\n"
-    "maxmemory:%zu\r\n"
-    "maxmemory_policy:%s\r\n"
-    "evicted_keys:%llu\r\n"
-    "\r\n"
-    "# Stats\r\n"
-    "total_commands:%llu\r\n"
-    "\r\n"
-    "# Keyspace\r\n"
-    "keys_total:%u\r\n"
-    "keys_with_ttl:%u\r\n"
-    "keys_no_ttl:%u\r\n"
-    "\r\n"
-    "# Persistence\r\n"
-    "rdb_last_save_time:%llu\r\n"
-    "rdb_changes_since_save:%u\r\n"
-    "rdb_last_save_ok:%d\r\n"
-    "rdb_last_save_size_bytes:%zu\r\n"
-    "aof_enabled:%d\r\n"
-    "aof_current_size:%zu\r\n"
-    "aof_base_size:%zu\r\n"
-    "aof_pending_rewrite:%d\r\n"
-    "aof_last_write_status:%s\r\n"
-    "aof_last_bgrewrite_status:%s\r\n"
-    "\r\n"
-    "# Replication\r\n"
-    "role:%s\r\n"
-    "master_replid:%s\r\n"
-    "connected_slaves:%zu\r\n"
-    "master_repl_offset:%llu\r\n"
-    "repl_backlog_active:%d\r\n"
-    "repl_backlog_size:%zu\r\n"
-    "repl_backlog_first_byte_offset:%llu\r\n"
-    "repl_backlog_histlen:%zu\r\n",
-    //server 
-    (unsigned long long)uptime_s,
-    (unsigned long long)uptime_s / 60,
-    (unsigned long long)uptime_s / 3600,
+__attribute__((format(printf, 2, 3)))
+static void info_add(std::string &out, const char *fmt, ...){
+  char line[512];
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  if (n <= 0){ return; }
+  // n is what vsnprintf WANTED to write; clamp so a long value truncates, never over-reads
+  out.append(line, std::min((size_t)n, sizeof(line) - 1));
+}
 
-    // clients 
-    g_data.connected_clients,
-    (unsigned long long)g_data.g_total_connections,
+static void info_server(std::string &o){
+  const uint64_t uptime_s = (get_monotonic_msec() - g_data.g_server_start_ms) / 1000;
+  o += "# Server\r\n";
+  o += "version:1.0.0\r\n";
+  info_add(o, "uptime_seconds:%llu\r\n", (unsigned long long)uptime_s);
+  info_add(o, "uptime_minutes:%llu\r\n", (unsigned long long)uptime_s / 60);
+  info_add(o, "uptime_hours:%llu\r\n", (unsigned long long)uptime_s / 3600);
+  o += "\r\n";
+}
 
-    // memory
-    g_data.used_memory,
-    (double)g_data.used_memory / (1024.0 * 1024.0),
-    memory,                                                   // RSS from get_memory_usage()
-    g_data.used_memory ? (double)memory / (double)g_data.used_memory : 0.0,
-    g_config.maxmemory,
-    maxmemory_policy_name(g_config.maxmemory_policy),
-    (unsigned long long)g_data.evicted_keys,
+static void info_clients(std::string &o){
+  o += "# Clients\r\n";
+  info_add(o, "connected_clients:%u\r\n", g_data.connected_clients);
+  info_add(o, "total_connections:%llu\r\n", (unsigned long long)g_data.g_total_connections);
+  o += "\r\n";
+}
 
-    //stats
-    (unsigned long long)g_data.g_total_commands,
+static void info_memory(std::string &o){
+  const size_t rss = get_memory_usage();
+  o += "# Memory\r\n";
+  info_add(o, "used_memory:%zu\r\n", g_data.used_memory);
+  info_add(o, "used_memory_human:%.2fM\r\n", (double)g_data.used_memory / (1024.0 * 1024.0));
+  info_add(o, "used_memory_rss:%zu\r\n", rss);
+  info_add(o, "mem_fragmentation_ratio:%.2f\r\n",
+           g_data.used_memory ? (double)rss / (double)g_data.used_memory : 0.0);
+  info_add(o, "maxmemory:%zu\r\n", g_config.maxmemory);
+  info_add(o, "maxmemory_policy:%s\r\n", maxmemory_policy_name(g_config.maxmemory_policy));
+  info_add(o, "evicted_keys:%llu\r\n", (unsigned long long)g_data.evicted_keys);
+  o += "\r\n";
+}
 
-    // keyspace 
-    keystats.total,
-    keystats.with_ttl,
-    keystats.total - keystats.with_ttl,
+static void info_stats(std::string &o){
+  o += "# Stats\r\n";
+  info_add(o, "total_commands:%llu\r\n", (unsigned long long)g_data.g_total_commands);
+  o += "\r\n";
+}
 
-    // persistence (rdb)
-    (unsigned long long)(g_data.g_last_save_ms / 1000),
-    g_data.g_writes_since_save,
-    (int)g_data.g_last_save_ok,
-    g_data.g_last_save_size_bytes,
-    // persistence (aof)
-    (int)g_config.aof_enable,
-    g_data.g_aof_current_size,
-    g_data.g_aof_base_size,
-    (int)(g_aof_child_pid != -1),
-    g_data.g_aof_write_err ? "err" : "ok",
-    g_data.g_aof_last_rewrite_ok ? "ok" : "err",
+static void info_keyspace(std::string &o){
+  const KeyStats ks = get_keys_stats();
+  o += "# Keyspace\r\n";
+  info_add(o, "keys_total:%u\r\n", ks.total);
+  info_add(o, "keys_with_ttl:%u\r\n", ks.with_ttl);
+  info_add(o, "keys_no_ttl:%u\r\n", ks.total - ks.with_ttl);
+  o += "\r\n";
+}
 
-    // replication
-    g_data.repl_state != ReplState::NONE ? "slave" : "master",
-    g_data.repl_id.c_str(),
-    g_data.replicas.size(),
-    (unsigned long long)g_data.master_repl_offset,
-    (int)!g_data.repl_backlog.empty(),
-    g_data.repl_backlog.size(),
-    (unsigned long long)repl_backlog_start_offset(),
-    g_data.repl_backlog_histlen
+static void info_persistence(std::string &o){
+  o += "# Persistence\r\n";
+  info_add(o, "rdb_last_save_time:%llu\r\n", (unsigned long long)(g_data.g_last_save_ms / 1000));
+  info_add(o, "rdb_changes_since_save:%u\r\n", g_data.g_writes_since_save);
+  info_add(o, "rdb_last_save_ok:%d\r\n", (int)g_data.g_last_save_ok);
+  info_add(o, "rdb_last_save_size_bytes:%zu\r\n", g_data.g_last_save_size_bytes);
+  info_add(o, "aof_enabled:%d\r\n", (int)g_config.aof_enable);
+  info_add(o, "aof_current_size:%zu\r\n", g_data.g_aof_current_size);
+  info_add(o, "aof_base_size:%zu\r\n", g_data.g_aof_base_size);
+  info_add(o, "aof_pending_rewrite:%d\r\n", (int)(g_aof_child_pid != -1));
+  info_add(o, "aof_last_write_status:%s\r\n", g_data.g_aof_write_err ? "err" : "ok");
+  info_add(o, "aof_last_bgrewrite_status:%s\r\n", g_data.g_aof_last_rewrite_ok ? "ok" : "err");
+  o += "\r\n";
+}
 
-  );
-  if (len < 0){ return resp_err(out, "ERR info formatting"); }
-  // clamp, never over read
-  // replica only fields: appended rather than folded into the format above
-  if (g_data.repl_state != ReplState::NONE && len < (int)sizeof(buf)){
-    len += snprintf(buf + len, sizeof(buf) - (size_t)len,
-      "master_host:%s\r\n"
-      "master_port:%d\r\n"
-      "master_link_status:%s\r\n",
-      g_data.master_host.c_str(), g_data.master_port,
-      g_data.repl_state == ReplState::STREAMING ? "up" : "down");
+static void info_replication(std::string &o){
+  const bool replica = g_data.replica_mode;
+  o += "# Replication\r\n";
+  info_add(o, "role:%s\r\n", replica ? "slave" : "master");
+  // the link fields belong beside the role, not appended after the backlog stats
+  if (replica){
+    info_add(o, "master_host:%s\r\n", g_data.master_host.c_str());
+    info_add(o, "master_port:%d\r\n", g_data.master_port);
+    info_add(o, "master_link_status:%s\r\n",
+             g_data.repl_state == ReplState::STREAMING ? "up" : "down");
   }
-  if (len >= (int)sizeof(buf)){ len = sizeof(buf) - 1; }
-  resp_str(out, buf, (size_t)len);         
+  info_add(o, "master_replid:%s\r\n", g_data.repl_id.c_str());
+  info_add(o, "connected_slaves:%zu\r\n", g_data.replicas.size());
+  info_add(o, "master_repl_offset:%llu\r\n", (unsigned long long)g_data.master_repl_offset);
+  info_add(o, "repl_backlog_active:%d\r\n", (int)!g_data.repl_backlog.empty());
+  info_add(o, "repl_backlog_size:%zu\r\n", g_data.repl_backlog.size());
+  info_add(o, "repl_backlog_first_byte_offset:%llu\r\n",
+           (unsigned long long)repl_backlog_start_offset());
+  info_add(o, "repl_backlog_histlen:%zu\r\n", g_data.repl_backlog_histlen);
+  o += "\r\n";
+}
+
+using InfoFn = void(*)(std::string &out);
+
+struct InfoSection {
+  const char *name; // lowercase, exactly as a client types it
+  InfoFn emit; // writes its own header, fields and trailing blank line
+};
+
+// Table order is output order, the same invariant k_config_table has for the file order
+static const InfoSection k_info_sections[] = {
+  {"server",      info_server},
+  {"clients",     info_clients},
+  {"memory",      info_memory},
+  {"stats",       info_stats},
+  {"keyspace",    info_keyspace},
+  {"persistence", info_persistence},
+  {"replication", info_replication},
+};
+
+static constexpr size_t k_info_nsections =
+  sizeof(k_info_sections) / sizeof(k_info_sections[0]);
+
+  // INFO [section ...] no argument means every sections
+static void do_info(std::vector<std::string> &cmd, Buffer *out){
+  bool all = (cmd.size() == 1);
+  bool want[k_info_nsections] = {};
+
+  for (size_t i = 1; i < cmd.size(); ++i){
+    // redis's collective names
+    if (arg_ieq(cmd[i], "all") || arg_ieq(cmd[i], "everything") || arg_ieq(cmd[i], "default")){
+      all = true;
+      continue;
+    }
+    for (size_t s = 0; s < k_info_nsections; ++s){
+      if (arg_ieq(cmd[i], k_info_sections[s].name)){ want[s] = true; break; }
+    }
+  }
+  
+  // emitted in table order, not argument order
+  std::string body;
+  body.reserve(1024);
+  for (size_t s = 0; s < k_info_nsections; ++s){
+    if (all || want[s]){ k_info_sections[s].emit(body); }
+  }
+  resp_str(out, body.data(), body.size());
 }
 
 // LPUSH key
@@ -2530,8 +2552,6 @@ static void propagate(const char *bytes, size_t len){
   if (!g_data.replicas.empty()){ repl_feed_replicas(bytes, len); }
 }
 
-static bool arg_ieq(const std::string &s, const char *lit);
-
 // REPLCONF <option> <value> ... - the wire-compatibility handshake. Every option is accept-and-ack
 static void do_replconf(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   (void)conn;
@@ -2575,7 +2595,9 @@ static void do_replicaof(std::vector<std::string> &cmd, Buffer *out){
   if (arg_ieq(cmd[1], "no") && arg_ieq(cmd[2], "one")){
     if (g_data.repl_state != ReplState::NONE){
       repl_stop();
-      fprintf(stderr, "replication: REPLICAOF NO ONE - this intance is a master again\n");
+      repl_new_id();
+      fprintf(stderr, "replication: promoted to master new replid %s\n",
+               g_data.repl_id.c_str());
     }
     return resp_ok(out);
   }
@@ -3809,7 +3831,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
   {"sdiffstore",   {do_sdiffstore,    3, -1, true}},
   {"smove",        {do_smove,         4,  4, true}},
   // server
-  {"info",         {do_info,          1,  1}},
+  {"info",         {do_info,          1, -1}},
   {"save",         {do_save,          1,  1}},
   {"bgsave",       {do_bgsave,        1,  1}},
   {"bgrewriteaof", {do_bgrewriteaof,  1,  1}},
@@ -3987,6 +4009,12 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn, const ch
   int argc = (int)cmd.size();
   if (argc < spec.min_args || (spec.max_args != -1 && argc > spec.max_args)){
     return resp_err_txn(out, conn,"ERR wrong number of arguments");
+  }
+
+  // Read-only replica
+  if (g_data.replica_mode && spec.is_write && !g_data.g_loading){
+    return resp_err_txn(out, conn,
+            "READONLY You can't write against a read only replica.");
   }
 
   // transaction control: conn-aware, and never queue

@@ -39,6 +39,9 @@ than using the STL containers.
 - **Transactions:** `MULTI`/`EXEC`/`DISCARD` with error poisoning (`EXECABORT`),
   plus `WATCH`/`UNWATCH` optimistic locking backed by an eager dirty-marking
   watcher registry
+- **Replication:** master-replica with `PSYNC` full resync (RDB image + live
+  write streaming, reusing the AOF byte stream) and a read-only gate on the
+  replica; `REPLICAOF host port` / `REPLICAOF NO ONE`
 - **Runtime configuration:** config file, selected environment overrides,
   `CONFIG GET`/`CONFIG SET`, and `CONFIG REWRITE` — every directive is one row in
   a single table owning its arity, parser, getter and on-disk form, checked for
@@ -202,6 +205,9 @@ REDIS_PASSWORD=kek1234 ./build/client                  # interactive REPL
 ### Transactions
 `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
 
+### Replication
+`REPLICAOF` (`SLAVEOF`), `REPLCONF`, `PSYNC`
+
 ### Admin / connection
 `AUTH`, `ACL`, `PING`, `ECHO`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
 `SAVE`, `BGSAVE`, `BGREWRITEAOF`
@@ -314,11 +320,18 @@ Recently completed (see `docs/planning/ROADMAP.md` for detail):
   passwordless. All three are now walks over one table, with a boot self-check on
   its shape.
 
+- **V10 — Replication** *(in progress)*: `PSYNC` full resync on both master and
+  replica sides (RDB image + live write streaming, reusing the AOF byte stream
+  as the replication stream), plus a read-only gate on the replica. What's left
+  is closing a restart-safety gap (a restarted replica must come back
+  read-only, not as a writable master) and, later, partial resync and `WAIT`.
+
 Next up:
 
-- **Replication**, and the pick-your-adventure upgrade catalog — both scoped in
-  `docs/planning/BACKLOG.md`.
-- **No open bugs.**
+- Finishing V10 Replication, then the pick-your-adventure upgrade catalog —
+  both scoped in `docs/planning/BACKLOG.md` / `docs/planning/ROADMAP.md`.
+- **No open bugs in the data path** (two low-severity, deliberately-deferred
+  items tracked in `docs/planning/BACKLOG.md` → Open Bugs).
 
 ## Acknowledgements
 

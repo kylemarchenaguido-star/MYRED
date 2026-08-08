@@ -398,42 +398,55 @@ in-memory change with no format consequences, unlike the RDB CRC.
 
 Missing features, not defects:
 
+- `COMMAND`, `COMMAND DOCS`, `COMMAND COUNT` (`redis-cli` interactive mode probes
+  these today, so this is a live usability gap, not just a compat checkbox).
 - Full Redis ACL rule-order fidelity ("last match wins") — upgrade path recorded
   in DECISIONS → ACL Model.
-- Pub/Sub channel-pattern enforcement (lands in V8.2 → ROADMAP Current Focus;
-  needs a new `User::channel_patterns` field).
-- `nopass`, selectors, `sanitize-payload`, `ACL LOAD`, `ACL SAVE`.
-- `COMMAND`, `COMMAND DOCS`, `COMMAND COUNT` (`redis-cli` interactive mode probes these).
-- Full `CONFIG GET/SET` coverage (also under Server Observability and Tooling).
+- Selectors, `sanitize-payload`, `ACL LOAD`, `ACL SAVE`.
+- Full `CONFIG GET/SET` coverage (also under Server Observability and Tooling;
+  largely closed by V9.8/V8.8 — what's left is niche: LFU knobs with no load
+  directives yet, and the deliberately-excluded multi-line `user`/
+  `rename-command` rows).
 
 ## Command Coverage Gaps
+
+Ordered by rough cost/value — trivial single-type gaps first, the two
+self-contained new-type efforts last.
+
+Hashes: `HRANDFIELD`, `HINCRBYFLOAT`.
+
+Sets: `SINTERCARD`.
+
+Generic: `COPY`, `SORT`, `SORT_RO`, `DUMP`, `RESTORE`, `EXPIRETIME`,
+`PEXPIRETIME`, `OBJECT HELP`, `SCAN ... TYPE`, `WAIT` (concrete design for this
+one lives in ROADMAP → V10.5).
 
 Sorted sets: `ZINCRBY`, `ZCARD`, `ZCOUNT`, `ZMSCORE`, `ZPOPMAX`, `ZRANGEBYSCORE`,
 `ZRANGEBYLEX`, `ZREVRANGE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`,
 `ZREMRANGEBYLEX`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`, `ZRANDMEMBER`,
-`ZSCAN`, `ZLEXCOUNT`, `ZRANGESTORE`, `ZMPOP`.
+`ZSCAN`, `ZLEXCOUNT`, `ZRANGESTORE`, `ZMPOP`. Biggest single-type gap and a
+heavily-used real-world type (leaderboards etc.) — highest payoff per command
+implemented.
 
 Strings and bitmaps: `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITOP`,
 `BITFIELD`, `SUBSTR`, `LCS`.
 
-Generic: `COPY`, `SORT`, `SORT_RO`, `DUMP`, `RESTORE`, `EXPIRETIME`,
-`PEXPIRETIME`, `OBJECT HELP`, `SCAN ... TYPE`, `WAIT`.
+Lists: `LPOS`, `LMOVE`, `RPOPLPUSH`, `LMPOP`, `BLPOP`, `BRPOP`, `BLMOVE`. The
+three blocking ops need the same "pending, resumed by a matching event or a
+timer" per-conn state as `WAIT` (ROADMAP → V10.5) — do not design that
+mechanism twice; copy whichever lands first.
 
-Hashes: `HRANDFIELD`, `HINCRBYFLOAT`.
-
-Lists: `LPOS`, `LMOVE`, `RPOPLPUSH`, `LMPOP`, `BLPOP`, `BRPOP`, `BLMOVE`.
-
-Sets: `SINTERCARD`.
-
-New data types: HyperLogLog (`PF*`), Streams (`X*`), Geo (`GEO*`), Bitmaps as a
-first-class area.
+New data types (biggest lift, least urgent): HyperLogLog (`PF*`), Streams
+(`X*`), Geo (`GEO*`), Bitmaps as a first-class area.
 
 ## Server Observability and Tooling
 
+- `HELLO` and RESP3 handshake — foundational for newer client libraries that
+  negotiate protocol version on connect.
 - `CLIENT LIST`, `CLIENT KILL`, `CLIENT SETNAME`, `CLIENT GETNAME`, `CLIENT ID`.
-- `HELLO` and RESP3 handshake.
 - `RESET`, `SLOWLOG`, `LATENCY`, `MONITOR`, `DEBUG`, `SHUTDOWN`, `LASTSAVE`, `TIME`.
-- Full `CONFIG GET/SET` surface.
+- Full `CONFIG GET/SET` surface (see BACKLOG → ACL and Command-Surface Feature
+  Gaps for what's actually left — mostly closed already by V9.8/V8.8).
 
 ## Platform Work
 

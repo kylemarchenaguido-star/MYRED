@@ -13,7 +13,7 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-07-31.
+Date: 2026-08-07.
 
 Primary commands:
 ```bash
@@ -44,7 +44,7 @@ Implemented command families:
 | **TLS** | **Implemented (V9.7)** |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | **Transactions** | **Implemented (V8.4–V8.7)** |
-| Replication | In progress (V10.1 — bookkeeping only, no networking) |
+| Replication | In progress (V10.1–V10.3a done: full resync + live streaming + read-only gate) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
@@ -57,7 +57,8 @@ propagation for writes, and read-only replica enforcement. Split into gated
 sub-steps, same shape as V9.7/V8's sub-milestones, because "replication" is
 really four separable systems (bookkeeping, handshake/full-resync, write-mode
 enforcement, partial resync) that fail independently and should be tested
-independently. **V10.1 is active below; V10.2–V10.6 stay in `BACKLOG.md`.**
+independently. **V10.1 through V10.3a are closed and archived in Completed
+Milestones below; V10.3b is the active step.**
 
 Sequenced deliberately after V9.8: replication adds config surface, and adding
 it to three hand-maintained lists was exactly the risk the config table removed.
@@ -93,204 +94,7 @@ before writing any of it:
   generation. Full resync's RDB payload can be produced by the same path rather
   than a new one (see V10.2's note on the pragmatic first cut).
 
-#### V10.1 - Replication identity, offset, and backlog (bookkeeping only, no networking) [Done]
-
-Closed 2026-08-03, grep-verified in the tree and building clean. Landed across
-`804de57` / `4b2c2ea` plus working-tree changes to `commands.cpp`/`server.cpp`.
-
-Pure data structures and accounting. No replica can connect yet in this step —
-it exists so the wire protocol in V10.2 has something real to report, and so the
-byte-accounting is provably correct before anything depends on it over a socket.
-
-- `GlobalData` gains `repl_id` (40 hex, regenerated every boot — reuse the
-  `rand_idx()` source `ACL GENPASS` already uses, don't add a second one),
-  `master_repl_offset`, and a ring buffer `repl_backlog` + `repl_backlog_pos` +
-  `repl_backlog_histlen`, sized by a new `repl-backlog-size` directive (default
-  1 MB, matching Redis). **`repl_backlog_off` is derived, never stored**
-  (`master_repl_offset - histlen + 1`): a second counter is a second thing to
-  drift.
-- One new `k_config_table` row for `repl-backlog-size` (`masterauth` /
-  `repl-timeout` come with V10.2) — through the V9.8 table, not an ad-hoc path.
-  `boot_only` for the first cut: resizing a live backlog without losing
-  in-flight partial-resync eligibility is a real design question, deferred
-  rather than guessed at. `emit == nullptr`, so it is a plain scalar and gets
-  the shared formatter plus the boot round-trip check for free.
-
-**Placement decision — the propagation choke point is *not* a sibling block in
-`do_request`.** This step's original plan called for one, reasoning that AOF and
-replication are independent gates on the same byte stream. The *reasoning* is
-right; the *location* is wrong, and would have shipped a diverging replica three
-ways:
-
-  1. **`SPOP` would replicate nondeterministically.** It sets `CmdSpec::aof_self`
-     precisely so `do_request` does *not* log it, and feeds a synthetic
-     deterministic `SREM` of the actually-popped members from inside the handler.
-     A `do_request` sibling either misses that frame or ships the raw `SPOP`, and
-     master and replica pop different members.
-  2. **Evictions would resurrect on the replica.** `free_memory_if_needed()`
-     feeds its synthetic `DEL` directly; it never passes through `do_request`'s
-     logging block at all. The existing comment there already says "so AOF replay
-     / replicas don't resurrect the key" — it was written for this.
-  3. **TTLs would replicate as relative times.** The `EXPIRE` → `PEXPIREAT`
-     re-encode lives *inside* `aof_feed`, so a sibling block encoding `snapshot`
-     ships `EXPIRE key 100`, which the replica applies 100 ms later against its
-     own clock. This is the same bug AOF already fixed once.
-
-  The correct choke point is where the AOF bytes are actually produced — the tail
-  of `aof_feed`/`aof_append_raw` — so the two sinks are fed from one call by
-  construction and *cannot* describe different histories. Same argument the V9.8
-  config table made: don't create a second list that has to be kept in sync by
-  hand. What moves is the **gate**, not the hook: the `g_config.aof_enable`
-  checks at the three call sites become one `propagate_enabled()` predicate
-  (`!g_loading && (aof_enable || backlog armed)`), and each sink carries its own
-  gate inside `propagate()`. Callers then decide only *whether a command produced
-  stream bytes at all* — which is the independence the original note was after.
-
-- Renames that follow, since the functions no longer serve only the AOF (no
-  aliases kept): `aof_feed` → `propagate_cmd`, `aof_append_raw` → `propagate`.
-- `INFO`'s `# Replication` stub (`do_info`) gains `master_replid`,
-  `master_repl_offset`, `repl_backlog_active`, `repl_backlog_size`,
-  `repl_backlog_first_byte_offset` and `repl_backlog_histlen` — the last four are
-  what make the ring's wrap observable from `redis-cli`, so this step needs no
-  new test script. `connected_slaves` is deliberately **not** added yet: a
-  hardcoded `0` is a field nobody remembers to make real in V10.2, which is this
-  project's most-repeated bug shape.
-- Done when: `master_repl_offset` advances by exactly the byte length of the
-  frames AOF would have logged (`SET foo bar` = 31 bytes over RESP), `SPOP` and
-  an eviction both advance it, `repl_backlog_histlen` saturates at
-  `repl-backlog-size` and `repl_backlog_first_byte_offset` starts advancing once
-  it does, and `CONFIG SET repl-backlog-size` is refused as boot-only.
-
-#### V10.2 - REPLCONF / PSYNC handshake + full resync [In Progress]
-
-Gated on V10.1. First real networking; still only the full-resync path —
-partial resync is V10.4, deliberately later.
-
-**Split into two halves, applied and verified separately** (same reasoning as
-V9.8's hybrid migration: this project's transcription-slip rate makes one large
-application worse than two verifiable ones, and the two halves fail in
-completely different ways):
-
-- **V10.2a - master side. [Done]** Closed 2026-08-03, verified with a raw
-  socket standing in for a replica: `+FULLRESYNC <replid> <offset>` matching
-  `INFO`, a correctly framed `$<len>` image with the `MYRED` magic, and live
-  `SET`/`SADD` frames arriving with no event-loop change. Two slips caught by
-  that probe rather than by the compiler — a missing `\r` in the `+FULLRESYNC`
-  terminator, and (pre-existing, see BACKLOG) `SPOP`'s synthetic `SREM` carrying
-  an empty key because `lookup_entry` had already swapped `cmd[1]` out. **The
-  second one had been corrupting the AOF since V9.6.4 and no suite noticed** —
-  the first thing replication bought this project was a way to *watch* the write
-  stream instead of trusting it.
-- **V10.2b - replica side.** `REPLICAOF host port`, the outbound connection as
-  a state machine in the same `poll()` loop, consuming `+FULLRESYNC` + RDB via
-  `rdb_load_buffer`, then applying the stream through `do_request`.
-
-- New commands: `REPLCONF listening-port <port>` / `REPLCONF capa <...>` (both
-  effectively no-ops that just ack `+OK`, kept for wire compatibility),
-  `REPLCONF ACK <offset>` (V10.5 needs it; safe to accept-and-ignore here),
-  `PSYNC <replid> <offset>`, and `REPLICAOF host port` / `REPLICAOF NO ONE`
-  (`SLAVEOF` as an alias — same `rename-command`-style aliasing already used
-  elsewhere, not a special case). These need `Conn`, so they're conn-aware
-  special-cases in `do_request` exactly like `AUTH`/`ACL`/pub-sub/transactions
-  — do not route them through `k_cmd_table`'s two-argument `CmdFn`.
-- **Master side**, on `PSYNC ? -1` (replica has no history — the only case this
-  step handles): mark the `Conn` with a new `bool is_replica` flag, reply
-  `+FULLRESYNC <repl_id> <master_repl_offset>\r\n`, then send an RDB payload,
-  then transition this `Conn` into the same "just keep pushing bytes into
-  `outgoing`" mode V8.1 built for Pub/Sub — every subsequent write's propagated
-  bytes (from V10.1) also get written into every `Conn` with
-  `is_replica == true`.
-- **Generating that RDB payload: `rdb_build_image()`, synchronously, not a
-  fork.** This step's original plan called for reusing `rdb_save_background`'s
-  fork path to write a snapshot to a distinct temp file and streaming that file
-  once the child exits. That is strictly more machinery than the codebase needs:
-  `rdb_build_aof_preamble()` already serializes the whole keyspace into a
-  `Buffer` in the parent, synchronously, and has done so since V6 — the
-  BGREWRITEAOF hybrid format depends on it. Splitting its bare-image half out as
-  `rdb_build_image()` gives full resync its payload with no fork, no temp file,
-  no child-reaping hook, and no completion callback. The cost is an honest one:
-  the loop stalls for the serialization, exactly as `SAVE` already does. Doing
-  it off-loop is a real optimization (backpressure on a slow replica while
-  forking is legitimately hard) and belongs after correctness — the same
-  ordering TLS used, V9.7.1–.4 before V9.7.5.
-- **The replica registry is a use-after-free hazard, not a convenience.**
-  `GlobalData::replicas` holds raw `Conn*` that `propagate()` dereferences on
-  every write, so `conn_destroy` must unlink — identical in kind to
-  `pubsub_remove_conn` and `watch_clear_conn`, and the third instance of this
-  exact pattern in the project.
-- **Replica side**: `REPLICAOF host port` opens a normal outbound connection
-  (just another fd in the same `poll()` loop — no new threading model needed,
-  this is the payoff of the single-threaded design) to the master, sends the
-  handshake, receives `+FULLRESYNC`, buffers the RDB bytes, and calls the
-  already-existing `rdb_load_buffer` on them directly — zero new parsing code.
-  From that point, every RESP frame arriving on the master connection is fed
-  through the normal `do_request` dispatch (so every command gets the exact
-  same handler a real client would trigger — no second implementation of
-  `SET`/`ZADD`/etc.), but originating from a privileged pseudo-`Conn` that
-  bypasses `NOAUTH`/ACL checks, mirroring exactly how AOF replay already
-  bypasses them via `g_data.g_loading`.
-- Done when: two MYRED instances, `REPLICAOF <master-host> <master-port>` on
-  the second, the replica's dataset matches the master's at the moment of
-  resync, and a `SET` issued on the master appears on the replica shortly
-  after with no further manual action.
-
-#### V10.2.1 - Optional-dependency build [Done] *(detour, not replication work)*
-
-Closed 2026-08-07. A **detour taken mid-V10.2b**, filed here to keep the V10.2
-block contiguous — it is build-system work, not replication work, and changes no
-runtime behaviour on a fully-provisioned machine.
-
-Trigger: on a dev machine with neither `libssl-dev` nor `libargon2-dev`,
-`find_package(OpenSSL REQUIRED)` failed at **configure** time, so the tree could
-not be built at all — not a degraded build, no build. Argon2 was already optional
-(CMake + `cred.cpp` guards, since V9.6); OpenSSL was the only hard blocker.
-
-- **OpenSSL is now optional**, mirroring the `MYRED_ARGON2` pattern already in the
-  file: `option(MYRED_TLS ... ON)` + a non-`REQUIRED` `find_package`, setting
-  `MYRED_HAVE_TLS` only on success. `OpenSSL::SSL`/`OpenSSL::Crypto` moved out of
-  the unconditional `target_link_libraries` into that branch.
-- **The V9.7.1 transport seam paid for itself a second time.** Because OpenSSL was
-  already confined to `transport.cpp`, and `Conn::ssl` is a forward-declared
-  `struct ssl_st *` in `state.h`, making TLS optional touched exactly one `.cpp`
-  and no header. The seam's first payoff was keeping `server.cpp` OpenSSL-free;
-  this is the second.
-- **`tr_read`/`tr_write` had to be *inverted*, not just `#ifdef`-wrapped.** Both
-  read `if (!c->ssl){ ...plaintext, all paths return... }` then fell through to a
-  TLS tail. Wrapping only that tail leaves the no-TLS build a path with no return
-  — `-Wreturn-type` under the project's `-Wall -Wextra -Wshadow`. The TLS block now
-  comes first, inside the guard, with an early return; plaintext is the
-  unconditional tail. The two `rv` declarations are not `-Wshadow` hits: the inner
-  scope closes before the outer one is declared.
-- **Fail loud, never downgrade.** A no-TLS `tr_tls_init` returns `false` when
-  `tls_port != 0` rather than ignoring the directive, so `fatal_exit` names the
-  missing package. Silently serving cleartext on a port an operator configured for
-  TLS is the worst available outcome. Consequence to know: **`myred.conf` and
-  `bench.conf` do not boot on a no-TLS build as shipped** — both set `tls-port`.
-- **The Argon2 fallback has a sharp edge now that it is reachable.** A build
-  without libargon2 cannot *verify* existing `$argon2id$` credentials — `cred.cpp`
-  returns `false` for the PHC branch — so a correct password answers `WRONGPASS`.
-  Not new code, but previously unreachable in practice; documented in README.
-- **zlib stays required, deliberately.** Compression is part of the on-disk RDB
-  format, so a build without it could not read snapshots written by a build with
-  it. Only its error message improved (names `zlib1g-dev`).
-- CMake prints a `MYRED build: TLS=... Argon2id=...` summary at configure time, so
-  a silently-absent optional dep is visible then rather than at runtime.
-
-Verified: both configurations build warning-free (the four `repl_*` unused-function
-warnings are V10.2b's half-written replica side, pre-existing); `--correctness-only`
-**652/652** green on the TLS-enabled build; the no-TLS build refuses a `tls-port`
-config with the actionable message.
-
-**Process note — a misspelled `#ifdef` is silent.** Hand-application slipped
-`MYRED_HAEV_TLS` for `MYRED_HAVE_TLS`. That is not a compile error in either
-direction: it takes the `#else` branch *forever*, so the build would have compiled
-and linked and run with TLS quietly stripped out **even on a machine with OpenSSL
-installed** — discoverable only by noticing `tls-port` had stopped working. Same
-family as the duplicated `{"multi", …}` key (V8.4) and the four parallel ACL lists:
-a name that is never checked against anything. Grep the guard spellings against
-the CMake definition after any edit to a `#ifdef` region.
-
-#### V10.3 - Read-only replica mode + command gating [Backlog]
+#### V10.3 - Read-only replica mode + command gating [In Progress]
 
 Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts
 writes from ordinary clients too, silently diverging from the master.
@@ -315,6 +119,51 @@ writes from ordinary clients too, silently diverging from the master.
   `SET` but correct data on `GET`; the replication stream itself still applies
   fine; `REPLICAOF NO ONE` makes the instance writable again with a new
   `repl_id`.
+
+**Split into two halves once the first one was testable** — V10.3a closed the
+in-memory gate, and testing it immediately exposed that the gate cannot protect a
+restart, which is V10.3b.
+
+##### V10.3b - `replicaof` config directive [In Progress]
+
+**The gate protects a running replica and nothing else.** A restarted replica
+comes back a *writable master pointed at nothing*: `REPLICAOF` is runtime-only
+state, there is no directive for it, and `CONFIG REWRITE` emits nothing — so the
+instance accepts writes that vanish the instant someone re-issues `REPLICAOF`,
+because full resync wipes the dataset first. Same divergence V10.3a exists to
+prevent, across a restart instead of a network drop. Found by testing V10.3a:
+both servers had been restarted for a rebuild, and the "replica" answered `OK` to
+`SET` — correctly, since it was no longer a replica.
+
+- One `k_config_table` row, `replicaof <host> <port>`, `boot_only` — the command
+  stays the only runtime path to the role, so there are not two spellings of the
+  same change.
+- **`apply` may only *record* the target, never connect.** `config_apply` runs
+  before `repl_init()` has minted a `repl_id`, before the local RDB/AOF load, and
+  before the poll loop exists. A resync image landing mid-load would then be
+  overwritten by the local dataset — the exact divergence this step is closing.
+  The connect is deferred to the last statement before the event loop.
+- **`apply` and `emit` deliberately read different state**, which is the shape of
+  a bug this project has shipped (V9.8's `appendonly` getter reading
+  `protected_mode`) and is correct only because it is intentional: `apply` stages
+  into `g_config`, while `emit` reports the **live** role from `g_data`, so
+  `CONFIG REWRITE` records what the server actually is after any runtime
+  `REPLICAOF` / `REPLICAOF NO ONE`. Same exception `requirepass` already carries,
+  whose `emit` reaches past its own getter. The boot round-trip check cannot catch
+  either, because it skips every row that supplies its own `emit`.
+- `get == nullptr`: two tokens, so there is no single-value form — the same reason
+  `user` and `rename-command` are absent from `CONFIG GET`. Divergence from Redis
+   7, which does answer `CONFIG GET replicaof`; `INFO replication` is the
+  supported way to ask here.
+- No `slaveof` spelling for the directive. The command keeps it because clients
+  send it over the wire; a config file is ours, and the no-shims rule applies.
+- A failed boot connect is **fatal**. Failing open would leave a writable instance
+  where the operator asked for a replica. Note that a master which is merely
+  *down* does not hit this: the connect is non-blocking, so `repl_start` returns
+  success on `EINPROGRESS` and the link simply never comes up.
+- Done when: a config file containing `replicaof 127.0.0.1 1336` comes up as a
+  read-only replica with no manual command; `REPLICAOF NO ONE` + `CONFIG REWRITE`
+  removes the line so the next boot is a master; and the reverse round-trips too.
 
 #### V10.4 - Partial resync via the backlog [Backlog]
 
@@ -383,6 +232,123 @@ V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed. One 🟡 filed in BACKLOG
 (`ACL GENPASS` uses a non-cryptographic PRNG), deliberately scheduled after V10.
 
 ## Completed Milestones
+
+### V10.1–V10.3a - Replication: bookkeeping, full resync, read-only gate [Done]
+
+Master-replica replication up through a working read-only replica: identity/
+backlog bookkeeping, the full-resync handshake on both sides, and the
+in-memory read-only gate. `V10.3b` (the `replicaof` config directive, closing
+the restart-safety gap) is still active — see Current Focus above.
+
+#### V10.1 - Replication identity, offset, and backlog [Done]
+
+Closed 2026-08-03. Pure bookkeeping, no networking yet: `GlobalData` gained
+`repl_id` (40 hex, regenerated at boot via the same `rand_idx()` source as
+`ACL GENPASS`), `master_repl_offset`, and a ring-buffer `repl_backlog`
+(`repl_backlog_pos`/`histlen`) sized by the new `repl-backlog-size` directive
+(`boot_only`, 1 MB default, added through `k_config_table`). `repl_backlog_off`
+is derived (`master_repl_offset - histlen + 1`), never stored.
+
+The propagation choke point sits at the tail of `aof_feed`/`aof_append_raw`
+(renamed `propagate_cmd`/`propagate`), not a sibling block in `do_request` —
+a sibling would have diverged the replica three ways: `SPOP`'s synthetic
+`SREM`, eviction's synthetic `DEL`, and `EXPIRE`'s relative-time re-encode all
+happen inside those two functions, not in `do_request`. The three separate
+`g_config.aof_enable` gates collapsed into one `propagate_enabled()`
+predicate. `INFO` gained `master_replid`/`master_repl_offset`/
+`repl_backlog_*` fields; `connected_slaves` deliberately stayed hardcoded `0`
+until V10.2 made it real.
+
+#### V10.2 - REPLCONF / PSYNC handshake + full resync [Done]
+
+Closed 2026-08-07 (**V10.2a**, master side, 2026-08-03; **V10.2b**, replica
+side, 2026-08-07). New commands `REPLCONF listening-port/capa/ACK` (ack-only
+no-ops), `PSYNC <replid> <offset>`, `REPLICAOF host port` / `REPLICAOF NO ONE`
+(`SLAVEOF` as a second wire-compat row, not an alias) — all conn-aware special
+cases in `do_request` except `REPLICAOF`, which is an ordinary `k_cmd_table`
+row since it mutates server-wide state rather than per-connection state.
+
+**Master side**: `PSYNC ? -1` marks the `Conn` `is_replica`, replies
+`+FULLRESYNC <repl_id> <offset>\r\n`, sends an RDB image via the new
+`rdb_build_image()` (a synchronous, no-fork split of the existing
+`rdb_build_aof_preamble()`), then streams every subsequent write into that
+`Conn`'s `outgoing` buffer exactly like a Pub/Sub subscriber.
+`GlobalData::replicas` holds raw `Conn*`; `conn_destroy` unlinks it — the
+third instance of the same use-after-free guard pattern as
+`pubsub_remove_conn`/`watch_clear_conn`.
+
+**Replica side**: `REPLICAOF host port` opens a normal outbound `poll()` fd, a
+state machine `HANDSHAKE → RDB_LEN → RDB_BODY → STREAMING` driven from
+`handle_read` (`repl_master_data` replaces `try_one_request` for that one
+`Conn`). The RDB image drains into `repl_rdb_buf` (not `incoming`, which never
+shrinks) and loads via the existing `rdb_load_buffer`. From `STREAMING` on,
+every frame runs through the normal `do_request` dispatch via a privileged
+pseudo-`Conn` that bypasses `NOAUTH`/ACL the same way AOF replay bypasses
+them under `g_loading`. The replica's dataset is wiped via the existing
+`flushall` handler before the image loads.
+
+Both link ends had to be exempted from the idle/IO timer sweeps (an idle
+master link is healthy; a replica may hear nothing for minutes) — the
+exemption must detach *and* `dlist_init` the conn's timer node, since
+`dlist_detach` doesn't self-link and a frozen `last_active_ms` still gets
+reaped.
+
+Three silent transcription slips caught only by watching the wire, not the
+compiler: `SPOP`'s synthetic `SREM` carried an empty key (pre-existing since
+V9.6.4, corrupting the AOF too — see BACKLOG); the master-link read branch was
+nested inside the `k_max_incoming` check instead of replacing it, so the
+replica's entire read path was dead code above 64 MB; and `+FULLRESYNC`'s
+length-12 compare against a literal missing its trailing space, so no
+handshake line ever matched.
+
+**Known limitations, deliberate** (all from `repl_apply` running under
+`g_loading`): replicated writes don't reach the replica's own AOF, don't fire
+keyspace notifications, and don't invalidate `WATCH`ers; chained replication
+doesn't work; a dropped link doesn't auto-reconnect. Each is a V10.3+
+concern, not a data-correctness bug.
+
+#### V10.2.1 - Optional-dependency build [Done]
+
+Closed 2026-08-07 (detour, not replication work — build-system only, taken
+mid-V10.2b). OpenSSL is now optional like Argon2 already was:
+`option(MYRED_TLS ON)` + non-`REQUIRED` `find_package`, gated on
+`MYRED_HAVE_TLS`. Confined to `transport.cpp`/`state.h`'s forward-declared
+`ssl_st*`, so making it optional touched one `.cpp`, no headers. `tr_read`/
+`tr_write` had to be restructured (TLS branch first with an early return,
+plaintext as the unconditional tail) to avoid a no-return path under
+`-Wreturn-type`. A no-TLS build fails loud (`fatal_exit`) rather than
+silently serving cleartext on a configured `tls-port`; zlib stays a hard
+requirement (on-disk RDB format compatibility). Caught one silent bug: a
+misspelled `#ifdef MYRED_HAEV_TLS` compiles clean and takes the `#else`
+branch forever — grep guard spellings against the CMake definition after any
+`#ifdef` edit.
+
+#### V10.2.2 - `INFO [section ...]` [Done]
+
+Closed 2026-08-07 (prerequisite surfaced by V10.2b — `INFO replication`
+previously errored on arity). `{do_info, 1, -1}` + `k_info_sections`, table
+order = output order, unknown sections emit nothing (matches Redis). The real
+win: `info_add`'s `__attribute__((format(printf, ...)))` makes `-Wformat`
+check every field against its own argument, replacing a ~25-conversion
+positional `snprintf` where a field could silently read the wrong variable —
+the same hand-maintained-parallel-list shape V9.8 removed from config. Note
+the blind spot this does *not* close: a field wired to the wrong variable
+still type-checks (the `appendonly`/`protected_mode` class from V9.8).
+
+#### V10.3a - Read-only replica gate [Done]
+
+Closed 2026-08-07. `g_data.replica_mode` (named to avoid colliding with
+`Conn::is_replica`, which means the opposite subject) gates writes in
+`do_request`, placed after ACL and the arity check so a rejected write inside
+`MULTI` behaves like an ACL denial (`EXECABORT`) via the existing
+`resp_err_txn` poison path. Role and link-phase are separate flags — gating
+on `repl_state != NONE` would silently promote a replica to writable on every
+dropped socket, since `repl_link_lost` resets `repl_state` but not the role.
+The replication stream itself bypasses the gate via `g_data.g_loading` (same
+flag `may_log`/`may_notify`/`may_watch` use) — a different bypass mechanism
+than `NOAUTH`'s, which uses a superuser identity. Verified live: `SET`/
+`FLUSHALL` on the replica answer `READONLY`, `GET` still serves, `REPLICAOF
+NO ONE` promotes with a new `master_replid`.
 
 ### V9.8 - Config refactor: one directive table [Done]
 

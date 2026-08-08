@@ -114,8 +114,9 @@ redis-cli --tls --insecure -p 1235 -a <PASS> ping
 openssl s_client -connect 127.0.0.1:1235 -tls1_3 </dev/null 2>&1 | head -20
 ```
 
-**The V9.7 close-out** — both must go green; these two runs predate the V9.7.5
-flags, which is the only reason the milestone is still open:
+**The V9.7 close-out gate** (V9.7 itself is closed — 603/603 green over both
+transports, 2026-07-25 — this pair of runs is the regression check, not an
+open item):
 
 ```bash
 ./build/server myred.conf

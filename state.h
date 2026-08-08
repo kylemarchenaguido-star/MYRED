@@ -20,7 +20,7 @@
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
-constexpr size_t k_repl_rdb_reserve_cap = 16u << 20; // 16 mib 
+constexpr uint64_t k_repl_rdb_reserve_max = 16 * 1024 * 1024;
 static constexpr size_t k_max_incoming = 2 * k_max_msg; // generous pipeline room
 constexpr size_t k_max_args = 65536;
 // secondes * miliseconds (5s -> 5000ms)
@@ -229,6 +229,8 @@ struct GlobalData{
   size_t repl_backlog_pos = 0;
   size_t repl_backlog_histlen = 0;
   ReplState repl_state = ReplState::NONE;
+  // Server wide role: set by REPLICAOF, cleared only by REPLICAOF NO ONE.
+  bool replica_mode = false; // different from from repl_state (that is the link phase)
   Conn *master_link = nullptr; // nullptr = this server is master
   std::string master_host;
   int master_port = 0;
@@ -371,10 +373,12 @@ int  config_selfcheck();
 
 // Replication bookkeping
 void repl_init(); // call once at boot
+void repl_new_id(); // fresh 40-hex identity: boot, and on promotion to master
 void repl_backlog_feed(const char *bytes,  size_t len); 
 uint64_t repl_backlog_start_offset(); // derived, for info
 bool repl_start(const std::string &host, int port, std::string &err);
 void repl_stop();
+
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);
