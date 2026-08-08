@@ -8,6 +8,10 @@
 
 #include <errno.h>
 #include <unistd.h>
+
+// OpenSSL stays private to this TU. Without MYRED_HAVE_TLS the TLS branches
+// compile out and Conn::ssl is always null, so only plaintext paths run.
+#ifdef MYRED_HAVE_TLS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -90,6 +94,20 @@ bool tr_tls_attach(Conn *c){
     return true;
 }
 
+#else // !MYRED_HAVE_TLS
+
+// tls-port must fail loudly, not silently serve cleartext on a TLS port.
+bool tr_tls_init(std::string &err){
+    if (g_config.tls_port == 0){ return true; }
+    err = "tls-port is set but this build has no TLS support "
+          "(install libssl-dev and re-run cmake, or unset tls-port)";
+    return false;
+}
+
+bool tr_tls_attach(Conn *c){ (void)c; return false; }
+
+#endif // MYRED_HAVE_TLS
+
 // Plaintext transport. each call refreshes the conn's transport demand flags
 // they describe only the most recent operation, never a stale one
 
@@ -98,29 +116,30 @@ IoResult tr_read(Conn *c, uint8_t *buf, size_t cap, size_t *n){
   c->tr_want_write = false;
   *n = 0;
 
-  // plaintext part
-  if (!c->ssl) {
-    ssize_t rv = read(c->fd, buf, cap);
-    if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
-    if (rv == 0){ return IoResult::PEER_CLOSED; }
-    if (errno == EAGAIN || errno == EINTR){
-        c->tr_want_read = true;
-        return IoResult::WANT_READ;
-    }
-    return IoResult::ERR;
-  }
-
+#ifdef MYRED_HAVE_TLS
   // TLS: one SSL_read; classify with SSL_get_error, NEVER errno, handle_read
   // loop while tr_has_pending() reports more buffered records
-  ERR_clear_error();
-  int rv = SSL_read(c->ssl, buf, (int)cap);
-  if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
-  int e = SSL_get_error(c->ssl, rv);
-  if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
-  if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
-  if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; } // clean close-notify
-  return IoResult::ERR; // SSL_ERROR_SYSCALL (dirty EOF) or SSL_ERROR_SSL
+  if (c->ssl) {
+    ERR_clear_error();
+    int rv = SSL_read(c->ssl, buf, (int)cap);
+    if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+    int e = SSL_get_error(c->ssl, rv);
+    if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
+    if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
+    if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; } // clean close-notify
+    return IoResult::ERR; // SSL_ERROR_SYSCALL (dirty EOF) or SSL_ERROR_SSL
+  }
+#endif
 
+  // plaintext part
+  ssize_t rv = read(c->fd, buf, cap);
+  if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+  if (rv == 0){ return IoResult::PEER_CLOSED; }
+  if (errno == EAGAIN || errno == EINTR){
+       c->tr_want_read = true;
+      return IoResult::WANT_READ;
+  }
+  return IoResult::ERR;
 }
 
 IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n){
@@ -128,35 +147,43 @@ IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n){
     c->tr_want_write = false;
     *n = 0;
 
-    // plaintext
-    if (!c->ssl){
-        ssize_t rv = write(c->fd, buf, len);
-        if (rv >= 0){ *n = (size_t)rv; return IoResult::OK; }
-        if (errno == EAGAIN || errno == EINTR){
-            c->tr_want_write = true;
-            return IoResult::WANT_WRITE;
-        }
-        return IoResult::ERR;
-    }
-    
+#ifdef MYRED_HAVE_TLS
     // TLS, SSL_MODE_ENABLE_PARTIAL_WRITE (set in tr_tls_init) makes short writes
     // legal, so rv < len is fine - handle_writes consumes n and keeps want_write
-    ERR_clear_error();
-    int rv = SSL_write(c->ssl, buf, (int)len);
-    if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
-    int e = SSL_get_error(c->ssl, rv);
-    if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
-    if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
-    if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; }
+    if (c->ssl){
+        ERR_clear_error();
+        int rv = SSL_write(c->ssl, buf, (int)len);
+        if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
+        int e = SSL_get_error(c->ssl, rv);
+        if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }
+        if (e == SSL_ERROR_WANT_WRITE){ c->tr_want_write = true; return IoResult::WANT_WRITE; }
+        if (e == SSL_ERROR_ZERO_RETURN){ return IoResult::PEER_CLOSED; }
+        return IoResult::ERR;
+    }
+#endif
+
+    // plaintext
+    ssize_t rv = write(c->fd, buf, len);
+    if (rv >= 0){ *n = (size_t)rv; return IoResult::OK; }
+    if (errno == EAGAIN || errno == EINTR){
+        c->tr_want_write = true;
+        return IoResult::WANT_WRITE;
+    }
     return IoResult::ERR;
 }
 
 // Do we can read without another poll wake?
 bool tr_has_pending(Conn *c){
+#ifdef MYRED_HAVE_TLS
+    if (c->ssl){ return SSL_has_pending(c->ssl) == 1; }
+#else
+    (void)c;
+#endif
     // plaintext: the socket is the only buffer; poll re-fires
-    if (!c->ssl){ return false; }
-    return SSL_has_pending(c->ssl) == 1;
+    return false;
 }
+
+#ifdef MYRED_HAVE_TLS
 
 IoResult tr_handshake(Conn *c){
     c->tr_want_read = false;
@@ -178,12 +205,23 @@ std::string tr_tls_error(){
     return buf;
 }
 
+#else // !MYRED_HAVE_TLS
+
+// Unreachable: tr_tls_init refuses to boot with tls-port set, so nothing is
+// ever marked tls_handshaking.
+IoResult tr_handshake(Conn *c){ (void)c; return IoResult::ERR; }
+std::string tr_tls_error(){ return "build without TLS support"; }
+
+#endif // MYRED_HAVE_TLS
+
 void tr_close(Conn *c){
+#ifdef MYRED_HAVE_TLS
     if (c->ssl){
         // one-shot close-notifyl do NOT retry or wait for the peer's
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
         c->ssl = nullptr;
     }
+#endif
     (void)close(c->fd);
 }

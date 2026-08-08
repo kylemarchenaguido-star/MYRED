@@ -772,6 +772,9 @@ int main(int argc, char **argv){
   #ifndef MYRED_HAVE_ARGON2
     fprintf(stderr, "startup: build without libargon2 - new password hashes fall back to lgeacy SHA-256\n");
   #endif
+  #ifndef MYRED_HAVE_TLS
+    fprintf(stderr, "startup: build without OpenSSL - TLS disabled (tls-port unavailable)\n");
+  #endif
 
   acl_bootstrap_default();
   acl_init_categories(); 

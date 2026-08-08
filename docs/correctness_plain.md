@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-07-28 21:05:49
+# MYRED stress test — 2026-08-07 22:36:47
 
 **Run:** correctness only over plaintext (passwordless) → 127.0.0.1:1234
 
@@ -163,17 +163,17 @@
   ✓ setrange on set → WRONGTYPE
 
 ── KEYS Command ──────────────────────────────────────
-  ✓ keys returns list → ['kb', 'ka', 'persist_zset', 'kc']
+  ✓ keys returns list → ['kb', 'ka', 'kc']
   ✓ ka in keys
   ✓ kb in keys
   ✓ kc in keys
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 4999
+  ✓ pttl returns int → 5000
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 4999ms
+  ℹ  remaining TTL: 5000ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -392,7 +392,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.2ms
+  ℹ  returned in 0.4ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -508,7 +508,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['port', '1234', 'bind', '0.0.0.0', 'protected-mode', 'yes', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '3600 1 300 100 60 10000', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'auditlog', '']
+  ✓ config get * -> array → ['port', '1234', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '3600 1 300 100 60 10000', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'masterauth', '', 'auditlog', '']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -520,12 +520,23 @@
   ✓ config set unknown parameter rejected
   ✓ config resetstat -> OK
   ✓ config bad subcommand -> error
+  ✓ [REG] maxmemory-samples reads back what was set
+  ✓ [REG] maxmemory-policy reads back what was set
+  ✓ [REG] maxmemory reads back what was set
+  ✓ [REG] appendfsync reads back what was set
+  ✓ [REG] appendfilename reads back what was set
+  ✓ [REG] dbfilename reads back what was set
+  ✓ [REG] auto-aof-rewrite-percentage reads back what was set
+  ✓ [REG] auto-aof-rewrite-min-size reads back what was set
+  ✓ [REG] notify-keyspace-events reads back what was set
+  ✓ [REG] appendonly no while protected-mode yes
+  ✓ [REG] appendonly yes while protected-mode no
 
 ── ACL: users, auth, key patterns ────────────────────
   ✓ acl whoami -> default
-  ✓ acl users -> array → ['probe', 'default']
+  ✓ acl users -> array → ['default']
   ✓ acl users contains default
-  ✓ acl list -> array → ['user probe on #<hash> ~good:* -@all', 'user default on nopass ~* &* +@all']
+  ✓ acl list -> array → ['user default on nopass ~* &* +@all']
   ✓ acl list includes default
   ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*']
   ✓ acl getuser exposes flags
@@ -555,7 +566,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:130\r\nuptime_minutes:2\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:17\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:67493888\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2756\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:8483\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:4\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:4\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:68182016\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2789\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:3125\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nmaster_replid:2875bcaca1325b4d4f604d1d547964047cebb24f\r\nconnected_slaves:0\r\nmaster_repl_offset:122275\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nrepl_backlog_histlen:122275\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -579,28 +590,28 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:130
-    uptime_minutes:2
+    uptime_seconds:4
+    uptime_minutes:0
     uptime_hours:0
     # Clients
     connected_clients:1
-    total_connections:17
+    total_connections:4
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:67493888
+    used_memory_rss:68182016
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
     evicted_keys:0
     # Stats
-    total_commands:2756
+    total_commands:2789
     # Keyspace
     keys_total:0
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:8483
+    rdb_last_save_time:3125
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -612,6 +623,13 @@
     aof_last_bgrewrite_status:ok
     # Replication
     role:master
+    master_replid:2875bcaca1325b4d4f604d1d547964047cebb24f
+    connected_slaves:0
+    master_repl_offset:122275
+    repl_backlog_active:1
+    repl_backlog_size:1048576
+    repl_backlog_first_byte_offset:1
+    repl_backlog_histlen:122275
 
 ── INFO: O(1) keyspace stats (heap-backed keys_with_ttl) 
   ✓ empty db → (0,0)
@@ -632,15 +650,15 @@
   ✓ save → OK
   ✓ dump.rdb exists
   ✓ dump.rdb not empty
-  ℹ  dump.rdb size: 75 bytes
+  ℹ  dump.rdb size: 19 bytes
   ✓ magic number correct
 
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 2.8ms: 'Background saving started'
+  ℹ  bgsave returned in 2.4ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 15.5ms
+  ℹ  100 ops during save took 34.5ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -692,7 +710,7 @@
 
 ── Memory: incremental eviction (EVICT_RUNNING semantics) 
   ✓ write admitted during overshoot
-  ✓ idle drain under cap (2268000 -> 524090 <= 524288)
+  ✓ idle drain under cap (2268000 -> 523908 <= 524288)
 
 ── ECHO + inline protocol ────────────────────────────
   ✓ echo roundtrip
@@ -807,27 +825,27 @@
   ✓ ttl preserved after save
 
 ═══════════════════════════════════════════════════════
-Results: 639/639 passed
-Runtime: 15.20s (42.0 assertions/sec)
+Results: 650/650 passed
+Runtime: 16.88s (38.5 assertions/sec)
 All tests passed!
 Slowest sections:
-  7.91s  11/11  Pub/Sub: keyspace notifications (V8.3)
-  1.11s  16/16  Transactions: WATCH / UNWATCH (V8.6-V8.7)
-  0.75s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
-  0.72s  9/9  UNLINK Command (async delete)
-  0.60s  10/10  TTL Commands: PEXPIRE / PTTL
-  0.58s  9/9  Memory: maxmemory eviction + OOM
-  0.53s  7/7  BGSAVE (fork-based background save)
-  0.51s  6/6  Persistence Round-trip (in-memory)
+  7.92s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  1.22s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
+  1.13s  16/16  Transactions: WATCH / UNWATCH (V8.6-V8.7)
+  1.06s  9/9  Memory: maxmemory eviction + OOM
+  0.93s  9/9  UNLINK Command (async delete)
+  0.61s  10/10  TTL Commands: PEXPIRE / PTTL
+  0.57s  7/7  BGSAVE (fork-based background save)
+  0.52s  16/16  Pub/Sub: SUBSCRIBE / UNSUBSCRIBE / PUBLISH (V8.1)
 ═══════════════════════════════════════════════════════
 
 -- Command Metrics -------------------------------------
-  Commands observed: 11752
+  Commands observed: 11798
   RESP errors:       119 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.14ms
-  Latency p50/p95/p99: 0.13/0.18/0.27ms
-  Latency max:       24.82ms
+  Latency avg:       0.27ms
+  Latency p50/p95/p99: 0.23/0.46/0.72ms
+  Latency max:       75.72ms
   Most used commands:
     set              8333 calls
     zadd             1634 calls
@@ -837,23 +855,23 @@ Slowest sections:
     get               202 calls
     sadd              123 calls
     hset              108 calls
+    config             74 calls
     info               34 calls
-    config             28 calls
     acl                16 calls
     multi              16 calls
   Slowest commands by average latency:
-    save              11.73ms avg over 2 calls
-    acl                3.19ms avg over 16 calls
-    bgsave             2.53ms avg over 2 calls
-    scan               0.39ms avg over 3 calls
-    zrevquery          0.28ms avg over 2 calls
-    zquery             0.27ms avg over 6 calls
-    setrange           0.27ms avg over 6 calls
-    setex              0.25ms avg over 4 calls
-    hscan              0.25ms avg over 4 calls
-    psubscribe         0.24ms avg over 1 calls
-    flushall           0.23ms avg over 13 calls
-    zpopmin            0.23ms avg over 5 calls
+    acl                8.89ms avg over 16 calls
+    bgsave             3.55ms avg over 2 calls
+    incrby             0.94ms avg over 4 calls
+    sdiffstore         0.68ms avg over 1 calls
+    decrby             0.67ms avg over 3 calls
+    subscribe          0.67ms avg over 2 calls
+    zquery             0.63ms avg over 6 calls
+    hscan              0.63ms avg over 4 calls
+    psubscribe         0.63ms avg over 1 calls
+    exec               0.63ms avg over 11 calls
+    getset             0.59ms avg over 3 calls
+    save               0.56ms avg over 2 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED

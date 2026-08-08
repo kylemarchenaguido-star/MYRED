@@ -12,10 +12,31 @@ endif()
 add_compile_options(-Wall -Wextra -Wshadow)
 
 
-# dependencies: zlib (RDB compression) and pthreads (thread pool)
-find_package(ZLIB REQUIRED)
+# hard dependencies: zlib (RDB compression) and pthreads (thread pool).
+# zlib stays required: compression is part of the on-disk RDB format, so a
+# build without it could not read snapshots written by a build with it.
+find_package(ZLIB)
+if(NOT ZLIB_FOUND)
+  message(FATAL_ERROR "zlib development files not found - required for RDB "
+                      "compression. Install with: sudo apt install zlib1g-dev")
+endif()
 find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
+
+# optional: OpenSSL for TLS (tls-port). Absent -> plaintext-only build; the
+# transport seam keeps OpenSSL inside transport.cpp, so nothing else changes.
+option(MYRED_TLS "Build TLS support (OpenSSL)" ON)
+if(MYRED_TLS)
+  find_package(OpenSSL)
+  if(OPENSSL_FOUND)
+    set(MYRED_HAVE_TLS TRUE)
+    message(STATUS "OpenSSL found: TLS enabled (tls-port available)")
+  else()
+    message(WARNING "MYRED_TLS=ON but OpenSSL dev files not found "
+                    "(sudo apt install libssl-dev) - building without TLS. "
+                    "Setting tls-port in the config will refuse to boot.")
+  endif()
+endif()
+
 # optional: Argon2id for new password hashes (falls back to SHA-256 when absent)
 option(MYRED_ARGON2 "Hash new passwords with Argon2id (libargon2)" ON)
 if(MYRED_ARGON2)
@@ -50,7 +71,12 @@ add_executable(server
   cred.cpp
   transport.cpp
 )
-target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
+
+if(MYRED_HAVE_TLS)
+  target_compile_definitions(server PRIVATE MYRED_HAVE_TLS)
+  target_link_libraries(server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 if(MYRED_HAVE_ARGON2)
   target_compile_definitions(server PRIVATE MYRED_HAVE_ARGON2)
@@ -60,3 +86,8 @@ endif()
 
 # client is standalone (sockets only)
 add_executable(client client.cpp)
+
+# what the resulting build can actually do, so an absent optional dep is
+# visible at configure time rather than as a surprise at runtime
+message(STATUS "MYRED build: TLS=${MYRED_HAVE_TLS} Argon2id=${MYRED_HAVE_ARGON2} "
+               "(OFF/empty = feature compiled out)")

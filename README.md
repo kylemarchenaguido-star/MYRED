@@ -81,11 +81,14 @@ than using the STL containers.
 
 ## Building
 
-Requires a C++17 compiler, **CMake ≥ 3.16**, **zlib**, and **pthreads**.
+Requires a C++20 compiler, **CMake ≥ 3.16**, **zlib**, and **pthreads**.
 
 ```bash
-# install deps (Debian/Ubuntu/WSL)
+# required deps (Debian/Ubuntu/WSL)
 sudo apt install build-essential cmake zlib1g-dev
+
+# optional deps - see the table below
+sudo apt install libssl-dev libargon2-dev
 
 # configure + build
 cmake -B build
@@ -93,6 +96,27 @@ cmake --build build
 ```
 
 This produces two binaries in `build/`: `server` and `client`.
+
+### Optional dependencies
+
+Both are detected at configure time and **compile out cleanly when absent** — the
+build succeeds either way, and CMake prints a summary line
+(`MYRED build: TLS=... Argon2id=...`) plus a warning naming the missing package.
+
+| Dependency | Package | Present | Absent |
+|---|---|---|---|
+| OpenSSL | `libssl-dev` | `tls-port` works | plaintext only; **setting `tls-port` refuses to boot** |
+| libargon2 | `libargon2-dev` | new passwords hashed with Argon2id | new passwords fall back to SHA-256; existing `$argon2id$` credentials **cannot be verified** |
+
+Force a feature off even when the library is installed with
+`-DMYRED_TLS=OFF` / `-DMYRED_ARGON2=OFF`.
+
+zlib is **not** optional: compression is part of the on-disk RDB format, so a
+build without it could not read snapshots written by a build with it.
+
+> Building without OpenSSL means `myred.conf` and `bench.conf` will not boot as
+> shipped — both set `tls-port`. Comment out their `tls-port` / `tls-cert-file` /
+> `tls-key-file` lines, or run `./build/server` with no config file.
 
 ## Running
 
