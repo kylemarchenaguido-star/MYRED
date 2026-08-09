@@ -94,7 +94,7 @@ before writing any of it:
   generation. Full resync's RDB payload can be produced by the same path rather
   than a new one (see V10.2's note on the pragmatic first cut).
 
-#### V10.3 - Read-only replica mode + command gating [In Progress]
+#### V10.3 - Read-only replica mode + command gating [Done]
 
 Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts
 writes from ordinary clients too, silently diverging from the master.
@@ -124,7 +124,7 @@ writes from ordinary clients too, silently diverging from the master.
 in-memory gate, and testing it immediately exposed that the gate cannot protect a
 restart, which is V10.3b.
 
-##### V10.3b - `replicaof` config directive [In Progress]
+##### V10.3b - `replicaof` config directive [Done]
 
 **The gate protects a running replica and nothing else.** A restarted replica
 comes back a *writable master pointed at nothing*: `REPLICAOF` is runtime-only
@@ -165,7 +165,19 @@ both servers had been restarted for a rebuild, and the "replica" answered `OK` t
   read-only replica with no manual command; `REPLICAOF NO ONE` + `CONFIG REWRITE`
   removes the line so the next boot is a master; and the reverse round-trips too.
 
-#### V10.4 - Partial resync via the backlog [Backlog]
+Closed 2026-08-07, all three verified live, including the fail-closed case: booted
+against a master that is down, the instance stays `role:slave` +
+`master_link_status:down` and still answers `READONLY` rather than exiting or
+coming up writable. **The check that carried the weight was `REPLICAOF NO ONE` +
+`CONFIG REWRITE` removing the line** — until promotion, the staged
+`g_config.replicaof_*` and the live `g_data.master_*` hold identical values, so an
+`emit` wired to the wrong one produces a byte-identical file and passes every
+other test. Same reasoning as V9.8's distinct-value `CONFIG` probes.
+`replica/replica.conf` + a Replication pair section in `docs/TESTING.md` are the
+durable fixtures (a `CONFIG REWRITE` rewrites the file from the table, so comments
+in it do not survive — the runbook is the place for instructions).
+
+#### V10.4 - Partial resync via the backlog [In Progress]
 
 Gated on V10.1 (backlog must exist) and V10.2 (basic full resync must be
 solid) — this step is purely an optimization on top of both, never a
@@ -189,6 +201,53 @@ enough to be the safe fallback.
   right data" — a full resync would also leave it with the right data, so the
   test must distinguish the two paths); a gap larger than
   `repl-backlog-size` correctly falls back to full resync instead of failing.
+
+**Split in two, same shape as V10.2 and for the same reason** — the halves fail
+differently and the master half is testable on its own with a raw socket:
+
+##### V10.4a - master side: accept `PSYNC <replid> <offset>` [In Progress]
+
+- Validation is arithmetic on "how many bytes is this replica missing", not on
+  the derived start offset: `need = (master_repl_offset + 1) - psync_offset`, and
+  the request is serviceable exactly when `psync_offset <= master_repl_offset + 1`
+  (not ahead of us) **and** `need <= repl_backlog_histlen` (still retained). That
+  formulation sidesteps `repl_backlog_start_offset()`'s `histlen == 0` sentinel
+  entirely, and `need == 0` — a replica that never missed a byte — falls out as a
+  valid `+CONTINUE` carrying no payload rather than a special case.
+- **The counters are part of the deliverable, not decoration.** The done-criteria
+  demands the two paths be distinguishable, and "the data is right" cannot do it —
+  a full resync also leaves the data right. `sync_full`, `sync_partial_ok` and
+  `sync_partial_err` in `INFO stats` (Redis's own names) make it machine-checkable
+  from a test; a log line alone would force log-scraping.
+- Every rejection reason falls through to the existing full-resync path, and
+  disabling the backlog (`repl-backlog-size 0`) means no partial resync ever.
+
+##### V10.4b - replica side: ask for one, accept `+CONTINUE` [In Progress]
+
+- **The replica already retains everything it needs**, which V10.3a made true
+  without meaning to: `repl_link_lost` deliberately keeps `replica_mode`,
+  `master_host` and `master_port`, and never touched `repl_id` or
+  `master_repl_offset`. So the reconnect state is already there — what is missing
+  is only asking with it.
+- `repl_start` must capture that history **before** its own `repl_stop()` call
+  clears the role, and may only claim it when reconnecting to *the same*
+  `host:port`. That condition is what makes `REPLICAOF NO ONE` → `REPLICAOF <same
+  master>` correctly force a full resync: promotion mints a fresh `repl_id`
+  (V10.3a), so the id on the wire would no longer be the master's.
+- `+CONTINUE` is handled in `HANDSHAKE` and jumps straight to `STREAMING` — **no
+  dataset wipe, no `rdb_load_buffer`, no offset reset.** It must be matched
+  *before* the existing "skip anything that is not `+FULLRESYNC`" ack rule, or it
+  is silently discarded as an `+OK`.
+
+##### V10.4c - automatic reconnect [Backlog]
+
+Deliberately not in V10.4a/b. Partial resync is fully testable without it (see
+`docs/TESTING.md`: a `socat` hop between the pair, killed and restarted, then
+re-issue `REPLICAOF` — `have_history` holds because host:port never changed), and
+a retry timer is a different concern: *when* to reconnect, with what backoff, and
+on which of the existing timer sweeps. V10.5's `REPLCONF ACK` cadence needs the
+same periodic hook, so the two should be designed together rather than having a
+second timer invented here.
 
 #### V10.5 - Replica ACK tracking + `WAIT` [Backlog]
 

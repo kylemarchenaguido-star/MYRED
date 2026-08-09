@@ -48,19 +48,55 @@ Override with `--log path.md`, disable with `--log ''`.
 
 ---
 
-## The two configs
+## The configs
 
-| | `myred.conf` | `bench.conf` |
-|---|---|---|
-| plaintext / TLS port | 1234 / 1235 | 1336 / 1337 |
-| auth | `requirepass` + `user alice` | **none** |
-| AOF | on | off |
-| maxmemory | 64 MB `allkeys-lru` | unlimited |
+| | `myred.conf` | `bench.conf` | `replica/replica.conf` |
+|---|---|---|---|
+| plaintext / TLS port | 1234 / 1235 | 1336 / 1337 | 1338 / — |
+| auth | `requirepass` + `user alice` | **none** | none |
+| AOF | on | off | off (see below) |
+| maxmemory | 64 MB `allkeys-lru` | unlimited | unlimited |
+| role | master | master | replica of `:1336` |
 
 **Benchmark against `bench.conf` only.** AOF fsync, the eviction ceiling, and the
 Argon2 AUTH gate all distort throughput. `redis-benchmark`'s 50-client AUTH storm
 also hits `k_max_auth_inflight=4` and returns `BUSY` — the KDF working as
 designed, not a result.
+
+### Replication pair
+
+`bench.conf` is the master, `replica/replica.conf` the replica. **Run the replica
+from its own directory** — the server opens `dump.rdb`/`appendonly.aof` by
+relative path, so a replica started from the project root would fight the master
+over the same files and load the master's snapshot as its own.
+
+```bash
+./build/server bench.conf                          # master  :1336, terminal 1
+cd replica && ../build/server replica.conf         # replica :1338, terminal 2
+```
+
+```bash
+redis-cli -p 1338 info replication   # role:slave + master_link_status:up
+redis-cli -p 1336 set k v && redis-cli -p 1338 get k     # v
+redis-cli -p 1338 set k v            # READONLY ... (V10.3a)
+```
+
+`replicaof` in that config file needs **V10.3b**; before it lands, drop the line
+and use `redis-cli -p 1338 replicaof 127.0.0.1 1336` after boot. Either way the
+role is what `INFO replication` reports — check `master_link_status:up` *first*,
+since every other assertion below is meaningless without it, and a restarted
+replica silently comes back a writable master until V10.3b.
+
+Two reads that localise a broken link fast: `master_replid` on the replica must be
+byte-identical to the master's (if it still shows its own boot id, the
+`+FULLRESYNC` line never parsed), and `master_repl_offset` counting up from zero
+with `repl_backlog_first_byte_offset:1` means the instance is propagating its
+*own* writes — i.e. it is not a replica at all.
+
+The replica has **no AOF on purpose**: replicated writes are applied under
+`g_data.g_loading`, which keeps them out of its own AOF, so one there would record
+only pre-replication state. Same reason it emits no keyspace notifications and
+does not invalidate its own `WATCH`ers — see ROADMAP → V10.2b known limitations.
 
 ## Build
 

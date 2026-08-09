@@ -1298,8 +1298,12 @@ static void info_memory(std::string &o){
 static void info_stats(std::string &o){
   o += "# Stats\r\n";
   info_add(o, "total_commands:%llu\r\n", (unsigned long long)g_data.g_total_commands);
+  info_add(o, "sync_full:%llu\r\n", (unsigned long long)g_data.sync_full);
+  info_add(o, "sync_partial_ok:%llu\r\n", (unsigned long long)g_data.sync_partial_ok);
+  info_add(o, "sync_partial_err:%llu\r\n", (unsigned long long)g_data.sync_partial_err);
   o += "\r\n";
 }
+
 
 static void info_keyspace(std::string &o){
   const KeyStats ks = get_keys_stats();
@@ -2562,10 +2566,41 @@ static void do_replconf(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
 // PSYNC <replid> <offset>
 static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
-  (void)cmd;
   // A replay Conn lives on the stack in aof_load; registering it would dangle
   if (g_data.g_loading){ return resp_err(out, "ERR PSYNC is not valid during loading"); }
   if (conn->is_replica){ return resp_err(out, "ERR this connections is already a replica"); }
+
+  // partial resync, only when the replica names our history and every byte it missed is still in the ring
+  if (cmd[1] != "?" && !g_data.repl_backlog.empty()){
+    long off = 0;
+    const bool id_ok = (cmd[1] == g_data.repl_id);
+    const bool off_ok = parse_int_strict(cmd[2].c_str(), &off) && off > 0;
+    const uint64_t want = off_ok ? (uint64_t)off : 0; // first byte the replica needs
+    const uint64_t next = g_data.master_repl_offset + 1; // first byte we have not produced
+
+    // framed as "how many bytes is it missing"
+    if (id_ok && off_ok && want <= next && (next - want) <= g_data.repl_backlog_histlen){
+      const uint64_t need = next - want; // need == 0 is legal: fully caught 
+      char cont[128];
+      int cn = snprintf(cont, sizeof(cont), "+CONTINUE %s\r\n", g_data.repl_id.c_str());
+      buf_append(out, cont, (size_t)cn);
+      repl_backlog_copy(need, out);
+      conn->is_replica = true;
+      g_data.replicas.insert(conn);
+      g_data.sync_partial_ok++;
+      fprintf(stderr, "replication: partial resync for %s from offset %llu (%llu bytes)\n",
+               conn->peer.c_str(), (unsigned long long)want, (unsigned long long)need);
+      return;
+    }
+
+    g_data.sync_partial_err++;
+    fprintf(stderr, "replication: partial resync refused for %s (%s), falling back to full\n",
+            conn->peer.c_str(),
+            !id_ok      ? "replid mismatch" :
+            !off_ok     ? "bad offset" :
+            want > next ? "replica claims to be ahead of us" :
+                          "gap older than the backlog");
+    }
 
   // The offset must be sampled before the image is serialized, with nothing propagating between
   const uint64_t start_offset = g_data.master_repl_offset;

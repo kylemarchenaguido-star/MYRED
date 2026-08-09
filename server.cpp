@@ -179,6 +179,11 @@ void repl_stop(){
 }
 
 bool repl_start(const std::string &host, int port, std::string &err){
+  const bool have_history = g_data.replica_mode && !g_data.repl_id.empty() &&
+                            g_data.master_host == host && g_data.master_port == port;
+  const std::string hist_id = g_data.repl_id;
+  const uint64_t hist_off = g_data.master_repl_offset;
+
   repl_stop();  
 
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -227,7 +232,13 @@ bool repl_start(const std::string &host, int port, std::string &err){
     aof_encode(hs, { "AUTH", std::string_view(g_config.masterauth) });
   }
   aof_encode(hs, { "REPLCONF", "listening-port", std::string_view(myport) });
-  aof_encode(hs, { "PSYNC", "?", "-1" });
+  // PSYNC <replid> <first byte we still need>. "? -1" means "no history, send it all".
+  const std::string psync_off = std::to_string(hist_off + 1);
+  if (have_history){
+    aof_encode(hs, { "PSYNC", std::string_view(hist_id), std::string_view(psync_off) });  
+  } else {
+    aof_encode(hs, { "PSYNC", "?", "-1" });  
+  }
   buf_append(&c->outgoing, hs.data(), hs.size());
 
   g_data.master_host = host;
@@ -235,7 +246,8 @@ bool repl_start(const std::string &host, int port, std::string &err){
   g_data.replica_mode = true; // role 
   g_data.repl_state = ReplState::HANDSHAKE;
   g_data.master_link = c;
-  fprintf(stderr, "replication: connecting to master %s\n", c->peer.c_str());
+  fprintf(stderr, "replication: connecting to master %s (%s)\n", c->peer.c_str(),
+          have_history ? "attempting partial resync" : "full resync");
   return true;
 }
 
@@ -282,6 +294,15 @@ static void repl_master_data(Conn *c){
           c->want_close = true;
           return;
         }
+        // +CONTINUE [<replid>] — the master kept our history: no image follows
+        if (line.compare(0, 9, "+CONTINUE") == 0){
+          g_data.repl_state = ReplState::STREAMING;
+          fprintf(stderr, "replication: partial resync accepted, continuing at offset %llu\n",
+                  (unsigned long long)g_data.master_repl_offset);
+          break;
+        }
+
+
         // the +OK acks for AUTH / REPLCONF arrive first and carry nothing we need
         if (line.compare(0, 12, "+FULLRESYNC ") != 0){ break; }
 
@@ -1024,6 +1045,15 @@ int main(int argc, char **argv){
 
   const size_t nlisten = listeners.size();
   std::vector<struct pollfd> poll_args; // This a vector of structs for arguments for poll_args
+
+  // Deferred replica connect
+  if (!g_config.replicaof_host.empty()){
+    std::string err;
+    if (!repl_start(g_config.replicaof_host, g_config.replicaof_port, err)){
+      errno = 0;
+      fatal_exit(("replicaof: " + err).c_str());
+    }
+  }
 
   while(!g_stop){
     

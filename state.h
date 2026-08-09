@@ -236,6 +236,9 @@ struct GlobalData{
   int master_port = 0;
   uint64_t repl_rdb_left = 0; // bytes of the resync image still to read
   std::string repl_rdb_buf; // acumulates it
+  uint64_t sync_full = 0;
+  uint64_t sync_partial_ok = 0;
+  uint64_t sync_partial_err = 0;
 };
 
 struct SaveCondition {
@@ -265,6 +268,9 @@ struct Config {
   int aof_rewrite_perc = 100; // ... or until it has doubled
   // replication
   size_t repl_backlog_size = 1024 * 1024; // 0 disables the backlog
+  // Boot stating for the replicaof directive
+  std::string replicaof_host;
+  int replicaof_port = 0;
   std::string masterauth; // plaintext; we must present it to the master.
   int maxmemory_samples = 10; // eviction sample size (best-of-n)
   int lfu_log_factor = 10; // LFU: higher = counter saturates slower
@@ -378,7 +384,7 @@ void repl_backlog_feed(const char *bytes,  size_t len);
 uint64_t repl_backlog_start_offset(); // derived, for info
 bool repl_start(const std::string &host, int port, std::string &err);
 void repl_stop();
-
+void repl_backlog_copy(uint64_t need, Buffer *out); // the ring's last 'need' bytes, oldest first
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);

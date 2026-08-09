@@ -501,7 +501,8 @@ static const ConfigDirective k_config_table[] = {
     [](std::string &o) -> bool { o = std::to_string(g_config.aof_rewrite_min_size); return true; },
     /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
-    // Not exposed by CONFIG GET (get == nullptr): both are write-only config-file
+      // Not exposed by CONFIG GET (get == nullptr): write-only config-file
+      // constructs with no single-value form.
 
   { "repl-backlog-size", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -515,6 +516,28 @@ static const ConfigDirective k_config_table[] = {
     },
     [](std::string &o) -> bool { o = std::to_string(g_config.repl_backlog_size); return true; },
     /*boot_only*/ true, /*masked*/ false, /*emit*/ nullptr},
+
+  { "replicaof", 2, 2,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long p = 0;
+      if (!parse_int_strict(a[1].c_str(), &p) || p <= 0 || p > 65535){
+        e = "invalid master port '" + a[1] + "'";
+        return CfgResult::BADVALUE;
+      }
+      // RECORD ONLY, never connect: this runs before repl_init() has minted a
+      // repl_id, before the local RDB/AOF load, and before the poll loop exists.
+      // main() performs the connect once all three are done.
+      g_config.replicaof_host = a[0];
+      g_config.replicaof_port = (int)p;
+      return CfgResult::OK;
+    },
+    /*get*/ nullptr,   // two tokens: no single-value form, like user/rename-command
+    /*boot_only*/ true, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (!g_data.replica_mode){ return; }
+      // the host is an IPv4 literal (inet_pton validates it), so it never needs quoting
+      fprintf(fp, "replicaof %s %d\n", g_data.master_host.c_str(), g_data.master_port);
+    } },
 
   { "masterauth", 1, 1,
     [](const std::vector<std::string> &a, std::string &) -> CfgResult {
@@ -1120,4 +1143,17 @@ void repl_backlog_feed(const char *bytes, size_t len){
   }
   g_data.repl_backlog_pos = (g_data.repl_backlog_pos + len) % cap;
   g_data.repl_backlog_histlen = std::min(g_data.repl_backlog_histlen + len, cap);
+}
+
+// The mirror of repl_backlog_feed hand back the last need bytes, oldest first
+void repl_backlog_copy(uint64_t need, Buffer *out){
+  if (need == 0){ return; }
+  const size_t cap = g_data.repl_backlog.size();
+  // repl_backlog_pos is the write cursor, so the newest byte is at pos - 1
+  const size_t start = (g_data.repl_backlog_pos + cap - (size_t)need) % cap;
+  const size_t first = std::min((size_t)need, cap - start);
+  buf_append(out, g_data.repl_backlog.data() + start, first);
+  if ((size_t)need > first){
+    buf_append(out, g_data.repl_backlog.data(), (size_t)need - first);
+  }
 }
