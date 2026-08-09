@@ -302,7 +302,6 @@ static void repl_master_data(Conn *c){
           break;
         }
 
-
         // the +OK acks for AUTH / REPLCONF arrive first and carry nothing we need
         if (line.compare(0, 12, "+FULLRESYNC ") != 0){ break; }
 

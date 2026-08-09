@@ -28,7 +28,8 @@ for design rationale.
   Twister is fully reconstructible from its output — 624 observed 32-bit words
   recover the internal state, and every past *and* future draw with it. So an
   attacker who obtains any one `ACL GENPASS` result (a password handed out in a
-  chat log, a ticket, a shell history) can in principle derive every other
+  chat log, a ticket, a shell history) can in 
+  ciple derive every other
   password the same process ever generated, including ones already set on other
   users. This is a *generator* weakness, not a storage one: Argon2id still
   protects the stored hash, so the exposure is confined to secrets minted by
@@ -152,6 +153,31 @@ hard technical dependency — nothing below actually needs replication to exist;
 auth, ACL, TLS, and transactions are the real attack surface this is aimed at.
 Bundled into one milestone number the same way Pub/Sub and Transactions shared
 V8 — for scheduling convenience, not because the pieces depend on each other.
+
+**Step 0, before any of the below: fold every local suite back into
+`stress_test.py`.** As of 2026-08-09 only `scripts/stress_test.py` is tracked;
+`test_pubsub.py`, `test_security.py`, `test_restart_matrix.py`,
+`test_replication.py`, `test_memory.py`, `test_async_auth.py`,
+`test_aof_restart.py`, `myred_testlib.py`, the `test_*.sh` scripts and the
+`diag_*.sh` helpers are gitignored and exist only in a working copy. That was a
+deliberate call — the test surface had grown faster than the fix list and no
+single command ran it all — but it means **their coverage is one `rm -rf` from
+gone**, and much of it pins bugs that really shipped:
+
+- Every check tagged `[REG]` in those files marks a real defect. Port them with
+  their comments intact; a `[REG]` without its story is just an assertion.
+- The suites that manage their own server (private ports 12401–12406, temp
+  workdirs, `myred_testlib.Server`) cannot become plain live-server sections —
+  restart, crash-recovery and replication tests need process control.
+  `stress_test.py` needs a "spawns its own instance" mode before those can move,
+  which is the real work of this step.
+- Highest-value coverage to preserve, in order: replication (whole milestone,
+  and both resync paths leave correct data so only its `sync_*` counter
+  assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
+  keyspace notifications, memory accounting invariants.
+- Do this *first*: the differential and fuzz work below is worth far more with
+  one runnable regression suite underneath it, and worth much less if the
+  existing coverage silently evaporates in the meantime.
 
 Structured, not "point an agent at the live server and see what happens" — that
 finds less than the combination below, because an LLM-driven agent is strong at

@@ -110,20 +110,11 @@ accounting drift, never to measure speed.
 
 ---
 
-## Suites that need no running server
+## The suite
 
-Private ports, temp dirs — safe to run while a real instance is up.
-
-```bash
-python3 scripts/test_pubsub.py [--evict]              # V8 pub/sub + notifications
-python3 scripts/test_security.py --destructive        # ACL, audit, protocol abuse
-python3 scripts/test_restart_matrix.py --destructive  # RDB/AOF restart + crash recovery
-python3 scripts/test_aof_restart.py
-```
-
-Add `--keep` to preserve the temp workdir (server stderr, configs) on failure.
-
-## Suites that need a running server
+`scripts/stress_test.py` is **the** harness — the only one tracked in the repo,
+and the one every other suite is being folded into (BACKLOG → V11). Needs a
+running server.
 
 ```bash
 ./build/server myred.conf     # in another terminal
@@ -131,13 +122,12 @@ Add `--keep` to preserve the temp workdir (server stderr, configs) on failure.
 python3 scripts/stress_test.py --password <PASS>
 python3 scripts/stress_test.py --password <PASS> --correctness-only
 python3 scripts/stress_test.py --password <PASS> --stress-only --stress-threads 16 --stress-ops 2000
-python3 scripts/test_async_auth.py --password <PASS>
-python3 scripts/test_memory.py --password <PASS>
-
-scripts/test_evict_tick.sh
-scripts/test_aof.sh   scripts/test_aof_rewrite.sh   scripts/test_aof_hybrid.sh
-scripts/diag_live.sh  scripts/diag_ttl.sh
+python3 scripts/stress_test.py --password <PASS> --bench
 ```
+
+Other `scripts/test_*.py` / `test_*.sh` files may exist in a working copy —
+they are gitignored, local-only, and not documented here on purpose. Anything
+worth keeping belongs inside `stress_test.py`.
 
 ---
 
@@ -198,10 +188,6 @@ Baselines live in `planning/ROADMAP.md` → Testing Matrix.
 
 ```bash
 cmake --build build -j && cmake --build build-dbg -j
-
-python3 scripts/test_pubsub.py --evict
-python3 scripts/test_security.py --destructive
-python3 scripts/test_restart_matrix.py --destructive
 
 ./build/server myred.conf &
 python3 scripts/stress_test.py --password <PASS>

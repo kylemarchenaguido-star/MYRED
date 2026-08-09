@@ -2621,6 +2621,7 @@ static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
   conn->is_replica = true;
   g_data.replicas.insert(conn);
+  g_data.sync_full++;
   fprintf(stderr, "replication: replica %s attached at offset %llu (%zu byte image)\n", 
            conn->peer.c_str(), (unsigned long long)start_offset, img_len);
 }

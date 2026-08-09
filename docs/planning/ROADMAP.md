@@ -44,7 +44,7 @@ Implemented command families:
 | **TLS** | **Implemented (V9.7)** |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | **Transactions** | **Implemented (V8.4–V8.7)** |
-| Replication | In progress (V10.1–V10.3a done: full resync + live streaming + read-only gate) |
+| Replication | In progress (V10.1–V10.4 done: resync, read-only, partial resync) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
@@ -52,208 +52,31 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ### V10 - Replication and High Availability [In Progress]
 
-Master-replica mode, `PSYNC`, a replication backlog, partial resync, replica
-propagation for writes, and read-only replica enforcement. Split into gated
-sub-steps, same shape as V9.7/V8's sub-milestones, because "replication" is
-really four separable systems (bookkeeping, handshake/full-resync, write-mode
-enforcement, partial resync) that fail independently and should be tested
-independently. **V10.1 through V10.3a are closed and archived in Completed
-Milestones below; V10.3b is the active step.**
+Master-replica mode, split into gated sub-steps because "replication" is four
+separable systems (bookkeeping, handshake/full-resync, write-mode enforcement,
+partial resync) that fail independently and are worth testing independently.
+Sequenced after V9.8 because replication adds config surface, and adding it to
+three hand-maintained lists was exactly the risk the config table removed.
 
-Sequenced deliberately after V9.8: replication adds config surface, and adding
-it to three hand-maintained lists was exactly the risk the config table removed.
+**V10.1-V10.4 are closed — see Completed Milestones. V10.5 is the active step**,
+and it absorbs the deferred V10.4c (automatic reconnect after a dropped link),
+which needs the same periodic hook as `REPLCONF ACK` and should be designed with
+it rather than inventing a second timer.
 
-**The dependency this milestone used to list — AOF canonicalization for renamed
-commands — is already satisfied**, not still pending. `do_request`
-(commands.cpp) already computes `bool renamed = (cmd[0] != canonical)` and, on a
-write, feeds a snapshot with `snapshot[0]` rewritten to the canonical name;
-replay already resolves through `k_cmd_table` under `g_data.g_loading`
-(`rename-command bricks the server on AOF restart`, fixed 2026-07-17). The
-stream AOF already produces — canonical command names,
-absolute-`PEXPIREAT`-reencoded TTLs, verbatim raw bytes for everything else —
-**is** a valid replication stream. V10 does not need to invent a wire format; it
-needs to fan those exact bytes out to replica connections instead of (or in
-addition to) the AOF file.
+#### V10.5 - Replica ACK tracking + `WAIT` (+ V10.4c reconnect) [In Progress]
 
-**Why this codebase is unusually well set up for this**, worth internalizing
-before writing any of it:
-- The single-threaded `poll()` loop means "propagate to N replicas" has the
-  same free-atomicity property already used for Transactions/EVAL — no
-  interleaving to reason about, no locking.
-- V8.1 Pub/Sub already proved the exact mechanism a replica connection needs:
-  `do_publish` (commands.cpp) writes a RESP-encoded payload directly into
-  *another* `Conn`'s `outgoing` buffer and sets `want_write = true`; the poll
-  loop picks it up on the next tick with zero event-loop changes. A replica
-  connection is a subscriber that never unsubscribes.
-- `rdb_load_buffer(const uint8_t *data, size_t size)` (rdb.h/rdb.cpp) already
-  exists and is already proven: `aof_load` (aof.cpp) calls it today to parse the
-  RDB preamble embedded in the hybrid AOF format. A replica receiving a
-  full-resync RDB payload over its socket calls this exact function on the
-  buffered bytes — no new parser.
-- `rdb_save_background` (rdb.cpp) already does fork-based, non-blocking snapshot
-  generation. Full resync's RDB payload can be produced by the same path rather
-  than a new one (see V10.2's note on the pragmatic first cut).
+Gated on V10.2. The replica currently never speaks back to its master and never
+reconnects on its own — both are the same missing piece, a periodic hook on the
+replica side, which is why V10.4c was folded in here.
 
-#### V10.3 - Read-only replica mode + command gating [Done]
-
-Gated on V10.2. Small, but load-bearing — without it V10.2's replica accepts
-writes from ordinary clients too, silently diverging from the master.
-
-- A **server-wide** mode flag (`g_data.is_replica` — not per-`Conn`; this is
-  unlike the `sub_channels`/`in_multi` per-connection modes, since the whole
-  server is read-only, not just one connection). Gate placement in
-  `do_request`: alongside the existing `NOAUTH` check, before ACL — a write
-  command from an ordinary client on a replica replies `-READONLY You can't
-  write against a read only replica.` and never reaches dispatch.
-- The exception that must not go through this gate at all: the replication
-  stream itself, applied via the privileged pseudo-`Conn` from V10.2. Route it
-  around the `is_replica` check the same way it already bypasses `NOAUTH` —
-  one bypass flag, not two.
-- `REPLICAOF NO ONE` clears `is_replica`, closes the master connection, and
-  **generates a fresh `repl_id`** — from this point the replica's write
-  history has diverged from its old master's, so it must not claim continuity
-  with the old `repl_id` (this is what makes V10.4's partial-resync validation
-  safe later: a `repl_id` mismatch always means "don't trust this offset,
-  fall back to full resync").
-- Done when: a plain client connected directly to a replica gets `READONLY` on
-  `SET` but correct data on `GET`; the replication stream itself still applies
-  fine; `REPLICAOF NO ONE` makes the instance writable again with a new
-  `repl_id`.
-
-**Split into two halves once the first one was testable** — V10.3a closed the
-in-memory gate, and testing it immediately exposed that the gate cannot protect a
-restart, which is V10.3b.
-
-##### V10.3b - `replicaof` config directive [Done]
-
-**The gate protects a running replica and nothing else.** A restarted replica
-comes back a *writable master pointed at nothing*: `REPLICAOF` is runtime-only
-state, there is no directive for it, and `CONFIG REWRITE` emits nothing — so the
-instance accepts writes that vanish the instant someone re-issues `REPLICAOF`,
-because full resync wipes the dataset first. Same divergence V10.3a exists to
-prevent, across a restart instead of a network drop. Found by testing V10.3a:
-both servers had been restarted for a rebuild, and the "replica" answered `OK` to
-`SET` — correctly, since it was no longer a replica.
-
-- One `k_config_table` row, `replicaof <host> <port>`, `boot_only` — the command
-  stays the only runtime path to the role, so there are not two spellings of the
-  same change.
-- **`apply` may only *record* the target, never connect.** `config_apply` runs
-  before `repl_init()` has minted a `repl_id`, before the local RDB/AOF load, and
-  before the poll loop exists. A resync image landing mid-load would then be
-  overwritten by the local dataset — the exact divergence this step is closing.
-  The connect is deferred to the last statement before the event loop.
-- **`apply` and `emit` deliberately read different state**, which is the shape of
-  a bug this project has shipped (V9.8's `appendonly` getter reading
-  `protected_mode`) and is correct only because it is intentional: `apply` stages
-  into `g_config`, while `emit` reports the **live** role from `g_data`, so
-  `CONFIG REWRITE` records what the server actually is after any runtime
-  `REPLICAOF` / `REPLICAOF NO ONE`. Same exception `requirepass` already carries,
-  whose `emit` reaches past its own getter. The boot round-trip check cannot catch
-  either, because it skips every row that supplies its own `emit`.
-- `get == nullptr`: two tokens, so there is no single-value form — the same reason
-  `user` and `rename-command` are absent from `CONFIG GET`. Divergence from Redis
-   7, which does answer `CONFIG GET replicaof`; `INFO replication` is the
-  supported way to ask here.
-- No `slaveof` spelling for the directive. The command keeps it because clients
-  send it over the wire; a config file is ours, and the no-shims rule applies.
-- A failed boot connect is **fatal**. Failing open would leave a writable instance
-  where the operator asked for a replica. Note that a master which is merely
-  *down* does not hit this: the connect is non-blocking, so `repl_start` returns
-  success on `EINPROGRESS` and the link simply never comes up.
-- Done when: a config file containing `replicaof 127.0.0.1 1336` comes up as a
-  read-only replica with no manual command; `REPLICAOF NO ONE` + `CONFIG REWRITE`
-  removes the line so the next boot is a master; and the reverse round-trips too.
-
-Closed 2026-08-07, all three verified live, including the fail-closed case: booted
-against a master that is down, the instance stays `role:slave` +
-`master_link_status:down` and still answers `READONLY` rather than exiting or
-coming up writable. **The check that carried the weight was `REPLICAOF NO ONE` +
-`CONFIG REWRITE` removing the line** — until promotion, the staged
-`g_config.replicaof_*` and the live `g_data.master_*` hold identical values, so an
-`emit` wired to the wrong one produces a byte-identical file and passes every
-other test. Same reasoning as V9.8's distinct-value `CONFIG` probes.
-`replica/replica.conf` + a Replication pair section in `docs/TESTING.md` are the
-durable fixtures (a `CONFIG REWRITE` rewrites the file from the table, so comments
-in it do not survive — the runbook is the place for instructions).
-
-#### V10.4 - Partial resync via the backlog [In Progress]
-
-Gated on V10.1 (backlog must exist) and V10.2 (basic full resync must be
-solid) — this step is purely an optimization on top of both, never a
-correctness requirement, so do not start it until full resync is trustworthy
-enough to be the safe fallback.
-
-- On `PSYNC <replid> <offset>` where `replid` is non-`?`: if it equals the
-  master's own `repl_id` **and** `offset` still falls inside the live
-  `repl_backlog` window, reply `+CONTINUE <repl_id>\r\n` and stream only the
-  missing tail from the backlog — no RDB transfer.
-- Any mismatch (different `repl_id`, or `offset` older than what the backlog
-  still retains) falls back to V10.2's full-resync path unconditionally. This
-  is the one piece of this whole milestone where "when in doubt, do the
-  expensive-but-correct thing" is the right default — an incorrect partial
-  resync is silent data divergence, which is much worse than an unnecessary
-  full RDB transfer.
-- Done when: a replica's connection is dropped and reconnected (or the network
-  is briefly interrupted) while writes continue on the master; reconnecting
-  with a gap small enough to still be in the backlog produces a `+CONTINUE`
-  (verify via a log line or `INFO replication`, not just "it still has the
-  right data" — a full resync would also leave it with the right data, so the
-  test must distinguish the two paths); a gap larger than
-  `repl-backlog-size` correctly falls back to full resync instead of failing.
-
-**Split in two, same shape as V10.2 and for the same reason** — the halves fail
-differently and the master half is testable on its own with a raw socket:
-
-##### V10.4a - master side: accept `PSYNC <replid> <offset>` [In Progress]
-
-- Validation is arithmetic on "how many bytes is this replica missing", not on
-  the derived start offset: `need = (master_repl_offset + 1) - psync_offset`, and
-  the request is serviceable exactly when `psync_offset <= master_repl_offset + 1`
-  (not ahead of us) **and** `need <= repl_backlog_histlen` (still retained). That
-  formulation sidesteps `repl_backlog_start_offset()`'s `histlen == 0` sentinel
-  entirely, and `need == 0` — a replica that never missed a byte — falls out as a
-  valid `+CONTINUE` carrying no payload rather than a special case.
-- **The counters are part of the deliverable, not decoration.** The done-criteria
-  demands the two paths be distinguishable, and "the data is right" cannot do it —
-  a full resync also leaves the data right. `sync_full`, `sync_partial_ok` and
-  `sync_partial_err` in `INFO stats` (Redis's own names) make it machine-checkable
-  from a test; a log line alone would force log-scraping.
-- Every rejection reason falls through to the existing full-resync path, and
-  disabling the backlog (`repl-backlog-size 0`) means no partial resync ever.
-
-##### V10.4b - replica side: ask for one, accept `+CONTINUE` [In Progress]
-
-- **The replica already retains everything it needs**, which V10.3a made true
-  without meaning to: `repl_link_lost` deliberately keeps `replica_mode`,
-  `master_host` and `master_port`, and never touched `repl_id` or
-  `master_repl_offset`. So the reconnect state is already there — what is missing
-  is only asking with it.
-- `repl_start` must capture that history **before** its own `repl_stop()` call
-  clears the role, and may only claim it when reconnecting to *the same*
-  `host:port`. That condition is what makes `REPLICAOF NO ONE` → `REPLICAOF <same
-  master>` correctly force a full resync: promotion mints a fresh `repl_id`
-  (V10.3a), so the id on the wire would no longer be the master's.
-- `+CONTINUE` is handled in `HANDSHAKE` and jumps straight to `STREAMING` — **no
-  dataset wipe, no `rdb_load_buffer`, no offset reset.** It must be matched
-  *before* the existing "skip anything that is not `+FULLRESYNC`" ack rule, or it
-  is silently discarded as an `+OK`.
-
-##### V10.4c - automatic reconnect [Backlog]
-
-Deliberately not in V10.4a/b. Partial resync is fully testable without it (see
-`docs/TESTING.md`: a `socat` hop between the pair, killed and restarted, then
-re-issue `REPLICAOF` — `have_history` holds because host:port never changed), and
-a retry timer is a different concern: *when* to reconnect, with what backoff, and
-on which of the existing timer sweeps. V10.5's `REPLCONF ACK` cadence needs the
-same periodic hook, so the two should be designed together rather than having a
-second timer invented here.
-
-#### V10.5 - Replica ACK tracking + `WAIT` [Backlog]
-
-Gated on V10.2. Independent of V10.4 — can be built in either order once
-basic streaming replication works.
-
+- **V10.4c automatic reconnect.** After `repl_link_lost` the instance stays a
+  read-only replica with its role, `repl_id` and offset intact (V10.3a), so a
+  retry needs only a timestamp and a backoff. **Landmine**: `repl_start` takes
+  `const std::string &host` and calls `repl_stop()`, which clears
+  `g_data.master_host` — a reconnect passing that member by reference would hand
+  `inet_pton` an empty string. Copy first. With this in place, partial resync
+  becomes automatic rather than something a human triggers by re-issuing
+  `REPLICAOF`.
 - Replica sends `REPLCONF ACK <offset>` back to the master on a timer (every
   ~1s, matching Redis's cadence) reporting how far it has applied. This needs
   a new timer type alongside the existing idle/IO/TLS-handshake ones
@@ -292,12 +115,13 @@ V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed. One 🟡 filed in BACKLOG
 
 ## Completed Milestones
 
-### V10.1–V10.3a - Replication: bookkeeping, full resync, read-only gate [Done]
+### V10.1–V10.4 - Replication: bookkeeping, resync, read-only, partial resync [Done]
 
-Master-replica replication up through a working read-only replica: identity/
-backlog bookkeeping, the full-resync handshake on both sides, and the
-in-memory read-only gate. `V10.3b` (the `replicaof` config directive, closing
-the restart-safety gap) is still active — see Current Focus above.
+Closed 2026-08-07. Working master-replica replication: identity/backlog
+bookkeeping, the full-resync handshake on both sides, a read-only replica that
+survives restarts, and partial resync off the backlog. Regression coverage is
+`scripts/test_replication.py` (own master + replica + a killable in-process TCP
+proxy). Remaining: V10.5 (ACK/`WAIT`/reconnect) and V10.6 (failover/cluster).
 
 #### V10.1 - Replication identity, offset, and backlog [Done]
 
@@ -408,6 +232,62 @@ flag `may_log`/`may_notify`/`may_watch` use) — a different bypass mechanism
 than `NOAUTH`'s, which uses a superuser identity. Verified live: `SET`/
 `FLUSHALL` on the replica answer `READONLY`, `GET` still serves, `REPLICAOF
 NO ONE` promotes with a new `master_replid`.
+
+#### V10.3b - `replicaof` config directive [Done]
+
+Closed 2026-08-07. The V10.3a gate protects a *running* replica only: a
+restarted one came back a writable master pointed at nothing, accepting writes
+that vanish the instant someone re-issues `REPLICAOF` (full resync wipes first).
+Found by testing V10.3a — both servers had been restarted for a rebuild and the
+"replica" correctly answered `OK`, because it no longer was one.
+
+One `boot_only` `k_config_table` row, so `REPLICAOF` stays the single runtime
+path. **`apply` may only record the target, never connect**: it runs before
+`repl_init()` mints a `repl_id`, before the local RDB/AOF load, and before the
+poll loop exists — a resync image landing mid-load would be overwritten by the
+local dataset. The connect is the last statement before the event loop, and a
+failure there is fatal (failing open would leave a writable instance where a
+replica was asked for). **`apply` and `emit` deliberately read different state**
+— `apply` stages into `g_config`, `emit` reports the live role from `g_data`, so
+`CONFIG REWRITE` records what the server *is*. Same exception `requirepass`
+carries; invisible to the boot round-trip check, which skips rows with their own
+`emit`. `get == nullptr` (two tokens, no single-value form, like
+`user`/`rename-command`).
+
+**The test that mattered was `REPLICAOF NO ONE` + `CONFIG REWRITE` dropping the
+line.** Until promotion the staged and live values are identical, so an `emit`
+bound to the wrong one is byte-identical and passes everything else — the same
+reasoning as V9.8's distinct-value `CONFIG` probes.
+
+#### V10.4 - Partial resync via the backlog [Done]
+
+Closed 2026-08-09 (**V10.4a** master, **V10.4b** replica; V10.4c reconnect
+deferred into V10.5). On `PSYNC <replid> <offset>` matching our `repl_id` with
+the gap still in the ring, the master replies `+CONTINUE <replid>` and streams
+only the missing tail from `repl_backlog_copy()` — no RDB.
+
+- **Validation is framed as "how many bytes is this replica missing"**:
+  `need = (master_repl_offset + 1) - psync_offset`, serviceable when
+  `psync_offset <= master_repl_offset + 1` and `need <= repl_backlog_histlen`.
+  That never touches `repl_backlog_start_offset()`, whose `histlen == 0`
+  sentinel is where an off-by-one would hide, and `need == 0` (fully caught up)
+  falls out as a valid empty `+CONTINUE` rather than a special case.
+- Every rejection falls through to full resync. An unnecessary RDB transfer
+  costs bandwidth; a wrongly accepted `+CONTINUE` is silent data divergence.
+- **The replica needed almost nothing new** — V10.3a already preserved
+  `replica_mode`/`master_host`/`master_port` across a link loss, and `repl_id`/
+  `master_repl_offset` were never cleared. `repl_start` captures that history
+  *before* its own `repl_stop()` call and claims it only for the same
+  `host:port`, which is what makes `REPLICAOF NO ONE` → re-point correctly force
+  a full resync (promotion minted a fresh `repl_id`). `+CONTINUE` must be matched
+  **before** the "skip anything that isn't `+FULLRESYNC`" ack rule, or it is
+  discarded as a stray `+OK`.
+- **`sync_full`/`sync_partial_ok`/`sync_partial_err` in `INFO stats` are part of
+  the deliverable, not instrumentation.** Both resync paths leave the replica
+  with correct data, so no data assertion can tell them apart; the counters are
+  what a test asserts on. `scripts/test_replication.py` caught a missing
+  `sync_full++` on its first run — the full-resync path worked, only the counter
+  didn't move.
 
 ### V9.8 - Config refactor: one directive table [Done]
 
@@ -761,19 +641,13 @@ python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <pass
 python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench  # passwordless TLS bench
 ```
 
-Restart / security / pubsub / eviction suites:
-```bash
-python3 scripts/test_restart_matrix.py [--destructive]   # private instance, port 12401
-python3 scripts/test_security.py       [--destructive]   # private instance, port 12402
-python3 scripts/test_pubsub.py         [--evict]         # private instance, port 12403
-scripts/test_evict_tick.sh                                # EVICT_RUNNING regression
-scripts/test_aof.sh  scripts/test_aof_rewrite.sh  scripts/test_aof_hybrid.sh
-```
-
-`test_pubsub.py` covers all of V8 (core, patterns, channel ACL, keyspace
-notifications) against its own server, and every check tagged `[REG]` pins a bug
-that actually shipped during development. `stress_test.py` carries the same
-ground as live-server sections plus a concurrent fan-out test.
+**`stress_test.py` is the only tracked suite.** The per-milestone suites
+(restart matrix, security, pub/sub, replication, eviction, the AOF shell
+scripts) are gitignored and local-only as of 2026-08-09 — their coverage is
+being folded into `stress_test.py`, tracked in BACKLOG → V11. Ports 12401–12406
+are reserved for their private instances so they never collide with a live
+server. Anything a local suite proves that `stress_test.py` does not is coverage
+at risk of being lost.
 
 **Benchmark only on a Release build** (`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release`;
 Debug runs `mem_selfcheck`'s whole-keyspace walk per command and poisons numbers).
