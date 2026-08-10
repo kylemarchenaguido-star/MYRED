@@ -58,25 +58,16 @@ partial resync) that fail independently and are worth testing independently.
 Sequenced after V9.8 because replication adds config surface, and adding it to
 three hand-maintained lists was exactly the risk the config table removed.
 
-**V10.1-V10.4 are closed — see Completed Milestones. V10.5 is the active step**,
-and it absorbs the deferred V10.4c (automatic reconnect after a dropped link),
-which needs the same periodic hook as `REPLCONF ACK` and should be designed with
-it rather than inventing a second timer.
+**V10.1-V10.4 are closed — see Completed Milestones. V10.5 is the active step.**
+It inherits `repl_cron`, the replica-side periodic hook V10.4c added, which is
+where `REPLCONF ACK`'s cadence belongs too — one sweep, not a second one.
 
-#### V10.5 - Replica ACK tracking + `WAIT` (+ V10.4c reconnect) [In Progress]
+#### V10.5 - Replica ACK tracking + `WAIT` [In Progress]
 
-Gated on V10.2. The replica currently never speaks back to its master and never
-reconnects on its own — both are the same missing piece, a periodic hook on the
-replica side, which is why V10.4c was folded in here.
+Gated on V10.2. The replica now reconnects on its own (V10.4c, below) but still
+never speaks back to its master: the link is one-directional, so the master
+cannot know how far any replica has actually applied.
 
-- **V10.4c automatic reconnect.** After `repl_link_lost` the instance stays a
-  read-only replica with its role, `repl_id` and offset intact (V10.3a), so a
-  retry needs only a timestamp and a backoff. **Landmine**: `repl_start` takes
-  `const std::string &host` and calls `repl_stop()`, which clears
-  `g_data.master_host` — a reconnect passing that member by reference would hand
-  `inet_pton` an empty string. Copy first. With this in place, partial resync
-  becomes automatic rather than something a human triggers by re-issuing
-  `REPLICAOF`.
 - Replica sends `REPLCONF ACK <offset>` back to the master on a timer (every
   ~1s, matching Redis's cadence) reporting how far it has applied. This needs
   a new timer type alongside the existing idle/IO/TLS-handshake ones
@@ -288,6 +279,34 @@ only the missing tail from `repl_backlog_copy()` — no RDB.
   what a test asserts on. `scripts/test_replication.py` caught a missing
   `sync_full++` on its first run — the full-resync path worked, only the counter
   didn't move.
+
+#### V10.4c - Automatic reconnect [Done]
+
+Closed 2026-08-09. `repl_cron(now_ms)` on the existing `process_timers` sweep
+re-dials whenever `replica_mode && !master_link`, with a backoff doubling
+`k_repl_retry_min_ms` (1 s) → `k_repl_retry_max_ms` (8 s) and resetting once a
+link reaches `STREAMING`. Partial resync is now automatic instead of something a
+human triggers by re-issuing `REPLICAOF`.
+
+- **`next_timer_ms()` had to learn about the retry deadline.** `poll()` sleeps
+  until the next timer and returns `-1` (forever) when there is none, so on a
+  replica with an idle keyspace `process_timers` would never run again and the
+  link would stay dead permanently. A reconnect is only as alive as the thing
+  that wakes the loop.
+- **The backoff has exactly one owner.** It grows in `repl_cron` *before* dialing
+  (so an attempt that fails synchronously cannot spin) and resets there too when
+  the link is healthy — not at the two points that enter `STREAMING`. `repl_stop`
+  is deliberately left alone: it is called *from* `repl_start`, so resetting the
+  delay there would flatten every retry to a fixed 1 s.
+- **Fixed a latent bug the retry loop would have weaponized.** `repl_start` called
+  `repl_stop()` — which clears `replica_mode` — *before* three failure returns,
+  and restored the role only on success. A failed dial therefore demoted the
+  instance to a **writable master**, and since `repl_cron` gates on
+  `replica_mode`, it would then never retry again. One transient `socket()`
+  failure was enough. `repl_stop()` now runs only after the socket is open and the
+  address validated, so every early return leaves the instance as it was.
+- The reconnect copies `g_data.master_host` before calling `repl_start`, which
+  takes `const std::string &` and clears that very member through `repl_stop()`.
 
 ### V9.8 - Config refactor: one directive table [Done]
 

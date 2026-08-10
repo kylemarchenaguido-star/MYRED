@@ -21,6 +21,9 @@
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
 constexpr uint64_t k_repl_rdb_reserve_max = 16 * 1024 * 1024;
+constexpr uint32_t k_repl_retry_min_ms = 1000; // first retry, matchings redis
+constexpr uint32_t k_repl_retry_max_ms = 8000; 
+constexpr uint32_t k_repl_ack_period_ms = 1000;
 static constexpr size_t k_max_incoming = 2 * k_max_msg; // generous pipeline room
 constexpr size_t k_max_args = 65536;
 // secondes * miliseconds (5s -> 5000ms)
@@ -169,6 +172,14 @@ struct Conn {
   std::vector<std::vector<std::string>> queue_cmds; // stored as TYPED (not canonicalized)
   bool is_replica = false; // PSYNC, propagate() streams the write log to it
   bool is_master_link = false; // outbound link to our master; read path is the repl state machine
+  // master side, what this replica has acknowledge
+  uint64_t ack_offset = 0;
+  uint64_t ack_time_ms = 0; // monotonic, 0 = never asked
+  int replica_port = 0; // from REPLCONF listening-port, the diable one
+  bool wait_pending = false;
+  uint64_t wait_target = 0; // master_repl_offset sample whwen wait was issued
+  int wait_numreplicas = 0;
+  uint64_t wait_deadline_ms = 0; // 0 = wait forever
 };
 
 // global hashtable
@@ -183,6 +194,9 @@ struct GlobalData{
   std::unordered_map<std::string, std::unordered_set<Conn*>> watchers;
   // PSYNC replica conns, propagate() dereferences these on every write.
   std::unordered_set<Conn *> replicas;
+  // Conns with a deferred wait reply
+  std::unordered_set<Conn *> waiters; // Conns with a deferred wait reply.
+  uint64_t repl_ack_at_ms = 0; // replica side, when to send the next REPLCONF ACK
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)
@@ -229,6 +243,8 @@ struct GlobalData{
   size_t repl_backlog_pos = 0;
   size_t repl_backlog_histlen = 0;
   ReplState repl_state = ReplState::NONE;
+  uint64_t repl_retry_at_ms = 0; // monotonic deadline
+  uint32_t repl_retry_delay_ms = 0;
   // Server wide role: set by REPLICAOF, cleared only by REPLICAOF NO ONE.
   bool replica_mode = false; // different from from repl_state (that is the link phase)
   Conn *master_link = nullptr; // nullptr = this server is master

@@ -184,8 +184,6 @@ bool repl_start(const std::string &host, int port, std::string &err){
   const std::string hist_id = g_data.repl_id;
   const uint64_t hist_off = g_data.master_repl_offset;
 
-  repl_stop();  
-
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0){ err = std::string("Socket (): ") + strerror(errno); return false; } 
 
@@ -202,6 +200,9 @@ bool repl_start(const std::string &host, int port, std::string &err){
   if (connect(fd, (const struct sockaddr *)&a, sizeof(a)) != 0 && errno != EINPROGRESS){
     err = std::string("connect(): ") + strerror(errno); close(fd); return false;
   }
+
+  // Only now tear down the old role: every early return above must leave the instance exactly as it was
+  repl_stop();  
 
   Conn *c = new Conn();
   c->fd = fd;
@@ -249,6 +250,38 @@ bool repl_start(const std::string &host, int port, std::string &err){
   fprintf(stderr, "replication: connecting to master %s (%s)\n", c->peer.c_str(),
           have_history ? "attempting partial resync" : "full resync");
   return true;
+}
+
+// Periodic, from proccess_timers, a replica whose link died re-dials its master
+static void repl_cron(uint64_t now_ms){
+  if (!g_data.replica_mode){ return; }
+
+  if (g_data.master_link){
+    // healthy link
+    if (g_data.repl_state == ReplState::STREAMING){ 
+      g_data.repl_retry_delay_ms = 0;
+      
+    }
+    return;
+  }
+
+  if (now_ms < g_data.repl_retry_at_ms){ return; }
+
+  // grow the backoff before dialing
+  g_data.repl_retry_delay_ms = g_data.repl_retry_delay_ms
+      ? std::min<uint32_t>(g_data.repl_retry_delay_ms * 2, k_repl_retry_max_ms)
+      : k_repl_retry_min_ms;
+  g_data.repl_retry_at_ms = now_ms + g_data.repl_retry_delay_ms;
+
+  // repl_start() calls repl_stop(), whicj clears g_data.master_host
+  const std::string host = g_data.master_host;
+  const int port = g_data.master_port;
+
+  std::string err;
+  if (!repl_start(host, port, err)){
+    fprintf(stderr,"replication: reconnect to %s:%d failed: %s (retry in %u ms)\n",
+             host.c_str(), port, err.c_str(), g_data.repl_retry_delay_ms);
+  }
 }
 
 // one CRLF-terminated line out of the incoming; false = need more bytes
@@ -547,6 +580,11 @@ static int32_t next_timer_ms() {
     next_ms = std::min(next_ms, now_ms + 100);
   }
 
+  // a disconnected replica must wake up to re-dial, even with nothing else pending
+  if (g_data.replica_mode && !g_data.master_link){
+    next_ms = std::min<uint64_t>(next_ms, g_data.repl_retry_at_ms);
+  }
+
   // no timers 
   if (next_ms == (uint64_t)-1){ return -1; }
   // already expired
@@ -699,6 +737,7 @@ static void process_timers(){
       }
     }
   }
+  repl_cron(now_ms);
 }
 
 static void conn_set_timer(Conn *conn, ConnTimer type){
