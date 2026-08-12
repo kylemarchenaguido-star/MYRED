@@ -276,6 +276,55 @@ archive entries below: N1 (AOF replay data loss), N2 (`migrate_pos`), the
 `next_timer_ms` triple (N3/N14/N21). Still open after the sweep: the 🔵/⚪
 performance-and-polish list and the Testing-debt items.
 
+### Post-V10 Carry-overs — 2026-08-11
+
+The two items left open when V10 closed, fixed together once replication shipped.
+
+- 🔴 **`SPOP`'s synthetic `SREM` frame carried an empty key.** `lookup_entry()`
+  takes `std::string &keystr` and its first act is `key.key.swap(keystr)` into a
+  default-constructed `LookupKey` — so the caller's string is left empty, and only
+  the *create* path ever moves it somewhere durable (`ent->key.swap(key.key)`).
+  `do_spop` passes `create=false` and then read `cmd[1]` to build its AOF/replica
+  frame, logging `SREM "" <member>`, which replays as a no-op against a
+  nonexistent key. Every popped member came back on AOF reload and on a replica.
+  Live since V9.6.4 (2026-07-16), when `CmdSpec::aof_self` and the synthetic frame
+  landed. Fixed by reading `ent->key`: the found entry's own copy, which cannot
+  drift from the entry being mutated and costs nothing on the non-feed path.
+  - **Found by watching the V10.2a replication stream, not by any suite** — see
+    BACKLOG → V11 Step 0 for the coverage gap it exposed.
+  - Generalisable, and the second instance of this family in the archive (see
+    "Handlers that `swap()` command strings…" under Persistence and AOF): **a
+    handler must not read `cmd[N]` after passing it to `lookup_entry`.** A scan of
+    every `do_*` found this as the only remaining case; re-run it after adding any
+    handler that builds its own propagation frame.
+
+- 🟡 **`ACL GENPASS` minted passwords from a non-cryptographic PRNG.** The branch
+  built its hex string with `hx[rand_idx(16)]`, and `rand_idx` is a single
+  process-wide `std::mt19937_64`. Mersenne Twister is fully reconstructible from
+  its output — 624 observed 32-bit words recover the state and with it every past
+  and future draw — so an attacker holding any one `GENPASS` result could derive
+  every other password the same process ever generated. A *generator* weakness,
+  not a storage one: Argon2id still protected the stored hash.
+  - Fixed by promoting what already existed rather than writing a third
+    generator. `cred.cpp` had a `getrandom(2)`-backed `fill_random()` (used for
+    Argon2id salts, already commented "NOT g_rng"), and `cred_dummy()` already
+    carried the bytes→hex loop. Both now sit behind one exported
+    `cred_random_hex(nhex)` in `cred.h`; `cred_dummy` was rewritten onto it, so
+    the hex encoder exists once.
+  - **The new path fails closed**: `cred_random_hex` returns `""` on entropy
+    failure and `genpass` turns that into an error reply. A predictable password
+    that looks random is worse than a visible failure. `cred_dummy` keeps its old
+    tolerance — its only job is to burn constant time, so a deterministic fallback
+    there is harmless and deliberate.
+  - Scope held deliberately narrow: `rand_idx()` itself is unchanged, because
+    eviction sampling, `RANDOMKEY`, `SPOP` and `hm_random` call it on hot paths and
+    want a fast PRNG, not a syscall. `g_data.repl_id` also still uses it — a
+    replication ID is a public identifier published in `INFO`, not a secret.
+  - Rejected from the filed plan: the `GRND_NONBLOCK` + `/dev/urandom` fallback.
+    `getrandom` with `flags=0` blocks only until the kernel pool is initialised,
+    which has already happened on a running server, so the fallback would be a
+    second code path that can essentially never execute.
+
 ### Persistence and AOF
 
 - AOF replay ran under an incomplete synthetic superuser (`all_keys` unset), so the

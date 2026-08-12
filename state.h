@@ -177,7 +177,7 @@ struct Conn {
   uint64_t ack_time_ms = 0; // monotonic, 0 = never asked
   int replica_port = 0; // from REPLCONF listening-port, the diable one
   bool wait_pending = false;
-  uint64_t wait_target = 0; // master_repl_offset sample whwen wait was issued
+  uint64_t wait_target = 0; // master_repl_offset sample when wait was issued
   int wait_numreplicas = 0;
   uint64_t wait_deadline_ms = 0; // 0 = wait forever
 };

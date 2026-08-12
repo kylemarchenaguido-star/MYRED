@@ -102,6 +102,7 @@ static void conn_destroy(Conn *conn){
   pubsub_remove_conn(conn); // drop from every channel before the Conn dies
   watch_clear_conn(conn);
   repl_remove_conn(conn);
+  wait_remove_conn(conn);   // waiters holds raw Conn* too
   repl_link_lost(conn);
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
@@ -260,7 +261,15 @@ static void repl_cron(uint64_t now_ms){
     // healthy link
     if (g_data.repl_state == ReplState::STREAMING){ 
       g_data.repl_retry_delay_ms = 0;
-      
+      // report progress on the same sweep
+      if (now_ms >= g_data.repl_ack_at_ms){
+        g_data.repl_ack_at_ms = now_ms + k_repl_ack_period_ms;
+        const std::string off =std::to_string(g_data.master_repl_offset);
+        std::string ack;
+        aof_encode(ack, { "REPLCONF", "ACK", std::string_view(off) });
+        buf_append(&g_data.master_link->outgoing, ack.data(), ack.size());
+        g_data.master_link->want_write = true;
+      }
     }
     return;
   }
@@ -581,11 +590,20 @@ static int32_t next_timer_ms() {
   }
 
   // a disconnected replica must wake up to re-dial, even with nothing else pending
-  if (g_data.replica_mode && !g_data.master_link){
-    next_ms = std::min<uint64_t>(next_ms, g_data.repl_retry_at_ms);
+  if (g_data.replica_mode){
+    if (!g_data.master_link){
+      next_ms = std::min<uint64_t>(next_ms, g_data.repl_retry_at_ms);
+    } else if (g_data.repl_state == ReplState::STREAMING){
+      next_ms = std::min<uint64_t>(next_ms, g_data.repl_ack_at_ms);
+    }
   }
 
-  // no timers 
+  // a pending WAIT must expire on time even on a completely idle server
+  for (const Conn *c : g_data.waiters){
+    if (c->wait_deadline_ms){ next_ms = std::min(next_ms, c->wait_deadline_ms); }
+  }
+
+  // no timers
   if (next_ms == (uint64_t)-1){ return -1; }
   // already expired
   if (next_ms <= now_ms){ return 0; }
@@ -737,6 +755,7 @@ static void process_timers(){
       }
     }
   }
+  wait_try_resume(); // expire any WAIT whose deadline has passed
   repl_cron(now_ms);
 }
 
@@ -769,7 +788,7 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
   // nothing runs with the pre-auth identity
-  if (conn->auth_pending){ return false; }
+  if (conn->auth_pending || conn->wait_pending){ return false; }
 
   std::vector<std::string> cmd;
   int32_t consumed = parse_resp_request(&conn->incoming, cmd);
@@ -797,7 +816,7 @@ static bool try_one_request(Conn *conn){
 
   // moved after do_request, raw must stay valid
   buf_consume(&conn->incoming, raw_len);
-  if (conn->auth_pending){
+  if (conn->auth_pending || conn->wait_pending){
     conn->want_read = false;
     conn->want_write = false;  
     return false; 
@@ -886,7 +905,12 @@ static void handle_read(Conn *conn){
     conn->want_write = true;
     // this is a optimization 
     return handle_write(conn);
-  } // else wants to keep reading.
+  } 
+  // Nothing to say — REPLCONF ACK is the one command that answers nothing. Undo
+  // try_one_request's optimistic write intent, or poll() reports POLLOUT, dispatch
+  // takes the want_write arm, and handle_write asserts on an empty buffer.
+  conn->want_read = true;
+  conn->want_write = false;
 }
 
 // After an async completion wrote a reply: drain any request that were buffered

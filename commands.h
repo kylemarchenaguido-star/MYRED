@@ -10,3 +10,5 @@ void evict_tick();
 void pubsub_remove_conn(Conn *conn); // drop conn from every channel it joined (teardown)
 void watch_clear_conn(Conn *conn); // drop conn from every watched key (teardown)
 void repl_remove_conn(Conn *conn); // drop conn from the replica registry (teardown)
+void wait_remove_conn(Conn *conn); // drop conn from the WAIT registry (teardown)
+void wait_try_resume();            // settle deferred WAITs (ack arrival, timer tick)

@@ -5,48 +5,6 @@ and feature gaps. See `ROADMAP.md` for current/completed work and `DECISIONS.md`
 for design rationale.
 
 ## Open Bugs / Correctness Follow-ups
-- 🔴 **`SPOP`'s synthetic `SREM` frame carries an empty key** — every popped
-  member resurrects on restart. `lookup_entry()` takes `std::string &keystr` and
-  **swaps it out** (`key.key.swap(keystr)`, commands.cpp), so `do_spop` reading
-  `cmd[1]` *after* its own lookup builds `SREM "" <member>`, which replays as a
-  no-op. Live since V9.6.4 (2026-07-16), when `CmdSpec::aof_self` + the
-  synthetic frame landed. Fix: `synth = { "srem", ent->key }` — the entry's own
-  key, which is where `lookup_entry` swapped the string *to*; no copy on the
-  non-feed path and it cannot drift from the entry being modified.
-  - **Found 2026-08-03 by watching the V10.2a replication stream**, not by any
-    suite: `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction
-    `DEL`/renamed-command frames but never `SPOP`, and `stress_test.py` does not
-    restart. Add a `SPOP`-then-restart case when next touching that suite.
-  - Generalisable: a handler must not read `cmd[N]` after passing it to
-    `lookup_entry`. A scan of every `do_*` found this as the only instance —
-    worth re-running that check after any handler that builds its own AOF frame.
-
-- 🟡 **`ACL GENPASS` generates passwords from a non-cryptographic PRNG.**
-  **Scheduled: after V10 ships.** `rand_idx()` (`common.h`) is
-  `std::mt19937_64` seeded once from `std::random_device`, and `do_acl`'s
-  `genpass` branch builds its hex string with `hx[rand_idx(16)]`. Mersenne
-  Twister is fully reconstructible from its output — 624 observed 32-bit words
-  recover the internal state, and every past *and* future draw with it. So an
-  attacker who obtains any one `ACL GENPASS` result (a password handed out in a
-  chat log, a ticket, a shell history) can in 
-  ciple derive every other
-  password the same process ever generated, including ones already set on other
-  users. This is a *generator* weakness, not a storage one: Argon2id still
-  protects the stored hash, so the exposure is confined to secrets minted by
-  this command.
-  - Fix shape: read from a real CSPRNG for credential material specifically —
-    `getrandom(2)` (glibc 2.25+, no fd to manage, `GRND_NONBLOCK` plus a
-    `/dev/urandom` fallback), used *only* by `genpass`. Do **not** repoint
-    `rand_idx()` itself: eviction sampling, `RANDOMKEY`, `SPOP` and
-    `hm_random` call it on hot paths and want a fast PRNG, not syscall-backed
-    entropy. Two generators with clearly separated jobs, one of them named for
-    the job (e.g. `secure_random_bytes()`).
-  - Deliberately **not** in scope: `g_data.repl_id` (V10.1) keeps using
-    `rand_idx()`. A replication ID is a public identifier published in `INFO`,
-    not a secret — predicting it grants nothing.
-  - Note when fixing: this is the same "a verifier is not a display value"
-    family as the `requirepass` masking decision in Open Decisions — worth
-    re-reading that entry first, since the two share a threat model.
 
 - ⚪ **Boot-time metadata cross-check for `k_cmd_table`** (follow-up, not a bug). V8.4's `discard`
   outage came from a duplicated `{"multi", …}` key in the `k_cmd_table`
@@ -57,18 +15,26 @@ for design rationale.
   must exist in `k_cmd_table` — would have caught it at boot. Same idea covers
   the four parallel ACL-category lists (DECISIONS → ACL Category Tagging).
 
-**No open bugs in the data path.** Of the two items above, the `k_cmd_table`
-cross-check is a hardening follow-up rather than a defect — V8.8 shipped the
-equivalent check for config directives and it caught six real violations on its
-first build, so the same idea applied to `k_cmd_table` is still worth doing. The
-`ACL GENPASS` entry is a genuine weakness but a contained one, deferred by
-decision (2026-08-03) until V10 ships rather than left unnoticed.
+**No open bugs in the data path.** The single item above is a hardening follow-up
+rather than a defect — V8.8 shipped the equivalent check for config directives and
+it caught six real violations on its first build, so the same idea applied to
+`k_cmd_table` is still worth doing.
 
 Every bug previously tracked here is FIXED; full root-cause
 writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
 bugs get filed here first, then folded into the CODE_REVIEW audit.
 
 Recently resolved (terse; detail in CODE_REVIEW / git):
+- `SPOP`'s synthetic `SREM` frame carried an empty key 🔴 — `lookup_entry()` swaps
+  the caller's `std::string &keystr` into its probe and only hands it back on the
+  *create* path, so `do_spop` reading `cmd[1]` afterwards logged `SREM "" <member>`
+  and every popped member came back on AOF reload and on a replica. Live since
+  V9.6.4. Fixed 2026-08-11 by reading `ent->key` (2026-08-11).
+- `ACL GENPASS` minted passwords from `rand_idx()` 🟡 — Mersenne Twister is
+  reconstructible from its output, so one leaked password exposed every other one
+  the process ever generated. Fixed 2026-08-11 by routing it through the new
+  `cred_random_hex()`, which is `getrandom(2)`-backed and fails closed
+  (2026-08-11).
 - `appendonly`'s getter read `protected_mode` 🔴 — introduced and fixed inside
   V9.8.2. Because V9.8.1 emits through the getter, `CONFIG REWRITE` wrote
   `appendonly <protected-mode's value>`, silently flipping AOF on or off across a
@@ -175,6 +141,12 @@ gone**, and much of it pins bugs that really shipped:
   and both resync paths leave correct data so only its `sync_*` counter
   assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
   keyspace notifications, memory accounting invariants.
+- **Known gap to close while porting: no `SPOP`-then-restart case anywhere.**
+  `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction `DEL`/
+  renamed-command frames but never `SPOP`, and `stress_test.py` does not restart
+  at all — which is why the empty-key `SREM` frame (fixed 2026-08-11) survived
+  from V9.6.4 until someone watched the replication stream by hand. Any command
+  carrying `CmdSpec::aof_self` needs a round-trip case, not just a live-reply one.
 - Do this *first*: the differential and fuzz work below is worth far more with
   one runnable regression suite underneath it, and worth much less if the
   existing coverage silently evaporates in the meantime.

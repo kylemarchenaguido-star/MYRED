@@ -1,6 +1,6 @@
 # MYRED Roadmap — Progress
 
-MYRED is a Redis-compatible in-memory database written from scratch in C++. It
+MYRED is a Redis-compaosible in-memory database written from scratch in C++. It
 speaks RESP and works with `redis-cli`, Redis clients, and `redis-benchmark`
 where the implemented command surface allows.
 
@@ -13,7 +13,7 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-08-07.
+Date: 2026-08-09.
 
 Primary commands:
 ```bash
@@ -44,7 +44,7 @@ Implemented command families:
 | **TLS** | **Implemented (V9.7)** |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | **Transactions** | **Implemented (V8.4–V8.7)** |
-| Replication | In progress (V10.1–V10.4 done: resync, read-only, partial resync) |
+| Replication | In progress (V10.1–V10.5 done; only V10.6 failover/cluster left) |
 
 Do not rely on old test-count claims; run the harness for the current count.
 
@@ -58,47 +58,19 @@ partial resync) that fail independently and are worth testing independently.
 Sequenced after V9.8 because replication adds config surface, and adding it to
 three hand-maintained lists was exactly the risk the config table removed.
 
-**V10.1-V10.4 are closed — see Completed Milestones. V10.5 is the active step.**
-It inherits `repl_cron`, the replica-side periodic hook V10.4c added, which is
-where `REPLCONF ACK`'s cadence belongs too — one sweep, not a second one.
-
-#### V10.5 - Replica ACK tracking + `WAIT` [In Progress]
-
-Gated on V10.2. The replica now reconnects on its own (V10.4c, below) but still
-never speaks back to its master: the link is one-directional, so the master
-cannot know how far any replica has actually applied.
-
-- Replica sends `REPLCONF ACK <offset>` back to the master on a timer (every
-  ~1s, matching Redis's cadence) reporting how far it has applied. This needs
-  a new timer type alongside the existing idle/IO/TLS-handshake ones
-  (`ConnTimer` in state.h) or a simple periodic check in the same tick loop
-  that already drives `process_timers()` — reuse that dispatch point rather
-  than adding a second timer sweep.
-- Master tracks a per-replica-`Conn` "last acked offset," surfaced in `INFO
-  replication` per connected replica (address, acked offset, lag).
-- `WAIT <numreplicas> <timeout>`: block the *requesting client's* reply (not
-  the event loop) until at least `numreplicas` have acked an offset ≥ the
-  master's offset at the moment `WAIT` was issued, or `timeout` elapses. This
-  is the same "can't literally block a single-threaded loop" family as the
-  still-not-implemented `BLPOP`/blocking-list commands already flagged in
-  ROADMAP's V8.4/V8.5 history — needs a per-conn "pending, resumed by a
-  matching event or a timer" state, not a blocking wait. Do not invent a new
-  pattern for this; if `BLPOP` lands first, copy its resume mechanism, don't
-  design a second one.
-- Done when: `WAIT 1 1000` against one healthy, caught-up replica returns
-  quickly; against a replica that's stopped acking, it returns after
-  `timeout` with a count less than requested, and the requesting connection
-  stays otherwise responsive the whole time it was "waiting."
+**V10.1-V10.5 are closed — see Completed Milestones.** Working master-replica
+replication: full and partial resync, read-only replicas that survive restarts,
+automatic reconnect, ack tracking and `WAIT`. Only V10.6 is left, and it is
+deliberately unscoped.
 
 #### V10.6 - Sentinel-style failover, cluster/hash-slot sharding [Backlog, unscoped]
 
 Deliberately left as a stub, not fleshed into steps yet. Both are separate,
 much larger problems (leader election and split-brain avoidance for failover;
 key-space partitioning and cross-node command routing for cluster) that
-deserve their own design pass once V10.1-V10.5 are running and have survived
-real testing — scoping them now, before basic replication even exists, would
-be designing against guesses instead of an actual working system's real
-failure modes. Revisit this section specifically once V10.5 is done.
+deserve their own design pass. **V10.1-V10.5 are now done and tested, so the
+precondition for scoping this is met** — it was deliberately left unscoped until
+there was a real working system to design against instead of guesses.
 
 **Carry-overs: all clear.** V9.7 TLS closed 2026-07-25 (603/603 both transports),
 V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed. One 🟡 filed in BACKLOG
@@ -106,13 +78,27 @@ V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed. One 🟡 filed in BACKLOG
 
 ## Completed Milestones
 
-### V10.1–V10.4 - Replication: bookkeeping, resync, read-only, partial resync [Done]
+### V10.1–V10.5 - Replication [Done]
 
-Closed 2026-08-07. Working master-replica replication: identity/backlog
-bookkeeping, the full-resync handshake on both sides, a read-only replica that
-survives restarts, and partial resync off the backlog. Regression coverage is
-`scripts/test_replication.py` (own master + replica + a killable in-process TCP
-proxy). Remaining: V10.5 (ACK/`WAIT`/reconnect) and V10.6 (failover/cluster).
+Closed 2026-08-09. Working master-replica replication end to end: identity and
+backlog bookkeeping, the full-resync handshake on both sides, read-only replicas
+Closed 2026-08-09. Working master-replica replication end to end: identity and
+backlog bookkeeping, the full-resync handshake on both sides, read-only replicas
+that survive restarts, partial resync off the backlog, automatic reconnect, ack
+tracking and `WAIT`. Only V10.6 (failover / cluster) is left.
+
+Regression coverage is `scripts/test_replication.py` — its own master, replica and
+a **killable in-process TCP proxy**, because partial resync needs the link to break
+while the master keeps running (killing the master destroys its backlog and mints a
+new `repl_id`, forcing a full resync and making the test silently vacuous). It is
+gitignored like every suite but `stress_test.py`; see BACKLOG → V11 Step 0.
+
+**The recurring lesson of this milestone, in three separate incidents: a deadline
+nothing wakes up for is not a deadline.** `next_timer_ms()` had to learn about the
+reconnect retry (V10.4c), the `REPLCONF ACK` cadence (V10.5) and the `WAIT` timeout
+(V10.5) — `poll()` sleeps until the next known timer and returns `-1` when there is
+none, so any periodic replication work that is not represented there simply stops
+the moment traffic does.
 
 #### V10.1 - Replication identity, offset, and backlog [Done]
 
@@ -286,8 +272,6 @@ Closed 2026-08-09. `repl_cron(now_ms)` on the existing `process_timers` sweep
 re-dials whenever `replica_mode && !master_link`, with a backoff doubling
 `k_repl_retry_min_ms` (1 s) → `k_repl_retry_max_ms` (8 s) and resetting once a
 link reaches `STREAMING`. Partial resync is now automatic instead of something a
-human triggers by re-issuing `REPLICAOF`.
-
 - **`next_timer_ms()` had to learn about the retry deadline.** `poll()` sleeps
   until the next timer and returns `-1` (forever) when there is none, so on a
   replica with an idle keyspace `process_timers` would never run again and the
@@ -307,6 +291,61 @@ human triggers by re-issuing `REPLICAOF`.
   address validated, so every early return leaves the instance as it was.
 - The reconnect copies `g_data.master_host` before calling `repl_start`, which
   takes `const std::string &` and clears that very member through `repl_stop()`.
+
+#### V10.5 - Replica ACK tracking + `WAIT` [Done]
+
+Closed 2026-08-09. The replication link is now bidirectional: the replica reports
+its applied offset once a second (`k_repl_ack_period_ms`) from `repl_cron`, the
+master records it per replica `Conn`, and `WAIT numreplicas timeout` answers how
+many replicas have caught up.
+
+- **`WAIT` needed no new blocking machinery.** The reply is deferred on the conn
+  and resumed through `conn_resume` — the exact path async `AUTH` already used —
+  and `osonn::in_exec`, which had been sitting in `state.h` labelled "blocking cmds
+  must not block" since V8.5, got its first user. `try_one_request` gates on
+  `auth_pending || wait_pending`, one notion of "this conn's reply is deferred".
+- **It answers immediately under `in_exec` or `g_loading`.** Inside `EXEC` the
+  reply is one element of an array `resp_arr()` has already sized, so deferring
+  would leave the batch permanently short; under `g_loading` the `Conn` is a stack
+  object in `repl_apply`/`aof_load`, so registering it in `waiters` would dangle —
+  the same reason `do_psync` refuses there.
+- `g_data.waiters` is the **fourth** raw-`Conn*` registry, so `conn_destroy`
+  unlinks it beside pubsub/watch/replicas. `wait_try_resume` collects before
+  settling: `wait_finish` erases from the set it is walking, and `conn_resume` can
+  destroy the conn outright.
+- An unsatisfiable `WAIT` returns a **short count, never an error** — the count is
+  the timeout signal. No `REPLCONF GETACK`: `WAIT` resolves off the periodic ack,
+  so it can take up to a second where Redis takes milliseconds. Deliberate — the
+  alternative is sending commands down the replication stream for the replica to
+  answer out-of-band from `repl_apply`.
+
+**Two bugs, and both were about waking the event loop.**
+
+- **`REPLCONF ACK` is the first command in MYRED that answers nothing**, and
+  `handle_read`'s tail only cleared `try_one_request`'s optimistic
+  `want_write = true` when there was actually output. So the conn sat in write
+  intent with an empty buffer, `poll()` reported `POLLOUT`, and `handle_write`
+  tripped its `assert`. `conn_resume` had carried the corrective `else` branch all
+  along while calling itself "the mirror of handle_read's tail" — it was the more
+  complete half. **In a Release build the assert compiles out and this degrades
+  along while calling itself "the mirror of handle_read's tail" — it was the more
+  complete half. **In a Release build the assert compiles out and this degrades
+  into a silent per-tick zero-length write instead of a crash**, so it would have
+  surfaced only as unexplained CPU on a master with replicas.
+- **`next_timer_ms()` knew about `repl_retry_at_ms` but not `repl_ack_at_ms`**, so
+  a replica sent one ack and then went silent the moment traffic stopped — `poll()`
+  slept straight through the cadence. Same class as V10.4c's, three lines away from
+  the fix that taught it. The `STREAMING` guard on the new branch matters: outside
+  it `repl_ack_at_ms` is still 0, and `min(next_ms, 0)` spins the loop at 100% CPU
+  for the whole handshake.
+- Diagnosing it produced a **false positive worth remembering**: a probe that read
+  `INFO` from the *replica* woke its loop and made an ack fly, so `WAIT` answered
+  correctly and the bug vanished under observation. Only measuring from the master
+  alone showed `lag` climbing 1,2,3,4,5,6 with no acks at all.
+- Also fixed: `REPLCONF listening-port` validated `p > 65536` instead of
+  `p < 65536`, so `replica_port` was never assigned and every `slave0:` line
+  reported `port=0` — the one field whose entire purpose is naming an address
+  worth dialing.
 
 ### V9.8 - Config refactor: one directive table [Done]
 
@@ -698,8 +737,6 @@ ratio recorded:
 | LPUSH | 2.00M | 1.19M | 60% |
 | SADD | 2.08M | 1.16M | 56% |
 | HSET | 1.96M | 1.16M | 59% |
-| SPOP | 2.70M | 1.28M | 47% |
-| ZADD | 1.92M | 1.14M | 59% |
 | MSET(10) | 870k | 637k | 73% |
 | LRANGE 100/300/500/600 | 213k/73k/45k/38k | 185k/56k/28k/22k | 87/77/62/59% |
 
