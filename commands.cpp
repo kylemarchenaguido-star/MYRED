@@ -16,7 +16,8 @@
 #include "stdlib.h"
 #include "string.h"
 #include <algorithm>
-#include <string>
+#include <cstddef>
+#include <cstdint>
 #include <unistd.h>
 // #include <random>
 #include <cerrno>
@@ -36,6 +37,8 @@ static constexpr const char *MSG_NOT_INT =
 // float";
 static constexpr const char *MSG_SYNTAX = "ERR syntax error";
 static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
+
+static size_t good_replicas(uint64_t now_ms);
 
 static void die(const char *msg) {
   int err = errno;
@@ -248,6 +251,7 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out) {
 static void do_set(std::vector<std::string> &cmd, Buffer *out) {
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
+    return resp_err(out, "WRONGTYPE wrong type");
     return resp_err(out, "WRONGTYPE wrong type");
   }
   entry_str(ent).swap(cmd[2]);
@@ -1549,8 +1553,25 @@ static void info_replication(std::string &o) {
     info_add(o, "master_port:%d\r\n", g_data.master_port);
     info_add(o, "master_link_status:%s\r\n",
              g_data.repl_state == ReplState::STREAMING ? "up" : "down");
+    info_add(o, "master_last_io_seconds_ago:%lld\r\n",
+            g_data.master_link
+                ? (long long)((get_monotonic_msec() - g_data.master_last_io_ms) / 1000)
+                : -1LL);
   }
+  info_add(o, "failover_state:%s\r\n",
+        g_data.failover_state == FailoverState::WAIT_FOR_SYNC
+            ? "waiting-for-sync"
+            : g_data.failover_state == FailoverState::IN_PROGRESS
+                  ? "failover-in-progress"
+                  : "no-failover");
   info_add(o, "master_replid:%s\r\n", g_data.repl_id.c_str());
+  info_add(o, "master_replid2:%s\r\n",
+           g_data.repl_id2.empty()
+               ? "0000000000000000000000000000000000000000"
+               : g_data.repl_id2.c_str());
+  info_add(o, "second_repl_offset:%lld\r\n",
+           g_data.repl_id2.empty() ? -1LL
+                                   : (long long)g_data.second_repl_offset);
   info_add(o, "connected_slaves:%zu\r\n", g_data.replicas.size());
   {
     const uint64_t now = get_monotonic_msec();
@@ -1570,6 +1591,10 @@ static void info_replication(std::string &o) {
   info_add(o, "repl_backlog_size:%zu\r\n", g_data.repl_backlog.size());
   info_add(o, "repl_backlog_first_byte_offset:%llu\r\n",
            (unsigned long long)repl_backlog_start_offset());
+  if (!g_data.replica_mode) {
+    info_add(o, "min_slaves_good_slaves:%zu\r\n",
+             good_replicas(get_monotonic_msec()));
+  }
   info_add(o, "repl_backlog_histlen:%zu\r\n", g_data.repl_backlog_histlen);
   o += "\r\n";
 }
@@ -3051,6 +3076,17 @@ void repl_remove_conn(Conn *conn) {
   fprintf(stderr, "replication: replica %s detached\n", conn->peer.c_str());
 }
 
+static size_t good_replicas(uint64_t now_ms){
+  const uint64_t max_lag_ms = (uint64_t)g_config.min_replicas_max_lag * 1000;
+  size_t n = 0;
+  for (const Conn *r : g_data.replicas) {
+    if (max_lag_ms == 0 || (r->ack_time_ms && now_ms - r->ack_time_ms <= max_lag_ms)){
+      n++;
+    }
+  }
+  return n;
+}
+
 static size_t replicas_acked(uint64_t offset) {
   size_t n = 0;
   for (const Conn *r : g_data.replicas) {
@@ -3076,6 +3112,14 @@ static void repl_feed_replicas(const char *bytes, size_t len) {
     buf_append(&r->outgoing, bytes, len);
     r->want_write = true;
   }
+}
+
+void repl_ping_replicas(){
+  if (g_data.replicas.empty()){ return; }
+  std::string frame;
+  aof_encode(frame, {"PING"});
+  repl_backlog_feed(frame.data(), frame.size());
+  repl_feed_replicas(frame.data(), frame.size());
 }
 
 // the one place the write stream reaches its sinks
@@ -3156,16 +3200,34 @@ static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     return resp_err(out, "ERR this connections is already a replica");
   }
 
+  // PSYNC <replid> <offset> FAILOVER, our master is handing over to us 
+  if (cmd.size() == 4) {
+    if (!arg_ieq(cmd[3], "failover")) {
+      return resp_err(out, "ERR syntax error");
+    }
+    if (!g_data.replica_mode) {
+      return resp_err(out, "ERR PSYNC FAILOVER but this server is not a replica");
+    }
+    repl_stop(); // closes our link to the old master, not this conn
+    repl_shift_id();
+    fprintf(stderr, "failover: promoted by %s, new replid %s (was %s at %llu)\n",
+            conn->peer.c_str(), g_data.repl_id.c_str(), g_data.repl_id2.c_str(),
+            (unsigned long long)g_data.second_repl_offset);
+
+  }
+
   // partial resync, only when the replica names our history and every byte it
   // missed is still in the ring
   if (cmd[1] != "?" && !g_data.repl_backlog.empty()) {
     long off = 0;
-    const bool id_ok = (cmd[1] == g_data.repl_id);
     const bool off_ok = parse_int_strict(cmd[2].c_str(), &off) && off > 0;
     const uint64_t want =
         off_ok ? (uint64_t)off : 0; // first byte the replica needs
     const uint64_t next =
         g_data.master_repl_offset + 1; // first byte we have not produced
+
+    // our current history, or the one we retired when we were propagate_enabled
+    const bool id_ok = (cmd[1] == g_data.repl_id) || (!g_data.repl_id2.empty() && cmd[1] == g_data.repl_id2 && want <= g_data.second_repl_offset);
 
     // framed as "how many bytes is it missing"
     if (id_ok && off_ok && want <= next &&
@@ -3192,12 +3254,11 @@ static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
             "replication: partial resync refused for %s (%s), falling back to "
             "full\n",
             conn->peer.c_str(),
-            !id_ok        ? "replid mismatch"
+            !id_ok        ? "unknown replid, or past our promotion boundary"
             : !off_ok     ? "bad offset"
             : want > next ? "replica claims to be ahead of us"
                           : "gap older than the backlog");
   }
-
   // The offset must be sampled before the image is serialized, with nothing
   // propagating between
   const uint64_t start_offset = g_data.master_repl_offset;
@@ -3224,14 +3285,109 @@ static void do_psync(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
           conn->peer.c_str(), (unsigned long long)start_offset, img_len);
 }
 
+// FAULOVER [TO <host> <port> [FORCE]] [ABORT] [TIMEOUT <ms>]
+static void do_failover(std::vector<std::string> &cmd, Buffer *out){
+  std::string host;
+  long port = 0, timeout_ms = 0;
+  bool have_to = false, force = false, want_abort =false;
+
+  for (size_t i = 1; i < cmd.size(); ++i){
+    if (arg_ieq(cmd[i], "abort")) { want_abort = true; continue; }
+    if (arg_ieq(cmd[i], "force")) { force = true; continue; }
+    if (arg_ieq(cmd[i], "to")) {
+      if (i + 2 >= cmd.size()) {
+        return resp_err(out, "ERR FAILOVER TO needs a host and a port");
+      }
+      host = cmd[i + 1];
+      if (!parse_int_strict(cmd[i + 2].c_str(), &port) || port < 1 || port > 65535) {
+        return resp_err(out, "ERR invalid FAILOVER target port");
+      }
+      have_to = true;
+      i += 2;
+      continue;
+    }
+    if (arg_ieq(cmd[i], "timeout")) {
+      if (i + 1 >= cmd.size() || !parse_int_strict(cmd[i + 1].c_str(), &timeout_ms) || timeout_ms < 0) {
+        return resp_err(out, "ERR invalid FAILOVER TIMEOUT");
+      }
+      i += 1;
+      continue;
+    }
+    return resp_err(out, "ERR syntax error") ;
+  }
+  
+  if (want_abort) {
+    if (g_data.failover_state == FailoverState::NONE) {
+      return resp_err(out, "ERR No failover in progress");
+    }
+    // deliberately refused once IN_PROGRESS
+    if (g_data.failover_state == FailoverState::IN_PROGRESS) {
+      return resp_err(out, "ERR Failover already in progress, cannot abort");
+    }
+    g_data.failover_state = FailoverState::NONE;
+    g_data.failover_host.clear();
+    g_data.failover_port = 0;
+    g_data.failover_deadline_ms = 0;
+    g_data.failover_force = false;
+    fprintf(stderr, "failover: aborted by client\n");
+    return resp_ok(out);
+  }
+
+  if (g_data.replica_mode) {
+    return resp_err(out, "ERR FAILOVER requires being a master");
+  }
+  if (g_data.failover_state != FailoverState::NONE) {
+    return resp_err(out, "ERR Failover already in progress");
+  }
+  if (force && !have_to) {
+    return resp_err(out, "ERR FAILOVER with FORCE requires TO <host> <port>");
+  }
+  if (force && timeout_ms == 0) {
+    return resp_err(out, "ERR FAILOVER with FORCE requires TIMEOUT");
+  }
+  if (g_data.replicas.empty()) {
+    return resp_err(out, "ERR FAILOVER requires connected replicas");
+  }
+
+  if (have_to) {
+    if (!replica_by_addr(host, (int)port)) {
+     return resp_err(out, "ERR FAILOVER target is not a connected replica");
+    }
+  } else {
+    // no target named
+    const Conn *best = nullptr;
+    for (const Conn *r : g_data.replicas) {
+      if (r->replica_port != 0 && (!best || r->ack_offset > best->ack_offset)) {
+        best = r;
+      }
+    }
+    if (!best) {
+      return resp_err(out, "ERR no replica has reported a listening-port yet");
+    }
+    host = best->peer.substr(0, best->peer.find(':'));
+    port = best->replica_port;
+  }
+
+  g_data.failover_state = FailoverState::WAIT_FOR_SYNC;
+  g_data.failover_host = host;
+  g_data.failover_port = (int)port;
+  g_data.failover_force = force;
+  g_data.failover_deadline_ms = timeout_ms ? get_monotonic_msec() + (uint64_t)timeout_ms : 0;
+  fprintf(stderr, "failover: waiting for %s:%d to reach offset %llu\n",
+          host.c_str(), (int)port,
+          (unsigned long long)g_data.master_repl_offset);
+  return resp_ok(out);
+}
+
 // REPLICAOF <host> <port> | REPLICAOF NO ONE.
 static void do_replicaof(std::vector<std::string> &cmd, Buffer *out) {
   if (arg_ieq(cmd[1], "no") && arg_ieq(cmd[2], "one")) {
-    if (g_data.repl_state != ReplState::NONE) {
+    if (g_data.replica_mode) {
       repl_stop();
-      repl_new_id();
-      fprintf(stderr, "replication: promoted to master new replid %s\n",
-              g_data.repl_id.c_str());
+      repl_shift_id();
+      fprintf(stderr, "replication: promoted to master, new repl_id %s (was %s at %llu)\n",
+                      g_data.repl_id.c_str(), g_data.repl_id2.c_str(),
+                      (unsigned long long)g_data.second_repl_offset);
     }
     return resp_ok(out);
   }
@@ -4860,12 +5016,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
     {"renamenx", {do_renamenx, 3, 3, true}},
     {"touch", {do_touch, 2, -1}},
     {"unlink", {do_asyncdel, 2, 2, true}},
-    {"keys",
-     {
-         do_keys,
-         1,
-         2,
-     }},
+    {"keys", { do_keys, 1, 2,}},
     {"scan", {do_scan, 2, -1}},
     {"randomkey", {do_randomkey, 1, 1}},
     {"dbsize", {do_dbsize, 1, 1}},
@@ -4955,11 +5106,10 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
     {"unwatch", {do_txn_stub, 1, 1}},
     // replication
     {"replconf", {do_pubsub_stub, 1, -1}},
-    {"psync", {do_pubsub_stub, 3, 3}},
-    {"replconf", {do_pubsub_stub, 1, -1}},
-    {"psync", {do_pubsub_stub, 3, 3}},
+    {"psync", {do_pubsub_stub, 3, 4}},
     {"replicaof", {do_replicaof, 3, 3}},
     {"slaveof", {do_replicaof, 3, 3}},
+    {"failover" , {do_failover, 1, 7}},
     {"wait", {do_pubsub_stub, 3, 3}},
 };
 
@@ -5133,13 +5283,25 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
     return resp_err_txn(out, conn, "ERR wrong number of arguments");
   }
 
-  // Read-only replica
-  if (g_data.replica_mode && spec.is_write && !g_data.g_loading) {
-    return resp_err_txn(
-        out, conn, "READONLY You can't write against a read only replica.");
+  // writes are paused for the duration of a handover
+  if (g_data.failover_state != FailoverState::NONE && spec.is_write && !g_data.g_loading) {
+    return resp_err_txn(out, conn, "FAILOVER Failover in progress, writes are paused");
   }
 
-  // transaction control: conn-aware, and never queue
+  // Read-only replica
+  if (g_data.replica_mode && spec.is_write && !g_data.g_loading) {
+      return resp_err_txn(
+          out, conn, "READONLY You can't write against a read only replica");
+  }
+
+  if (!g_data.replica_mode && g_config.min_replicas_to_write > 0 &&
+  spec.is_write && !g_data.g_loading &&
+  good_replicas(get_monotonic_msec()) < 
+  (size_t)g_config.min_replicas_to_write) {
+      return resp_err_txn(
+          out, conn, "NOREPLICAS Not enough good replicas to write.");
+    }  // transaction control: conn-aware, and never queue
+
   if (canonical == "multi") {
     return do_multi(cmd, out, conn);
   }
@@ -5368,8 +5530,7 @@ void acl_init_categories() {
       {"unwatch", KeySpec::NONE},
       {"replconf", KeySpec::NONE},
       {"psync", KeySpec::NONE},
-      {"replconf", KeySpec::NONE},
-      {"psync", KeySpec::NONE},
+      {"failover", KeySpec::NONE},
       {"replicaof", KeySpec::NONE},
       {"slaveof", KeySpec::NONE},
       {"wait", KeySpec::NONE},
@@ -5388,8 +5549,6 @@ void acl_init_categories() {
       {"keys", CAT_KEYSPACE | CAT_DANGEROUS | CAT_SLOW},
       {"scan", CAT_KEYSPACE | CAT_SLOW},
       {"dbsize", CAT_KEYSPACE},
-      {"randomkey", CAT_KEYSPACE},
-      {"del", CAT_KEYSPACE},
       {"unlink", CAT_KEYSPACE},
       {"exists", CAT_KEYSPACE},
       {"touch", CAT_KEYSPACE},
@@ -5413,8 +5572,7 @@ void acl_init_categories() {
       {"unwatch", CAT_FAST | CAT_TRANSACTION},
       {"replconf", CAT_ADMIN | CAT_DANGEROUS},
       {"psync", CAT_ADMIN | CAT_DANGEROUS},
-      {"replconf", CAT_ADMIN | CAT_DANGEROUS},
-      {"psync", CAT_ADMIN | CAT_DANGEROUS},
+      {"failover", CAT_ADMIN | CAT_DANGEROUS},
       {"replicaof", CAT_ADMIN | CAT_DANGEROUS},
       {"slaveof", CAT_ADMIN | CAT_DANGEROUS},
       {"wait", CAT_SLOW},

@@ -225,6 +225,53 @@ choke point, and `metadata_selfcheck` fails the boot if it appears in
 its masked `<set>` value reaching disk would make the next boot hash that literal
 string as the password.
 
+### Replication and Failover (V10)
+
+**The AOF stream *is* the replication stream.** Propagation hangs off the tail of
+`propagate_cmd`/`propagate` rather than a sibling block in `do_request`, because
+the synthetic frames that make replay correct — `SPOP`'s `SREM`, eviction's
+`DEL`, `EXPIRE`'s absolute re-encode — are produced *inside* those functions. A
+second call site would have diverged the replica three ways for free.
+
+**Role and link phase are different flags, and conflating them is a
+split-brain.** `g_data.replica_mode` is the role; `repl_state` is the phase of the
+socket. `repl_link_lost` resets the phase and deliberately keeps the role, which
+is how `repl_cron` knows to re-dial — so anything gated on `repl_state` (the
+read-only check, `REPLICAOF NO ONE`) silently promotes a replica to writable on
+every dropped socket. Same trap in the opposite direction: `Conn::is_replica`
+means "this connection is a replica *of us*", the opposite subject to
+`replica_mode`.
+
+**Everything periodic must appear in `next_timer_ms()`.** `poll()` sleeps until
+the next known timer and returns `-1` when there is none, so a deadline nothing
+wakes up for is not a deadline. Six replication deadlines have had to be added
+one incident at a time (retry, ack cadence, `WAIT`, replica link timeout, master
+reap, failover timeout). Any new periodic replication work starts here, not in
+the cron that consumes it — and its test must run on a genuinely idle server,
+observing through stderr rather than `INFO`, or it proves nothing.
+
+**Both resync paths leave a correct replica**, so `sync_full`/`sync_partial_ok`/
+`sync_partial_err` are load-bearing API, not instrumentation: they are the only
+observable that distinguishes a partial resync from a full one. Every rejection
+in `do_psync` falls through to a full resync on purpose — an unnecessary RDB
+costs bandwidth, a wrongly accepted `+CONTINUE` is silent divergence.
+
+**Promotion renames the stream, it does not end it.** `repl_shift_id()` retires
+the old identity into `repl_id2`/`second_repl_offset` so siblings can partial-resync
+across a role change, and a replica receiving `+CONTINUE <newid>` must **adopt**
+that id — the bytes are continuous, only the name changed. A replica also feeds
+its own backlog from the master's bytes **verbatim** while streaming, because the
+ring cannot be backfilled after the promotion that needs it.
+
+**`FAILOVER` is a role transition, not an election.** The master pauses writes,
+waits for the target's ack to reach `master_repl_offset`, then demotes and sends
+`PSYNC <replid> <off> FAILOVER`; the target promotes *before* the resync logic
+runs, so the offsets line up and it owes zero bytes. The pause is what freezes
+the finish line — without it the target never arrives. Two deliberate divergences
+from Redis: `ABORT` is refused once `IN_PROGRESS` (we have already asked someone
+else to take over), and paused writes are **refused** with `-FAILOVER` rather
+than blocked (BACKLOG has the deferred-reply version).
+
 ### Transport Seam (TLS)
 
 All per-connection socket I/O routes through `transport.h/.cpp`

@@ -325,6 +325,39 @@ The two items left open when V10 closed, fixed together once replication shipped
     which has already happened on a running server, so the fallback would be a
     second code path that can essentially never execute.
 
+### V10.6c/d Apply Slips — 2026-08-13
+
+Five defects introduced while hand-applying the V10.6c/d snippets, all found and
+fixed the same day. None shipped; they are archived because the *shape* recurs
+and four of the five were invisible to `-Wall -Wextra`.
+
+- 🔴 **The `READONLY` gate was deleted.** The `min-replicas-to-write` check was
+  meant to be inserted *after* the read-only check and instead **replaced** it, so
+  every replica in the tree accepted writes and V10.3a was silently undone. The
+  comment above it (`// Read-only replica`) survived, which is what made the diff
+  look right. **Rule: after applying an "insert after X" snippet, grep that X is
+  still there** — verifying only that the new lines landed cannot detect this.
+- 🔴 **`FAILOVER TO` rejected every usable port**: `port < 1 || port < 65535`
+  where the second test means `> 65535`. Identical to V10.5's `REPLCONF
+  listening-port` bug (`p > 65536` for `p < 65536`) — same subsystem, same
+  inverted comparison, four days apart. Both were caught by a test that used a
+  realistic port; neither is visible by reading the line in isolation, because
+  each half is individually plausible.
+- 🔴 **`FORCE` was parsed, validated, and discarded.** `do_failover` never wrote
+  `g_data.failover_force = force;`, so the flag was only ever assigned `false` and
+  `failover_cron` always took the "timed out, aborting (no FORCE)" branch. The
+  code reads correctly at every point; only a runtime test that actually forces a
+  handover past a lagging target can see it. Found by
+  `scripts/test_replication.py`'s V10.6d phase on its first run.
+- 🟠 **`failover_state` was emitted inside `INFO`'s `if (replica)` block**, so the
+  one state it exists to report — `WAIT_FOR_SYNC`, which only ever occurs on a
+  *master* — was unobservable. A half-applied repair then left `master_replid`
+  emitted twice for a replica.
+- 🟡 **`min-replicas-max-lag` defaulted to 0** instead of 10, which means "do not
+  judge on lag": every connected replica counts, including one still loading its
+  image, quietly turning off the half of V10.6c that makes the floor mean
+  anything.
+
 ### Persistence and AOF
 
 - AOF replay ran under an incomplete synthetic superuser (`all_keys` unset), so the

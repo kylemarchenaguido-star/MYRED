@@ -7,6 +7,7 @@
 #include "thread_pool.h"
 #include "deque.h"
 #include "set.h"
+#include <cstdint>
 #include <variant>
 #include <atomic>
 #include <stdint.h>
@@ -126,6 +127,13 @@ enum class ReplState : uint8_t {
   STREAMING,  // applying the command stream
 };
 
+// a coordinated handover, master side
+enum class FailoverState {
+  NONE,
+  WAIT_FOR_SYNC, // writes paused, waiting for the target to ack out last byte 
+  IN_PROGRESS, // demoted; PSYNC ... FAILOVER sent, waiting for the reply 
+};
+
 typedef struct ssl_st SSL; // OpenSSL's own typedef; we keep openssl/ss.h out of this header
 
 struct User {
@@ -197,6 +205,8 @@ struct GlobalData{
   // Conns with a deferred wait reply
   std::unordered_set<Conn *> waiters; // Conns with a deferred wait reply.
   uint64_t repl_ack_at_ms = 0; // replica side, when to send the next REPLCONF ACK
+  uint64_t master_last_io_ms = 0; // replica side, monotonic, last time any buyte arrived from the master
+  uint64_t repl_ping_at_ms = 0; // master side, when to send the next keepalive
   //timers and connection
   DList idle_list; // list of waiting connections 
   DList io_list;  // list of waiting io (read and write)
@@ -239,6 +249,8 @@ struct GlobalData{
   // second thing to drift.
   std::string repl_id; // 40 hex, regenerated every boot
   uint64_t master_repl_offset = 0; // total bytes ever propagated; never resets
+  std::string repl_id2; // The history we used to server under, kept across a promotion instead of being overwritten
+  uint64_t second_repl_offset = 0; // first offsset belonging to repl_id, not repl_id2
   std::vector<char> repl_backlog; // sized once at boot; empty == disabled
   size_t repl_backlog_pos = 0;
   size_t repl_backlog_histlen = 0;
@@ -255,6 +267,11 @@ struct GlobalData{
   uint64_t sync_full = 0;
   uint64_t sync_partial_ok = 0;
   uint64_t sync_partial_err = 0;
+  FailoverState failover_state = FailoverState::NONE;
+  std::string failover_host;
+  int failover_port = 0;
+  uint64_t failover_deadline_ms = 0; // 0 = wait indefinitely
+  bool failover_force = false; // proceed on timeout even if not caught up 
 };
 
 struct SaveCondition {
@@ -284,6 +301,10 @@ struct Config {
   int aof_rewrite_perc = 100; // ... or until it has doubled
   // replication
   size_t repl_backlog_size = 1024 * 1024; // 0 disables the backlog
+  int repl_timeout_ms =  60 * 1000; // silence on a replication link that neither errors nor closes.
+  int repl_ping_period_ms = 10 * 1000; // master->replica keepalive 
+  int min_replicas_to_write = 0; // refuse writes unless this many replicas look healthy, 0 = disable
+  int min_replicas_max_lag = 10; // a replica is healthy if checked this many times, 0 = do not judge by lag 
   // Boot stating for the replicaof directive
   std::string replicaof_host;
   int replicaof_port = 0;
@@ -396,11 +417,14 @@ int  config_selfcheck();
 // Replication bookkeping
 void repl_init(); // call once at boot
 void repl_new_id(); // fresh 40-hex identity: boot, and on promotion to master
+void repl_shift_id(); // promotion: retire repl_id into repl_id2, then mint a new one
 void repl_backlog_feed(const char *bytes,  size_t len); 
 uint64_t repl_backlog_start_offset(); // derived, for info
 bool repl_start(const std::string &host, int port, std::string &err);
 void repl_stop();
 void repl_backlog_copy(uint64_t need, Buffer *out); // the ring's last 'need' bytes, oldest first
+void repl_ping_replicas(); // master side keepalive 
+Conn *replica_by_addr(const std::string &host, int port); // the connected replica listening on host:port, or nullptr
 
 bool parse_memory_size(const std::string &s, size_t *out);
 bool parse_maxmemory_policy(const std::string &s, MaxmemoryPolicy *out);

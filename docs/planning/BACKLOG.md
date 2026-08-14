@@ -15,10 +15,35 @@ for design rationale.
   must exist in `k_cmd_table` — would have caught it at boot. Same idea covers
   the four parallel ACL-category lists (DECISIONS → ACL Category Tagging).
 
-**No open bugs in the data path.** The single item above is a hardening follow-up
-rather than a defect — V8.8 shipped the equivalent check for config directives and
-it caught six real violations on its first build, so the same idea applied to
-`k_cmd_table` is still worth doing.
+- 🟡 **A master never schedules a wakeup for its own keepalive** (V10.6 residual,
+  latent). In `next_timer_ms()` (`server.cpp:704`) the `repl_ping_at_ms` deadline
+  is nested inside `if (g_data.replica_mode)`, so a plain master has no timer for
+  the `PING` that V10.6b made the other half of `repl-timeout`. It is latent
+  rather than live: a `STREAMING` replica's `REPLCONF ACK` arrives every second
+  and wakes `poll()` on inbound data, well inside the 10s ping period, so the
+  ping always goes out on time. But the schedule is being met by network traffic
+  rather than by the timer meant to guarantee it — the same shape as every other
+  bug in that milestone, and it stops being latent the moment a replica goes
+  quiet, which is exactly when the keepalive matters. Fix is to hoist the branch
+  to the top level of `next_timer_ms()`.
+- ⚪ **`INFO` renders a never-acked replica as `state=online,lag=0`**
+  (`commands.cpp:1583`) — "never heard from" displayed as "perfectly caught up",
+  on the line an operator reads during an incident. `state=` is hardcoded
+  `online`; the honest fix is a real `online` vs `sync` distinction, which
+  `ack_time_ms == 0` already carries.
+- ⚪ **The `FAILOVER` write pause refuses instead of blocking.** Redis pauses
+  clients so the write lands *after* the handover; MYRED answers `-FAILOVER`. The
+  correctness property is identical — no write survives past the offset snapshot
+  — but a client sees an error where Redis shows a delay. Doing it properly means
+  routing paused writes through the deferred-reply path `WAIT` already uses
+  (`conn_resume`, `g_data.waiters`). Deliberate for V10.6d; filed rather than
+  forgotten.
+
+**No open bugs in the data path.** The items above are a hardening follow-up, a
+latent scheduling gap, an observability wart and a deliberate protocol
+divergence — none of them can corrupt or lose data. V8.8 shipped the equivalent
+boot-time check for config directives and it caught six real violations on its
+first build, so the same idea applied to `k_cmd_table` is still worth doing.
 
 Every bug previously tracked here is FIXED; full root-cause
 writeups live in `CODE_REVIEW.md` → Resolved Bugs Archive and in git history. New
@@ -102,14 +127,18 @@ reasoning changes.
 
 Both halves of V8 are **done** and live in `ROADMAP.md` → Completed Milestones:
 Pub/Sub (V8.1–V8.3) 2026-07-25, Transactions (V8.4–V8.7) 2026-07-26. The two open
-bugs above are now **V8.8**, the active milestone in ROADMAP → Current Focus.
+bugs that were listed here became **V8.8**, closed 2026-07-26 — ROADMAP →
+Completed Milestones.
 
 ### V10 - Replication and High Availability → moved to `ROADMAP.md`
 
-**V10 is the active milestone and all of it now lives in `ROADMAP.md` → Current
-Focus**: the preamble (why this codebase is already set up for replication, and
-why the AOF stream *is* the replication stream), completed **V10.1**, active
-**V10.2**, and the remaining steps V10.3–V10.6. Nothing V10 is left here.
+**V10.1–V10.6d are DONE** (closed 2026-08-13) and compacted into `ROADMAP.md` →
+Completed Milestones: bookkeeping, handshake and full resync, read-only replicas,
+partial resync, automatic reconnect, `WAIT`, silent-link detection, the
+`min-replicas-*` durability floor, and coordinated `FAILOVER`. The only V10 work
+left is **V10.6e** (automatic, Sentinel-style election), which is `ROADMAP.md` →
+Current Focus and gated on V11 Step 0 below. Cluster/hash-slot sharding split out
+to V12 on 2026-08-12. Nothing V10 is left here.
 
 ### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security (post-1.0)
 
@@ -141,6 +170,15 @@ gone**, and much of it pins bugs that really shipped:
   and both resync paths leave correct data so only its `sync_*` counter
   assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
   keyspace notifications, memory accounting invariants.
+- **`test_replication.py` grew again on 2026-08-13** and is now ~145 checks
+  across twelve phases, including the whole of V10.6c/d. Three shapes in it do
+  not exist anywhere in `stress_test.py` and are the real porting work: a
+  freezable proxy (a link that goes silent *without* closing), assertions read
+  from a server's **stderr file** rather than over the wire (polling `INFO` wakes
+  the loop and hides every missing-deadline bug), and phases that spawn a second
+  pair of instances because a handover swaps both roles. It is also the suite
+  that caught the `FORCE`-never-stored defect, which reads correctly and only
+  misbehaves at runtime.
 - **Known gap to close while porting: no `SPOP`-then-restart case anywhere.**
   `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction `DEL`/
   renamed-command frames but never `SPOP`, and `stress_test.py` does not restart
@@ -186,43 +224,27 @@ a real fuzzer.
 - Run the adversarial/live-server pieces against a disposable local instance
   only, never anything that matters if it crashes or hangs.
 
-## Deferred TLS Optimizations (V9.7.5 tail)
+## Deferred TLS Optimizations (V9.7.5 tail) → moved to `ROADMAP.md` as V10.6.1
 
-The body of V9.7.5 shipped (see ROADMAP → V9.7). These three are intentionally
-NOT done — each is gated on a measured need, not implemented speculatively.
-Escalate only when a metric demands it.
+Scheduled 2026-08-12 as a short detour **after V10.6 (failover) closes**, and the
+full text moved with it — ROADMAP → Current Focus → **V10.6.1**. All three items
+(accept-storm handshake CPU, kTLS, cert reload without restart) keep the gate they
+had here: measure first, implement only what a metric demands. Nothing TLS is left
+in this file.
 
-- **Handshake CPU under an accept storm** — escalate in this exact order, and
-  re-measure accept-to-first-command latency under a connection burst after each
-  step before moving to the next:
-  1. Session resumption (done, V9.7.5) — already reduces how many *full* handshakes occur.
-  2. Cap accepts per poll tick: change the unbounded
-     `while (handle_accept(listeners[i].fd, listeners[i].is_tls) == 0) {}` to a
-     bounded loop (e.g. `k_max_accepts_per_tick`) so one connection burst can't
-     monopolize a tick and starve already-established connections' read/write
-     readiness. Cheapest, and helps plaintext too.
-  3. Last resort only, if 1-2 don't hold up: move the `SSL_do_handshake` call
-     (`tr_handshake`) onto `g_data.thread_pool`, posting the result back through
-     the same completion-channel pattern the Argon2 auth path uses (V9.6.2) —
-     including its conn-id liveness check, since the conn can be destroyed (client
-     gave up, `tls-handshake-timeout` fired) while the handshake CPU work is in
-     flight on a worker thread.
-- **kTLS** (`SSL_OP_ENABLE_KTLS`): do not implement speculatively — requires a
-  measured before/after on MYRED's actual small-message workload showing it
-  matters first. Not planned until that measurement exists.
-- **Cert reload without restart** (operability, not perf; explicitly last, only
-  once everything above is done and stable):
-  1. Add a trigger — a dedicated command or `CONFIG SET` support for
-     `tls-cert-file`/`tls-key-file` specifically (reversing V9.7.2's boot-only
-     decision for just those two directives).
-  2. Build a **new** `SSL_CTX` by re-running `tr_tls_init`'s sequence — do not
-     mutate `g_tls_ctx` in place, so a bad cert/key is rejected without disturbing
-     the live context.
-  3. On success only, atomically repoint `g_tls_ctx = new_ctx;` — do **not**
-     `SSL_CTX_free` the old one. OpenSSL refcounts it (every live conn's `SSL*`
-     holds a reference via `tr_tls_attach`), so it frees itself once the last
-     connection using it closes. On validation failure, keep serving on the old
-     ctx and report the error — never leave the server without a working `SSL_CTX`.
+## V12 - Cluster / hash-slot sharding [Unscoped]
+
+Split out of V10.6 on 2026-08-12. It was bundled with failover under one number
+and that is why V10.6 stayed unscoped for three weeks — the two share no code and
+no design. Failover is a role transition on top of replication that already
+exists; this is key-space partitioning, and it touches every command's key
+extraction, adds `MOVED`/`ASK` to the error surface, needs a gossip protocol on a
+second port, and needs resharding to be interruptible. It gets its own design
+pass, after V11.
+
+Note the hard ordering against V11: cluster multiplies the state space that the
+differential and fuzz work has to cover, so building it *before* there is one
+runnable regression suite means testing it by hand forever.
 
 ## Memory and Encoding Optimizations
 

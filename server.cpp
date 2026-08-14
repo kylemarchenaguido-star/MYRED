@@ -1,5 +1,6 @@
 // stdlib
 #include <assert.h>
+#include <cstdint>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 // system
 #include <fcntl.h>
 #include <poll.h>
+#include <string_view>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -36,7 +38,7 @@
 #include "rdb.h"
 #include "commands.h"
 #include "aof.h"
-#include "sha256.h"
+// #include "sha256.h"
 #include "cred.h"
 #include "transport.h"
 
@@ -179,9 +181,19 @@ void repl_stop(){
   g_data.repl_rdb_buf.shrink_to_fit();
 }
 
+static void failover_reset(const std::string &why) {
+  fprintf(stderr, "failover: %s\n", why.c_str());
+  g_data.failover_state =FailoverState::NONE;
+  g_data.failover_host.clear();
+  g_data.failover_port = 0;
+  g_data.failover_deadline_ms = 0;
+  g_data.failover_force = false;
+}
+
 bool repl_start(const std::string &host, int port, std::string &err){
-  const bool have_history = g_data.replica_mode && !g_data.repl_id.empty() &&
-                            g_data.master_host == host && g_data.master_port == port;
+  const bool have_history =
+      (g_data.replica_mode || g_data.failover_state == FailoverState::IN_PROGRESS) &&
+      !g_data.repl_id.empty();
   const std::string hist_id = g_data.repl_id;
   const uint64_t hist_off = g_data.master_repl_offset;
 
@@ -236,10 +248,12 @@ bool repl_start(const std::string &host, int port, std::string &err){
   aof_encode(hs, { "REPLCONF", "listening-port", std::string_view(myport) });
   // PSYNC <replid> <first byte we still need>. "? -1" means "no history, send it all".
   const std::string psync_off = std::to_string(hist_off + 1);
-  if (have_history){
-    aof_encode(hs, { "PSYNC", std::string_view(hist_id), std::string_view(psync_off) });  
+  if (g_data.failover_state == FailoverState::IN_PROGRESS){
+    aof_encode(hs, { "PSYNC", std::string_view(hist_id), std::string_view(psync_off), "FAILOVER" });  
+  } else if (have_history){
+    aof_encode(hs, { "PSYNC", std::string_view(hist_id), std::string_view(psync_off)});  
   } else {
-    aof_encode(hs, { "PSYNC", "?", "-1" });  
+    aof_encode(hs, { "PSYNC", "?", "-1"});
   }
   buf_append(&c->outgoing, hs.data(), hs.size());
 
@@ -248,6 +262,7 @@ bool repl_start(const std::string &host, int port, std::string &err){
   g_data.replica_mode = true; // role 
   g_data.repl_state = ReplState::HANDSHAKE;
   g_data.master_link = c;
+  g_data.master_last_io_ms = get_monotonic_msec(); // from the dial, not from the first byte
   fprintf(stderr, "replication: connecting to master %s (%s)\n", c->peer.c_str(),
           have_history ? "attempting partial resync" : "full resync");
   return true;
@@ -255,9 +270,41 @@ bool repl_start(const std::string &host, int port, std::string &err){
 
 // Periodic, from proccess_timers, a replica whose link died re-dials its master
 static void repl_cron(uint64_t now_ms){
+  const uint64_t timeout_ms = (uint64_t)g_config.repl_timeout_ms;
+
+  if (!g_data.replicas.empty() && g_config.repl_ping_period_ms > 0 && now_ms >= g_data.repl_ping_at_ms){
+    g_data.repl_ping_at_ms = now_ms + (uint64_t)g_config.repl_ping_period_ms;
+    repl_ping_replicas();
+  }
+
+  if (timeout_ms > 0 && !g_data.replicas.empty()){
+    std::vector<Conn *> dead;
+    for (Conn *r : g_data.replicas){
+      if (r->ack_time_ms && now_ms - r->ack_time_ms > timeout_ms){
+        dead.push_back(r);
+      }
+    }
+    // collect first, conn_destroy -> repl_remove_conn erases from the set above
+    for (Conn *r : dead){
+      fprintf(stderr, "replication: replica %s silent for %llu ms, dropping it\n",
+              r->peer.c_str(), (unsigned long long)(now_ms - r->ack_time_ms));
+      conn_destroy(r); // the poll always spinns without this
+    }
+  }
+
   if (!g_data.replica_mode){ return; }
 
   if (g_data.master_link){
+
+  if (timeout_ms > 0 && now_ms - g_data.master_last_io_ms > timeout_ms){
+      Conn *c = g_data.master_link;
+      fprintf(stderr, "replication: no data from master %s for %llu ms, dropping the link\n",
+              c->peer.c_str(),
+              (unsigned long long)(now_ms - g_data.master_last_io_ms));
+      conn_destroy(c);
+      return;
+  } 
+
     // healthy link
     if (g_data.repl_state == ReplState::STREAMING){ 
       g_data.repl_retry_delay_ms = 0;
@@ -291,6 +338,48 @@ static void repl_cron(uint64_t now_ms){
     fprintf(stderr,"replication: reconnect to %s:%d failed: %s (retry in %u ms)\n",
              host.c_str(), port, err.c_str(), g_data.repl_retry_delay_ms);
   }
+}
+
+// Drives a FAILOVER from WAIT_FOR_SYNC to IN_PROGRESS, called every timer sweep
+static void failover_cron(uint64_t now_ms) {
+  if (g_data.failover_state != FailoverState::WAIT_FOR_SYNC){ return; }
+
+  Conn *t = replica_by_addr(g_data.failover_host, g_data.failover_port);
+  if (!t) {
+    // repl-timeout may have dropped it out from under us, or it went away on its own
+    failover_reset("target replica is gone, aborting");
+    return;
+  }
+
+  const bool synced = t->ack_offset >= g_data.master_repl_offset;
+  const bool expired = g_data.failover_deadline_ms && now_ms >= g_data.failover_deadline_ms;
+  if (!synced && !expired){ return; }
+  if (!synced && !g_data.failover_force){
+    failover_reset("timed out waiting for the target to catch up, aborting (no FORCE)");
+    return;
+  }
+  if (!synced){
+    fprintf(stderr, "failover: FORCE, handing over at %llu with the target at %llu, losing %llu bytes\n",
+            (unsigned long long)g_data.master_repl_offset,
+            (unsigned long long)t->ack_offset,
+            (unsigned long long)(g_data.master_repl_offset - t->ack_offset));
+  }
+  
+  const std::string host = g_data.failover_host; // t dies below, and these with it 
+  const int port = g_data.failover_port;
+  g_data.failover_state = FailoverState::IN_PROGRESS; // before repl_start, it reads this
+
+  // our replicas have to go 
+  std::vector<Conn *> old(g_data.replicas.begin(), g_data.replicas.end());
+  for (Conn *r: old){ conn_destroy(r); }
+  
+  std::string err;
+  if (!repl_start(host, port, err)) {
+    // we have already dropped every replica; there is no clean way back
+    failover_reset("could not dial the new master (" + err + "), still the master with no replicas");
+    return;
+  }
+  fprintf(stderr, "failover: demoted, PSYNC FAILOVER sent to %s:%d\n", host.c_str(), port);
 }
 
 // one CRLF-terminated line out of the incoming; false = need more bytes
@@ -338,7 +427,22 @@ static void repl_master_data(Conn *c){
         }
         // +CONTINUE [<replid>] — the master kept our history: no image follows
         if (line.compare(0, 9, "+CONTINUE") == 0){
+          // a promoted master answers CONTINUE under its new replid, adopt it 
+          const size_t sp = line.find(' ', 9);
+          if (sp != std::string::npos){
+            const std::string newid = line.substr(sp + 1);
+            if (!newid.empty() && newid != g_data.repl_id){
+              fprintf(stderr, "replication: master history renamed %s -> %s\n",
+                      g_data.repl_id.c_str(), newid.c_str());
+              g_data.repl_id = newid;
+              g_data.repl_id2.clear();
+              g_data.second_repl_offset = 0;
+            }
+          }
           g_data.repl_state = ReplState::STREAMING;
+          if (g_data.failover_state != FailoverState::NONE){
+            failover_reset("complete");
+          }
           fprintf(stderr, "replication: partial resync accepted, continuing at offset %llu\n",
                   (unsigned long long)g_data.master_repl_offset);
           break;
@@ -356,7 +460,14 @@ static void repl_master_data(Conn *c){
         // adopt the master's history: from here our won past writes are irrevelant, we are its copy
         g_data.repl_id = line.substr(12, sp - 12);
         g_data.master_repl_offset = strtoull(line.c_str() + sp + 1, nullptr, 10);
+        g_data.repl_id2.clear();
+        g_data.second_repl_offset = 0;
+        g_data.repl_backlog_pos = 0;
+        g_data.repl_backlog_histlen = 0;
         g_data.repl_state = ReplState::RDB_LEN;
+        if (g_data.failover_state != FailoverState::NONE){
+          failover_reset("complete");
+        }
         fprintf(stderr, "replication: full resync from %s at offset %llu\n",
                  g_data.repl_id.c_str(), (unsigned long long)g_data.master_repl_offset);
         break;
@@ -424,9 +535,9 @@ static void repl_master_data(Conn *c){
           c->want_close = true;
           return;
         }
+        repl_backlog_feed((const char *)buf_data(&c->incoming), (size_t)consumed);
         buf_consume(&c->incoming, (size_t)consumed);
         // our offset is the MASTER's: count the bytes we accepted
-        g_data.master_repl_offset += (size_t)consumed;
         if (!cmd.empty()){ repl_apply(cmd); }
         break;
       }
@@ -593,9 +704,32 @@ static int32_t next_timer_ms() {
   if (g_data.replica_mode){
     if (!g_data.master_link){
       next_ms = std::min<uint64_t>(next_ms, g_data.repl_retry_at_ms);
-    } else if (g_data.repl_state == ReplState::STREAMING){
-      next_ms = std::min<uint64_t>(next_ms, g_data.repl_ack_at_ms);
-    }
+    } else {
+      // every phase, not just streaming, the point is to expire a handshake that is never going to get a reply
+      if (g_config.repl_timeout_ms > 0){
+        next_ms = std::min<uint64_t>(next_ms, g_data.master_last_io_ms + (uint64_t)g_config.repl_timeout_ms);
+      }
+      if (g_data.repl_state == ReplState::STREAMING){
+        next_ms = std::min<uint64_t>(next_ms, g_data.repl_ack_at_ms);
+      }
+      if (!g_data.replicas.empty() && g_config.repl_ping_period_ms > 0){
+        next_ms = std::min<uint64_t>(next_ms, g_data.repl_ping_at_ms);
+      }
+    } 
+  }
+
+  // a master stays awake only because its replicas ACL once a second.
+  if (g_config.repl_timeout_ms > 0){
+    for (const Conn *r: g_data.replicas){
+      if (r->ack_time_ms){
+        next_ms = std::min<uint64_t>(next_ms, r->ack_time_ms + (uint64_t)g_config.repl_timeout_ms);
+      }
+    } 
+  }
+
+  // a failover waiting on a target that has gone quite must still time out
+  if (g_data.failover_state != FailoverState::NONE && g_data.failover_deadline_ms){
+    next_ms = std::min(next_ms, g_data.failover_deadline_ms);
   }
 
   // a pending WAIT must expire on time even on a completely idle server
@@ -757,6 +891,7 @@ static void process_timers(){
   }
   wait_try_resume(); // expire any WAIT whose deadline has passed
   repl_cron(now_ms);
+  failover_cron(now_ms); 
 }
 
 static void conn_set_timer(Conn *conn, ConnTimer type){
@@ -878,7 +1013,10 @@ static void handle_read(Conn *conn){
     // The master link drains per chunk: a full-resync image is unbounded, so it
     // must never accumulate in `incoming`
     if (conn->is_master_link){
-      if (n > 0){ repl_master_data(conn); }
+      if (n > 0){
+        g_data.master_last_io_ms = get_monotonic_msec();
+        repl_master_data(conn); 
+      }
       if (conn->want_close){ return; }
     } else if (buf_size(&conn->incoming) > k_max_incoming){
       fprintf(stderr, "fd %d: incoming buffer over %zu bytes, closing\n", conn->fd, k_max_incoming);

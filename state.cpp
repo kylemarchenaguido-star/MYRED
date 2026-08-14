@@ -4,6 +4,7 @@
 #include "sha256.h"
 #include "cred.h"
 #include <arpa/inet.h>  
+#include <cstddef>
 #include <time.h>
 #include <cctype>
 #include <cstdlib>
@@ -516,6 +517,60 @@ static const ConfigDirective k_config_table[] = {
     },
     [](std::string &o) -> bool { o = std::to_string(g_config.repl_backlog_size); return true; },
     /*boot_only*/ true, /*masked*/ false, /*emit*/ nullptr},
+
+  { "repl-timeout", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long s = 0;
+      if (!parse_int_strict(a[0].c_str(), &s) || s < 0 || s > 3600){
+        e = "invalid repl-timeout (seconds, 0 to disable, max 3600)";
+        return CfgResult::BADVALUE;
+      }
+      g_config.repl_timeout_ms = (int)s * 1000; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      o = std::to_string(g_config.repl_timeout_ms / 1000); return true;
+    },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+  { "repl-ping-replica-period", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long s = 0;
+      if (!parse_int_strict(a[0].c_str(), &s) || s < 0 || s > 3600){
+        e = "invalid repl-ping-replica-period (seconds, 0 to disable, max 3600)";
+        return CfgResult::BADVALUE;
+      }
+      g_config.repl_ping_period_ms = (int)s * 1000; 
+      g_data.repl_ping_at_ms = get_monotonic_msec() + g_config.repl_ping_period_ms;
+      return CfgResult::OK;
+    },
+    [](std::string &o) -> bool {
+      o = std::to_string(g_config.repl_ping_period_ms / 1000); return true;
+    },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+{ "min-replicas-to-write", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long n = 0;
+      if (!parse_int_strict(a[0].c_str(), &n) || n < 0 || n > 1024){
+        e = "invalid min-replicas-to-write (0 to disable)";
+        return CfgResult::BADVALUE;
+      }
+      g_config.min_replicas_to_write = (int)n; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.min_replicas_to_write); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
+
+  { "min-replicas-max-lag", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long s = 0;
+      if (!parse_int_strict(a[0].c_str(), &s) || s < 0 || s > 3600){
+        e = "invalid min-replicas-max-lag (seconds, 0 to ignore lag)";
+        return CfgResult::BADVALUE;
+      }
+      g_config.min_replicas_max_lag = (int)s; return CfgResult::OK;
+    },
+    [](std::string &o) -> bool { o = std::to_string(g_config.min_replicas_max_lag); return true; },
+    /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
   { "replicaof", 2, 2,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -1091,6 +1146,14 @@ bool expire_if_needed(Entry *ent){
   return true;
 }
 
+Conn *replica_by_addr(const std::string &host, int port){
+  for (Conn *r : g_data.replicas){
+    const std::string ip = r->peer.substr(0, r->peer.find(':'));
+    if (ip == host && r->replica_port == port){ return r; }
+  }
+  return nullptr; 
+}
+
 // Replication
 // 40 hex chars, the shape redis uses. not a secret - it is published in INFO 
 // and exists only so a reconnecting replica can tell "same master history"
@@ -1105,6 +1168,13 @@ static std::string repl_gen_id(){
 
 void repl_new_id(){
   g_data.repl_id = repl_gen_id();
+}
+
+// promotion to master, the Identity we served under becomes history rather than being overwritten
+void repl_shift_id(){
+  g_data.repl_id2 = g_data.repl_id;
+  g_data.second_repl_offset = g_data.master_repl_offset + 1;
+  repl_new_id();
 }
 
 void repl_init(){
