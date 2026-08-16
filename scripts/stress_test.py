@@ -6998,13 +6998,30 @@ def compare_summaries(old_path: str, new_path: str) -> int:
 
     def tag(d):
         p = d.get("platform", {})
-        return (f"{p.get('env', '?')} / {p.get('kernel', '?')} / "
-                f"{(p.get('cpu_model') or '?')[:40]}")
+        b = d.get("bench") or {}
+        bits = [p.get("env", "?"), p.get("kernel", "?"),
+                (p.get("cpu_model") or "?")[:40]]
+        gov = p.get("governor")
+        if gov:
+            bits.append(f"governor={gov}")
+        tr = (b.get("params") or {}).get("transport") or d.get("transport")
+        if tr:
+            bits.append(tr)
+        return " / ".join(bits)
 
     print(f"{BOLD}A{RESET}  {old_path}\n   {tag(old)}")
     print(f"{BOLD}B{RESET}  {new_path}\n   {tag(new)}")
     ob, nb = old.get("bench") or {}, new.get("bench") or {}
-    if ob.get("params") and nb.get("params") and ob["params"] != nb["params"]:
+
+    # `transport` is deliberately NOT part of this check. It is the one
+    # difference somebody legitimately wants to measure — plaintext against TLS
+    # on the same box is the whole point — and it does not scale throughput the
+    # way -n/-c/-P do. It is reported in the label above instead.
+    def scaling_params(p):
+        return {k: v for k, v in (p or {}).items() if k != "transport"}
+
+    if (ob.get("params") and nb.get("params")
+            and scaling_params(ob["params"]) != scaling_params(nb["params"])):
         print(f"\n{RED}refusing to compare: the benchmark parameters differ{RESET}")
         print(f"  A: {ob['params']}")
         print(f"  B: {nb['params']}")
