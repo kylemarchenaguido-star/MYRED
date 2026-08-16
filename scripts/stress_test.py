@@ -4092,6 +4092,24 @@ def _wait_for_aof(path: str, needle: bytes, timeout: float = 5.0) -> bool:
     return False
 
 
+def _aof_settled(sock: socket.socket, path: str, tag: str,
+                 timeout: float = 10.0) -> bool:
+    """Write a sentinel, then wait for it to appear in the AOF on disk.
+
+    Reading the file straight after a command is a race even with `appendfsync
+    always`: the reply and the flush are not the same event, and under load the
+    gap is wide enough to lose the last frame or two. Since the AOF is written
+    in command order, a sentinel that has landed proves everything before it
+    has too — which is the only cheap way to snapshot the file at a point that
+    is guaranteed to contain the writes under test.
+    """
+    key = f"__aof_sentinel__:{tag}"
+    cmd(sock, "SET", key, tag)
+    ok = _wait_for_aof(path, _frame(key), timeout)
+    cmd(sock, "DEL", key)
+    return ok
+
+
 def _wait_for_hybrid(path: str, timeout: float = 10.0) -> bool:
     """BGREWRITEAOF finalizes asynchronously and renames the tmp over the AOF;
     wait for the magic rather than for a fixed sleep."""
@@ -4101,6 +4119,33 @@ def _wait_for_hybrid(path: str, timeout: float = 10.0) -> bool:
             return True
         time.sleep(0.1)
     return False
+
+
+def _rewrite_diagnostics(sock: socket.socket, inst: "Instance", aof: str) -> str:
+    """Everything needed to tell a broken auto-rewrite from a mistimed test.
+
+    The trigger reads four numbers and is blocked by a fifth condition, none of
+    which are visible from "it did not fire". Printing them turns one failure
+    into a diagnosis instead of a reproduction attempt.
+    """
+    try:
+        info = info_dict(sock, "persistence")
+        cur = info.get("aof_current_size")
+        base = info.get("aof_base_size")
+        pending = info.get("aof_pending_rewrite")
+        min_size = get_directive(sock, "auto-aof-rewrite-min-size")
+        perc = get_directive(sock, "auto-aof-rewrite-percentage")
+        growth = "n/a"
+        if cur and base and int(base) > 0:
+            growth = f"{(int(cur) - int(base)) * 100 // int(base)}%"
+        state = (f"aof_current_size={cur} aof_base_size={base} growth={growth} "
+                 f"(needs >= {perc}%, and size >= {min_size}); "
+                 f"aof_pending_rewrite={pending}; on-disk={len(_aof_bytes(aof))}B")
+    except Exception as e:
+        state = f"could not read INFO/CONFIG: {type(e).__name__}: {e}"
+    tail = [l for l in inst.stderr_tail(40) if "aof_rewrite" in l][-6:]
+    return state + ("\n    server said: " + " | ".join(tail) if tail
+                    else "\n    server logged nothing about aof_rewrite")
 
 
 def _replay_log_clean(ctx: "PhaseCtx", inst: "Instance", label: str):
@@ -4169,7 +4214,7 @@ def phase_aof_gating(ctx: "PhaseCtx"):
     cmd(s, "EXPIRE", "gate:foo", "5000")            # -> absolute PEXPIREAT
 
     ctx.ok("AOF exists and is non-empty",
-           _wait_for_aof(aof, _frame("gate:foo")),
+           _aof_settled(s, aof, "gate"),
            f"nothing landed in {aof}")
     blob = _aof_bytes(aof)
 
@@ -4249,7 +4294,7 @@ def phase_aof_rewrite(ctx: "PhaseCtx"):
     # are broken when they are working.
     cmd(s, "SET", "rw:ttl", "keepme")
     cmd(s, "EXPIRE", "rw:ttl", "10000")
-    _wait_for_aof(aof, _frame("rw:ttl"))
+    _aof_settled(s, aof, "rewrite")
     before = len(_aof_bytes(aof))
 
     cmd(s, "BGREWRITEAOF")
@@ -4271,26 +4316,51 @@ def phase_aof_rewrite(ctx: "PhaseCtx"):
            not [f for f in os.listdir(d) if f.startswith("appebdonly")],
            f"found: {[f for f in os.listdir(d) if f.startswith('appebdonly')]}")
 
-    # Auto-trigger: arm it only now, then bloat past the growth percentage.
+    # Auto-trigger: arm it only now, then keep writing until it fires.
     #
-    # The assertion is on the server's own "aof_rewrite: started" line, not on
-    # the file shrinking. Once armed, the threshold is 100% growth over a 195-byte
-    # base, so the trigger fires again every few hundred writes — which means a
-    # size sampled after the loop is a size sampled at an arbitrary point in some
-    # later growth cycle, and "did it shrink?" is a coin flip. Counting the log
-    # line makes the same question deterministic. No BGREWRITEAOF is issued from
-    # here on, so any increase can only be the auto-trigger.
-    mark = srv.stderr_text().count("aof_rewrite: started")
+    # The needle is the server's own "auto-trigger" line, which `server_cron`
+    # prints immediately before calling `aof_rewrite_background()`. Three
+    # properties of that call site decide the shape of this test:
+    #
+    #   - The whole block is gated on `g_aof_child_pid == -1 && g_rdb_child_pid
+    #     == -1`, so while ANY fork is in flight the condition is not even
+    #     evaluated.
+    #   - It is rate-limited to once a second, and the clock only advances when
+    #     the block actually runs.
+    #   - `aof_rewrite_background()` itself can still bail with "already
+    #     running" and never log "started" — so "started" is the wrong needle;
+    #     "auto-trigger" is emitted unconditionally once the condition holds.
+    #
+    # Which is why the writes continue INSIDE the wait. A fixed burst followed
+    # by a passive wait asks the trigger to fire in one specific window: if a
+    # rewrite completes during the burst it resets the base, and with the writes
+    # stopped no further growth is ever generated, so the deadline expires
+    # against a server behaving perfectly. Writing throughout regenerates growth
+    # continuously, and then the only way to miss is a trigger that genuinely
+    # does not work. (This is the third shape of this check. The first asserted
+    # the file shrank — a coin flip, because the sample lands at an arbitrary
+    # point in some later growth cycle. The second watched the wrong log line
+    # and still failed under load only.)
+    auto_needle = "aof_rewrite: auto-trigger"
+    mark = srv.stderr_text().count(auto_needle)
     cmd(s, "CONFIG", "SET", "auto-aof-rewrite-min-size", "4096")
     cmd(s, "CONFIG", "SET", "auto-aof-rewrite-percentage", "100")
-    for i in range(2000):
-        cmd(s, "SET", "rw:k", str(i))
-    fired = wait_until(
-        lambda: srv.stderr_text().count("aof_rewrite: started") > mark, 10.0)
+
+    fired = False
+    churn = 0
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        for _ in range(200):
+            cmd(s, "SET", "rw:churn", str(churn))
+            churn += 1
+        if srv.stderr_text().count(auto_needle) > mark:
+            fired = True
+            break
+        time.sleep(0.2)          # let server_cron reach its once-a-second check
     ctx.ok("the auto-trigger fired at the configured growth percentage", fired,
-           f"the AOF is {len(_aof_bytes(aof))} bytes over a 4096-byte floor and "
-           f"the server never logged another rewrite — "
-           f"auto-aof-rewrite-percentage never tripped")
+           f"{churn} writes over {30.0:.0f}s never tripped "
+           f"auto-aof-rewrite-percentage=100 above a 4096-byte floor.\n"
+           f"    {_rewrite_diagnostics(s, srv, aof)}")
 
     # Disarm before the restart: a rewrite still in flight when the server stops
     # is a race between finalize and shutdown, and it belongs to a different test
@@ -4301,12 +4371,18 @@ def phase_aof_rewrite(ctx: "PhaseCtx"):
     ttl_before = cmd(s, "TTL", "rw:ttl")
     ctx.ok("the TTL is still live before the restart",
            isinstance(ttl_before, int) and ttl_before > 0, f"ttl={ttl_before}")
+    churn_last = cmd(s, "GET", "rw:churn")
     s.close()
     srv = ctx.restart(srv, "aof-rewrite-replay")
     s = raw_conn(port)
     _replay_log_clean(ctx, srv, "post-rewrite replay")
     ctx.ok("the compacted file reconstructs the string",
            cmd(s, "GET", "rw:k") == "1999", f"got {cmd(s, 'GET', 'rw:k')!r}")
+    # rw:churn was written after the last auto-rewrite, so it is the delta the
+    # preamble does not contain — the half a hybrid AOF loses silently.
+    ctx.ok("the writes made after the last auto-rewrite survived too",
+           cmd(s, "GET", "rw:churn") == churn_last,
+           f"before={churn_last!r} after={cmd(s, 'GET', 'rw:churn')!r}")
     ttl_after = cmd(s, "TTL", "rw:ttl")
     ctx.ok("[REG] the TTL survived the rewrite as an absolute deadline",
            isinstance(ttl_after, int) and 0 < ttl_after <= (ttl_before or 10000),
@@ -4359,7 +4435,7 @@ def phase_aof_hybrid(ctx: "PhaseCtx"):
     # the delta: written AFTER the rewrite, so it appends as RESP behind the RDB
     cmd(s, "SET", "hy:delta", "123")
     cmd(s, "LPUSH", "hy:list", "FRONT")
-    _wait_for_aof(aof, _frame("hy:delta"))
+    _aof_settled(s, aof, "delta")
     s.close()
 
     srv = ctx.restart(srv, "aof-hybrid-replay")
