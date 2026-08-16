@@ -38,6 +38,7 @@ from one machine never overwrites a run from another.
   Kernel:       6.6.87.2-microsoft-standard-WSL2
   CPU:          AMD Ryzen 5 3600X 6-Core Processor
   Threads:      12 (usable by this process: 12)
+  Crypto ISA:   aes pclmulqdq sha_ni avx2  (no vaes — one AES block per instruction)
   Memory:       12209364 kB  swap 3145728 kB
   Governor:     n/a
   Load average: 0.15 0.07 0.05 1/441 27995
@@ -78,6 +79,11 @@ with `--log ''`. The JSON always sits beside the markdown.
 The JSON carries the platform block, the build type, per-phase pass/fail/skip
 counts, and the parsed `redis-benchmark` throughput — everything a comparison
 needs and nothing that requires re-reading a transcript.
+
+**`Crypto ISA` is there because it decides TLS throughput and the CPU model name
+does not tell you.** A part with `vaes` + `vpclmulqdq` runs several AES blocks
+per instruction where plain `aes` runs one, which is large enough to make a TLS
+comparison between two machines meaningless if you don't know which is which.
 
 ---
 
@@ -294,7 +300,22 @@ python3 scripts/stress_test.py --compare docs/logs/WSL/full_plain.json \
 
 It prints per-test ops/sec for both sides and the ratio, and **refuses outright**
 when the two runs used different `-n`/`-c`/`-P` — throughput scales with all
-three, so a mismatch manufactures whatever result you want.
+three, so a mismatch manufactures whatever result you want. Transport is *not*
+part of that check: plaintext against TLS on one box is a comparison you
+legitimately want, so it is labelled rather than refused.
+
+```bash
+python3 scripts/stress_test.py --compare docs/logs/Native/full_plain.json \
+                                         docs/logs/Native/full_tls.json
+```
+
+**Only the redis-benchmark table measures the server.** The Python stress
+phase's ops/sec is client-bound — eight GIL-contending threads parsing RESP in
+the interpreter — and on a five-run-per-side measurement it reports TLS ~13%
+*faster* than plaintext, well outside a 3–6% spread. That is a real property of
+the client (the `ssl` module releases the GIL across longer C sections than a
+bare socket), not of MYRED. Compare it across runs of the *same* transport, and
+never between transports.
 
 There is no verdict column and there will not be one: a single run per side has
 no noise floor to judge a delta against. Read the structural differences (a VM's

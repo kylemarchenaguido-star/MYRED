@@ -63,6 +63,7 @@ import subprocess
 import tempfile
 import atexit
 import ssl
+import weakref
 from typing import Any, Optional
 
 # ─── configuration ────────────────────────────────────────────────────────────
@@ -208,30 +209,100 @@ def send_request(sock: socket.socket, *args: str) -> None:
     sock.sendall(bytes(out))
 
 
+# ─── buffered reads ───────────────────────────────────────────────────────────
+#
+# RESP is read a line or a declared length at a time, and the obvious
+# implementation asks the kernel for ONE BYTE per call. A 100k-element KEYS
+# reply then costs over a million syscalls, and what comes back is a measurement
+# of CPython rather than of the server: 1422 ms client-side against 19 ms of
+# actual server CPU for the same command, and the distortion scales with the
+# host's syscall cost — 26x between two machines the C client puts 2.3x apart.
+#
+# So every socket gets a read buffer. A WeakKeyDictionary because sockets are
+# opened and closed all over this file and nobody is going to remember to
+# unregister one; when the socket is collected its buffer goes with it.
+#
+# A second thing this fixes: the old line reader accumulated bytes into a LOCAL
+# buffer, so a socket timeout part-way through a line discarded the bytes it had
+# already taken from the kernel and left the stream desynchronised. Buffered,
+# a timeout is resumable — which is what the pub/sub push readers rely on.
+
+class _ReadBuf:
+    __slots__ = ("buf", "pos")
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.pos = 0
+
+
+_READ_BUFS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_READ_CHUNK = 64 * 1024
+
+
+def _readbuf(sock: socket.socket) -> "_ReadBuf":
+    r = _READ_BUFS.get(sock)
+    if r is None:
+        r = _ReadBuf()
+        _READ_BUFS[sock] = r
+    return r
+
+
+def _consumed(r: "_ReadBuf") -> None:
+    """Reclaim the consumed prefix. Cheap when the buffer is fully drained,
+    which is the common case between commands."""
+    if r.pos == len(r.buf):
+        del r.buf[:]
+        r.pos = 0
+    elif r.pos > (1 << 20):
+        del r.buf[:r.pos]
+        r.pos = 0
+
+
+def _fill(sock: socket.socket, r: "_ReadBuf") -> None:
+    chunk = sock.recv(_READ_CHUNK)
+    if not chunk:
+        raise ConnectionError("Server closed connection")
+    r.buf += chunk
+
+
 def _recv_line(sock: socket.socket) -> bytes:
-    """Read one CRLF-terminated line, returning the content without CRLF."""
-    buf = bytearray()
+    """Read one CRLF-terminated line, returning the content without CRLF.
+
+    Scans for the CRLF pair rather than treating a bare \\r as a framing error:
+    RESP simple strings and errors cannot contain either byte, so the pair IS
+    the delimiter, and a length-prefixed bulk payload never reaches this path.
+    """
+    r = _readbuf(sock)
     while True:
-        c = sock.recv(1)
-        if not c:
-            raise ConnectionError("Server closed connection")
-        if c == b"\r":
-            nl = sock.recv(1)            # consume the \n
-            if nl != b"\n":
-                raise RespError("malformed line ending")
-            return bytes(buf)
-        buf += c
+        i = r.buf.find(b"\r\n", r.pos)
+        if i >= 0:
+            line = bytes(r.buf[r.pos:i])
+            r.pos = i + 2
+            _consumed(r)
+            return line
+        _fill(sock, r)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     """Read exactly n bytes."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Server closed connection")
-        buf += chunk
-    return bytes(buf)
+    r = _readbuf(sock)
+    while len(r.buf) - r.pos < n:
+        _fill(sock, r)
+    out = bytes(r.buf[r.pos:r.pos + n])
+    r.pos += n
+    _consumed(r)
+    return out
+
+
+def _skip_exact(sock: socket.socket, n: int) -> None:
+    """Discard exactly n bytes without materialising them — the trailing CRLF
+    of every bulk string, which is one throwaway allocation per element on a
+    reply that can hold 100k of them."""
+    r = _readbuf(sock)
+    while len(r.buf) - r.pos < n:
+        _fill(sock, r)
+    r.pos += n
+    _consumed(r)
 
 
 def recv_response(sock: socket.socket) -> Any:
@@ -265,7 +336,7 @@ def recv_response(sock: socket.socket) -> Any:
         if length < 0:
             return None
         data = _recv_exact(sock, length)
-        _recv_exact(sock, 2)             # consume trailing \r\n
+        _skip_exact(sock, 2)             # consume trailing \r\n
         return data.decode(errors="replace")
 
     if prefix == b"*":
@@ -2271,7 +2342,15 @@ def stress_worker(host: str, port: int, ops: int,
             elif op == 31:
                 cmd(sock, "memory", "usage", random_key())
             elif op == 32:
-                k = random_key()
+                # A key this worker owns, NOT one from the shared random pool.
+                # `random_key()` draws from 201 names shared by every worker, and
+                # another worker's DEL between the SET and the OBJECT lands often
+                # enough to fail roughly one run in three. OBJECT ENCODING
+                # answering "ERR no such key" for a key that is gone is correct
+                # Redis behaviour, so the race was in the test's expectation, not
+                # in the server. Concurrent deletion is still exercised by every
+                # other op in the mix.
+                k = f"stress_obj_{wid}"
                 cmd(sock, "set", k, "v")
                 cmd(sock, "object", "encoding", k)
             elif op == 33:
@@ -2326,6 +2405,20 @@ def run_stress_test(host: str, port: int, threads_count: int,
 
     print(f"\n  Elapsed:    {elapsed:.2f}s")
     print(f"  Throughput: {throughput:.0f} ops/sec")
+    # Said here, at the number, because the warning being elsewhere has not
+    # stopped anyone reading it as a server measurement — twice now.
+    #
+    # This figure is CLIENT-BOUND: eight Python threads contending for the GIL,
+    # parsing RESP in the interpreter. Measured on one machine, five runs each,
+    # it reports TLS ~13% FASTER than plaintext, well outside a 3-6% spread —
+    # a genuine and repeatable property of the *client*, since the ssl module
+    # releases the GIL across longer C sections than a bare socket does. The
+    # server cannot be faster with encryption added.
+    #
+    # Use it to compare the same transport across runs. For anything about
+    # MYRED's own speed, read the redis-benchmark table (--bench).
+    print(f"  {YELLOW}note{RESET} client-bound (GIL-contended); never use this "
+          f"to compare transports — see --bench for server throughput")
     stats.report(metrics_top)
     return stats.errors == 0
 
@@ -3565,6 +3658,26 @@ def _proc_kv(path: str, keys) -> dict:
     return out
 
 
+# The ISA extensions that decide TLS throughput, in the order they matter.
+# OpenSSL dispatches AES-GCM onto whichever of these the CPU advertises, and the
+# difference between them is large: a part with VAES + VPCLMULQDQ processes
+# several AES blocks per instruction where plain AES-NI does one.
+#
+# This list exists because a WSL/Native comparison came out with the TLS gap
+# 20% WIDER than the plaintext gap, and the explanation turned out to be Tiger
+# Lake having VAES while Zen 2 does not — a fact that was nowhere in the run
+# summary and had to be dug out of /proc/cpuinfo by hand afterwards. Recording
+# `cpu_model` is not enough: the model name does not tell you what the crypto
+# path will be.
+CRYPTO_FLAGS = ("aes", "vaes", "pclmulqdq", "vpclmulqdq", "sha_ni",
+                "avx2", "avx512f", "avx512vl")
+
+
+def _cpu_flags(flags: str) -> list:
+    have = set(flags.split())
+    return [f for f in CRYPTO_FLAGS if f in have]
+
+
 def _cpu_count_from_proc() -> Optional[int]:
     text = _read("/proc/cpuinfo")
     if not text:
@@ -3640,6 +3753,7 @@ def platform_facts() -> dict:
         "cpu_threads":    _cpu_count_from_proc() or os.cpu_count(),
         "cpu_affinity":   affinity,
         "cpu_mhz":        cpu.get("cpu MHz"),
+        "crypto_isa":     _cpu_flags(flags) if flags else None,
         "mem_total":      mem.get("MemTotal"),
         "swap_total":     mem.get("SwapTotal"),
         # things that silently change a benchmark
@@ -3679,6 +3793,10 @@ def print_platform(facts: dict):
     print(f"  CPU:          {facts.get('cpu_model')}")
     print(f"  Threads:      {facts.get('cpu_threads')} "
           f"(usable by this process: {facts.get('cpu_affinity')})")
+    isa = facts.get("crypto_isa")
+    if isa is not None:
+        note = "" if "vaes" in isa else "  (no vaes — one AES block per instruction)"
+        print(f"  Crypto ISA:   {' '.join(isa) or 'none'}{note}")
     print(f"  Memory:       {facts.get('mem_total')}"
           + (f"  swap {facts['swap_total']}" if facts.get("swap_total") else ""))
     print(f"  Governor:     {facts.get('governor') or 'n/a'}"
@@ -7007,6 +7125,11 @@ def compare_summaries(old_path: str, new_path: str) -> int:
         tr = (b.get("params") or {}).get("transport") or d.get("transport")
         if tr:
             bits.append(tr)
+        # Only on a TLS side, and only when it is the discriminating fact: this
+        # is the line that explains a TLS gap the plaintext numbers do not.
+        isa = p.get("crypto_isa")
+        if tr == "tls" and isa is not None:
+            bits.append("vaes" if "vaes" in isa else "no-vaes")
         return " / ".join(bits)
 
     print(f"{BOLD}A{RESET}  {old_path}\n   {tag(old)}")
