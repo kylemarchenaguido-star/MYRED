@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-08-15 23:00:35
+# MYRED stress test — 2026-08-15 23:46:06
 
 **Run:** correctness + concurrency + managed-instance phases + stress + redis-benchmark over TLS (passwordless) → 127.0.0.1:1234
 
@@ -13,14 +13,15 @@
   Product:      HP ProBook 450 G8 Notebook PC
   CPU:          11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz
   Threads:      8 (usable by this process: 8)
+  Crypto ISA:   aes vaes pclmulqdq vpclmulqdq sha_ni avx2 avx512f avx512vl
   Memory:       16045708 kB  swap 0 kB
   Governor:     performance  no_turbo=0
-  Load average: 0.24 0.19 0.19 1/775 19665
+  Load average: 0.61 0.23 0.11 1/781 24831
   somaxconn:    4096   nofile=524288   tcp_ulp=espintcp mptcp
   Build:        RELEASE  [build-rel/]
   Log:          docs/logs/Native/full_tls.md
 
-✓ Spawned the primary instance on 127.0.0.1:12591  (/tmp/myred-primary-gy5y34gz)
+✓ Spawned the primary instance on 127.0.0.1:12591  (/tmp/myred-primary-zn3dgte6)
   Transport:    TLS (cert not verified)
   Auth:         none
 ✓ Server is reachable
@@ -403,7 +404,7 @@
   ✓ unlink large → 1
   ✓ unlink fast (<100ms)
   ✓ large zset immediately gone
-  ℹ  returned in 0.1ms
+  ℹ  returned in 0.0ms
 
 ── Sets: SADD / SREM / SISMEMBER / SMISMEMBER / SCARD / SMEMBERS 
   ✓ sadd 3 new → 3
@@ -519,7 +520,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['port', '12590', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '12591', 'tls-cert-file', '/tmp/myred-primary-gy5y34gz/myred-primary-cert.pem', 'tls-key-file', '/tmp/myred-primary-gy5y34gz/myred-primary-key.pem', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
+  ✓ config get * -> array → ['port', '12590', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '12591', 'tls-cert-file', '/tmp/myred-primary-zn3dgte6/myred-primary-cert.pem', 'tls-key-file', '/tmp/myred-primary-zn3dgte6/myred-primary-key.pem', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -577,7 +578,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:1\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:72568832\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2789\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:7221\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:e895ef838192c925c2e9ec6760ed2eff38883e4a\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122299\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122299\r\n\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:1\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:72613888\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2789\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:9952\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:714d70e6611fe366484b065a98c25780ed6c12fb\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122299\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122299\r\n\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -610,7 +611,7 @@
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:72568832
+    used_memory_rss:72613888
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
@@ -625,7 +626,7 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:7221
+    rdb_last_save_time:9952
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -638,7 +639,7 @@
     # Replication
     role:master
     failover_state:no-failover
-    master_replid:e895ef838192c925c2e9ec6760ed2eff38883e4a
+    master_replid:714d70e6611fe366484b065a98c25780ed6c12fb
     master_replid2:0000000000000000000000000000000000000000
     second_repl_offset:-1
     connected_slaves:0
@@ -728,7 +729,7 @@
 
 ── Memory: incremental eviction (EVICT_RUNNING semantics) 
   ✓ write admitted during overshoot
-  ✓ idle drain under cap (2268000 -> 523908 <= 524288)
+  ✓ idle drain under cap (2268000 -> 524090 <= 524288)
 
 ── ECHO + inline protocol ────────────────────────────
   ✓ echo roundtrip
@@ -848,13 +849,13 @@
 ── Pub/Sub: fan-out under concurrent publishers ──────
   ✓ no publisher/reader errors
   ✓ every subscriber received every message
-    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.24s (16,797 deliveries/s)
+    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.08s (49,712 deliveries/s)
 
 ═══════════════════════════════════════════════════════
   Managed-instance phases
 ═══════════════════════════════════════════════════════
   Binary:   /home/kylemg/testfiles/testfiles/build-rel/server
-  Workdir:  /tmp/myred-suite-kixwjhto
+  Workdir:  /tmp/myred-suite-b_5b54of
   Ports:    from 12500
   Phases:   unit, memory, config, auth, security, persistence, tls, replication
 
@@ -957,7 +958,7 @@
   ✓ the connection is closed after repeated auth failures
   ✓ all 8 concurrent AUTHs completed
   ✓ all 200 PINGs were answered during the AUTH storm
-  info PING during an AUTH storm: p50=0.03ms p99=0.06ms
+  info PING during an AUTH storm: p50=0.02ms p99=0.08ms
          a synchronous Argon2 verify would put p99 at 20-60ms+; that gap is the whole point of the async path.
   ✓ AUTH #1 accepted (the credential survives any rehash)
   ✓ AUTH #2 accepted (the credential survives any rehash)
@@ -1111,7 +1112,7 @@
   ✓ the presented certificate can be fingerprinted
   ✓ CONFIG SET tls-cert-file is accepted
   ✓ [REG] new connections are served the NEW certificate
-  info hot reload took 0.51ms (a restart costs tens of ms and drops every connection)
+  info hot reload took 0.60ms (a restart costs tens of ms and drops every connection)
   ✓ CONFIG SET tls-key-file is accepted
   ✓ [REG] tls-key-file reads back the key path, not the cert path
   ✓ [REG] the connection established before the rotation still works
@@ -1308,16 +1309,16 @@
 
 ═══════════════════════════════════════════════════════
 Results: 1023/1023 passed
-Runtime: 50.10s (20.4 assertions/sec)
+Runtime: 49.65s (20.6 assertions/sec)
 All tests passed!
 Slowest sections:
-  7.91s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  7.92s  11/11  Pub/Sub: keyspace notifications (V8.3)
   7.00s  3/3  Replication: an idle link must survive
   5.29s  47/47  Replication: coordinated FAILOVER
-  5.15s  7/7  Security: protocol abuse (server must keep serving)
+  5.16s  7/7  Security: protocol abuse (server must keep serving)
   3.97s  9/9  Replication: REPLCONF ACK + WAIT
   3.55s  15/15  Replication: min-replicas-to-write durability floor
-  3.07s  11/11  Replication: a wedged link (silent, not closed)
+  3.02s  11/11  Replication: a wedged link (silent, not closed)
   1.26s  17/17  Replication: promotion keeps the history
 ═══════════════════════════════════════════════════════
 
@@ -1326,181 +1327,181 @@ Slowest sections:
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    0.64s
-  Throughput: 6240 ops/sec
+  Elapsed:    0.19s
+  Throughput: 20993 ops/sec
+  note client-bound (GIL-contended); never use this to compare transports — see --bench for server throughput
   Total ops:   4000
   Errors:      0
-  Latency avg: 1.14ms
+  Latency avg: 0.35ms
   Latency min: 0.02ms
-  Latency max: 25.28ms
-  Latency p50: 0.26ms
-  Latency p95: 2.58ms
-  Latency p99: 20.05ms
+  Latency max: 2.37ms
+  Latency p50: 0.25ms
+  Latency p95: 0.92ms
+  Latency p99: 1.44ms
   No errors!
   Operation mix:
-    getex_px              125 ok     0 errors
-    sismember             125 ok     0 errors
-    getdel                122 ok     0 errors
-    smembers              121 ok     0 errors
-    set                   118 ok     0 errors
-    rpush                 118 ok     0 errors
-    strlen                116 ok     0 errors
-    keyspace_scan         114 ok     0 errors
+    hset                  123 ok     0 errors
+    lrange                117 ok     0 errors
+    smembers              117 ok     0 errors
+    mset                  116 ok     0 errors
+    ping                  113 ok     0 errors
+    incr                  112 ok     0 errors
     sadd                  112 ok     0 errors
-    append                109 ok     0 errors
-    ttl_triplet           109 ok     0 errors
-    zscore                108 ok     0 errors
+    strlen                111 ok     0 errors
+    del                   111 ok     0 errors
+    zscore                111 ok     0 errors
+    sscan                 111 ok     0 errors
+    srandmember           108 ok     0 errors
   Slowest operations by average latency:
-    keys                  17.81ms avg over 88 ops
-    keyspace_scan         12.76ms avg over 114 ops
-    hscan                  1.51ms avg over 98 ops
-    sscan                  1.28ms avg over 98 ops
-    hgetall                1.17ms avg over 100 ops
-    smembers               1.15ms avg over 121 ops
-    zrevquery              0.87ms avg over 77 ops
-    lrange                 0.65ms avg over 93 ops
-    ttl_triplet            0.62ms avg over 109 ops
-    list_pop_trim          0.58ms avg over 97 ops
-    zquery                 0.57ms avg over 101 ops
-    zpopmin                0.49ms avg over 102 ops
-  ℹ  cleaned 169 leftover keys
+    keyspace_scan          1.32ms avg over 102 ops
+    ttl_triplet            0.81ms avg over 95 ops
+    list_pop_trim          0.80ms avg over 94 ops
+    object_encoding        0.55ms avg over 86 ops
+    keys                   0.55ms avg over 97 ops
+    getex_px               0.55ms avg over 92 ops
+    config_get             0.33ms avg over 96 ops
+    srandmember            0.31ms avg over 108 ops
+    hscan                  0.31ms avg over 99 ops
+    hset                   0.31ms avg over 123 ops
+    zrevquery              0.31ms avg over 104 ops
+    getdel                 0.31ms avg over 94 ops
+  ℹ  cleaned 165 leftover keys
 
 ═══════════════════════════════════════════════════════
   Speed baseline (redis-benchmark)
 ═══════════════════════════════════════════════════════
   PING_INLINE: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  PING_INLINE: 1612903.25 requests per second, p50=0.279 msec
-  PING_MBULK: 1587301.50 requests per second, p50=0.279 msec
+  PING_INLINE: 1612903.25 requests per second, p50=0.247 msec
+  PING_MBULK: 1562499.88 requests per second, p50=0.287 msec
   SET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  SET: 1408450.62 requests per second, p50=0.407 msec
+  SET: 1388889.00 requests per second, p50=0.415 msec
   GET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  GET: 1428571.38 requests per second, p50=0.407 msec
+  GET: 1428571.38 requests per second, p50=0.415 msec
   INCR: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  INCR: 1265822.75 requests per second, p50=0.471 msec
+  INCR: 1282051.25 requests per second, p50=0.471 msec
   LPUSH: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  LPUSH: 1219512.12 requests per second, p50=0.463 msec
+  LPUSH: 1250000.00 requests per second, p50=0.463 msec
   RPUSH: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  RPUSH: 1265822.75 requests per second, p50=0.463 msec
+  RPUSH: 1250000.00 requests per second, p50=0.463 msec
   LPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  LPOP: 1351351.38 requests per second, p50=0.439 msec
+  LPOP: 1111111.12 requests per second, p50=0.463 msec
   RPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  RPOP: 1265822.75 requests per second, p50=0.447 msec
+  RPOP: 1041666.69 requests per second, p50=0.463 msec
   SADD: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  SADD: 1265822.75 requests per second, p50=0.463 msec
+  SADD: 1010101.00 requests per second, p50=0.503 msec
   HSET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  HSET: 1265822.75 requests per second, p50=0.479 msec
+  HSET: 1250000.00 requests per second, p50=0.487 msec
   SPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  SPOP: 1492537.25 requests per second, p50=0.367 msec
+  SPOP: 1449275.38 requests per second, p50=0.375 msec
   ZADD: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  ZADD: 1204819.38 requests per second, p50=0.503 msec
+  ZADD: 1204819.38 requests per second, p50=0.511 msec
   ZPOPMIN: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  ZPOPMIN: 1041666.69 requests per second, p50=0.479 msec
+  ZPOPMIN: 1333333.25 requests per second, p50=0.431 msec
   LPUSH (needed to benchmark LRANGE): rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  LPUSH (needed to benchmark LRANGE): 1219512.12 requests per second, p50=0.471 msec
-  LRANGE_100 (first 100 elements): rps=125952.0 (overall: 176898.9) avg_msec=4.199 (overall: 4.199) 31488 requests
-  LRANGE_100 (first 100 elements): rps=195136.0 (overall: 187551.4) avg_msec=4.055 (overall: 4.112) 80272 requests
-  LRANGE_100 (first 100 elements): 189035.92 requests per second, p50=3.951 msec
-  LRANGE_300 (first 300 elements): rps=25768.9 (overall: 45549.3) avg_msec=5.828 (overall: 5.828) 6468 requests
-  LRANGE_300 (first 300 elements): rps=53464.0 (overall: 50596.9) avg_msec=5.069 (overall: 5.317) 19834 requests
-  LRANGE_300 (first 300 elements): rps=54111.6 (overall: 51968.9) avg_msec=5.030 (overall: 5.200) 33416 requests
-  LRANGE_300 (first 300 elements): rps=56488.0 (overall: 53234.0) avg_msec=4.681 (overall: 5.046) 47538 requests
-  LRANGE_300 (first 300 elements): rps=57840.0 (overall: 54241.5) avg_msec=4.698 (overall: 4.965) 61998 requests
-  LRANGE_300 (first 300 elements): rps=58296.0 (overall: 54969.1) avg_msec=4.669 (overall: 4.909) 76572 requests
-  LRANGE_300 (first 300 elements): rps=56008.0 (overall: 55127.7) avg_msec=4.850 (overall: 4.900) 90630 requests
-  LRANGE_300 (first 300 elements): 55679.29 requests per second, p50=4.351 msec
-  LRANGE_500 (first 500 elements): rps=6888.0 (overall: 19133.3) avg_msec=11.227 (overall: 11.227) 1722 requests
-  LRANGE_500 (first 500 elements): rps=28912.0 (overall: 26323.5) avg_msec=8.022 (overall: 8.639) 8950 requests
-  LRANGE_500 (first 500 elements): rps=28603.2 (overall: 27293.9) avg_msec=7.640 (overall: 8.193) 16158 requests
-  LRANGE_500 (first 500 elements): rps=27464.0 (overall: 27344.4) avg_msec=8.086 (overall: 8.161) 23024 requests
-  LRANGE_500 (first 500 elements): rps=25920.3 (overall: 27017.4) avg_msec=8.401 (overall: 8.214) 29530 requests
-  LRANGE_500 (first 500 elements): rps=28868.0 (overall: 27361.9) avg_msec=7.968 (overall: 8.166) 36747 requests
-  LRANGE_500 (first 500 elements): rps=26912.7 (overall: 27290.9) avg_msec=8.070 (overall: 8.151) 43529 requests
-  LRANGE_500 (first 500 elements): rps=29206.3 (overall: 27552.2) avg_msec=7.513 (overall: 8.059) 50889 requests
-  LRANGE_500 (first 500 elements): rps=28358.6 (overall: 27648.7) avg_msec=7.959 (overall: 8.046) 58007 requests
-  LRANGE_500 (first 500 elements): rps=27876.5 (overall: 27673.1) avg_msec=8.118 (overall: 8.054) 65004 requests
-  LRANGE_500 (first 500 elements): rps=27904.0 (overall: 27695.3) avg_msec=8.103 (overall: 8.059) 71980 requests
-  LRANGE_500 (first 500 elements): rps=28269.8 (overall: 27746.1) avg_msec=8.247 (overall: 8.076) 79104 requests
-  LRANGE_500 (first 500 elements): rps=26980.1 (overall: 27684.1) avg_msec=7.805 (overall: 8.054) 85876 requests
-  LRANGE_500 (first 500 elements): rps=27533.6 (overall: 27672.7) avg_msec=7.588 (overall: 8.019) 92842 requests
-  LRANGE_500 (first 500 elements): rps=27832.7 (overall: 27683.9) avg_msec=7.983 (overall: 8.017) 99828 requests
-  LRANGE_500 (first 500 elements): 27700.83 requests per second, p50=7.791 msec
-  LRANGE_600 (first 600 elements): rps=18818.2 (overall: 19755.2) avg_msec=10.806 (overall: 10.806) 4761 requests
-  LRANGE_600 (first 600 elements): rps=21656.1 (overall: 20728.7) avg_msec=9.835 (overall: 10.287) 10240 requests
-  LRANGE_600 (first 600 elements): rps=21587.3 (overall: 21018.8) avg_msec=9.946 (overall: 10.169) 15680 requests
-  LRANGE_600 (first 600 elements): rps=21274.9 (overall: 21083.2) avg_msec=9.637 (overall: 10.034) 21020 requests
-  LRANGE_600 (first 600 elements): rps=22664.0 (overall: 21400.2) avg_msec=9.668 (overall: 9.956) 26686 requests
-  LRANGE_600 (first 600 elements): rps=22826.1 (overall: 21640.7) avg_msec=9.675 (overall: 9.906) 32461 requests
-  LRANGE_600 (first 600 elements): rps=22924.6 (overall: 21825.3) avg_msec=9.631 (overall: 9.864) 38238 requests
-  LRANGE_600 (first 600 elements): rps=22642.9 (overall: 21928.1) avg_msec=9.822 (overall: 9.859) 43944 requests
-  LRANGE_600 (first 600 elements): rps=22646.8 (overall: 22008.4) avg_msec=9.793 (overall: 9.851) 49651 requests
-  LRANGE_600 (first 600 elements): rps=22462.2 (overall: 22053.8) avg_msec=9.642 (overall: 9.830) 55289 requests
-  LRANGE_600 (first 600 elements): rps=22496.0 (overall: 22093.9) avg_msec=9.612 (overall: 9.810) 60913 requests
-  LRANGE_600 (first 600 elements): rps=22532.0 (overall: 22130.4) avg_msec=9.699 (overall: 9.800) 66546 requests
-  LRANGE_600 (first 600 elements): rps=22382.5 (overall: 22149.8) avg_msec=9.871 (overall: 9.806) 72164 requests
-  LRANGE_600 (first 600 elements): rps=22043.7 (overall: 22142.2) avg_msec=10.157 (overall: 9.831) 77719 requests
-  LRANGE_600 (first 600 elements): rps=21786.6 (overall: 22118.3) avg_msec=9.854 (overall: 9.833) 83231 requests
-  LRANGE_600 (first 600 elements): rps=20980.1 (overall: 22047.1) avg_msec=10.177 (overall: 9.853) 88497 requests
-  LRANGE_600 (first 600 elements): rps=21892.4 (overall: 22038.0) avg_msec=10.121 (overall: 9.869) 93992 requests
-  LRANGE_600 (first 600 elements): rps=22148.0 (overall: 22044.1) avg_msec=10.220 (overall: 9.888) 99529 requests
-  LRANGE_600 (first 600 elements): 22060.45 requests per second, p50=9.759 msec
+  LPUSH (needed to benchmark LRANGE): 1234567.88 requests per second, p50=0.463 msec
+  LRANGE_100 (first 100 elements): rps=125004.0 (overall: 175284.9) avg_msec=4.256 (overall: 4.256) 31376 requests
+  LRANGE_100 (first 100 elements): rps=194432.0 (overall: 186442.9) avg_msec=4.070 (overall: 4.143) 79984 requests
+  LRANGE_100 (first 100 elements): 187969.92 requests per second, p50=3.975 msec
+  LRANGE_300 (first 300 elements): rps=26936.0 (overall: 48446.0) avg_msec=6.631 (overall: 6.631) 6734 requests
+  LRANGE_300 (first 300 elements): rps=57641.4 (overall: 54364.1) avg_msec=4.642 (overall: 5.274) 21202 requests
+  LRANGE_300 (first 300 elements): rps=54920.0 (overall: 54581.2) avg_msec=4.900 (overall: 5.127) 34932 requests
+  LRANGE_300 (first 300 elements): rps=55713.1 (overall: 54900.1) avg_msec=4.796 (overall: 5.032) 48916 requests
+  LRANGE_300 (first 300 elements): rps=55672.0 (overall: 55069.2) avg_msec=4.728 (overall: 4.965) 62834 requests
+  LRANGE_300 (first 300 elements): rps=56494.0 (overall: 55326.2) avg_msec=4.792 (overall: 4.933) 77014 requests
+  LRANGE_300 (first 300 elements): rps=56486.1 (overall: 55503.3) avg_msec=4.654 (overall: 4.890) 91192 requests
+  LRANGE_300 (first 300 elements): 55617.35 requests per second, p50=4.327 msec
+  LRANGE_500 (first 500 elements): rps=6816.0 (overall: 19586.2) avg_msec=11.636 (overall: 11.636) 1704 requests
+  LRANGE_500 (first 500 elements): rps=29780.9 (overall: 27156.8) avg_msec=7.481 (overall: 8.252) 9179 requests
+  LRANGE_500 (first 500 elements): rps=27726.2 (overall: 27400.0) avg_msec=7.569 (overall: 7.957) 16166 requests
+  LRANGE_500 (first 500 elements): rps=27676.0 (overall: 27482.1) avg_msec=8.076 (overall: 7.993) 23085 requests
+  LRANGE_500 (first 500 elements): rps=27948.2 (overall: 27589.4) avg_msec=8.236 (overall: 8.049) 30100 requests
+  LRANGE_500 (first 500 elements): rps=27853.8 (overall: 27639.1) avg_msec=7.933 (overall: 8.027) 37147 requests
+  LRANGE_500 (first 500 elements): rps=28448.0 (overall: 27766.0) avg_msec=8.040 (overall: 8.029) 44259 requests
+  LRANGE_500 (first 500 elements): rps=27432.5 (overall: 27720.5) avg_msec=8.160 (overall: 8.047) 51172 requests
+  LRANGE_500 (first 500 elements): rps=27412.0 (overall: 27683.7) avg_msec=8.002 (overall: 8.042) 58025 requests
+  LRANGE_500 (first 500 elements): rps=27765.9 (overall: 27692.5) avg_msec=8.191 (overall: 8.058) 65022 requests
+  LRANGE_500 (first 500 elements): rps=27776.0 (overall: 27700.5) avg_msec=8.089 (overall: 8.061) 71966 requests
+  LRANGE_500 (first 500 elements): rps=26266.9 (overall: 27574.2) avg_msec=8.733 (overall: 8.117) 78559 requests
+  LRANGE_500 (first 500 elements): rps=28652.0 (overall: 27661.2) avg_msec=8.105 (overall: 8.116) 85722 requests
+  LRANGE_500 (first 500 elements): rps=27243.0 (overall: 27629.9) avg_msec=7.764 (overall: 8.090) 92560 requests
+  LRANGE_500 (first 500 elements): rps=27648.0 (overall: 27631.1) avg_msec=7.836 (overall: 8.073) 99472 requests
+  LRANGE_500 (first 500 elements): 27662.52 requests per second, p50=7.831 msec
+  LRANGE_600 (first 600 elements): rps=19314.7 (overall: 21263.2) avg_msec=10.537 (overall: 10.537) 4848 requests
+  LRANGE_600 (first 600 elements): rps=22422.3 (overall: 21870.6) avg_msec=9.990 (overall: 10.243) 10476 requests
+  LRANGE_600 (first 600 elements): rps=22604.0 (overall: 22122.1) avg_msec=9.799 (overall: 10.087) 16127 requests
+  LRANGE_600 (first 600 elements): rps=22406.4 (overall: 22194.9) avg_msec=9.599 (overall: 9.961) 21751 requests
+  LRANGE_600 (first 600 elements): rps=22636.0 (overall: 22284.6) avg_msec=9.683 (overall: 9.904) 27410 requests
+  LRANGE_600 (first 600 elements): rps=22251.0 (overall: 22278.9) avg_msec=10.034 (overall: 9.926) 32995 requests
+  LRANGE_600 (first 600 elements): rps=22301.6 (overall: 22282.2) avg_msec=9.767 (overall: 9.903) 38615 requests
+  LRANGE_600 (first 600 elements): rps=22230.2 (overall: 22275.6) avg_msec=9.696 (overall: 9.877) 44217 requests
+  LRANGE_600 (first 600 elements): rps=22392.0 (overall: 22288.6) avg_msec=9.619 (overall: 9.848) 49815 requests
+  LRANGE_600 (first 600 elements): rps=22664.0 (overall: 22326.4) avg_msec=9.924 (overall: 9.855) 55481 requests
+  LRANGE_600 (first 600 elements): rps=22406.4 (overall: 22333.7) avg_msec=9.882 (overall: 9.858) 61105 requests
+  LRANGE_600 (first 600 elements): rps=22268.0 (overall: 22328.2) avg_msec=9.924 (overall: 9.863) 66672 requests
+  LRANGE_600 (first 600 elements): rps=22728.0 (overall: 22359.1) avg_msec=9.741 (overall: 9.854) 72354 requests
+  LRANGE_600 (first 600 elements): rps=22239.0 (overall: 22350.4) avg_msec=9.756 (overall: 9.847) 77936 requests
+  LRANGE_600 (first 600 elements): rps=22028.0 (overall: 22328.9) avg_msec=9.754 (overall: 9.841) 83443 requests
+  LRANGE_600 (first 600 elements): rps=21893.7 (overall: 22301.2) avg_msec=9.873 (overall: 9.843) 89004 requests
+  LRANGE_600 (first 600 elements): rps=22246.0 (overall: 22297.9) avg_msec=9.759 (overall: 9.838) 94610 requests
+  LRANGE_600 (first 600 elements): 22306.49 requests per second, p50=9.631 msec
   MSET (10 keys): rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan) 0 requests
-  MSET (10 keys): 625000.00 requests per second, p50=1.111 msec
+  MSET (10 keys): 588235.31 requests per second, p50=1.111 msec
 
 -- Throughput summary ----------------------------------
   test                    ops/sec    p50 ms
-  ping_inline           1,612,903     0.279
-  ping_mbulk            1,587,302     0.279
-  spop                  1,492,537     0.367
-  get                   1,428,571     0.407
-  set                   1,408,451     0.407
-  lpop                  1,351,351     0.439
-  incr                  1,265,823     0.471
-  rpush                 1,265,823     0.463
-  rpop                  1,265,823     0.447
-  sadd                  1,265,823     0.463
-  hset                  1,265,823     0.479
-  lpush                 1,219,512     0.463
-  zadd                  1,204,819     0.503
-  zpopmin               1,041,667     0.479
-  mset                    625,000     1.111
-  lrange_100              189,036     3.951
-  lrange_300               55,679     4.351
-  lrange_500               27,701     7.791
-  lrange_600               22,060     9.759
+  ping_inline           1,612,903     0.247
+  ping_mbulk            1,562,500     0.287
+  spop                  1,449,275     0.375
+  get                   1,428,571     0.415
+  set                   1,388,889     0.415
+  zpopmin               1,333,333     0.431
+  incr                  1,282,051     0.471
+  lpush                 1,250,000     0.463
+  rpush                 1,250,000     0.463
+  hset                  1,250,000     0.487
+  zadd                  1,204,819     0.511
+  lpop                  1,111,111     0.463
+  rpop                  1,041,667     0.463
+  sadd                  1,010,101     0.503
+  mset                    588,235     1.111
+  lrange_100              187,970     3.975
+  lrange_300               55,617     4.327
+  lrange_500               27,663     7.831
+  lrange_600               22,306     9.631
 
 -- Command Metrics -------------------------------------
-  Commands observed: 40986
+  Commands observed: 40858
   RESP errors:       214 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.21ms
-  Latency p50/p95/p99: 0.02/0.31/1.33ms
-  Latency max:       1001.18ms
+  Latency avg:       0.13ms
+  Latency p50/p95/p99: 0.02/0.30/0.60ms
+  Latency max:       1001.26ms
   Most used commands:
-    set             27083 calls
-    zadd             2023 calls
-    rpush            1436 calls
-    get              1068 calls
+    set             26990 calls
+    zadd             2026 calls
+    rpush            1425 calls
+    get              1088 calls
     publish          1009 calls
-    del               717 calls
-    lpop              599 calls
+    del               731 calls
+    lpop              596 calls
     sadd              459 calls
-    hset              402 calls
-    srem              401 calls
-    type              375 calls
-    info              360 calls
+    hset              444 calls
+    srem              413 calls
+    srandmember       364 calls
+    type              363 calls
   Slowest commands by average latency:
-    wait             618.11ms avg over 4 calls
-    auth              24.46ms avg over 2 calls
-    keys              16.52ms avg over 95 calls
-    scan              11.79ms avg over 117 calls
-    acl                4.41ms avg over 36 calls
-    hscan              1.45ms avg over 102 calls
-    sscan              1.23ms avg over 102 calls
-    hgetall            1.11ms avg over 106 calls
-    smembers           1.02ms avg over 137 calls
-    zrevquery          0.84ms avg over 79 calls
-    bgsave             0.58ms avg over 2 calls
-    lrange             0.55ms avg over 110 calls
+    wait             617.93ms avg over 4 calls
+    auth              24.77ms avg over 2 calls
+    acl                4.36ms avg over 36 calls
+    bgsave             0.61ms avg over 2 calls
+    keys               0.52ms avg over 104 calls
+    scan               0.45ms avg over 105 calls
+    zrevquery          0.30ms avg over 106 calls
+    hscan              0.30ms avg over 103 calls
+    zpopmin            0.29ms avg over 102 calls
+    getdel             0.29ms avg over 98 calls
+    lpush              0.28ms avg over 102 calls
+    mset               0.28ms avg over 122 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
