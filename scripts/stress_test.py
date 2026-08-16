@@ -54,8 +54,13 @@ import argparse
 import sys
 import os
 import re
+import json
+import select
 import shutil
+import signal
+import hashlib
 import subprocess
+import tempfile
 import atexit
 import ssl
 from typing import Any, Optional
@@ -109,28 +114,42 @@ class _Tee:
 
 
 def run_kind(args) -> str:
-    """Which phase mix this invocation runs. Precedence: bench > stress > correctness."""
-    if args.bench:
-        return "bench"
+    """Which phase mix this invocation runs.
+
+    'full' is the everything run: the managed-instance phases only exist when a
+    binary was named, so naming one is what distinguishes a complete run from a
+    live-server one.
+    """
     if args.stress_only:
         return "stress"
     if args.correctness_only:
         return "correctness"
+    if getattr(args, "server", None):
+        return "full"
+    if args.bench:
+        return "bench"
     return "stress_results"
 
 
-def default_log_path(args) -> str:
-    """Per-run log name so a TLS run never overwrites the plaintext one.
+def default_log_path(args, facts: dict) -> str:
+    """Per-run log path, split by environment first.
 
-    docs/{bench,stress,correctness,stress_results}_{plain,tls}.md
+        <log-dir>/{WSL,Native}/{full,bench,stress,correctness,stress_results}_{plain,tls}.md
+
+    The environment directory is the point: a throughput number from a VM and
+    one from bare metal are not the same measurement, and filing them under one
+    name makes the difference disappear the moment the second run finishes.
     """
-    return os.path.join("docs",
+    root = getattr(args, "log_dir", None) or os.path.join("docs", "logs")
+    return os.path.join(root, env_slug(facts),
                         f"{run_kind(args)}_{'tls' if args.tls else 'plain'}.md")
 
 
 def run_label(args, host: str, port: int) -> str:
     """One-line human description of what this run actually covers."""
     phases = {
+        "full":           "correctness + concurrency + managed-instance phases "
+                          "+ stress" + (" + redis-benchmark" if args.bench else ""),
         "bench":          "correctness + concurrency + stress + redis-benchmark",
         "stress":         "stress only",
         "correctness":    "correctness only",
@@ -179,7 +198,10 @@ def send_request(sock: socket.socket, *args: str) -> None:
     out = bytearray()
     out += f"*{len(args)}\r\n".encode()
     for a in args:
-        encoded = a.encode()
+        # str() rather than a bare .encode(): callers pass ints for counts and
+        # timeouts often enough that requiring strings only ever produces a
+        # TypeError somewhere far from the mistake.
+        encoded = str(a).encode()
         out += f"${len(encoded)}\r\n".encode()
         out += encoded
         out += b"\r\n"
@@ -3400,11 +3422,39 @@ def test_transaction_watch(r: TestRunner, host: str, port: int):
         b.close()
 
 
+# Parsed redis-benchmark output, kept so the run summary carries comparable
+# numbers instead of only a wall of text. `-q` prints one line per test:
+#   SET: 123456.78 requests per second, p50=0.207 msec
+#   LRANGE_100 (first 100 elements): 45678.12 requests per second, p50=1.7 msec
+_BENCH_LINE = re.compile(
+    r"^(?P<name>[^:]+):\s+(?P<rps>[\d.]+)\s+requests per second"
+    r"(?:.*?p50=(?P<p50>[\d.]+))?", re.I)
+
+
+def _bench_name(raw: str) -> Optional[str]:
+    """Normalize a redis-benchmark label into a stable key, or None to drop it.
+
+    The lrange tests carry a parenthetical ("first 100 elements") that is part
+    of the label, not of the identity, and the run prints an extra LPUSH line
+    for the data it has to load first — a real measurement of something nobody
+    asked for, which would otherwise sit in the table next to the real LPUSH row.
+    """
+    name = raw.strip()
+    if "needed to benchmark" in name.lower():
+        return None
+    return name.split(" (")[0].strip().lower()
+
+BENCH_RESULTS = {"params": None, "tests": {}}
+
+
 def run_redis_benchmark(host: str, port: int, password: Optional[str],
                         requests: int, clients: int, pipeline: int) -> bool:
     print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  Speed baseline (redis-benchmark){RESET}")
     print(f"{'═' * 55}")
+    BENCH_RESULTS["params"] = {"requests": requests, "clients": clients,
+                               "pipeline": pipeline,
+                               "transport": "tls" if G_TLS else "plain"}
     exe = shutil.which("redis-benchmark")
     if not exe:
         print(f"{YELLOW}redis-benchmark not found — skipping (install redis-tools){RESET}")
@@ -3458,13 +3508,3592 @@ def run_redis_benchmark(host: str, port: int, password: Optional[str],
             ok = False
             continue
         for ln in proc.stdout.splitlines():
-            if ln.strip():
-                print(f"  {ln}")
+            if not ln.strip():
+                continue
+            print(f"  {ln}")
+            m = _BENCH_LINE.match(ln.strip())
+            if m:
+                key = _bench_name(m.group("name"))
+                if key:
+                    BENCH_RESULTS["tests"][key] = {
+                        "rps": float(m.group("rps")),
+                        "p50": float(m.group("p50")) if m.group("p50") else None,
+                    }
         if proc.returncode != 0:
             for ln in proc.stderr.splitlines():
                 print(f"  {RED}{ln}{RESET}")
             ok = False
     return ok
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PLATFORM — which machine produced these numbers
+#
+#  Everything here is read straight out of the kernel (/proc, /sys) rather than
+#  guessed from `platform.uname()`, because the two questions that decide whether
+#  a throughput number is comparable — "is this WSL?" and "is the CPU allowed to
+#  run flat out?" — are only answerable from the kernel's own view.
+#
+#  The environment kind picks the log directory (docs/logs/WSL vs docs/logs/
+#  Native), so a run from a VM and a run from bare metal never overwrite each
+#  other's results.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _read(path: str, limit: int = 65536) -> Optional[str]:
+    """Read a /proc or /sys file, or None if it does not exist / is unreadable."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read(limit).strip()
+    except OSError:
+        return None
+
+
+def _proc_kv(path: str, keys) -> dict:
+    """Pull `key: value` lines (the /proc/meminfo and /proc/cpuinfo shape)."""
+    out = {}
+    text = _read(path)
+    if not text:
+        return out
+    wanted = set(keys)
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        if k in wanted and k not in out:
+            out[k] = v.strip()
+    return out
+
+
+def _cpu_count_from_proc() -> Optional[int]:
+    text = _read("/proc/cpuinfo")
+    if not text:
+        return None
+    n = sum(1 for l in text.splitlines() if l.startswith("processor"))
+    return n or None
+
+
+def _is_wsl(osrelease: str, version: str) -> Optional[str]:
+    """Return 'WSL1'/'WSL2'/None. Four independent signals, because any one of
+    them can be absent: a custom-built WSL2 kernel drops 'microsoft' from
+    osrelease, and a container inside WSL has no WSL_DISTRO_NAME."""
+    blob = f"{osrelease} {version}".lower()
+    hit = ("microsoft" in blob or "wsl" in blob
+           or os.environ.get("WSL_DISTRO_NAME")
+           or os.environ.get("WSL_INTEROP")
+           or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+           or os.path.exists("/run/WSL"))
+    if not hit:
+        return None
+    # WSL1 emulates the syscall surface on an NT kernel and reports a 4.4
+    # osrelease; WSL2 is a real Linux kernel in a Hyper-V VM. They are not
+    # comparable to each other, let alone to bare metal.
+    if "wsl2" in blob:
+        return "WSL2"
+    if osrelease.startswith("4.4.") and "microsoft" in blob:
+        return "WSL1"
+    return "WSL2"
+
+
+def _in_container() -> Optional[str]:
+    if os.path.exists("/.dockerenv"):
+        return "docker"
+    cg = _read("/proc/1/cgroup") or ""
+    for marker in ("docker", "kubepods", "containerd", "lxc", "podman"):
+        if marker in cg:
+            return marker
+    return None
+
+
+def platform_facts() -> dict:
+    """Kernel-sourced description of this machine. Values that are unavailable
+    come back None rather than being invented."""
+    osrelease = _read("/proc/sys/kernel/osrelease") or ""
+    version = _read("/proc/version") or ""
+    cpu = _proc_kv("/proc/cpuinfo", ("model name", "cpu MHz", "flags"))
+    mem = _proc_kv("/proc/meminfo", ("MemTotal", "SwapTotal"))
+    wsl = _is_wsl(osrelease, version)
+
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = None
+    try:
+        import resource
+        nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:
+        nofile = None
+
+    flags = cpu.get("flags", "")
+    facts = {
+        # identity
+        "env":            "WSL" if wsl else "Native",
+        "wsl_version":    wsl,
+        "container":      _in_container(),
+        "kernel":         osrelease or None,
+        "kernel_build":   (version.split(" #")[0] or None) if version else None,
+        "product":        _read("/sys/class/dmi/id/product_name"),
+        "init":           _read("/proc/1/comm"),
+        "virtualized":    ("hypervisor" in flags) if flags else None,
+        # capacity
+        "cpu_model":      cpu.get("model name"),
+        "cpu_threads":    _cpu_count_from_proc() or os.cpu_count(),
+        "cpu_affinity":   affinity,
+        "cpu_mhz":        cpu.get("cpu MHz"),
+        "mem_total":      mem.get("MemTotal"),
+        "swap_total":     mem.get("SwapTotal"),
+        # things that silently change a benchmark
+        "governor":       _read("/sys/devices/system/cpu/cpu0/cpufreq/"
+                                "scaling_governor"),
+        "no_turbo":       _read("/sys/devices/system/cpu/intel_pstate/no_turbo"),
+        "loadavg":        _read("/proc/loadavg"),
+        "somaxconn":      _read("/proc/sys/net/core/somaxconn"),
+        "overcommit":     _read("/proc/sys/vm/overcommit_memory"),
+        "tcp_ulp":        _read("/proc/sys/net/ipv4/tcp_available_ulp"),
+        "nofile_soft":    nofile,
+        # who ran it
+        "python":         sys.version.split()[0],
+        "uname":          " ".join(os.uname()) if hasattr(os, "uname") else None,
+    }
+    return facts
+
+
+def env_slug(facts: dict) -> str:
+    """The log subdirectory: 'WSL' or 'Native'. Exactly two buckets on purpose —
+    the split exists so a WSL number is never mistaken for a bare-metal one."""
+    return "WSL" if facts.get("env") == "WSL" else "Native"
+
+
+def print_platform(facts: dict):
+    print(f"\n{BOLD}{BLUE}-- Platform (read from the kernel) {'-' * 21}{RESET}")
+    kind = facts["env"]
+    detail = facts.get("wsl_version") or ""
+    if facts.get("container"):
+        detail = f"{detail} in {facts['container']}".strip()
+    elif not detail and facts.get("virtualized"):
+        detail = "virtualized"
+    print(f"  Environment:  {BOLD}{kind}{RESET}" + (f" ({detail})" if detail else ""))
+    print(f"  Kernel:       {facts.get('kernel')}")
+    if facts.get("product"):
+        print(f"  Product:      {facts['product']}")
+    print(f"  CPU:          {facts.get('cpu_model')}")
+    print(f"  Threads:      {facts.get('cpu_threads')} "
+          f"(usable by this process: {facts.get('cpu_affinity')})")
+    print(f"  Memory:       {facts.get('mem_total')}"
+          + (f"  swap {facts['swap_total']}" if facts.get("swap_total") else ""))
+    print(f"  Governor:     {facts.get('governor') or 'n/a'}"
+          + (f"  no_turbo={facts['no_turbo']}" if facts.get("no_turbo") else ""))
+    print(f"  Load average: {facts.get('loadavg')}")
+    print(f"  somaxconn:    {facts.get('somaxconn')}   "
+          f"nofile={facts.get('nofile_soft')}   "
+          f"tcp_ulp={facts.get('tcp_ulp') or 'none'}")
+
+    # The two caveats that actually invalidate a throughput comparison.
+    if facts.get("governor") not in (None, "performance"):
+        print(f"  {YELLOW}note{RESET} the CPU governor is "
+              f"'{facts.get('governor')}' — throughput will vary with how warm "
+              f"the machine is. 'performance' is the comparable setting.")
+    try:
+        busy = float((facts.get("loadavg") or "0").split()[0])
+        if busy > 1.0:
+            print(f"  {YELLOW}note{RESET} load average is {busy} before the run "
+                  f"started — something else is using this machine and the "
+                  f"numbers below are not a clean baseline.")
+    except (ValueError, IndexError):
+        pass
+
+
+# ─── build type of the binary under test ──────────────────────────────────────
+#
+# A Debug build runs mem_selfcheck() after every command and it walks the whole
+# keyspace, so it is O(keyspace) per command. Correctness runs on Debug are
+# valuable (that walk is what catches accounting drift); speed runs on Debug are
+# meaningless. We can only tell when the caller names the binary.
+
+OPTIMIZED_BUILD_TYPES = {"release", "relwithdebinfo", "minsizerel"}
+
+
+def build_facts(binary: Optional[str]) -> dict:
+    """CMAKE_BUILD_TYPE from the CMakeCache.txt beside the binary, plus whether
+    the binary still carries debug info. Either alone can mislead: RelWithDebInfo
+    has debug info and is optimized; a hand-compiled binary has no cache file."""
+    out = {"binary": binary, "cmake_build_type": None, "debug_info": None,
+           "optimized": None}
+    if not binary or not os.path.exists(binary):
+        return out
+    out["binary"] = os.path.abspath(binary)
+    cache = os.path.join(os.path.dirname(out["binary"]), "CMakeCache.txt")
+    text = _read(cache) or ""
+    for line in text.splitlines():
+        if line.startswith("CMAKE_BUILD_TYPE:"):
+            out["cmake_build_type"] = line.split("=", 1)[1].strip() or None
+            break
+    exe = shutil.which("file")
+    if exe:
+        try:
+            res = subprocess.run([exe, "-b", out["binary"]],
+                                 capture_output=True, text=True, timeout=10)
+            out["debug_info"] = "with debug_info" in res.stdout
+        except (OSError, subprocess.SubprocessError):
+            pass
+    t = (out["cmake_build_type"] or "").lower()
+    if t:
+        out["optimized"] = t in OPTIMIZED_BUILD_TYPES
+    elif out["debug_info"] is not None:
+        out["optimized"] = not out["debug_info"]
+    return out
+
+
+def warn_if_unmeasurable(bf: dict, benching: bool) -> bool:
+    """Print the build type; return False when it is unfit for a speed run."""
+    label = bf.get("cmake_build_type") or (
+        "unknown (no CMakeCache.txt beside the binary)")
+    print(f"  Build:        {label}"
+          + (f"  [{os.path.basename(os.path.dirname(bf['binary']))}/]"
+             if bf.get("binary") else ""))
+    if bf.get("optimized") is False:
+        print(f"  {YELLOW}warning{RESET} this is a Debug build: mem_selfcheck() "
+              f"walks the whole keyspace after every command, so every timing "
+              f"below is O(keyspace) per op. Correctness is still valid — speed "
+              f"is not. Build with "
+              f"-DCMAKE_BUILD_TYPE=Release for numbers.")
+        return not benching
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SERVER CONTROL — phases that own their own instances
+#
+#  Everything above this line talks to a server somebody else started. The
+#  phases below need process control: a restart is the only way to prove the AOF
+#  replays, a SIGKILL is the only way to prove crash recovery, and replication
+#  needs two instances and a link between them that can be cut.
+#
+#  Each instance runs on a private high port in its own temp directory with its
+#  own config, so a run is safe while a real server is up on 1234, and two
+#  concurrent runs on different --base-port values cannot collide.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SPAWN_TIMEOUT = 15.0          # boot-to-listening; generous for a Debug build
+
+
+class Instance:
+    """One server lifetime: spawn in `workdir`, SIGTERM on stop, keep stderr.
+
+    stderr is kept in a file rather than a pipe because several phases assert on
+    what the server logged, and because a failure without the server's own words
+    is unusable evidence.
+    """
+
+    def __init__(self, binary: str, workdir: str, conf: str, tag: str, port: int):
+        self.binary = binary
+        self.workdir = workdir
+        self.conf = conf
+        self.tag = tag
+        self.port = port
+        self.stderr_path = os.path.join(workdir, f"stderr-{tag}.log")
+        self.log = open(self.stderr_path, "wb")
+        self.proc = subprocess.Popen([binary, conf], cwd=workdir,
+                                     stdout=self.log, stderr=self.log)
+        deadline = time.time() + SPAWN_TIMEOUT
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                self.log.close()
+                tail = "\n      ".join(
+                    self.stderr_text().strip().splitlines()[-6:])
+                raise RuntimeError(
+                    f"[{tag}] server exited at startup "
+                    f"(rc={self.proc.returncode}), see {self.stderr_path}\n"
+                    f"    stderr tail:\n      {tail}")
+            try:
+                socket.create_connection(("127.0.0.1", port), 0.2).close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.stop()
+        raise RuntimeError(f"[{tag}] server never opened port {port}")
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        if not self.log.closed:
+            self.log.close()
+
+    def kill9(self):
+        """Simulate a crash: SIGKILL, no shutdown save, possibly torn AOF tail."""
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if not self.log.closed:
+            self.log.close()
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def stderr_text(self) -> str:
+        try:
+            with open(self.stderr_path, "rb") as f:
+                return f.read().decode(errors="replace")
+        except OSError:
+            return ""
+
+    def stderr_tail(self, n: int = 12) -> list:
+        return self.stderr_text().strip().splitlines()[-n:]
+
+
+def write_conf(path: str, lines) -> str:
+    with open(path, "w") as f:
+        f.write("".join(str(l) + "\n" for l in lines))
+    return path
+
+
+# ─── raw client for spawned instances ─────────────────────────────────────────
+#
+# The live-server client above reads the --tls/--password globals, which is
+# exactly wrong here: these instances have their own passwords and are
+# plaintext unless the phase asked for TLS. So these open a bare socket and
+# authenticate with what the caller passes.
+
+def raw_conn(port: int, password: Optional[str] = None,
+             user: Optional[str] = None, host: str = "127.0.0.1",
+             timeout: float = TIMEOUT_SEC) -> socket.socket:
+    s = socket.create_connection((host, port), timeout)
+    s.settimeout(timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    if password is not None:
+        args = ("auth", user, password) if user else ("auth", password)
+        deadline = time.time() + TIMEOUT_SEC
+        while True:
+            send_request(s, *args)
+            try:
+                reply = recv_response(s)
+                break
+            except RespError as e:
+                # k_max_auth_inflight is 4; a burst of connects can legally bounce
+                if "BUSY" in str(e) and time.time() < deadline:
+                    time.sleep(0.05)
+                    continue
+                s.close()
+                raise
+        if reply != "OK":
+            s.close()
+            raise RespError(f"AUTH failed: {reply!r}")
+    return s
+
+
+def err_of(sock: socket.socket, *args: str) -> Optional[str]:
+    """Send a command; return the error text, or None if it did NOT error."""
+    try:
+        cmd(sock, *args)
+        return None
+    except RespError as e:
+        return str(e)
+
+
+def reply_or_err(sock: socket.socket, *args: str):
+    """(reply, error_text) — exactly one is None.
+
+    `cmd` raises on -ERR, which inside a long sequence would abandon every check
+    after it. A phase has to be able to record "this was rejected" and carry on.
+    """
+    try:
+        return cmd(sock, *args), None
+    except RespError as e:
+        return None, str(e)
+
+
+def info_dict(sock: socket.socket, section: Optional[str] = None) -> dict:
+    """INFO as a dict, falling back to the whole dump if the section is unknown."""
+    try:
+        raw = cmd(sock, "INFO", section) if section else cmd(sock, "INFO")
+    except RespError:
+        raw = cmd(sock, "INFO")
+    out = {}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k] = v
+    return out
+
+
+def wait_until(pred, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    """Poll until pred() is truthy. Swallows the transient errors that a
+    reconnecting instance produces while it is between links."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if pred():
+                return True
+        except (RuntimeError, ConnectionError, OSError):
+            pass
+        time.sleep(interval)
+    return False
+
+
+def has_directive(sock: socket.socket, name: str) -> bool:
+    """Capability probe: does this binary know the directive at all? Phases gate
+    on this rather than on a version string, so the suite stays runnable while a
+    milestone is half-applied and says which half is missing."""
+    try:
+        r = cmd(sock, "CONFIG", "GET", name)
+    except RespError:
+        return False
+    return isinstance(r, list) and len(r) >= 2
+
+
+def get_directive(sock: socket.socket, name: str):
+    r = cmd(sock, "CONFIG", "GET", name)
+    return r[1] if isinstance(r, list) and len(r) >= 2 else None
+
+
+# ─── phase context ────────────────────────────────────────────────────────────
+
+class PhaseCtx:
+    """What a spawned phase gets: the binary, a private port range, a temp
+    workdir, and the shared TestRunner.
+
+    Instances register themselves here so the evidence dump can find them even
+    when a phase dies halfway through — which is precisely when their stderr is
+    worth reading.
+    """
+
+    def __init__(self, r: "TestRunner", server_bin: str, root: str,
+                 base_port: int, destructive: bool = False):
+        self.r = r
+        self.server_bin = server_bin
+        self.root = root
+        self.destructive = destructive
+        self._next_port = base_port
+        self.instances = []          # [(tag, Instance)]
+        self.skipped = 0
+
+    # -- ports -------------------------------------------------------------
+    def port(self) -> int:
+        """Next free private port. Bind-tests each candidate: a stale instance
+        from an interrupted run would otherwise be adopted as ours."""
+        for _ in range(200):
+            p = self._next_port
+            self._next_port += 1
+            try:
+                probe = socket.socket()
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("127.0.0.1", p))
+                probe.close()
+                return p
+            except OSError:
+                continue
+        raise RuntimeError("no free port in range")
+
+    def ports(self, n: int) -> list:
+        return [self.port() for _ in range(n)]
+
+    # -- directories -------------------------------------------------------
+    def dir(self, name: str) -> str:
+        d = os.path.join(self.root, name)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # -- instances ---------------------------------------------------------
+    def start(self, tag: str, workdir: str, conf: str, port: int) -> Instance:
+        inst = Instance(self.server_bin, workdir, conf, tag, port)
+        self.instances.append((tag, inst))
+        return inst
+
+    def restart(self, inst: Instance, tag: Optional[str] = None) -> Instance:
+        """Stop and re-spawn from the same config — the shape every persistence
+        assertion needs. Returns the NEW instance; the old one is dead."""
+        inst.stop()
+        return self.start(tag or f"{inst.tag}-restart", inst.workdir,
+                          inst.conf, inst.port)
+
+    def stop_all(self):
+        for _, inst in reversed(self.instances):
+            try:
+                inst.stop()
+            except Exception:
+                pass
+
+    # -- assertions --------------------------------------------------------
+    def ok(self, name: str, condition, detail: str = "") -> bool:
+        """check(name, cond) with a failure detail — the shape the ported
+        phases are written in. Anything falsy fails."""
+        if condition:
+            print(f"  {GREEN}✓{RESET} {name}")
+            self.r.passed += 1
+            self.r._record_result(True)
+            return True
+        print(f"  {RED}✗{RESET} {name}" + (f"\n    {detail}" if detail else ""))
+        self.r.errors.append(name)
+        self.r.failed += 1
+        self.r._record_result(False)
+        return False
+
+    def skip(self, name: str, why: str):
+        """Not a pass and not a failure: this binary does not have the feature.
+        Counted and reported separately so a skipped milestone can never be
+        mistaken for a green one."""
+        self.skipped += 1
+        print(f"  {YELLOW}skip{RESET} {name} — {why}")
+
+    def section(self, title: str):
+        self.r.section(title)
+
+    # -- evidence ----------------------------------------------------------
+    def dump_evidence(self, limit: int = 12):
+        for tag, inst in self.instances:
+            tail = inst.stderr_tail(limit)
+            if not tail:
+                continue
+            print(f"\n{YELLOW}{tag} stderr tail ({inst.stderr_path}){RESET}")
+            for line in tail:
+                print("   " + line)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: PERSISTENCE — AOF gating, replay, rewrite, hybrid, restart matrix
+#
+#  Every check here needs a restart, a crash, or the bytes on disk, so none of
+#  them can be expressed against a live server. The invariant they share: what
+#  the server answers before a restart and what it answers after must be the
+#  same thing.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+AOF_MAGIC = b"MYAOFRDB"
+
+
+def _aof_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def _frame(name: str) -> bytes:
+    """The exact bulk-string encoding of one AOF argument, so a search for the
+    SET frame cannot match the letters 's','e','t' inside a value."""
+    b = name.encode()
+    return b"$%d\r\n%s\r\n" % (len(b), b)
+
+
+def _wait_for_aof(path: str, needle: bytes, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in _aof_bytes(path):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for_hybrid(path: str, timeout: float = 10.0) -> bool:
+    """BGREWRITEAOF finalizes asynchronously and renames the tmp over the AOF;
+    wait for the magic rather than for a fixed sleep."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _aof_bytes(path)[:8] == AOF_MAGIC:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _replay_log_clean(ctx: "PhaseCtx", inst: "Instance", label: str):
+    err = inst.stderr_text()
+    ctx.ok(f"{label}: stderr shows a replay happened",
+           "aof_load: replayed" in err,
+           f"stderr had no 'aof_load: replayed' line ({inst.stderr_path})")
+    bad = [l for l in err.splitlines() if "aof_load: WARNING" in l]
+    ctx.ok(f"{label}: no replay-error WARNING in stderr", not bad,
+           bad[0] if bad else "")
+
+
+def _snapshot(sock: socket.socket) -> dict:
+    """Full keyspace snapshot: {key: (type, value-repr)} for exact comparison.
+    Exact rather than "the keys I remember writing", because eviction picks its
+    own victims and the post-restart keyspace must match whatever it chose."""
+    snap = {}
+    for k in sorted(cmd(sock, "KEYS") or []):
+        t = cmd(sock, "TYPE", k)
+        if t == "string":
+            v = cmd(sock, "GET", k)
+        elif t == "zset":
+            v = tuple((m, cmd(sock, "ZSCORE", k, m)) for m in ("a", "b", "c"))
+        elif t == "hash":
+            v = tuple(cmd(sock, "HGETALL", k) or [])
+        elif t == "set":
+            v = tuple(sorted(cmd(sock, "SMEMBERS", k) or []))
+        elif t == "list":
+            v = tuple(cmd(sock, "LRANGE", k, "0", "-1") or [])
+        else:
+            v = f"<{t}>"
+        snap[k] = (t, v)
+    return snap
+
+
+def phase_aof_gating(ctx: "PhaseCtx"):
+    """What reaches the AOF and what must not.
+
+    The gate is the whole point: a read in the log is a correctness bug on
+    replay (it re-runs as a write on a replica), and a no-op write in the log
+    means the command's "did anything change?" test is wrong.
+    """
+    ctx.section("Persistence: AOF write gating")
+    port = ctx.port()
+    d = ctx.dir("aof-gate")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        "appendonly yes",
+        "appendfilename appendonly.aof",
+        # 'always' rather than 'everysec': the assertions are about the bytes on
+        # disk, and a 1s window would turn every one of them into a race.
+        "appendfsync always",
+        "dbfilename dump.rdb",
+        'save ""',
+    ])
+    aof = os.path.join(d, "appendonly.aof")
+    srv = ctx.start("aof-gate", d, conf, port)
+    s = raw_conn(port)
+
+    cmd(s, "SET", "gate:foo", "bar")
+    cmd(s, "INCR", "gate:counter")
+    cmd(s, "GET", "gate:foo")                       # read  -> must NOT be logged
+    cmd(s, "SETEX", "gate:sess", "100", "hi")       # write -> SET + PEXPIREAT
+    cmd(s, "SETNX", "gate:foo", "NOPE")             # no-op -> must NOT be logged
+    cmd(s, "DEL", "gate:missing")                   # no-op -> must NOT be logged
+    cmd(s, "EXPIRE", "gate:foo", "5000")            # -> absolute PEXPIREAT
+
+    ctx.ok("AOF exists and is non-empty",
+           _wait_for_aof(aof, _frame("gate:foo")),
+           f"nothing landed in {aof}")
+    blob = _aof_bytes(aof)
+
+    ctx.ok("the write was logged", _frame("gate:foo") in blob)
+    ctx.ok("[REG] a read is never logged", _frame("get") not in blob,
+           "a GET frame reached the AOF — on replay it would run as a command "
+           "against a loading keyspace")
+    ctx.ok("[REG] a failed SETNX is not logged", _frame("NOPE") not in blob,
+           "SETNX that changed nothing still wrote a frame — the no-op gate is "
+           "not consulted")
+    ctx.ok("[REG] a DEL of a missing key is not logged",
+           _frame("gate:missing") not in blob,
+           "DEL of a nonexistent key wrote a frame")
+
+    # SETEX must decompose: a relative TTL replayed verbatim would restart the
+    # clock on every boot and the key would never expire.
+    ctx.ok("SETEX is logged as SET + absolute PEXPIREAT",
+           _frame("SET") in blob and _frame("PEXPIREAT") in blob,
+           "no SET/PEXPIREAT pair in the AOF")
+    ctx.ok("SETEX's relative TTL is not in the log", _frame("setex") not in blob,
+           "the verbatim SETEX frame is there — its TTL restarts on every replay")
+    ctx.ok("EXPIRE is rewritten to an absolute PEXPIREAT",
+           _frame("expire") not in blob and blob.count(_frame("PEXPIREAT")) >= 2,
+           f"PEXPIREAT frames found: {blob.count(_frame('PEXPIREAT'))}")
+
+    # ordering: the value has to exist before its deadline is applied
+    ctx.ok("PEXPIREAT follows the SET it belongs to",
+           blob.find(_frame("SET")) < blob.find(_frame("PEXPIREAT")),
+           "the deadline frame precedes the value frame")
+
+    # the TTL survives a restart as an absolute deadline
+    ttl_before = cmd(s, "TTL", "gate:sess")
+    s.close()
+    srv = ctx.restart(srv, "aof-gate-replay")
+    s = raw_conn(port)
+    _replay_log_clean(ctx, srv, "replay")
+    ttl_after = cmd(s, "TTL", "gate:sess")
+    ctx.ok("SETEX ttl survived the restart without resetting",
+           isinstance(ttl_after, int) and 0 < ttl_after <= (ttl_before or 100),
+           f"before={ttl_before} after={ttl_after}")
+    ctx.ok("INCR replayed to the same value", cmd(s, "GET", "gate:counter") == "1",
+           f"got {cmd(s, 'GET', 'gate:counter')!r}")
+    s.close()
+    srv.stop()
+
+
+def phase_aof_rewrite(ctx: "PhaseCtx"):
+    """BGREWRITEAOF: manual and automatic, and what the compacted file has to
+    still reconstruct."""
+    ctx.section("Persistence: BGREWRITEAOF (manual + auto-trigger)")
+    port = ctx.port()
+    d = ctx.dir("aof-rewrite")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        "appendonly yes",
+        "appendfilename appendonly.aof",
+        "appendfsync always",
+        "dbfilename dump.rdb",
+        'save ""',
+        # The auto-trigger is deliberately LEFT AT ITS DEFAULT (64 MB floor)
+        # for the manual half. Arming it here would let a background rewrite
+        # land in the middle of the measurement, and then "the file did not
+        # shrink" means "it had already been compacted", not a bug.
+    ])
+    aof = os.path.join(d, "appendonly.aof")
+    srv = ctx.start("aof-rewrite", d, conf, port)
+    s = raw_conn(port)
+
+    # bloat: one key rewritten 2000 times is 2000 frames that compact to one
+    for i in range(2000):
+        cmd(s, "SET", "rw:k", str(i))
+    cmd(s, "RPUSH", "rw:list", "a", "b", "c", "d", "e")
+    cmd(s, "HSET", "rw:h", "f1", "v1", "f2", "v2")
+    cmd(s, "SADD", "rw:s", "m1", "m2", "m3")
+    # The TTL goes on a key nothing overwrites afterwards: SET discards a TTL by
+    # design, so putting it on rw:k would make the test assert Redis semantics
+    # are broken when they are working.
+    cmd(s, "SET", "rw:ttl", "keepme")
+    cmd(s, "EXPIRE", "rw:ttl", "10000")
+    _wait_for_aof(aof, _frame("rw:ttl"))
+    before = len(_aof_bytes(aof))
+
+    cmd(s, "BGREWRITEAOF")
+    got_hybrid = _wait_for_hybrid(aof)
+    ctx.ok("manual BGREWRITEAOF produced a hybrid file (MYAOFRDB preamble)",
+           got_hybrid, f"first 8 bytes: {_aof_bytes(aof)[:8]!r}")
+    after = len(_aof_bytes(aof))
+    ctx.ok(f"the rewrite compacted the log ({before} -> {after} bytes)",
+           after < before, f"before={before} after={after}")
+
+    # Finalize renames the temp over the AOF, so a .tmp during the rewrite is
+    # correct and only one that OUTLIVES it is a leak. Poll for its absence.
+    def _no_tmp():
+        return not [f for f in os.listdir(d) if f.endswith(".tmp")]
+    ctx.ok("[REG] the rewrite leaves no temp file behind",
+           wait_until(_no_tmp, 10.0),
+           f"leftovers: {[f for f in os.listdir(d) if f.endswith('.tmp')]}")
+    ctx.ok("[REG] no misspelled AOF file was created",
+           not [f for f in os.listdir(d) if f.startswith("appebdonly")],
+           f"found: {[f for f in os.listdir(d) if f.startswith('appebdonly')]}")
+
+    # Auto-trigger: arm it only now, then bloat past the growth percentage.
+    #
+    # The assertion is on the server's own "aof_rewrite: started" line, not on
+    # the file shrinking. Once armed, the threshold is 100% growth over a 195-byte
+    # base, so the trigger fires again every few hundred writes — which means a
+    # size sampled after the loop is a size sampled at an arbitrary point in some
+    # later growth cycle, and "did it shrink?" is a coin flip. Counting the log
+    # line makes the same question deterministic. No BGREWRITEAOF is issued from
+    # here on, so any increase can only be the auto-trigger.
+    mark = srv.stderr_text().count("aof_rewrite: started")
+    cmd(s, "CONFIG", "SET", "auto-aof-rewrite-min-size", "4096")
+    cmd(s, "CONFIG", "SET", "auto-aof-rewrite-percentage", "100")
+    for i in range(2000):
+        cmd(s, "SET", "rw:k", str(i))
+    fired = wait_until(
+        lambda: srv.stderr_text().count("aof_rewrite: started") > mark, 10.0)
+    ctx.ok("the auto-trigger fired at the configured growth percentage", fired,
+           f"the AOF is {len(_aof_bytes(aof))} bytes over a 4096-byte floor and "
+           f"the server never logged another rewrite — "
+           f"auto-aof-rewrite-percentage never tripped")
+
+    # Disarm before the restart: a rewrite still in flight when the server stops
+    # is a race between finalize and shutdown, and it belongs to a different test
+    # than the one below.
+    cmd(s, "CONFIG", "SET", "auto-aof-rewrite-min-size", "67108864")
+    wait_until(_no_tmp, 10.0)
+
+    ttl_before = cmd(s, "TTL", "rw:ttl")
+    ctx.ok("the TTL is still live before the restart",
+           isinstance(ttl_before, int) and ttl_before > 0, f"ttl={ttl_before}")
+    s.close()
+    srv = ctx.restart(srv, "aof-rewrite-replay")
+    s = raw_conn(port)
+    _replay_log_clean(ctx, srv, "post-rewrite replay")
+    ctx.ok("the compacted file reconstructs the string",
+           cmd(s, "GET", "rw:k") == "1999", f"got {cmd(s, 'GET', 'rw:k')!r}")
+    ttl_after = cmd(s, "TTL", "rw:ttl")
+    ctx.ok("[REG] the TTL survived the rewrite as an absolute deadline",
+           isinstance(ttl_after, int) and 0 < ttl_after <= (ttl_before or 10000),
+           f"before={ttl_before} after={ttl_after} — a rewrite that emits no "
+           f"PEXPIREAT loses every TTL in the snapshot")
+    ctx.ok("compacted file reconstructs the list",
+           cmd(s, "LRANGE", "rw:list", "0", "-1") == ["a", "b", "c", "d", "e"])
+    ctx.ok("compacted file reconstructs the hash",
+           cmd(s, "HGET", "rw:h", "f1") == "v1")
+    ctx.ok("compacted file reconstructs the set", cmd(s, "SCARD", "rw:s") == 3)
+    s.close()
+    srv.stop()
+
+
+def phase_aof_hybrid(ctx: "PhaseCtx"):
+    """The hybrid format: RDB preamble + RESP delta.
+
+    Three distinct failure modes live here, and only the third is loud:
+      - the delta written after a rewrite is lost (silent: the preamble loads
+        and the dataset looks plausible, just older),
+      - a plain RESP file with no preamble stops loading (breaks every existing
+        deployment on upgrade),
+      - a torn tail eats the preamble instead of truncating (total data loss).
+    """
+    ctx.section("Persistence: hybrid AOF (RDB preamble + RESP delta)")
+    port = ctx.port()
+    d = ctx.dir("aof-hybrid")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        "appendonly yes",
+        "appendfilename appendonly.aof",
+        "appendfsync always",
+        "dbfilename dump.rdb",
+        'save ""',
+    ])
+    aof = os.path.join(d, "appendonly.aof")
+    srv = ctx.start("aof-hybrid", d, conf, port)
+    s = raw_conn(port)
+
+    cmd(s, "SET", "hy:s", "hello")
+    cmd(s, "EXPIRE", "hy:s", "9000")
+    cmd(s, "RPUSH", "hy:list", "a", "b", "c", "d")
+    cmd(s, "HSET", "hy:h", "f1", "v1", "f2", "v2")
+    cmd(s, "SADD", "hy:set", "x", "y", "z")
+    cmd(s, "ZADD", "hy:z", "1", "a", "2", "b", "3", "c")
+    cmd(s, "BGREWRITEAOF")
+    ctx.ok("rewrite produced the MYAOFRDB preamble", _wait_for_hybrid(aof),
+           f"first 8 bytes: {_aof_bytes(aof)[:8]!r}")
+
+    # the delta: written AFTER the rewrite, so it appends as RESP behind the RDB
+    cmd(s, "SET", "hy:delta", "123")
+    cmd(s, "LPUSH", "hy:list", "FRONT")
+    _wait_for_aof(aof, _frame("hy:delta"))
+    s.close()
+
+    srv = ctx.restart(srv, "aof-hybrid-replay")
+    s = raw_conn(port)
+    err = srv.stderr_text()
+    ctx.ok("stderr reports loading the RDB preamble",
+           "RDB preamble" in err or "preamble" in err,
+           f"no preamble line in {srv.stderr_path}")
+    ctx.ok("preamble restored the string", cmd(s, "GET", "hy:s") == "hello")
+    ctx.ok("preamble restored the TTL",
+           isinstance(cmd(s, "TTL", "hy:s"), int) and cmd(s, "TTL", "hy:s") > 0)
+    ctx.ok("preamble restored the hash", cmd(s, "HGET", "hy:h", "f2") == "v2")
+    ctx.ok("preamble restored the set", cmd(s, "SCARD", "hy:set") == 3)
+    ctx.ok("preamble restored the zset",
+           as_float(cmd(s, "ZSCORE", "hy:z", "b")) == 2.0)
+    ctx.ok("[REG] the RESP delta replayed on top of the preamble",
+           cmd(s, "GET", "hy:delta") == "123",
+           "the preamble loaded but the delta written after the rewrite is "
+           "gone — the silent half of the hybrid bug")
+    ctx.ok("delta ordering survived (LPUSH landed at the front)",
+           cmd(s, "LRANGE", "hy:list", "0", "-1")
+           == ["FRONT", "a", "b", "c", "d"])
+    s.close()
+    srv.stop()
+
+    # backward compatibility: a plain RESP AOF with no preamble must still load
+    os.remove(aof)
+    for junk in ("dump.rdb",):
+        p = os.path.join(d, junk)
+        if os.path.exists(p):
+            os.remove(p)
+    with open(aof, "wb") as f:
+        f.write(b"*3\r\n$3\r\nset\r\n$6\r\ncompat\r\n$3\r\nyes\r\n")
+    srv = ctx.start("aof-compat", d, conf, port)
+    s = raw_conn(port)
+    ctx.ok("[REG] a plain RESP AOF with no preamble still loads",
+           cmd(s, "GET", "compat") == "yes",
+           "a pre-hybrid AOF stopped loading — every existing deployment would "
+           "come up empty on upgrade")
+    _replay_log_clean(ctx, srv, "plain-RESP load")
+    s.close()
+    srv.stop()
+
+    # torn tail: a half-written command must truncate, not condemn the preamble
+    os.remove(aof)
+    p = os.path.join(d, "dump.rdb")
+    if os.path.exists(p):
+        os.remove(p)
+    srv = ctx.start("aof-torn-seed", d, conf, port)
+    s = raw_conn(port)
+    cmd(s, "SET", "hy:keep", "me")
+    cmd(s, "BGREWRITEAOF")
+    made = _wait_for_hybrid(aof)
+    s.close()
+    srv.stop()
+    if not made:
+        ctx.skip("torn-tail recovery",
+                 "the rewrite never produced a hybrid file, so the test would "
+                 "not be exercising the preamble path")
+        return
+    with open(aof, "ab") as f:
+        f.write(b"*3\r\n$3\r\nset")          # half a command, as a crash leaves it
+    srv = ctx.start("aof-torn", d, conf, port)
+    s = raw_conn(port)
+    ctx.ok("[REG] a torn RESP tail truncates and leaves the preamble intact",
+           cmd(s, "GET", "hy:keep") == "me",
+           "the partial trailing frame took the whole file down with it")
+    ctx.ok("server is serving after recovering from the torn tail",
+           cmd(s, "PING") == "PONG")
+    s.close()
+    srv.stop()
+
+
+def phase_restart_matrix(ctx: "PhaseCtx"):
+    """Every write path whose AOF frame differs from the command that caused it.
+
+    A command that logs itself verbatim is uninteresting here. These are the
+    ones that translate — a relative TTL into an absolute deadline, an alias
+    into its canonical name, a pop into a delete — because a translation is
+    where the replay and the live reply can silently disagree.
+    """
+    ctx.section("Persistence: restart matrix (translated AOF frames)")
+    password = "restart-matrix-pass"
+    port = ctx.port()
+    d = ctx.dir("restart-matrix")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        f'requirepass "{password}"',
+        "appendonly yes",
+        "appendfilename appendonly.aof",
+        "appendfsync everysec",
+        "dbfilename dump.rdb",
+        'save ""',
+        "rename-command getdel gdel",
+    ])
+    aof = os.path.join(d, "appendonly.aof")
+    srv = ctx.start("restart-matrix", d, conf, port)
+    s = raw_conn(port, password)
+
+    # Eviction FIRST: allkeys-random can take ANY key, so the sentinels for the
+    # checks below must not exist yet — only the ev:* fodder may be sacrificed.
+    val = "e" * 400
+    for i in range(200):
+        cmd(s, "SET", f"ev:{i}", val)
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "allkeys-random")
+    cmd(s, "CONFIG", "SET", "maxmemory", "65536")
+    for i in range(200, 300):
+        try:
+            cmd(s, "SET", f"ev:{i}", val)
+        except RespError:
+            pass                        # OOM is fine; we only need evictions
+    time.sleep(0.5)                     # let evict_tick drain
+    cmd(s, "CONFIG", "SET", "maxmemory", "0")
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "noeviction")
+    dbsize = cmd(s, "DBSIZE")
+    ctx.ok("eviction actually removed keys", dbsize < 300, f"dbsize={dbsize}")
+
+    cmd(s, "SET", "rm:str", "v1")
+
+    # GETEX EX: the TTL must be logged as an absolute deadline
+    cmd(s, "SET", "rm:ttl", "vttl")
+    ctx.ok("GETEX rm:ttl ex 100 returns the value",
+           cmd(s, "GETEX", "rm:ttl", "ex", "100") == "vttl")
+    ttl1 = cmd(s, "TTL", "rm:ttl")
+    ctx.ok("GETEX set a TTL", isinstance(ttl1, int) and 0 < ttl1 <= 100,
+           f"ttl={ttl1}")
+
+    # GETDEL exists only under its alias; the AOF must carry the canonical name
+    cmd(s, "SET", "rm:gone", "bye")
+    ctx.ok("canonical 'getdel' is renamed away",
+           err_of(s, "GETDEL", "rm:gone") is not None)
+    ctx.ok("alias gdel returns the value", cmd(s, "gdel", "rm:gone") == "bye")
+    ctx.ok("gdel deleted the key", cmd(s, "EXISTS", "rm:gone") == 0)
+
+    # ZPOPMIN: the popped member must stay popped
+    cmd(s, "ZADD", "rm:z", "1", "a", "2", "b", "3", "c")
+    cmd(s, "ZPOPMIN", "rm:z")
+    ctx.ok("zpopmin removed the min member", cmd(s, "ZSCORE", "rm:z", "a") is None)
+    ctx.ok("zpopmin kept b", cmd(s, "ZSCORE", "rm:z", "b") is not None)
+
+    # SPOP: aof_self, and the case that had no coverage anywhere until now. SPOP
+    # picks its victim at random, so the frame it logs cannot be the command it
+    # received — it has to log the member it actually removed.
+    cmd(s, "SADD", "rm:spop", "m0", "m1", "m2", "m3", "m4")
+    popped = cmd(s, "SPOP", "rm:spop")
+    ctx.ok("SPOP returned a member", popped in ("m0", "m1", "m2", "m3", "m4"),
+           f"got {popped!r}")
+    ctx.ok("SPOP left 4 members", cmd(s, "SCARD", "rm:spop") == 4)
+    survivors = tuple(sorted(cmd(s, "SMEMBERS", "rm:spop") or []))
+
+    # SPOP with a count, and SPOP that empties the key — the empty-key path is
+    # the one that produced a malformed frame once already (via SREM).
+    cmd(s, "SADD", "rm:spopall", "a", "b", "c")
+    cmd(s, "SPOP", "rm:spopall", "3")
+    ctx.ok("SPOP <count> emptied the set", cmd(s, "EXISTS", "rm:spopall") == 0)
+
+    # SREM down to empty: the frame that shipped broken from V9.6.4 to V10
+    cmd(s, "SADD", "rm:srem", "only")
+    cmd(s, "SREM", "rm:srem", "only")
+    ctx.ok("SREM to empty removed the key", cmd(s, "EXISTS", "rm:srem") == 0)
+
+    cmd(s, "HSET", "rm:h", "f", "v")
+    cmd(s, "LPUSH", "rm:l", "x", "y", "z")
+
+    before = _snapshot(s)
+    ttl_before = cmd(s, "TTL", "rm:ttl")
+    s.close()
+    srv.stop()
+    ctx.ok("AOF exists and is non-empty",
+           os.path.exists(aof) and os.path.getsize(aof) > 0)
+
+    srv = ctx.start("restart-matrix-replay", d, conf, port)
+    s = raw_conn(port, password)
+    _replay_log_clean(ctx, srv, "restart")
+
+    after = _snapshot(s)
+    ctx.ok("keyspace size matches pre-shutdown", len(after) == len(before),
+           f"{len(before)} -> {len(after)}")
+    missing = [k for k in before if k not in after]
+    extra = [k for k in after if k not in before]
+    ctx.ok("no key lost by replay", not missing, f"missing: {missing[:5]}")
+    ctx.ok("no key resurrected by replay", not extra, f"extra: {extra[:5]}")
+    diff = [k for k in before if k in after and before[k] != after[k]]
+    ctx.ok("every surviving value is identical", not diff,
+           f"first diff: {diff[0] if diff else ''} "
+           f"{before.get(diff[0]) if diff else ''} != "
+           f"{after.get(diff[0]) if diff else ''}")
+
+    ttl2 = cmd(s, "TTL", "rm:ttl")
+    ctx.ok("GETEX ttl survived within its original bound",
+           isinstance(ttl2, int) and 0 < ttl2 <= (ttl_before or 100),
+           f"ttl before={ttl_before} after={ttl2}")
+    ctx.ok("gdel'd key is still gone", cmd(s, "EXISTS", "rm:gone") == 0)
+    ctx.ok("zpopmin'd member is still gone", cmd(s, "ZSCORE", "rm:z", "a") is None)
+    ctx.ok("[REG] the SPOP'd member is still gone after replay",
+           tuple(sorted(cmd(s, "SMEMBERS", "rm:spop") or [])) == survivors,
+           f"before={survivors} after="
+           f"{tuple(sorted(cmd(s, 'SMEMBERS', 'rm:spop') or []))} — SPOP logged "
+           f"the command instead of the member it actually removed, so the "
+           f"replay popped a different one")
+    ctx.ok("[REG] the set SPOP emptied stayed empty",
+           cmd(s, "EXISTS", "rm:spopall") == 0)
+    ctx.ok("[REG] the set SREM emptied stayed empty",
+           cmd(s, "EXISTS", "rm:srem") == 0)
+    ctx.ok("the alias still resolves after restart",
+           cmd(s, "SET", "rm:gone2", "x") == "OK"
+           and cmd(s, "gdel", "rm:gone2") == "x")
+
+    if ctx.destructive:
+        ctx.section("Persistence: crash recovery (SIGKILL mid-traffic)")
+        for i in range(50):
+            cmd(s, "SET", f"crash:{i}", "x")
+        s.close()
+        srv.kill9()                     # no shutdown save, AOF tail may be torn
+        try:
+            srv = ctx.start("crash-reboot", d, conf, port)
+            booted = True
+        except RuntimeError as e:
+            booted = False
+            ctx.ok("server boots after SIGKILL", False, str(e))
+        if booted:
+            ctx.ok("server boots after SIGKILL", True)
+            s = raw_conn(port, password)
+            n = sum(1 for i in range(50)
+                    if cmd(s, "EXISTS", f"crash:{i}") == 1)
+            # everysec fsync means a partial tail is CORRECT, not a failure —
+            # what must hold is that the boot succeeds and the pre-crash data
+            # is intact.
+            ctx.ok("the pre-crash keyspace is intact after the crash boot",
+                   cmd(s, "GET", "rm:str") == "v1",
+                   "data written long before the crash did not come back")
+            print(f"  {YELLOW}info{RESET} crash writes recovered: {n}/50 "
+                  f"(everysec fsync makes fewer than 50 correct)")
+            s.close()
+    else:
+        s.close()
+    srv.stop()
+
+
+def phase_rdb_roundtrip(ctx: "PhaseCtx"):
+    """RDB alone, with the AOF off: SAVE, restart, and every type has to come
+    back — including the TTL, which is the field an RDB writer forgets."""
+    ctx.section("Persistence: RDB save/load round-trip")
+    port = ctx.port()
+    d = ctx.dir("rdb")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        "appendonly no",
+        "dbfilename dump.rdb",
+        'save ""',
+    ])
+    srv = ctx.start("rdb", d, conf, port)
+    s = raw_conn(port)
+
+    cmd(s, "SET", "rdb:s", "value")
+    cmd(s, "EXPIRE", "rdb:s", "8000")
+    cmd(s, "RPUSH", "rdb:l", "a", "b", "c")
+    cmd(s, "HSET", "rdb:h", "f", "v")
+    cmd(s, "SADD", "rdb:set", "m1", "m2")
+    cmd(s, "ZADD", "rdb:z", "1.5", "a", "2.5", "b")
+    ctx.ok("SAVE returns OK", cmd(s, "SAVE") == "OK")
+    ctx.ok("dump.rdb was written",
+           os.path.getsize(os.path.join(d, "dump.rdb")) > 0)
+    before = _snapshot(s)
+    ttl_before = cmd(s, "TTL", "rdb:s")
+    s.close()
+
+    srv = ctx.restart(srv, "rdb-load")
+    s = raw_conn(port)
+    after = _snapshot(s)
+    ctx.ok("every key came back from the RDB", set(after) == set(before),
+           f"missing: {sorted(set(before) - set(after))} "
+           f"extra: {sorted(set(after) - set(before))}")
+    diff = [k for k in before if k in after and before[k] != after[k]]
+    ctx.ok("every value came back identical", not diff,
+           f"first diff: {diff[0] if diff else ''}")
+    ttl_after = cmd(s, "TTL", "rdb:s")
+    ctx.ok("the TTL came back from the RDB as an absolute deadline",
+           isinstance(ttl_after, int) and 0 < ttl_after <= (ttl_before or 8000),
+           f"before={ttl_before} after={ttl_after}")
+    ctx.ok("zset scores survived at full precision",
+           as_float(cmd(s, "ZSCORE", "rdb:z", "a")) == 1.5)
+    s.close()
+    srv.stop()
+
+
+def phase_persistence(ctx: "PhaseCtx"):
+    phase_aof_gating(ctx)
+    phase_aof_rewrite(ctx)
+    phase_aof_hybrid(ctx)
+    phase_rdb_roundtrip(ctx)
+    phase_restart_matrix(ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: SECURITY — ACL enforcement, renamed commands, audit log, protocol abuse
+#
+#  The instance here is disposable on purpose: several of these checks lock a
+#  connection out, rewrite the config file, and (with --destructive) throw
+#  malformed frames at the parser. None of that belongs anywhere near a server
+#  somebody is using.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SEC_ADMIN_PW = "sec-admin-pass"
+SEC_LIMITED_PW = "sec-limited-pass"
+SEC_KEYED_PW = "sec-keyed-pass"
+SEC_SMOVER_PW = "sec-smover-pass"
+SEC_WRONG_PW = "sec-wrong-pass-attempt"
+SEC_ALL_SECRETS = [SEC_ADMIN_PW, SEC_LIMITED_PW, SEC_KEYED_PW, SEC_SMOVER_PW,
+                   SEC_WRONG_PW]
+
+ACL_CATEGORIES = ["read", "write", "keyspace", "admin", "dangerous", "fast",
+                  "slow", "connection", "transaction"]
+
+
+def _noperm(sock: socket.socket, *args: str) -> bool:
+    """True iff the command is refused specifically with NOPERM. A plain -ERR
+    is not good enough: an unknown command would also 'fail'."""
+    e = err_of(sock, *args)
+    return e is not None and "NOPERM" in e
+
+
+def phase_security(ctx: "PhaseCtx"):
+    ctx.section("Security: ACL enforcement, renames, audit log")
+    port = ctx.port()
+    d = ctx.dir("security")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        f'requirepass "{SEC_ADMIN_PW}"',
+        'auditlog "audit.log"',
+        "appendonly no",
+        "dbfilename dump.rdb",
+        'save ""',
+        "rename-command flushall wipeall",
+        'rename-command object ""',
+    ])
+    audit_path = os.path.join(d, "audit.log")
+    srv = ctx.start("security", d, conf, port)
+    admin = raw_conn(port, SEC_ADMIN_PW)
+
+    ctx.ok("setuser limited (+@read +@write)",
+           cmd(admin, "ACL", "SETUSER", "limited", "on", f">{SEC_LIMITED_PW}",
+               "~*", "+@read", "+@write") == "OK")
+    ctx.ok("setuser keyed (~data:*)",
+           cmd(admin, "ACL", "SETUSER", "keyed", "on", f">{SEC_KEYED_PW}",
+               "~data:*", "+@read", "+@write") == "OK")
+    ctx.ok("setuser smover (~src:* ~dst:*)",
+           cmd(admin, "ACL", "SETUSER", "smover", "on", f">{SEC_SMOVER_PW}",
+               "~src:*", "~dst:*", "+@read", "+@write") == "OK")
+    ctx.ok("setuser ghost (passwordless — must survive a round-trip)",
+           cmd(admin, "ACL", "SETUSER", "ghost", "on", "~*", "+@read") == "OK")
+
+    def seed():
+        cmd(admin, "SET", "data:1", "d1")
+        cmd(admin, "SET", "other:1", "o1")
+        cmd(admin, "SADD", "src:s", "m")
+        cmd(admin, "SADD", "src:s2", "m2")
+    seed()
+
+    # --- control plane is not reachable from a data-plane grant --------------
+    # +@read +@write is the grant every application gets. If any admin command
+    # answers to it, the category split does nothing.
+    lim = raw_conn(port, SEC_LIMITED_PW, user="limited")
+    ctx.ok("limited: GET works", cmd(lim, "GET", "data:1") == "d1")
+    ctx.ok("limited: SET works", cmd(lim, "SET", "lim:k", "v") == "OK")
+    ctx.ok("limited: CONFIG GET denied", _noperm(lim, "CONFIG", "GET", "maxmemory"))
+    ctx.ok("limited: ACL WHOAMI denied", _noperm(lim, "ACL", "WHOAMI"))
+    ctx.ok("limited: KEYS denied", _noperm(lim, "KEYS"))
+    ctx.ok("limited: MEMORY denied", _noperm(lim, "MEMORY", "USAGE", "data:1"))
+    ctx.ok("limited: the flushall alias is denied too", _noperm(lim, "wipeall"),
+           "renaming a command must not launder its category")
+    lim.close()
+
+    # --- rename-command: canonical gone, alias live, '' disables -------------
+    ctx.ok("canonical FLUSHALL is unknown",
+           (err_of(admin, "FLUSHALL") or "").startswith("ERR"))
+    ctx.ok("a command renamed to '' is unreachable",
+           (err_of(admin, "OBJECT", "ENCODING", "data:1") or "").startswith("ERR"))
+    cmd(admin, "SET", "wipe:k", "x")
+    ctx.ok("the alias works for admin", cmd(admin, "wipeall") == "OK")
+    ctx.ok("the alias really flushed", cmd(admin, "EXISTS", "wipe:k") == 0)
+    seed()
+
+    # --- audit log: the events are there, the secrets are not ----------------
+    anon = raw_conn(port)
+    bad = err_of(anon, "AUTH", SEC_WRONG_PW)
+    anon.close()
+    ctx.ok("a wrong password is rejected", bad is not None)
+    time.sleep(0.3)                    # async auth completion writes the event
+    try:
+        with open(audit_path, "r", errors="replace") as f:
+            log = f.read()
+    except OSError as e:
+        log = ""
+        ctx.ok("audit log is readable", False, str(e))
+    ctx.ok("audit records auth_success", "event=auth_success" in log)
+    ctx.ok("audit records auth_fail", "event=auth_fail" in log)
+    ctx.ok("audit records acl_change", "sub=setuser" in log)
+    ctx.ok("audit records acl_deny", "event=acl_deny" in log)
+    leaked = [p for p in SEC_ALL_SECRETS if p and p in log]
+    ctx.ok("[REG] no plaintext password reaches the audit log", not leaked,
+           f"leaked: {leaked} — an audit log is copied around freely, so a "
+           f"password in it is worse than no log")
+
+    # --- key patterns, including the two-key resolver ------------------------
+    kd = raw_conn(port, SEC_KEYED_PW, user="keyed")
+    ctx.ok("keyed: a key inside the pattern is allowed",
+           cmd(kd, "GET", "data:1") == "d1")
+    ctx.ok("keyed: a key outside the pattern is denied",
+           _noperm(kd, "GET", "other:1"))
+    ctx.ok("keyed: writing outside the pattern is denied",
+           _noperm(kd, "SET", "other:2", "x"))
+    kd.close()
+    sm = raw_conn(port, SEC_SMOVER_PW, user="smover")
+    ctx.ok("smover: SMOVE with both keys granted is allowed",
+           cmd(sm, "SMOVE", "src:s", "dst:s", "m") == 1)
+    ctx.ok("[REG] smover: SMOVE to an ungranted destination is denied",
+           _noperm(sm, "SMOVE", "src:s2", "forbidden:d", "m2"),
+           "the key resolver only checked the source — a two-key command needs "
+           "both sides checked")
+    sm.close()
+
+    # --- ACL CAT: advertise and parse are a matched pair ---------------------
+    # A category emitted by ACL CAT but not accepted by ACL SETUSER writes a
+    # +@cat into the config that the NEXT boot rejects, silently dropping the
+    # grant. Adding a category means updating this list.
+    cats = cmd(admin, "ACL", "CAT")
+    ctx.ok("ACL CAT returns a list", isinstance(cats, list), f"got {cats!r}")
+    ctx.ok(f"ACL CAT lists exactly the {len(ACL_CATEGORIES)} categories",
+           sorted(cats or []) == sorted(ACL_CATEGORIES), f"got {cats!r}")
+    # 'off' first: User::enable defaults to true, so a bare SETUSER would leave
+    # an enabled +@admin +@dangerous user behind. Deleted immediately so it
+    # never reaches the CONFIG REWRITE below.
+    ctx.ok("[REG] every advertised category is also parseable",
+           all(cmd(admin, "ACL", "SETUSER", "cattest", "off", f"+@{c}") == "OK"
+               for c in (cats or [])),
+           f"got {cats!r}")
+    cmd(admin, "ACL", "DELUSER", "cattest")
+
+    # --- config round-trip: emit and parse are a matched pair too ------------
+    ctx.ok("CONFIG REWRITE returns OK", cmd(admin, "CONFIG", "REWRITE") == "OK")
+    with open(conf) as f:
+        newconf = f.read()
+    ctx.ok("the rewritten config keeps the port", f"port {port}" in newconf)
+    ctx.ok("the rewritten config keeps the users", "user limited" in newconf)
+    admin.close()
+    if f"port {port}" not in newconf:
+        ctx.ok("skipping the restart: the rewritten config lost its port",
+               False, "restarting would bind the default port instead")
+    else:
+        srv = ctx.restart(srv, "security-roundtrip")
+        admin = raw_conn(port, SEC_ADMIN_PW)
+        ctx.ok("admin auth survives the round-trip", cmd(admin, "PING") == "PONG")
+        ctx.ok("a passwordless user survives the round-trip",
+               cmd(admin, "ACL", "GETUSER", "ghost") is not None)
+        lim = raw_conn(port, SEC_LIMITED_PW, user="limited")
+        ctx.ok("limited auth survives the round-trip",
+               cmd(lim, "GET", "data:1") == "d1")
+        ctx.ok("limited is still denied the control plane after the round-trip",
+               _noperm(lim, "CONFIG", "GET", "maxmemory"),
+               "the grant widened across a rewrite — the emitted rule and the "
+               "parsed rule disagree")
+        lim.close()
+        admin.close()
+
+    if ctx.destructive:
+        ctx.section("Security: protocol abuse (server must keep serving)")
+
+        def abuse(name, payload):
+            raw = socket.socket()
+            raw.settimeout(TIMEOUT_SEC)
+            try:
+                raw.connect(("127.0.0.1", port))
+                raw.sendall(payload)
+                raw.recv(256)          # an error reply or a close — both fine
+            except OSError:
+                pass                   # killing its own connection is allowed
+            finally:
+                raw.close()
+            try:
+                probe = raw_conn(port, SEC_ADMIN_PW)
+                alive = cmd(probe, "PING") == "PONG"
+                probe.close()
+            except Exception:
+                alive = False
+            ctx.ok(f"server survives {name}", alive,
+                   "the malformed frame took the whole server down, not just "
+                   "its own connection")
+
+        abuse("an absurd multibulk count", b"*99999999\r\n")
+        abuse("a garbage array header", b"*abc\r\n")
+        abuse("a negative bulk length", b"*1\r\n$-5\r\n")
+        abuse("a bulk length that overflows int64",
+              b"*1\r\n$99999999999999999999\r\n")
+        abuse("an oversized inline line", b"x" * (2 * 1024 * 1024))
+        abuse("a key name full of RESP control bytes",
+              b"*3\r\n$3\r\nset\r\n$5\r\na\r\nb\r\n$1\r\nv\r\n")
+        ctx.ok("the server process is still alive", srv.alive())
+
+    srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: ASYNC AUTH — the KDF runs on a worker, the event loop must not stall
+#
+#  Argon2id costs tens of milliseconds by design. Verifying it on the event loop
+#  would stall every other connection for that long, so the verify runs on a
+#  worker and the connection is resumed by a completion. That design has three
+#  failure modes and each check below is one of them: commands pipelined behind
+#  the AUTH get lost or reordered, a completion is delivered to the wrong
+#  connection, or the loop stalls anyway.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+AUTH_PW = "async-auth-pass"
+
+
+class _Hang(Exception):
+    """The server accepted the connection and then never replied."""
+
+
+def _auth_retry(sock: socket.socket, password: str, tries: int = 8) -> str:
+    """AUTH, retrying past -BUSY: the inflight cap is a valid, bounded answer,
+    not a failure."""
+    for _ in range(tries):
+        send_request(sock, "auth", password)
+        try:
+            return recv_response(sock)
+        except RespError as e:
+            if "BUSY" in str(e):
+                time.sleep(0.25)
+                continue
+            raise
+    raise RuntimeError("still -BUSY after retries (the inflight cap never cleared)")
+
+
+def phase_async_auth(ctx: "PhaseCtx"):
+    ctx.section("Auth: async verify, pipelining, lockout, loop latency")
+    port = ctx.port()
+    d = ctx.dir("auth")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        f'requirepass "{AUTH_PW}"',
+        'auditlog "audit.log"',
+        "appendonly no",
+        'save ""',
+    ])
+    audit_path = os.path.join(d, "audit.log")
+    srv = ctx.start("auth", d, conf, port)
+
+    # --- pipeline gating + resume -------------------------------------------
+    # AUTH + PING + SET in ONE packet. The verify runs on a worker, so the two
+    # commands behind it must stay buffered (never executed pre-auth) and then
+    # be drained in order by the completion path.
+    s = socket.create_connection(("127.0.0.1", port), TIMEOUT_SEC)
+    s.settimeout(TIMEOUT_SEC)
+    try:
+        payload = bytearray()
+        for args in (("auth", AUTH_PW), ("ping",), ("set", "auth:k", "1")):
+            buf = bytearray()
+            buf += f"*{len(args)}\r\n".encode()
+            for a in args:
+                buf += f"${len(a)}\r\n{a}\r\n".encode()
+            payload += buf
+        s.sendall(bytes(payload))
+        r1 = recv_response(s)
+        if r1 != "OK":
+            ctx.ok("AUTH accepted", False, f"got {r1!r}")
+        else:
+            r2, r3 = recv_response(s), recv_response(s)
+            ctx.ok("[REG] three replies arrive in order (OK, PONG, OK)",
+                   r2 == "PONG" and r3 == "OK",
+                   f"got PING={r2!r} SET={r3!r} — the commands pipelined behind "
+                   f"AUTH were dropped or reordered")
+            send_request(s, "get", "auth:k")
+            ctx.ok("the pipelined SET actually executed with the authed identity",
+                   recv_response(s) == "1")
+    except OSError as e:
+        ctx.ok("pipelined AUTH did not hang", False, f"{type(e).__name__}: {e}")
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+    # --- wrong password + lockout -------------------------------------------
+    s = socket.create_connection(("127.0.0.1", port), TIMEOUT_SEC)
+    s.settimeout(TIMEOUT_SEC)
+    e = err_of(s, "auth", "definitely-wrong")
+    ctx.ok("a wrong password answers WRONGPASS",
+           e is not None and "WRONGPASS" in e, f"got {e!r}")
+    closed = False
+    for _ in range(40):
+        try:
+            send_request(s, "auth", "definitely-wrong")
+            recv_response(s)
+        except RespError:
+            continue                       # WRONGPASS / BUSY: keep going
+        except (ConnectionError, OSError):
+            closed = True                  # the server hung up: correct
+            break
+    ctx.ok("the connection is closed after repeated auth failures", closed,
+           "the server answered forever — k_max_failed_auth never terminated "
+           "the connection")
+    try:
+        s.close()
+    except OSError:
+        pass
+
+    # --- completion delivery under concurrency ------------------------------
+    N = 8
+    results = [None] * N
+
+    def worker(i):
+        try:
+            w = socket.create_connection(("127.0.0.1", port), TIMEOUT_SEC)
+            w.settimeout(TIMEOUT_SEC)
+            results[i] = _auth_retry(w, AUTH_PW)
+            send_request(w, "ping")
+            if recv_response(w) != "PONG":
+                results[i] = "ping-failed-after-auth"
+            w.close()
+        except Exception as ex:
+            results[i] = f"{type(ex).__name__}: {ex}"
+
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=TIMEOUT_SEC * 4)
+    got = sum(1 for r in results if r == "OK")
+    ctx.ok(f"all {N} concurrent AUTHs completed", got == N,
+           f"results={results} — a lost or misrouted completion leaves its "
+           f"connection hanging forever")
+
+    # --- the loop keeps answering while the KDF is busy ---------------------
+    stop = threading.Event()
+
+    def storm():
+        while not stop.is_set():
+            try:
+                w = socket.create_connection(("127.0.0.1", port), TIMEOUT_SEC)
+                w.settimeout(TIMEOUT_SEC)
+                for _ in range(3):
+                    if stop.is_set():
+                        break
+                    try:
+                        send_request(w, "auth", "wrong-pw")
+                        recv_response(w)
+                    except RespError:
+                        pass               # WRONGPASS / BUSY are expected
+                w.close()
+            except Exception:
+                time.sleep(0.05)
+
+    stormers = [threading.Thread(target=storm, daemon=True) for _ in range(4)]
+    for t in stormers:
+        t.start()
+    lat = []
+    try:
+        s = raw_conn(port, AUTH_PW)
+        for _ in range(200):
+            t0 = time.perf_counter()
+            send_request(s, "ping")
+            recv_response(s)
+            lat.append((time.perf_counter() - t0) * 1000.0)
+        s.close()
+    except Exception as ex:
+        ctx.ok("the event loop answered during the AUTH storm", False,
+               f"{type(ex).__name__}: {ex}")
+    finally:
+        stop.set()
+        for t in stormers:
+            t.join(timeout=2.0)
+
+    ctx.ok("all 200 PINGs were answered during the AUTH storm", len(lat) == 200,
+           f"only {len(lat)} came back")
+    if lat:
+        lat.sort()
+        p50 = _percentile(lat, 0.50)
+        p99 = _percentile(lat, 0.99)
+        print(f"  {YELLOW}info{RESET} PING during an AUTH storm: "
+              f"p50={p50:.2f}ms p99={p99:.2f}ms")
+        print(f"         a synchronous Argon2 verify would put p99 at 20-60ms+; "
+              f"that gap is the whole point of the async path.")
+
+    # --- credential rehash + redaction --------------------------------------
+    # Two sequential AUTHs on fresh connections. If the first triggered a
+    # rehash (legacy digest -> Argon2id), the second proves the swapped-in
+    # credential still verifies.
+    for i in (1, 2):
+        w = raw_conn(port, AUTH_PW)
+        ctx.ok(f"AUTH #{i} accepted (the credential survives any rehash)",
+               cmd(w, "PING") == "PONG")
+        w.close()
+    try:
+        with open(audit_path, errors="replace") as f:
+            data = f.read()
+    except OSError:
+        data = None
+    if data is None:
+        ctx.skip("audit redaction", "the audit log was not written")
+    else:
+        legacy = hashlib.sha256(AUTH_PW.encode()).hexdigest()
+        leaked = ("$argon2id$" in data) or (AUTH_PW in data) or (legacy in data)
+        ctx.ok("[REG] the audit log carries no plaintext, digest, or PHC hash",
+               not leaked,
+               "a credential in any form reached the audit log")
+        n = data.count("event=cred_rehash")
+        print(f"  {YELLOW}info{RESET} cred_rehash events this lifetime: {n} "
+              f"(0 is correct for a credential already stored as Argon2id)")
+
+    srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: CONFIG ROUND-TRIP — what CONFIG REWRITE writes must be what boots
+#
+#  The live-server CONFIG section above writes a value and reads it back inside
+#  one process. That catches a getter wired to the wrong field, and it cannot
+#  catch anything else: a directive whose *emit* is broken reads back perfectly
+#  for as long as the process lives, and only loses its value at the next boot.
+#  Making the value cross a restart is the only way to test the emit at all.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Directives whose value is set at runtime, rewritten, and then has to come back
+# after a restart. Each probe is deliberately DIFFERENT from the default, since
+# a value that matches the default survives a completely missing emit.
+REWRITE_PROBES = [
+    ("maxmemory-samples", "7"),
+    ("maxmemory-policy", "allkeys-random"),
+    ("maxmemory", "12345678"),
+    ("appendfsync", "always"),
+    ("auto-aof-rewrite-percentage", "77"),
+    ("auto-aof-rewrite-min-size", "12345678"),
+    ("notify-keyspace-events", "AKE"),
+    ("repl-timeout", "77"),
+    ("repl-ping-replica-period", "13"),
+    ("min-replicas-to-write", "0"),
+    ("min-replicas-max-lag", "17"),
+]
+
+# Boot-only directives: CONFIG SET must refuse them, so the only way to probe
+# their emit is to set them in the file the server boots from and make the value
+# cross a rewrite. Both of these own a hand-written emit, and a hand-written
+# emit is the one thing config_selfcheck's round-trip deliberately skips.
+BOOT_ONLY_PROBES = [
+    ("repl-backlog-size", "1048576"),
+    ("tls-handshake-timeout", "45"),
+]
+
+CFG_PW = "config-roundtrip-pass"
+
+
+def phase_config_roundtrip(ctx: "PhaseCtx"):
+    ctx.section("Config: CONFIG REWRITE survives a restart")
+    port = ctx.port()
+    d = ctx.dir("config-rt")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        f'requirepass "{CFG_PW}"',
+        "appendonly no",
+        "dbfilename dump.rdb",
+        'save ""',
+    ] + [f"{n} {v}" for n, v in BOOT_ONLY_PROBES])
+    srv = ctx.start("config-rt", d, conf, port)
+    s = raw_conn(port, CFG_PW)
+
+    # A boot-only directive must refuse CONFIG SET — that refusal IS the
+    # contract, so it is asserted rather than skipped past.
+    for name, want in BOOT_ONLY_PROBES:
+        if not has_directive(s, name):
+            ctx.skip(f"{name} round-trip", "this binary has no such directive")
+            continue
+        ctx.ok(f"{name} read its boot value from the config file",
+               get_directive(s, name) == want,
+               f"got {get_directive(s, name)!r}, wrote {want!r}")
+        ctx.ok(f"{name} is boot-only and refuses CONFIG SET",
+               err_of(s, "CONFIG", "SET", name, want) is not None,
+               "a boot-only directive that accepts CONFIG SET reports a value "
+               "the running server is not actually using")
+
+    # A channel ACL, because its emitted form is where two tokens once fused.
+    cmd(s, "ACL", "SETUSER", "chan", "on", ">chanpass", "resetchannels",
+        "&news.*", "~*", "+@read")
+    cmd(s, "ACL", "SETUSER", "allch", "on", ">allchpass", "allchannels", "~*",
+        "+@read")
+
+    # Set each probe and record what the RUNNING server says the value is. That
+    # — not the literal we sent — is what must survive, so a directive that
+    # normalizes its input (notify-keyspace-events reorders its flags) is
+    # compared against its own normalized form instead of failing spuriously.
+    live = {}
+    for name, probe in REWRITE_PROBES:
+        if not has_directive(s, name):
+            ctx.skip(f"{name} round-trip", "this binary has no such directive")
+            continue
+        try:
+            cmd(s, "CONFIG", "SET", name, probe)
+        except RespError as e:
+            ctx.ok(f"CONFIG SET {name} {probe}", False, str(e))
+            continue
+        live[name] = get_directive(s, name)
+        ctx.ok(f"{name} reads back after the set", live[name] is not None)
+
+    ctx.ok("CONFIG REWRITE returns OK", cmd(s, "CONFIG", "REWRITE") == "OK")
+    with open(conf) as f:
+        text = f.read()
+    ctx.ok("[REG] the rewritten config still carries requirepass",
+           "requirepass" in text,
+           "a rewrite that drops requirepass restarts the server passwordless, "
+           "and every connection then auto-authenticates as the nopass default "
+           "user with +@all ~*")
+    ctx.ok("the rewritten config carries the channel grant", "&news.*" in text,
+           text[:400])
+    ctx.ok("[REG] no fused '~*&*' token in the rewritten config",
+           "~*&*" not in text,
+           "the channel token was emitted with no separating space, so the next "
+           "boot parses '~*&*' as one key pattern and the grant silently changes")
+    s.close()
+
+    srv = ctx.restart(srv, "config-rt-boot")
+    try:
+        s = raw_conn(port, CFG_PW)
+        authed = True
+    except Exception as e:
+        authed = False
+        ctx.ok("[REG] the old password still authenticates after the round-trip",
+               False, f"{type(e).__name__}: {e}")
+    if not authed:
+        srv.stop()
+        return
+    ctx.ok("[REG] the old password still authenticates after the round-trip", True)
+
+    anon = socket.create_connection(("127.0.0.1", port), TIMEOUT_SEC)
+    anon.settimeout(TIMEOUT_SEC)
+    ctx.ok("[REG] an unauthenticated connection is still refused",
+           err_of(anon, "GET", "anything") is not None,
+           "the restarted server accepts unauthenticated commands — the "
+           "rewrite lost requirepass")
+    anon.close()
+
+    for name, want in list(live.items()) + [
+            (n, v) for n, v in BOOT_ONLY_PROBES if has_directive(s, n)]:
+        got = get_directive(s, name)
+        ctx.ok(f"[REG] {name} survived the rewrite ({want!r})", got == want,
+               f"was {want!r} before the rewrite, {got!r} after the restart — "
+               f"this directive's emit is wrong, which a same-process "
+               f"set/get round-trip cannot detect")
+
+    listing = cmd(s, "ACL", "LIST") or []
+    joined = " ".join(listing) if isinstance(listing, list) else str(listing)
+    ctx.ok("the channel grant survived the restart", "&news.*" in joined, joined)
+    ctx.ok("[REG] no fused '~*&*' token in ACL LIST", "~*&*" not in joined, joined)
+    ctx.ok("the allchannels user survived the restart", " &*" in joined, joined)
+
+    s.close()
+    srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: MEMORY — the accounting invariant, per type
+#
+#  The strongest statement the accounting can make is "drain everything, and
+#  used_memory returns to exactly what it was", because entry_del subtracts the
+#  exact bytes last charged. A non-zero residual means a discharge path is
+#  missing or something is double-counted — and doing it one type at a time is
+#  what localizes the broken handler instead of just proving one exists.
+#
+#  It runs on its own instance because every check here starts with a FLUSHALL
+#  and ends by moving maxmemory.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Both of these read the WHOLE INFO dump rather than a named section. A section
+# name that is merely wrong — evicted_keys lives under Memory, not Stats — comes
+# back as a missing key, and `.get(name, 0)` then reads as a counter that never
+# moved, which is indistinguishable from a real result.
+
+def _used_memory(sock: socket.socket) -> int:
+    v = info_field(sock, "used_memory") or info_field(sock, "used_memory_bytes")
+    if v is None:
+        raise RuntimeError("no used_memory field in INFO")
+    return int(v)
+
+
+def _evicted_keys(sock: socket.socket) -> int:
+    v = info_field(sock, "evicted_keys")
+    try:
+        return int(v) if v is not None else 0
+    except ValueError:
+        return 0
+
+
+def _set_or_oom(sock: socket.socket, key: str, val: str) -> str:
+    try:
+        cmd(sock, "SET", key, val)
+        return "OK"
+    except RespError as e:
+        if "OOM" in str(e):
+            return "OOM"
+        raise
+
+
+def _drain_to_zero(ctx: "PhaseCtx", s: socket.socket, name: str, build, drain):
+    base = _used_memory(s)
+    build(s)
+    grew = _used_memory(s)
+    drain(s)
+    back = _used_memory(s)
+    ctx.ok(f"{name}: grows on build", grew > base, f"base={base} grew={grew}")
+    ctx.ok(f"{name}: back to baseline after drain", back == base,
+           f"base={base} after={back} (leak={back - base})")
+
+
+def phase_memory(ctx: "PhaseCtx"):
+    ctx.section("Memory: per-type accounting invariants")
+    port = ctx.port()
+    d = ctx.dir("memory")
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {port}",
+        "appendonly no",
+        'save ""',
+    ])
+    srv = ctx.start("memory", d, conf, port)
+    s = raw_conn(port)
+
+    cmd(s, "FLUSHALL")
+    ctx.ok("an empty database accounts for 0 bytes", _used_memory(s) == 0,
+           f"got {_used_memory(s)}")
+
+    # per-type create -> delete round-trips
+    _drain_to_zero(ctx, s, "string (set/del)",
+                   lambda c: cmd(c, "SET", "k", "x" * 5000),
+                   lambda c: cmd(c, "DEL", "k"))
+    _drain_to_zero(ctx, s, "list (rpush/lpop-all)",
+                   lambda c: [cmd(c, "RPUSH", "L", f"item-{i}") for i in range(500)],
+                   lambda c: [cmd(c, "LPOP", "L") for _ in range(500)])
+    _drain_to_zero(ctx, s, "hash (hset/hdel-all)",
+                   lambda c: cmd(c, "HSET", "H", *sum(
+                       ([f"f{i}", f"v{i}"] for i in range(300)), [])),
+                   lambda c: [cmd(c, "HDEL", "H", f"f{i}") for i in range(300)])
+    _drain_to_zero(ctx, s, "set (sadd/srem-all)",
+                   lambda c: cmd(c, "SADD", "S", *[f"m{i}" for i in range(300)]),
+                   lambda c: [cmd(c, "SREM", "S", f"m{i}") for i in range(300)])
+    _drain_to_zero(ctx, s, "zset (zadd/zpopmin-all)",
+                   lambda c: cmd(c, "ZADD", "Z", *sum(
+                       ([str(i), f"m{i}"] for i in range(300)), [])),
+                   lambda c: cmd(c, "ZPOPMIN", "Z", "300"))
+
+    # the may-delete branches: a key that reaches empty through a value command
+    # rather than through DEL takes a different discharge path
+    _drain_to_zero(ctx, s, "list emptied via lrem",
+                   lambda c: [cmd(c, "RPUSH", "LR", "dup") for _ in range(200)],
+                   lambda c: cmd(c, "LREM", "LR", "0", "dup"))
+    _drain_to_zero(ctx, s, "list emptied via ltrim",
+                   lambda c: [cmd(c, "RPUSH", "LT", f"i{i}") for i in range(200)],
+                   lambda c: cmd(c, "LTRIM", "LT", "5", "1"))   # start>stop clears
+    _drain_to_zero(ctx, s, "set emptied via spop",
+                   lambda c: cmd(c, "SADD", "SP", *[f"m{i}" for i in range(200)]),
+                   lambda c: cmd(c, "SPOP", "SP", "200"))
+
+    # overwrite stability: replacing a value repeatedly must not leak
+    cmd(s, "FLUSHALL")
+    cmd(s, "SET", "ov", "start")
+    before = _used_memory(s)
+    for i in range(1000):
+        cmd(s, "SET", "ov", ("v%d" % i) * (i % 50 + 1))
+    cmd(s, "SET", "ov", "start")
+    after = _used_memory(s)
+    ctx.ok("a string overwritten 1000 times leaks nothing",
+           abs(after - before) <= 64, f"before={before} after={after}")
+
+    _drain_to_zero(ctx, s, "append growth",
+                   lambda c: [cmd(c, "APPEND", "AP", "z" * 100) for _ in range(200)],
+                   lambda c: cmd(c, "DEL", "AP"))
+    _drain_to_zero(ctx, s, "sinterstore dest",
+                   lambda c: (cmd(c, "SADD", "A", *[str(i) for i in range(200)]),
+                              cmd(c, "SADD", "B", *[str(i) for i in range(100, 300)]),
+                              cmd(c, "SINTERSTORE", "DST", "A", "B")),
+                   lambda c: cmd(c, "DEL", "A", "B", "DST"))
+    _drain_to_zero(ctx, s, "rename re-key",
+                   lambda c: (cmd(c, "SET", "old", "y" * 1000),
+                              cmd(c, "RENAME", "old", "new")),
+                   lambda c: cmd(c, "DEL", "new"))
+
+    # a big mixed load, then FLUSHALL must land on exactly 0
+    cmd(s, "FLUSHALL")
+    for i in range(200):
+        cmd(s, "SET", f"str:{i}", "v" * (i + 1))
+        cmd(s, "RPUSH", f"list:{i}", *[f"e{j}" for j in range(i % 20 + 1)])
+        cmd(s, "HSET", f"hash:{i}", "a", "1", "b", "2", "c", str(i))
+        cmd(s, "SADD", f"set:{i}", *[f"m{j}" for j in range(i % 15 + 1)])
+        cmd(s, "ZADD", f"zset:{i}", "1", "x", "2", "y", str(i), "z")
+    loaded = _used_memory(s)
+    cmd(s, "FLUSHALL")
+    residual = _used_memory(s)
+    ctx.ok("a mixed load grows used_memory", loaded > 0, f"loaded={loaded}")
+    ctx.ok("FLUSHALL returns used_memory to exactly 0", residual == 0,
+           f"residual={residual} — a discharge path is missing or something is "
+           f"counted twice")
+
+    # --- the cap is enforced two ways, and they must not be confusable -------
+    # Both floods push ~6 MB into a 1 MB cap. Staying near the cap proves the
+    # limit is enforced; growing to multiples of it means -OOM is being ignored.
+    ctx.section("Memory: maxmemory (noeviction vs allkeys-lru)")
+    CAP = 1024 * 1024
+    VAL = "y" * 1000
+    BOUND = CAP + CAP // 2          # tolerate one write of overshoot
+    cmd(s, "CONFIG", "SET", "maxmemory", str(CAP))
+
+    cmd(s, "FLUSHALL")
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "noeviction")
+    ev_before = _evicted_keys(s)
+    oks = ooms = 0
+    for i in range(6000):
+        r = _set_or_oom(s, f"ne:{i}", VAL)
+        oks += (r == "OK")
+        ooms += (r == "OOM")
+        if ooms >= 50:
+            break
+    ctx.ok("noeviction: writes succeed, then start refusing",
+           oks > 0 and ooms > 0, f"ok={oks} oom={ooms}")
+    ctx.ok("noeviction: used_memory stays bounded near the cap",
+           _used_memory(s) <= BOUND, f"used={_used_memory(s)} bound={BOUND}")
+    ctx.ok("noeviction: nothing was evicted",
+           _evicted_keys(s) == ev_before,
+           f"evicted_delta={_evicted_keys(s) - ev_before} — noeviction must "
+           f"refuse the write, not make room for it")
+    ctx.ok("noeviction: a write over the cap is refused",
+           _set_or_oom(s, "over", VAL) == "OOM")
+
+    cmd(s, "FLUSHALL")
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "allkeys-lru")
+    ev0 = _evicted_keys(s)
+    ooms = 0
+    for i in range(6000):
+        ooms += (_set_or_oom(s, f"lru:{i}", VAL) == "OOM")
+    ctx.ok("allkeys-lru: no write is ever refused", ooms == 0, f"oom={ooms}")
+    ctx.ok("allkeys-lru: used_memory held near the cap",
+           _used_memory(s) <= BOUND, f"used={_used_memory(s)} bound={BOUND}")
+    ctx.ok("allkeys-lru: evicted_keys climbed",
+           _evicted_keys(s) - ev0 > 0, f"evicted={_evicted_keys(s) - ev0}")
+
+    # --- incremental eviction: the overshoot must not lock writes out --------
+    ctx.section("Memory: incremental eviction under a large overshoot")
+    cmd(s, "CONFIG", "SET", "maxmemory", "0")
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "allkeys-random")
+    cmd(s, "FLUSHALL")
+    for i in range(6000):
+        cmd(s, "SET", f"ev:{i}", VAL)        # ~6 MB, then drop the cap to 1 MB
+    over_keys = cmd(s, "DBSIZE")
+    cmd(s, "CONFIG", "SET", "maxmemory", str(CAP))
+    ctx.ok("[REG] the write right after a 6x overshoot is admitted",
+           _set_or_oom(s, "ev:probe", "1") == "OK",
+           "the server refused writes until repeated attempts had chipped the "
+           "overshoot away 100 keys at a time")
+
+    # idle drain: no further writes at all — evict_tick alone has to get under
+    deadline = time.time() + 15.0
+    um = _used_memory(s)
+    while um > CAP and time.time() < deadline:
+        time.sleep(0.2)
+        um = _used_memory(s)
+    ctx.ok(f"the keyspace drains while completely idle "
+           f"({over_keys} keys -> {cmd(s, 'DBSIZE')})",
+           um <= CAP, f"used_memory stalled at {um}, cap is {CAP} — evict_tick "
+                      f"is not doing work between commands")
+
+    cmd(s, "CONFIG", "SET", "maxmemory", "0")
+    cmd(s, "CONFIG", "SET", "maxmemory-policy", "noeviction")
+    cmd(s, "FLUSHALL")
+    s.close()
+    srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: REPLICATION — a master, a replica, and a link that can be cut
+#
+#  Runs a master and a replica on private ports with a killable TCP proxy
+#  between them, so every replication path is reachable from one command with no
+#  manual setup.
+#
+#  Two rules run through all of it:
+#    - A partial resync and a full resync BOTH leave the replica holding correct
+#      data, so every partial-resync check asserts on the master's sync_*
+#      counters and never on "the keys are there".
+#    - A proxy, not a kill: the master has to stay up across the gap. Killing it
+#      would destroy the backlog and mint a new replid, forcing a full resync and
+#      making the partial-resync checks silently vacuous.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The minimum the server accepts (k_repl_backlog_min). Deliberately tiny: it is
+# what makes "a gap larger than the backlog" reachable with a few KB of writes.
+BACKLOG_BYTES = 16 * 1024
+
+# Replication is asynchronous, so every cross-instance assertion polls.
+SYNC_WAIT = 5.0
+
+# What the repl-timeout phases wind the timeout down to. It has to clear
+# k_repl_ack_period_ms (1s) with room to spare or the master reaps a healthy
+# replica between two of its own ACKs, and it has to stay small or the phase crawls.
+SHORT_TIMEOUT = 3
+SHORT_LAG = 2
+
+
+class Proxy:
+    """A killable TCP hop: replica -> proxy -> master.
+
+    stop() closes the listener AND every live pair, so the replica sees a FIN and
+    its master link really dies; start() reopens on the same port.
+
+    freeze() is the other failure mode, and the interesting one: stop moving
+    bytes but leave every socket OPEN. A link that closes is already handled —
+    poll() reports it immediately. A link that just goes quiet is invisible to
+    poll() and only a clock can catch it.
+    """
+
+    def __init__(self, listen_port: int, target_port: int):
+        self.listen_port = listen_port
+        self.target_port = target_port
+        self._lock = threading.Lock()
+        self._conns = []
+        self._lsock = None
+        self._thread = None
+        self._stop = threading.Event()
+        # survives stop()/start() on purpose: thawing is always explicit
+        self._frozen = threading.Event()
+
+    def freeze(self):
+        self._frozen.set()
+
+    def thaw(self):
+        self._frozen.clear()
+
+    def start(self):
+        self._stop = threading.Event()
+        with self._lock:
+            self._conns = []
+        self._lsock = socket.socket()
+        self._lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._lsock.bind(("127.0.0.1", self.listen_port))
+        self._lsock.listen(8)
+        self._lsock.settimeout(0.2)
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        with self._lock:
+            socks = ([self._lsock] + self._conns) if self._lsock else list(self._conns)
+            self._conns = []
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._lsock = None
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                client, _ = self._lsock.accept()
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(
+                    ("127.0.0.1", self.target_port), 2)
+            except OSError:
+                client.close()
+                continue
+            with self._lock:
+                self._conns += [client, upstream]
+            threading.Thread(target=self._pump, args=(client, upstream),
+                             daemon=True).start()
+
+    def _pump(self, a, b):
+        pair = [a, b]
+        try:
+            while not self._stop.is_set():
+                if self._frozen.is_set():
+                    # Deliberately do NOT read: bytes pile up in the kernel
+                    # buffers exactly as they would against a black-holed path,
+                    # and neither end sees an error, an EOF, or a reset.
+                    time.sleep(0.05)
+                    continue
+                ready, _, _ = select.select(pair, [], [], 0.2)
+                for s in ready:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (b if s is a else a).sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in pair:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+# ─── replication helpers ──────────────────────────────────────────────────────
+
+def _link_up(sock: socket.socket) -> bool:
+    d = info_dict(sock, "replication")
+    return d.get("role") == "slave" and d.get("master_link_status") == "up"
+
+
+def _counters(sock: socket.socket):
+    d = info_dict(sock, "stats")
+    return (int(d.get("sync_full", -1)),
+            int(d.get("sync_partial_ok", -1)),
+            int(d.get("sync_partial_err", -1)))
+
+
+def _conf_has_replicaof(path: str) -> bool:
+    with open(path) as f:
+        return any(l.strip().startswith("replicaof ") for l in f)
+
+
+def _set_if_present(sock: socket.socket, name: str, value) -> bool:
+    """Set a directive the binary may not have yet. True if it took."""
+    if not has_directive(sock, name):
+        return False
+    cmd(sock, "CONFIG", "SET", name, str(value))
+    return True
+
+
+def _log_has(inst: "Instance", needle: str) -> bool:
+    """Poll the server's stderr FILE, not the server.
+
+    The point of the timeout phases is that a deadline fires on an IDLE
+    instance. Polling INFO to find out would wake the event loop and hide
+    exactly the bug being tested — a deadline missing from next_timer_ms() only
+    misbehaves while nothing else wakes the loop — so the observation has to
+    happen off to the side.
+    """
+    return needle in inst.stderr_text()
+
+
+def _slave0(sock: socket.socket) -> dict:
+    out = {}
+    for part in info_dict(sock, "replication").get("slave0", "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k] = v
+    return out
+
+
+# ─── the phases ───────────────────────────────────────────────────────────────
+
+def _repl_full_resync(ctx, master, replica, replica_srv):
+    ctx.section("Replication: full resync")
+    ctx.ok("the replica booted into the role from its config file",
+           wait_until(lambda: _link_up(replica), SYNC_WAIT),
+           f"INFO replication = {info_dict(replica, 'replication')}")
+    rd = info_dict(replica, "replication")
+    md = info_dict(master, "replication")
+    ctx.ok("the replica reports role:slave", rd.get("role") == "slave",
+           rd.get("role"))
+    ctx.ok("[REG] the replica adopted the master's replid",
+           rd.get("master_replid") == md.get("master_replid"),
+           f"replica={rd.get('master_replid')} master={md.get('master_replid')}")
+    ctx.ok("the master counts one connected replica",
+           wait_until(lambda: info_dict(master, "replication")
+                      .get("connected_slaves") == "1", SYNC_WAIT),
+           info_dict(master, "replication").get("connected_slaves"))
+    for k, v in (("pre1", "a"), ("pre2", "b"), ("pre3", "c")):
+        ctx.ok(f"the pre-resync key {k} arrived",
+               wait_until(lambda k=k, v=v: cmd(replica, "GET", k) == v, SYNC_WAIT))
+    log = replica_srv.stderr_text()
+    ctx.ok("the replica logged the resync", "streaming from master" in log,
+           (log.strip().splitlines() or ["<empty>"])[-1])
+
+
+def _repl_streaming(ctx, master, replica):
+    ctx.section("Replication: live streaming")
+    cmd(master, "SET", "live1", "v1")
+    ctx.ok("SET propagates",
+           wait_until(lambda: cmd(replica, "GET", "live1") == "v1", SYNC_WAIT))
+    cmd(master, "SADD", "liveset", "m1", "m2")
+    ctx.ok("SADD propagates",
+           wait_until(lambda: cmd(replica, "SCARD", "liveset") == 2, SYNC_WAIT))
+    cmd(master, "DEL", "live1")
+    ctx.ok("DEL propagates",
+           wait_until(lambda: cmd(replica, "GET", "live1") is None, SYNC_WAIT))
+    cmd(master, "SET", "ttlkey", "x")
+    cmd(master, "EXPIRE", "ttlkey", "1000")
+    ctx.ok("[REG] a TTL replicates as an absolute time, not a relative one",
+           wait_until(lambda: 0 < int(cmd(replica, "TTL", "ttlkey")) <= 1000,
+                      SYNC_WAIT),
+           "a relative EXPIRE re-applied on the replica drifts, or misses entirely")
+    # SPOP and SREM are chosen by the server, not by the command: what the
+    # replica must receive is the member that was actually removed.
+    cmd(master, "SADD", "replset", "a", "b", "c", "d")
+    popped = cmd(master, "SPOP", "replset")
+    ctx.ok("[REG] SPOP replicates the member it removed, not the command",
+           wait_until(lambda: sorted(cmd(replica, "SMEMBERS", "replset") or [])
+                      == sorted(cmd(master, "SMEMBERS", "replset") or []),
+                      SYNC_WAIT),
+           f"master popped {popped!r}; the replica popped something else, so the "
+           f"two sets have diverged while both look plausible")
+
+
+def _repl_readonly(ctx, master, replica):
+    ctx.section("Replication: read-only gate")
+    err = err_of(replica, "SET", "nope", "1")
+    ctx.ok("a write from an ordinary client is refused",
+           err is not None and err.startswith("READONLY"), err)
+    err = err_of(replica, "FLUSHALL")
+    ctx.ok("[REG] FLUSHALL is refused too (it carries is_write)",
+           err is not None and err.startswith("READONLY"), err)
+    ctx.ok("reads are still served", cmd(replica, "GET", "pre1") == "a")
+    ctx.ok("MULTI itself is allowed", err_of(replica, "MULTI") is None)
+    ctx.ok("a queued write is refused at queue time",
+           err_of(replica, "SET", "nope", "1") is not None)
+    err = err_of(replica, "EXEC")
+    ctx.ok("the poisoned transaction aborts",
+           err is not None and "EXECABORT" in err, err)
+    cmd(master, "SET", "after_gate", "ok")
+    ctx.ok("[REG] the replication stream still applies through the gate",
+           wait_until(lambda: cmd(replica, "GET", "after_gate") == "ok", SYNC_WAIT),
+           "the gate must exempt the stream, or the replica silently forks")
+
+
+def _repl_link_loss(ctx, replica, proxy):
+    ctx.section("Replication: link loss must not promote")
+    proxy.stop()
+    ctx.ok("the link goes down",
+           wait_until(lambda: info_dict(replica, "replication")
+                      .get("master_link_status") == "down", SYNC_WAIT),
+           info_dict(replica, "replication").get("master_link_status"))
+    d = info_dict(replica, "replication")
+    ctx.ok("[REG] a dropped socket does NOT promote the replica",
+           d.get("role") == "slave",
+           "the role went to master on link loss — both instances would then "
+           "accept writes")
+    ctx.ok("[REG] the master address survives the drop",
+           bool(d.get("master_host")) and bool(d.get("master_port")), str(d))
+    err = err_of(replica, "SET", "nope", "1")
+    ctx.ok("[REG] still read-only while disconnected",
+           err is not None and err.startswith("READONLY"), err)
+
+
+def _repl_partial(ctx, master, replica, proxy, proxy_port):
+    ctx.section("Replication: partial resync")
+    full0, ok0, _ = _counters(master)
+    for i in range(20):
+        cmd(master, "SET", f"gap{i}", f"v{i}")
+    proxy.start()
+    cmd(replica, "REPLICAOF", "127.0.0.1", str(proxy_port))
+    ctx.ok("the link comes back", wait_until(lambda: _link_up(replica), SYNC_WAIT),
+           str(info_dict(replica, "replication")))
+    ctx.ok("the gap keys arrived",
+           wait_until(lambda: cmd(replica, "GET", "gap19") == "v19", SYNC_WAIT))
+    full1, ok1, _ = _counters(master)
+    ctx.ok("[REG] the reconnect was a PARTIAL resync", ok1 == ok0 + 1,
+           f"sync_partial_ok {ok0} -> {ok1} (correct data alone proves nothing "
+           f"here — both resync paths produce it)")
+    ctx.ok("[REG] no RDB was retransferred", full1 == full0,
+           f"sync_full {full0} -> {full1}")
+
+
+def _repl_gap_too_large(ctx, master, replica, proxy, proxy_port):
+    ctx.section("Replication: a gap larger than the backlog falls back")
+    proxy.stop()
+    ctx.ok("the link is down again",
+           wait_until(lambda: info_dict(replica, "replication")
+                      .get("master_link_status") == "down", SYNC_WAIT))
+    full0, ok0, err0 = _counters(master)
+    blob = "x" * 1024
+    for i in range(BACKLOG_BYTES // 1024 * 3):
+        cmd(master, "SET", f"big{i}", blob)
+    cmd(master, "SET", "past_the_gap", "yes")
+    proxy.start()
+    cmd(replica, "REPLICAOF", "127.0.0.1", str(proxy_port))
+    ctx.ok("the link comes back", wait_until(lambda: _link_up(replica), SYNC_WAIT))
+    ctx.ok("the replica caught up",
+           wait_until(lambda: cmd(replica, "GET", "past_the_gap") == "yes",
+                      SYNC_WAIT * 2))
+    full1, ok1, err1 = _counters(master)
+    ctx.ok("[REG] an unservable offset degrades to a FULL resync",
+           full1 == full0 + 1,
+           f"sync_full {full0} -> {full1}: a +CONTINUE here is silent divergence")
+    ctx.ok("the refusal was counted", err1 == err0 + 1,
+           f"sync_partial_err {err0} -> {err1}")
+
+
+def _repl_auto_reconnect(ctx, master, replica, proxy):
+    ctx.section("Replication: automatic reconnect")
+    full0, ok0, _ = _counters(master)
+    proxy.stop()
+    ctx.ok("the link is down",
+           wait_until(lambda: info_dict(replica, "replication")
+                      .get("master_link_status") == "down", SYNC_WAIT))
+    for i in range(10):
+        cmd(master, "SET", f"auto{i}", f"v{i}")
+    proxy.start()
+    # deliberately NO manual REPLICAOF: the replica must re-dial on its own
+    ctx.ok("[REG] the replica re-dials without being told",
+           wait_until(lambda: _link_up(replica), 25.0),
+           "repl_cron never fired — check that next_timer_ms() wakes poll() for "
+           "a disconnected replica, or it never runs on an idle keyspace")
+    ctx.ok("writes missed during the outage arrived",
+           wait_until(lambda: cmd(replica, "GET", "auto9") == "v9", SYNC_WAIT))
+    full1, ok1, _ = _counters(master)
+    ctx.ok("the automatic reconnect used a partial resync",
+           ok1 == ok0 + 1 and full1 == full0,
+           f"sync_full {full0}->{full1} sync_partial_ok {ok0}->{ok1}")
+
+
+def _repl_wait(ctx, master, master_port):
+    ctx.section("Replication: REPLCONF ACK + WAIT")
+    cmd(master, "SET", "ackkey", "v")
+    ctx.ok("the master learns the replica's offset from periodic acks",
+           wait_until(lambda: int(_slave0(master).get("offset", 0)) > 0, 6.0),
+           f"slave0 = {_slave0(master)}")
+
+    t0 = time.time()
+    n = cmd(master, "WAIT", "1", "4000")
+    ctx.ok("WAIT 1 counts the caught-up replica", n == 1, str(n))
+    ctx.ok("...and returned well inside its timeout", time.time() - t0 < 3.5,
+           f"{time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    n = cmd(master, "WAIT", "5", "1000")
+    dt = time.time() - t0
+    ctx.ok("[REG] an unsatisfiable WAIT returns a short count, not an error",
+           n == 1, str(n))
+    ctx.ok("...after roughly its timeout", 0.7 < dt < 3.0, f"{dt:.1f}s")
+    ctx.ok("the connection still works afterwards", cmd(master, "PING") == "PONG")
+
+    blocker = raw_conn(master_port)
+    send_request(blocker, "WAIT", "5", "2000")     # cannot be satisfied
+    other = raw_conn(master_port)
+    ctx.ok("[REG] a pending WAIT does not block the event loop",
+           cmd(other, "PING") == "PONG",
+           "the loop stalled: WAIT must defer its reply, not wait in the handler")
+    ctx.ok("the deferred client is resumed on timeout", recv_response(blocker) == 1)
+    blocker.close()
+    other.close()
+
+    cmd(master, "MULTI")
+    cmd(master, "WAIT", "5", "5000")
+    t0 = time.time()
+    res = cmd(master, "EXEC")
+    ctx.ok("[REG] WAIT inside EXEC answers immediately instead of deferring",
+           isinstance(res, list) and len(res) == 1 and time.time() - t0 < 2.0,
+           f"{res!r} after {time.time() - t0:.1f}s — the reply is one element of "
+           f"an array whose size has already been written")
+
+
+def _repl_min_replicas(ctx, master, replica, proxy):
+    """The durability floor. The interesting half is not "does it refuse" but
+    WHICH replicas count: one that is connected and has stopped acking must stop
+    counting while still in g_data.replicas. Hence a freeze rather than a drop —
+    dropping it would prove repl-timeout and say nothing about the lag gate."""
+    ctx.section("Replication: min-replicas-to-write durability floor")
+    to_write0 = get_directive(master, "min-replicas-to-write")
+    max_lag0 = get_directive(master, "min-replicas-max-lag")
+    ctx.ok("min-replicas-to-write defaults to 0 (feature off)",
+           to_write0 == "0", str(to_write0))
+    ctx.ok("min-replicas-max-lag defaults to 10 seconds", max_lag0 == "10",
+           f"{max_lag0!r}: 0 means 'do not judge on lag', so every connected "
+           f"replica counts — including one still loading its resync image, "
+           f"which can neither ack nor serve")
+
+    ctx.ok("a negative count is rejected",
+           err_of(master, "CONFIG", "SET", "min-replicas-to-write", "-1") is not None)
+    ctx.ok("a count past the cap is rejected",
+           err_of(master, "CONFIG", "SET", "min-replicas-to-write", "2000") is not None)
+    ctx.ok("a lag past the cap is rejected",
+           err_of(master, "CONFIG", "SET", "min-replicas-max-lag", "99999") is not None)
+    ctx.ok("a lag of 0 is accepted (do not judge on lag)",
+           err_of(master, "CONFIG", "SET", "min-replicas-max-lag", "0") is None)
+
+    ctx.ok("the link is healthy before the floor goes up",
+           wait_until(lambda: _link_up(replica), SYNC_WAIT),
+           info_dict(replica, "replication").get("master_link_status"))
+    cmd(master, "CONFIG", "SET", "min-replicas-max-lag", str(SHORT_LAG))
+    cmd(master, "CONFIG", "SET", "min-replicas-to-write", "1")
+
+    ctx.ok("a replica that is acking satisfies the floor",
+           err_of(master, "SET", "floor_ok", "1") is None)
+    d = info_dict(master, "replication")
+    ctx.ok("[REG] INFO reports the good-replica count on a MASTER",
+           d.get("min_slaves_good_slaves") == "1",
+           f"min_slaves_good_slaves={d.get('min_slaves_good_slaves')!r} — this "
+           f"is the field an operator reads to find out why writes are refused")
+
+    proxy.freeze()                       # present, but no longer acking
+    time.sleep(SHORT_LAG + 1.5)
+    err = err_of(master, "SET", "floor_bad", "1")
+    ctx.ok("[REG] a replica that stopped acking stops counting",
+           err is not None and err.startswith("NOREPLICAS"), err)
+    ctx.ok("...and the refusal is the whole cost: reads are untouched",
+           cmd(master, "GET", "floor_ok") == "1")
+    d = info_dict(master, "replication")
+    ctx.ok("min_slaves_good_slaves fell to 0",
+           d.get("min_slaves_good_slaves") == "0",
+           d.get("min_slaves_good_slaves"))
+    ctx.ok("[REG] the lagging replica is still CONNECTED",
+           d.get("connected_slaves") == "1",
+           "the master reaped it instead, so this phase proved repl-timeout and "
+           "said nothing at all about the lag gate")
+
+    proxy.thaw()
+    ctx.ok("writes resume once the acks come back",
+           wait_until(lambda: err_of(master, "SET", "floor_back", "1") is None,
+                      15.0),
+           "the floor never lifted after the link recovered")
+
+    # a replica applying its master's stream has no replicas of its own, so a
+    # floor evaluated there would drop the write
+    cmd(replica, "CONFIG", "SET", "min-replicas-to-write", "1")
+    cmd(master, "SET", "stream_through_floor", "yes")
+    ctx.ok("[REG] the floor never refuses the replication stream itself",
+           wait_until(lambda: cmd(replica, "GET", "stream_through_floor") == "yes",
+                      SYNC_WAIT),
+           "the gate must test !replica_mode AND !g_loading — a replica that "
+           "drops a write it was sent has silently forked from its master")
+    cmd(replica, "CONFIG", "SET", "min-replicas-to-write", "0")
+    cmd(master, "CONFIG", "SET", "min-replicas-to-write", to_write0)
+    cmd(master, "CONFIG", "SET", "min-replicas-max-lag", max_lag0)
+
+
+def _repl_timeout_config(ctx, master):
+    ctx.section("Replication: repl-timeout directive")
+    before = get_directive(master, "repl-timeout")
+    ctx.ok("repl-timeout defaults to 60 seconds", before == "60", str(before))
+    # The units check a same-process round-trip CANNOT do: get->apply->get still
+    # agrees with itself when the getter forgets its /1000, because apply() and
+    # get() are wrong in the same direction.
+    cmd(master, "CONFIG", "SET", "repl-timeout", "5")
+    got = get_directive(master, "repl-timeout")
+    ctx.ok("[REG] repl-timeout round-trips in SECONDS, not milliseconds",
+           got == "5", f"got {got!r}; 5000 means the getter is missing its /1000")
+    ctx.ok("a value past the cap is rejected",
+           err_of(master, "CONFIG", "SET", "repl-timeout", "99999") is not None,
+           "out-of-range values must fail loudly, not clamp silently")
+    ctx.ok("0 is accepted (disabled)",
+           err_of(master, "CONFIG", "SET", "repl-timeout", "0") is None)
+    cmd(master, "CONFIG", "SET", "repl-timeout", before)
+
+
+def _repl_idle_keepalive(ctx, master, replica, replica_srv):
+    """An idle master is a HEALTHY master and the timeout must not say otherwise.
+
+    Nothing travels master->replica on a link with no writes: REPLCONF ACK is
+    replica->master only and the master never answers it. So a timeout measured
+    on inbound bytes expires on a perfectly good link the moment traffic stops —
+    the replica drops it, resyncs, and does it again every repl-timeout seconds
+    forever. repl-ping-replica-period is what buys the difference.
+    """
+    ctx.section("Replication: an idle link must survive")
+    pinged = _set_if_present(master, "repl-ping-replica-period", 1)
+    cmd(replica, "CONFIG", "SET", "repl-timeout", str(SHORT_TIMEOUT))
+    ctx.ok("the link is up before the idle window",
+           wait_until(lambda: _link_up(replica), SYNC_WAIT))
+    mark = replica_srv.stderr_text().count("no data from master")
+    cmd(master, "SET", "idle_probe", "1")      # one write, then nothing at all
+    time.sleep(SHORT_TIMEOUT * 2 + 1)          # deliberately past the timeout
+    drops = replica_srv.stderr_text().count("no data from master") - mark
+    ctx.ok("[REG] a quiet master is not mistaken for a dead one", drops == 0,
+           f"the replica dropped a healthy master {drops}x in "
+           f"{SHORT_TIMEOUT * 2 + 1}s"
+           + ("" if pinged else
+              " — and there is no repl-ping-replica-period directive, so the "
+              "master sends nothing at all on an idle link: this also flaps on "
+              "the 60s default, just once a minute instead of twice in seven "
+              "seconds"))
+    ctx.ok("...and the link is still up afterwards", _link_up(replica),
+           info_dict(replica, "replication").get("master_link_status"))
+    cmd(replica, "CONFIG", "SET", "repl-timeout", "60")
+
+
+def _repl_wedged(ctx, master, replica, master_srv, replica_srv, proxy):
+    """A link that goes silent without closing. Nothing on either side has a
+    reason to look at the clock, so before repl-timeout this state was permanent."""
+    ctx.section("Replication: a wedged link (silent, not closed)")
+    ctx.ok("healthy before the freeze", wait_until(lambda: _link_up(replica),
+                                                   SYNC_WAIT),
+           info_dict(replica, "replication").get("master_link_status"))
+    _set_if_present(master, "repl-ping-replica-period", 1)
+    for s in (master, replica):
+        cmd(s, "CONFIG", "SET", "repl-timeout", str(SHORT_TIMEOUT))
+
+    io_before = info_dict(replica, "replication").get("master_last_io_seconds_ago")
+    ctx.ok("master_last_io_seconds_ago is present and small",
+           io_before is not None and 0 <= int(io_before) <= 2, str(io_before))
+
+    proxy.freeze()
+    # From here until the asserts, NOTHING touches either server. Both are fully
+    # idle, so the only thing that can fire the timeout is a deadline
+    # next_timer_ms() actually knows about. Watching stderr keeps the
+    # observation off the wire — an INFO poll would wake the loop and mask the
+    # bug outright.
+    ctx.ok("[REG] the replica drops a silent master with no traffic to wake it",
+           wait_until(lambda: _log_has(replica_srv, "no data from master"),
+                      SHORT_TIMEOUT + 4),
+           "still STREAMING: either repl_cron has no timeout check, or "
+           "next_timer_ms() has no deadline for it and poll() slept through it")
+    ctx.ok("[REG] the master drops a replica that stopped acking",
+           wait_until(lambda: _log_has(master_srv, "silent for"),
+                      SHORT_TIMEOUT + 4),
+           "a dead replica left in g_data.replicas keeps counting toward WAIT")
+
+    d = info_dict(replica, "replication")
+    ctx.ok("the replica reports the link down",
+           d.get("master_link_status") == "down", d.get("master_link_status"))
+    # -1 only while there is no socket at all. By now the replica has usually
+    # re-dialled into the frozen proxy and sits in HANDSHAKE with a fresh stamp,
+    # so the deterministic property is the negative one: it must never still be
+    # reporting the real age of the master's last word.
+    io_down = d.get("master_last_io_seconds_ago")
+    ctx.ok("master_last_io_seconds_ago reflects the drop, not a stale age",
+           io_down == "-1" or 0 <= int(io_down) <= 2,
+           f"{io_down} (expected -1, or small after the re-dial)")
+    ctx.ok("[REG] a dropped link does NOT promote the replica",
+           d.get("role") == "slave",
+           "losing the master must never make an instance writable")
+    ctx.ok("the master shows no replicas",
+           info_dict(master, "replication").get("connected_slaves") == "0",
+           info_dict(master, "replication").get("connected_slaves"))
+    ctx.ok("a reaped replica cannot satisfy WAIT",
+           cmd(master, "WAIT", "1", "500") == 0)
+
+    proxy.thaw()
+    ctx.ok("it reconnects on its own once the path comes back",
+           wait_until(lambda: _link_up(replica), 15.0),
+           str(info_dict(replica, "replication")))
+    cmd(master, "SET", "after_wedge", "ok")
+    ctx.ok("streaming resumed",
+           wait_until(lambda: cmd(replica, "GET", "after_wedge") == "ok", SYNC_WAIT))
+    for s in (master, replica):
+        cmd(s, "CONFIG", "SET", "repl-timeout", "60")
+    _set_if_present(master, "repl-ping-replica-period", 10)
+
+
+def _repl_promotion(ctx, master, replica, replica_conf, proxy_port):
+    ctx.section("Replication: promotion")
+    before = info_dict(replica, "replication").get("master_replid")
+    cmd(replica, "REPLICAOF", "NO", "ONE")
+    d = info_dict(replica, "replication")
+    ctx.ok("promoted to master", d.get("role") == "master", d.get("role"))
+    ctx.ok("[REG] promotion mints a NEW replid",
+           d.get("master_replid") != before,
+           "keeping the old master's replid would let a later reconnect accept "
+           "an unsafe +CONTINUE")
+    ctx.ok("writable again", err_of(replica, "SET", "now", "writable") is None)
+
+    cmd(replica, "CONFIG", "REWRITE")
+    ctx.ok("[REG] CONFIG REWRITE drops the replicaof line after promotion",
+           not _conf_has_replicaof(replica_conf),
+           "emit is reading the staged g_config instead of the live g_data role")
+
+    full0, ok0, _ = _counters(master)
+    cmd(replica, "REPLICAOF", "127.0.0.1", str(proxy_port))
+    ctx.ok("re-attached", wait_until(lambda: _link_up(replica), SYNC_WAIT))
+    full1, ok1, _ = _counters(master)
+    ctx.ok("[REG] a promoted instance forfeits its history (full resync)",
+           full1 == full0 + 1 and ok1 == ok0,
+           f"sync_full {full0}->{full1} sync_partial_ok {ok0}->{ok1}")
+    cmd(replica, "CONFIG", "REWRITE")
+    ctx.ok("CONFIG REWRITE restores the line once it is a replica again",
+           _conf_has_replicaof(replica_conf))
+
+
+def _repl_restart(ctx, replica_dir, replica_conf, replica_port, master):
+    ctx.section("Replication: a restart keeps the role")
+    srv = ctx.start("replica-restart", replica_dir, replica_conf, replica_port)
+    replica = raw_conn(replica_port)
+    ctx.ok("[REG] a restarted replica comes back a REPLICA, not a writable master",
+           wait_until(lambda: _link_up(replica), SYNC_WAIT * 2),
+           str(info_dict(replica, "replication")))
+    cmd(master, "SET", "after_restart", "yes")
+    ctx.ok("streaming resumed after the restart",
+           wait_until(lambda: cmd(replica, "GET", "after_restart") == "yes",
+                      SYNC_WAIT))
+    err = err_of(replica, "SET", "nope", "1")
+    ctx.ok("still read-only after the restart",
+           err is not None and err.startswith("READONLY"), err)
+    replica.close()
+    return srv
+
+
+def _repl_failover(ctx, m_port, r_port, p_port):
+    """The coordinated, zero-loss handover.
+
+    On its own pair, because a handover swaps both roles and every later phase
+    on the main pair would then be talking to the wrong instance.
+
+    The target sits behind a proxy so its ACKs can be stopped WITHOUT stopping
+    the target itself: the write pause, ABORT and the TIMEOUT abort all need a
+    replica that is present but not caught up. The handover dial does not use
+    the proxy — it goes to the address named in FAILOVER TO — so a frozen path
+    can never hide a broken handover.
+    """
+    ctx.section("Replication: coordinated FAILOVER")
+    fdir = ctx.dir("failover")
+    mdir, rdir = ctx.dir("failover/master"), ctx.dir("failover/replica")
+    mconf = write_conf(os.path.join(mdir, "fo-master.conf"),
+                       [f"port {m_port}", "appendonly no", 'save ""'])
+    rconf = write_conf(os.path.join(rdir, "fo-replica.conf"),
+                       [f"port {r_port}", "appendonly no", 'save ""',
+                        f"replicaof 127.0.0.1 {p_port}"])
+    proxy = Proxy(p_port, m_port)
+    proxy.start()
+    m = r = None
+    msrv = rsrv = None
+    try:
+        msrv = ctx.start("fo-master", mdir, mconf, m_port)
+        m = raw_conn(m_port)
+        for i in range(5):
+            cmd(m, "SET", f"fo{i}", f"v{i}")
+        rsrv = ctx.start("fo-replica", rdir, rconf, r_port)
+        r = raw_conn(r_port)
+        ctx.ok("the failover pair is linked", wait_until(lambda: _link_up(r),
+                                                          SYNC_WAIT * 2),
+               str(info_dict(r, "replication")))
+
+        for args, want in (
+            (("FAILOVER", "TO", "127.0.0.1"), "needs a host and a port"),
+            (("FAILOVER", "TO", "127.0.0.1", "0"), "invalid FAILOVER target port"),
+            (("FAILOVER", "TO", "127.0.0.1", "70000"), "invalid FAILOVER target port"),
+            (("FAILOVER", "TIMEOUT", "abc"), "invalid FAILOVER TIMEOUT"),
+            (("FAILOVER", "WAT"), "syntax error"),
+            (("FAILOVER", "FORCE", "TIMEOUT", "1000"), "FORCE requires TO"),
+            (("FAILOVER", "ABORT"), "No failover in progress"),
+        ):
+            err = err_of(m, *args)
+            ctx.ok(f"{' '.join(args)} -> {want}",
+                   err is not None and want.lower() in err.lower(), str(err))
+
+        err = err_of(m, "FAILOVER", "TO", "127.0.0.1", str(r_port), "FORCE")
+        ctx.ok("FORCE without TIMEOUT is refused",
+               err is not None and "TIMEOUT" in err, str(err))
+        err = err_of(m, "FAILOVER", "TO", "127.0.0.1", "9999")
+        ctx.ok("[REG] a valid port with no replica behind it is 'not a connected "
+               "replica'",
+               err is not None and "not a connected replica" in err,
+               f"{err!r} — 'invalid FAILOVER target port' for an ordinary port "
+               f"means the range check reads `port < 65535` where it means "
+               f"`port > 65535`, which rejects every port anyone would use")
+        err = err_of(r, "FAILOVER")
+        ctx.ok("FAILOVER on a replica is refused",
+               err is not None and "requires being a master" in err, str(err))
+
+        proxy.freeze()                     # present, but no longer acking
+        for i in range(5):
+            cmd(m, "SET", f"pause{i}", "x")
+
+        rep, err = reply_or_err(m, "FAILOVER", "TO", "127.0.0.1", str(r_port),
+                                "TIMEOUT", "30000")
+        if not ctx.ok("FAILOVER TO <the connected replica> accepted", rep == "OK",
+                      err or repr(rep)):
+            ctx.skip("the rest of the failover phase",
+                     f"FAILOVER TO was rejected: {err}")
+            return
+
+        d = info_dict(m, "replication")
+        ctx.ok("[REG] INFO reports the pause on the MASTER",
+               d.get("failover_state") == "waiting-for-sync",
+               f"failover_state={d.get('failover_state')!r} — that state only "
+               f"ever exists on a master, so a field emitted inside the "
+               f"`if (replica)` block can never be seen in the one state an "
+               f"operator needs it for")
+        err = err_of(m, "SET", "during_pause", "1")
+        ctx.ok("[REG] writes are paused while the handover waits",
+               err is not None and err.startswith("FAILOVER"),
+               f"{err!r} — every write accepted here moves the offset the target "
+               f"is trying to reach, and the handover never converges")
+        ctx.ok("reads are served throughout the pause", cmd(m, "GET", "fo0") == "v0")
+        err = err_of(m, "FAILOVER", "TO", "127.0.0.1", str(r_port))
+        ctx.ok("a second FAILOVER is refused",
+               err is not None and "already in progress" in err, str(err))
+
+        rep, err = reply_or_err(m, "FAILOVER", "ABORT")
+        ctx.ok("FAILOVER ABORT unwinds a waiting handover", rep == "OK", str(err))
+        ctx.ok("writes flow again after the abort",
+               err_of(m, "SET", "after_abort", "1") is None)
+        ctx.ok("the role never changed",
+               info_dict(m, "replication").get("role") == "master")
+
+        needle = "timed out waiting for the target"
+        mark = msrv.stderr_text().count(needle)
+        rep, err = reply_or_err(m, "FAILOVER", "TO", "127.0.0.1", str(r_port),
+                                "TIMEOUT", "1500")
+        ctx.ok("FAILOVER with a short TIMEOUT accepted", rep == "OK", str(err))
+        # NOTHING may touch either server until the log says so: a deadline that
+        # only fires because an INFO poll woke poll() is not wired.
+        ctx.ok("[REG] the TIMEOUT fires with no traffic to wake the loop",
+               wait_until(lambda: msrv.stderr_text().count(needle) > mark, 8.0),
+               "still waiting: next_timer_ms() has no entry for "
+               "failover_deadline_ms, so poll() slept straight past it")
+        ctx.ok("the timed-out master is writable again",
+               wait_until(lambda: err_of(m, "SET", "after_timeout", "1") is None,
+                          SYNC_WAIT),
+               "failover_reset never ran, or it left the pause gate up")
+        ctx.ok("...still a master, having handed over to nobody",
+               info_dict(m, "replication").get("role") == "master")
+        ctx.ok("failover_state is back to no-failover",
+               info_dict(m, "replication").get("failover_state", "no-failover")
+               == "no-failover")
+
+        for i in range(5):
+            cmd(m, "SET", f"lost{i}", "x")    # never reaches the frozen target
+        full0, ok0, _ = _counters(r)
+        rep, err = reply_or_err(m, "FAILOVER", "TO", "127.0.0.1", str(r_port),
+                                "FORCE", "TIMEOUT", "1500")
+        ctx.ok("FAILOVER ... FORCE accepted", rep == "OK", str(err))
+        ctx.ok("[REG] FORCE hands over past a target that never caught up",
+               wait_until(lambda: _log_has(msrv, "FORCE, handing over"), 10.0),
+               "without FORCE this must abort; with it, it must say how many "
+               "bytes it is stepping over")
+        ctx.ok("the old master demoted itself",
+               wait_until(lambda: info_dict(m, "replication").get("role")
+                          == "slave", 15.0),
+               info_dict(m, "replication").get("role"))
+        ctx.ok("the target promoted itself on PSYNC ... FAILOVER",
+               wait_until(lambda: info_dict(r, "replication").get("role")
+                          == "master", 15.0),
+               "the 4th PSYNC argument never reached do_psync, or repl_shift_id "
+               "was not called before the resync logic read the identity")
+        ctx.ok("the demoted master re-attached to it",
+               wait_until(lambda: _link_up(m), 15.0),
+               str(info_dict(m, "replication")))
+        ctx.ok("[REG] a forced handover is NOT served a +CONTINUE",
+               _counters(r)[0] == full0 + 1 and _counters(r)[1] == ok0,
+               f"sync_full {full0}->{_counters(r)[0]} — the demoted master is "
+               f"AHEAD of the offset the target promoted at, so serving it from "
+               f"the backlog would keep writes the new master never saw: two "
+               f"instances, one replid, different data")
+        ctx.ok("the writes FORCE stepped over are gone",
+               wait_until(lambda: cmd(m, "GET", "lost4") is None, 15.0),
+               "that loss is what the keyword buys and what the log line counts; "
+               "if they survived, the resync did not replace the dataset")
+        ctx.ok("failover_state cleared on the demoted master",
+               info_dict(m, "replication").get("failover_state") == "no-failover",
+               "failover_reset('complete') is missing from the HANDSHAKE outcome "
+               "that ran — the pause gate then stays up forever after a handover")
+        proxy.thaw()
+
+        # Whichever instance holds the master role NOW drives the clean handover.
+        # FORCE may have been refused or silently dropped, and the zero-RDB
+        # handover is the headline of the milestone: it must not become
+        # collateral damage of the phase above it.
+        src, dst, dst_port = ((m, r, r_port)
+                              if info_dict(m, "replication").get("role") == "master"
+                              else (r, m, m_port))
+        ctx.ok("the pair is healthy again before the clean handover",
+               wait_until(lambda: _link_up(dst), 30.0),
+               str(info_dict(dst, "replication")))
+        rep, err = reply_or_err(src, "SET", "pre_clean", "1")
+        ctx.ok("the master takes writes before the handover", rep == "OK", str(err))
+        ctx.ok("...and they reach the replica",
+               wait_until(lambda: cmd(dst, "GET", "pre_clean") == "1", SYNC_WAIT))
+        err = err_of(dst, "SET", "nope", "1")
+        ctx.ok("the replica is read-only going in",
+               err is not None and err.startswith("READONLY"),
+               f"{err!r} — an instance that still accepts writes on the losing "
+               f"side of a handover is the split brain this all exists to avoid")
+
+        full0, ok0, _ = _counters(dst)
+        shared_id = info_dict(src, "replication").get("master_replid")
+        rep, err = reply_or_err(src, "FAILOVER", "TO", "127.0.0.1", str(dst_port),
+                                "TIMEOUT", "10000")
+        ctx.ok("the clean FAILOVER is accepted", rep == "OK", str(err))
+        ctx.ok("the roles swapped",
+               wait_until(lambda: info_dict(dst, "replication").get("role")
+                          == "master"
+                          and info_dict(src, "replication").get("role") == "slave",
+                          20.0),
+               f"target={info_dict(dst, 'replication').get('role')} "
+               f"source={info_dict(src, 'replication').get('role')}")
+        ctx.ok("the demoted instance re-attached",
+               wait_until(lambda: _link_up(src), 15.0),
+               str(info_dict(src, "replication")))
+
+        full1, ok1, _ = _counters(dst)
+        ctx.ok("[REG] a coordinated handover moves NO RDB image",
+               full1 == full0 and ok1 == ok0 + 1,
+               f"sync_full {full0}->{full1} sync_partial_ok {ok0}->{ok1} — this "
+               f"is the entire point of the command. A full resync here means "
+               f"the pause let a write through, the ack wait finished early, or "
+               f"PSYNC FAILOVER promoted after the resync logic instead of before")
+
+        dd = info_dict(dst, "replication")
+        ctx.ok("promotion retired the shared history into master_replid2",
+               dd.get("master_replid2") == shared_id,
+               f"master_replid2={dd.get('master_replid2')} shared={shared_id}")
+        ctx.ok("[REG] the demoted instance adopted the new replid from +CONTINUE",
+               info_dict(src, "replication").get("master_replid")
+               == dd.get("master_replid"),
+               f"demoted={info_dict(src, 'replication').get('master_replid')} "
+               f"promoted={dd.get('master_replid')} — quoting the old name on the "
+               f"next reconnect asks for a history that has expired past "
+               f"second_repl_offset, and every reconnect after this one is full")
+        ctx.ok("no data was lost across the coordinated handover",
+               cmd(dst, "GET", "pre_clean") == "1",
+               "the write acked before the pause must survive it")
+        ctx.ok("the new master is writable",
+               err_of(dst, "SET", "post_clean", "1") is None)
+        ctx.ok("...and streams to the demoted one",
+               wait_until(lambda: cmd(src, "GET", "post_clean") == "1", SYNC_WAIT))
+
+        rep, err = reply_or_err(dst, "FAILOVER", "TIMEOUT", "10000")
+        ctx.ok("a bare FAILOVER is accepted (the target is chosen automatically)",
+               rep == "OK", str(err))
+        ctx.ok("...and it handed over to the only replica there is",
+               wait_until(lambda: info_dict(src, "replication").get("role")
+                          == "master"
+                          and info_dict(dst, "replication").get("role") == "slave",
+                          20.0),
+               "the auto-pick walks g_data.replicas for the highest ack_offset "
+               "and needs a replica that reported its listening-port")
+    finally:
+        for s in (m, r):
+            try:
+                if s is not None:
+                    s.close()
+            except OSError:
+                pass
+        proxy.stop()
+        for srv in (rsrv, msrv):
+            if srv is not None:
+                srv.stop()
+
+
+def _repl_promotion_history(ctx, master_srv, master, master_port, r1_port, r2_port):
+    """Two replicas of one master; the master dies; one replica is promoted; the
+    other is repointed at it. The survivor must serve that sibling from the
+    history it retired, not force a full RDB out of a cluster already a node down.
+    """
+    ctx.section("Replication: promotion keeps the history")
+    r1 = raw_conn(r1_port)
+    r2_dir = ctx.dir("replica2")
+    r2_conf = write_conf(os.path.join(r2_dir, "replica2.conf"), [
+        f"port {r2_port}",
+        "appendonly no",
+        'save ""',
+        f"replicaof 127.0.0.1 {master_port}",     # straight at the master
+    ])
+    r2_srv = ctx.start("replica2", r2_dir, r2_conf, r2_port)
+    r2 = raw_conn(r2_port)
+    try:
+        ctx.ok("the second replica attached", wait_until(lambda: _link_up(r2),
+                                                          SYNC_WAIT * 2),
+               str(info_dict(r2, "replication")))
+        for i in range(20):
+            cmd(master, "SET", f"hist{i}", "x" * 64)
+        ctx.ok("both replicas caught up",
+               wait_until(lambda: cmd(r1, "GET", "hist19") == "x" * 64
+                          and cmd(r2, "GET", "hist19") == "x" * 64, SYNC_WAIT))
+
+        # repl_backlog_feed() advances master_repl_offset itself, so a surviving
+        # manual += counts every byte twice. Nothing downstream can tell you
+        # that — the data is still correct — but the offset the replica reports
+        # is silently double.
+        m_off = info_dict(master, "replication").get("master_repl_offset")
+        ctx.ok("[REG] the replica's offset matches the master's exactly",
+               wait_until(lambda: info_dict(r1, "replication")
+                          .get("master_repl_offset") == m_off, SYNC_WAIT),
+               f"master {m_off}, replica "
+               f"{info_dict(r1, 'replication').get('master_repl_offset')} — "
+               f"roughly double means the STREAMING branch still has its own +=")
+
+        # With no feed the ring is empty at the instant of promotion, and it
+        # cannot be backfilled afterwards, so every sibling full-resyncs no
+        # matter what repl_id2 says.
+        histlen = int(info_dict(r1, "replication").get("repl_backlog_histlen", 0))
+        ctx.ok("[REG] a replica feeds its own backlog while streaming",
+               histlen > 0,
+               "repl_backlog_feed is only called from propagate(), which "
+               "propagate_enabled() gates off while g_loading is set")
+
+        old_replid = info_dict(r1, "replication").get("master_replid")
+
+        # Kill the master for real. The proxy stays up with nothing upstream,
+        # which is a dead master rather than a partitioned one.
+        master_srv.stop()
+        ctx.ok("the surviving replica noticed the master is gone",
+               wait_until(lambda: not _link_up(r1), 10.0))
+
+        # The promotion gate. This is the ONLY case anyone promotes in, and
+        # gating on repl_state (the link phase) instead of replica_mode (the
+        # role) makes the command a silent no-op precisely here.
+        cmd(r1, "REPLICAOF", "NO", "ONE")
+        d = info_dict(r1, "replication")
+        ctx.ok("[REG] REPLICAOF NO ONE promotes a replica whose master is DOWN",
+               d.get("role") == "master",
+               "gated on repl_state instead of replica_mode: repl_link_lost() "
+               "sets repl_state NONE and keeps replica_mode, so this no-ops")
+        ctx.ok("...and it is writable", err_of(r1, "SET", "k", "v") is None)
+        ctx.ok("[REG] promotion RETIRES the old replid into master_replid2",
+               d.get("master_replid2") == old_replid,
+               f"master_replid2={d.get('master_replid2')} old={old_replid} — 40 "
+               f"zeros means repl_shift_id() was never called")
+        ctx.ok("second_repl_offset marks the handover point",
+               d.get("second_repl_offset", "-1") != "-1"
+               and int(d["second_repl_offset"]) > 0,
+               d.get("second_repl_offset"))
+        ctx.ok("a new replid was still minted", d.get("master_replid") != old_replid)
+
+        # The payoff: the sibling must NAME the old history and the promoted
+        # instance must HONOUR it. Both resync paths leave r2 with correct data,
+        # so only the counters can tell them apart.
+        full0, ok0, _ = _counters(r1)
+        cmd(r2, "REPLICAOF", "127.0.0.1", str(r1_port))
+        ctx.ok("the sibling re-attached to the promoted instance",
+               wait_until(lambda: _link_up(r2), 15.0),
+               str(info_dict(r2, "replication")))
+        full1, ok1, _ = _counters(r1)
+        ctx.ok("[REG] the sibling PARTIAL-resyncs off the retired history",
+               ok1 == ok0 + 1 and full1 == full0,
+               f"sync_full {full0}->{full1} sync_partial_ok {ok0}->{ok1} — a full "
+               f"resync here means repl_id2 was not offered or not honoured")
+
+        cmd(r1, "SET", "post_failover", "yes")
+        ctx.ok("the new master streams to the sibling",
+               wait_until(lambda: cmd(r2, "GET", "post_failover") == "yes",
+                          SYNC_WAIT))
+
+        # A promoted master answers +CONTINUE under its NEW replid and the
+        # sibling has to adopt it off that line. Not adopting it is invisible
+        # exactly once — the data is right, the counters say partial — and then
+        # every reconnect after this one full-resyncs. The storm this exists to
+        # prevent comes back on the second reconnect, not the first.
+        new_id = info_dict(r1, "replication").get("master_replid")
+        ctx.ok("[REG] the sibling adopted the promoted master's replid",
+               wait_until(lambda: info_dict(r2, "replication")
+                          .get("master_replid") == new_id, SYNC_WAIT),
+               f"r2={info_dict(r2, 'replication').get('master_replid')} "
+               f"r1={new_id} — the +CONTINUE branch never read the id off the "
+               f"line it arrived on")
+
+        if _set_if_present(r2, "repl-timeout", 1):
+            _set_if_present(r1, "repl-ping-replica-period", 60)   # real silence
+            full2, ok2, _ = _counters(r1)
+            # Watch the master's counters, not the replica's link state: the
+            # re-dial is faster than any poll interval, so "down" is a state
+            # this can miss entirely, while a resync the master SERVED stays put.
+            ctx.ok("the sibling's link bounced at least once",
+                   wait_until(lambda: sum(_counters(r1)[:2]) > full2 + ok2, 15.0),
+                   f"sync_full/ok still {_counters(r1)[:2]} — repl-timeout 1 "
+                   f"never dropped a link silent for longer than that")
+            _set_if_present(r2, "repl-timeout", 60)
+            ctx.ok("the sibling re-dialled on its own",
+                   wait_until(lambda: _link_up(r2), 25.0),
+                   str(info_dict(r2, "replication")))
+            full3, ok3, _ = _counters(r1)
+            # However many times it flapped, not one of them may have cost an
+            # image. The ZERO is the contract; the other number is weather.
+            ctx.ok("[REG] every reconnect after the promotion is still partial",
+                   full3 == full2 and ok3 > ok2,
+                   f"sync_full {full2}->{full3} sync_partial_ok {ok2}->{ok3} — "
+                   f"one partial and then a full on every reconnect after it is "
+                   f"the signature of a replica still quoting the dead master's "
+                   f"replid")
+            _set_if_present(r1, "repl-ping-replica-period", 10)
+        else:
+            ctx.skip("second reconnect stays partial",
+                     "no repl-timeout directive to bounce the link with")
+    finally:
+        for s in (r1, r2):
+            try:
+                s.close()
+            except OSError:
+                pass
+    return r2_srv
+
+
+def phase_replication(ctx: "PhaseCtx"):
+    m_port, r_port, p_port = ctx.ports(3)
+    r2_port = ctx.port()
+    fo_m, fo_r, fo_p = ctx.ports(3)
+
+    mdir, rdir = ctx.dir("repl/master"), ctx.dir("repl/replica")
+    mconf = write_conf(os.path.join(mdir, "master.conf"), [
+        f"port {m_port}",
+        "appendonly no",
+        'save ""',
+        # small on purpose: it makes "a gap larger than the backlog" cheap
+        f"repl-backlog-size {BACKLOG_BYTES}",
+    ])
+    rconf = write_conf(os.path.join(rdir, "replica.conf"), [
+        f"port {r_port}",
+        "appendonly no",
+        'save ""',
+        f"replicaof 127.0.0.1 {p_port}",
+    ])
+    print(f"  master :{m_port}   proxy :{p_port}   replica :{r_port}")
+
+    proxy = Proxy(p_port, m_port)
+    master_srv = replica_srv = None
+    master = replica = None
+    try:
+        master_srv = ctx.start("master", mdir, mconf, m_port)
+        master = raw_conn(m_port)
+        # seed BEFORE the replica exists, so the resync image has something in it
+        for k, v in (("pre1", "a"), ("pre2", "b"), ("pre3", "c")):
+            cmd(master, "SET", k, v)
+
+        # Capability probes rather than version strings: the suite stays useful
+        # while a milestone is half-applied, and says which half is missing.
+        has_counters = "sync_full" in info_dict(master, "stats")
+        has_history = "master_replid2" in info_dict(master, "replication")
+        has_timeout = has_directive(master, "repl-timeout")
+        has_floor = has_directive(master, "min-replicas-to-write")
+        fo_err = err_of(master, "FAILOVER", "ABORT")
+        has_failover = fo_err is not None and "unknown command" not in fo_err
+
+        proxy.start()
+        replica_srv = ctx.start("replica", rdir, rconf, r_port)
+        replica = raw_conn(r_port)
+
+        _repl_full_resync(ctx, master, replica, replica_srv)
+        _repl_streaming(ctx, master, replica)
+        _repl_readonly(ctx, master, replica)
+        _repl_link_loss(ctx, replica, proxy)
+
+        if has_counters:
+            _repl_partial(ctx, master, replica, proxy, p_port)
+            _repl_gap_too_large(ctx, master, replica, proxy, p_port)
+            _repl_auto_reconnect(ctx, master, replica, proxy)
+        else:
+            ctx.skip("partial resync", "INFO has no sync_* counters, so a partial "
+                                       "and a full resync are indistinguishable")
+            proxy.start()
+            cmd(replica, "REPLICAOF", "127.0.0.1", str(p_port))
+            wait_until(lambda: _link_up(replica), SYNC_WAIT)
+
+        _repl_wait(ctx, master, m_port)
+
+        if has_floor:
+            _repl_min_replicas(ctx, master, replica, proxy)
+        else:
+            ctx.skip("durability floor", "no min-replicas-to-write directive")
+
+        if has_timeout:
+            _repl_timeout_config(ctx, master)
+            _repl_idle_keepalive(ctx, master, replica, replica_srv)
+            _repl_wedged(ctx, master, replica, master_srv, replica_srv, proxy)
+        else:
+            ctx.skip("wedged-link detection", "no repl-timeout directive")
+
+        _repl_promotion(ctx, master, replica, rconf, p_port)
+
+        replica.close()
+        replica = None
+        replica_srv.stop()
+        replica_srv = _repl_restart(ctx, rdir, rconf, r_port, master)
+
+        if has_failover:
+            _repl_failover(ctx, fo_m, fo_r, fo_p)
+        else:
+            ctx.skip("coordinated handover", "no FAILOVER command in this binary")
+
+        # LAST: it stops the master on purpose, so nothing may run after it.
+        if has_history:
+            _repl_promotion_history(ctx, master_srv, master, m_port, r_port, r2_port)
+            master = None                  # the phase above stopped the master
+        else:
+            ctx.skip("sibling partial-resync after promotion",
+                     "INFO has no master_replid2")
+    finally:
+        for s in (master, replica):
+            try:
+                if s is not None:
+                    s.close()
+            except OSError:
+                pass
+        proxy.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: TLS — the handshake, and rotating a certificate without a restart
+#
+#  The throughput side of TLS is a measurement, not an assertion, and lives
+#  outside this suite. What belongs here is the part that can break silently:
+#  a certificate swap that is accepted and does nothing, or one that is refused
+#  and leaves the configuration pointing at material the server never loaded.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _selfsigned(dirpath: str, cn: str):
+    """A throwaway cert/key pair. Returns (cert, key), or (None, None) when
+    openssl is not installed."""
+    exe = shutil.which("openssl")
+    if not exe:
+        return None, None
+    key = os.path.join(dirpath, f"{cn}-key.pem")
+    crt = os.path.join(dirpath, f"{cn}-cert.pem")
+    try:
+        subprocess.run(
+            [exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", key, "-out", crt, "-days", "2", "-subj", f"/CN={cn}"],
+            check=True, capture_output=True, timeout=60)
+    except (subprocess.SubprocessError, OSError):
+        return None, None
+    return crt, key
+
+
+def _bare_tls_ctx() -> "ssl.SSLContext":
+    """Self-signed test material: verification is off by design."""
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+def _tls_conn(port: int, timeout: float = TIMEOUT_SEC) -> socket.socket:
+    raw = socket.create_connection(("127.0.0.1", port), timeout)
+    raw.settimeout(timeout)
+    return _bare_tls_ctx().wrap_socket(raw, server_hostname=None)
+
+
+def _peer_fingerprint(port: int, timeout: float = TIMEOUT_SEC):
+    s = _tls_conn(port, timeout)
+    try:
+        der = s.getpeercert(binary_form=True)
+    finally:
+        s.close()
+    return hashlib.sha256(der).hexdigest()[:16] if der else None
+
+
+def phase_tls(ctx: "PhaseCtx"):
+    ctx.section("TLS: handshake and live certificate rotation")
+    d = ctx.dir("tls")
+    crt, key = _selfsigned(d, "myred-test")
+    if not crt:
+        ctx.skip("TLS", "openssl is not on PATH, so no test certificate could "
+                        "be generated")
+        return
+
+    # The server runs on COPIES: rotation overwrites them in place, which is how
+    # every real rotation works (certbot, cert-manager, a mounted secret all
+    # write new bytes to the same path), and it keeps the repo's own material
+    # out of reach.
+    live_cert = os.path.join(d, "server-cert.pem")
+    live_key = os.path.join(d, "server-key.pem")
+    shutil.copyfile(crt, live_cert)
+    shutil.copyfile(key, live_key)
+
+    plain_port, tls_port = ctx.ports(2)
+    conf = write_conf(os.path.join(d, "srv.conf"), [
+        f"port {plain_port}",
+        f"tls-port {tls_port}",
+        f'tls-cert-file "{live_cert}"',
+        f'tls-key-file "{live_key}"',
+        "appendonly no",
+        'save ""',
+    ])
+    try:
+        srv = ctx.start("tls", d, conf, plain_port)
+    except RuntimeError as e:
+        ctx.ok("the server boots with TLS configured", False, str(e))
+        return
+    ctx.ok("the server boots with TLS configured", True)
+
+    # --- both listeners work, and neither confuses the other -----------------
+    try:
+        t = _tls_conn(tls_port)
+        ctx.ok("a TLS handshake completes on the tls-port",
+               cmd(t, "PING") == "PONG")
+        ctx.ok("RESP works over TLS",
+               cmd(t, "SET", "tls:k", "v") == "OK" and cmd(t, "GET", "tls:k") == "v")
+        ver = t.version()
+        print(f"  {YELLOW}info{RESET} negotiated {ver}, "
+              f"cipher {(t.cipher() or ('?',))[0]}")
+        t.close()
+    except Exception as e:
+        ctx.ok("a TLS handshake completes on the tls-port", False,
+               f"{type(e).__name__}: {e}")
+
+    p = raw_conn(plain_port)
+    ctx.ok("the plaintext port still serves plaintext", cmd(p, "PING") == "PONG")
+
+    # A plaintext client on the TLS port sends a RESP array where a ClientHello
+    # is expected. That connection must die and nothing else may.
+    junk = socket.create_connection(("127.0.0.1", tls_port), TIMEOUT_SEC)
+    junk.settimeout(2.0)
+    try:
+        junk.sendall(b"*1\r\n$4\r\nPING\r\n")
+        junk.recv(64)
+    except OSError:
+        pass
+    finally:
+        junk.close()
+    ctx.ok("a plaintext client on the TLS port kills only its own connection",
+           cmd(p, "PING") == "PONG")
+
+    # ...and the reverse: a TLS ClientHello at the plaintext port.
+    try:
+        bad = _tls_conn(plain_port, timeout=3.0)
+        bad.close()
+        handshook = True
+    except Exception:
+        handshook = False
+    ctx.ok("a TLS client on the plaintext port does not get a handshake",
+           not handshook)
+    ctx.ok("the server survives both mismatches", cmd(p, "PING") == "PONG")
+
+    # --- live rotation -------------------------------------------------------
+    if not has_directive(p, "tls-cert-file"):
+        ctx.skip("certificate rotation", "no tls-cert-file directive")
+        p.close()
+        srv.stop()
+        return
+
+    fp0 = _peer_fingerprint(tls_port)
+    ctx.ok("the presented certificate can be fingerprinted", fp0 is not None)
+
+    # An established connection, held open across the rotation. Surviving it is
+    # the entire difference between a reload and a restart.
+    held = _tls_conn(tls_port)
+    cmd(held, "SET", "tls:held", "before")
+
+    new_crt, new_key = _selfsigned(d, "rotated")
+    shutil.copyfile(new_crt, live_cert)
+    shutil.copyfile(new_key, live_key)
+
+    t0 = time.perf_counter()
+    rep, err = reply_or_err(p, "CONFIG", "SET", "tls-cert-file", live_cert)
+    reload_ms = (time.perf_counter() - t0) * 1000.0
+    ctx.ok("CONFIG SET tls-cert-file is accepted", rep == "OK", str(err))
+    if rep == "OK":
+        fp1 = _peer_fingerprint(tls_port)
+        ctx.ok("[REG] new connections are served the NEW certificate",
+               fp1 is not None and fp1 != fp0,
+               f"still presenting {fp0} — the directive was accepted but the "
+               f"SSL_CTX was never swapped")
+        print(f"  {YELLOW}info{RESET} hot reload took {reload_ms:.2f}ms "
+              f"(a restart costs tens of ms and drops every connection)")
+
+    # [REG] tls-key-file must write the KEY field. Its apply() and its get() were
+    # once wired to the cert field, which round-trips perfectly and only shows up
+    # as a server that will not boot after the next rewrite.
+    rep, err = reply_or_err(p, "CONFIG", "SET", "tls-key-file", live_key)
+    ctx.ok("CONFIG SET tls-key-file is accepted", rep == "OK", str(err))
+    got = cmd(p, "CONFIG", "GET", "tls-key-file")
+    got = got[1] if isinstance(got, list) and len(got) >= 2 else None
+    ctx.ok("[REG] tls-key-file reads back the key path, not the cert path",
+           got == live_key,
+           f"tls-key-file reads {got!r}, expected {live_key!r} — the row is "
+           f"wired to the wrong g_config field")
+
+    ctx.ok("[REG] the connection established before the rotation still works",
+           cmd(held, "GET", "tls:held") == "before",
+           "rotating the certificate tore down live sessions — that is a "
+           "restart with extra steps")
+    held.close()
+
+    # A refused swap must change nothing at all.
+    fp_now = _peer_fingerprint(tls_port)
+    err = err_of(p, "CONFIG", "SET", "tls-cert-file",
+                 os.path.join(d, "does-not-exist.pem"))
+    ctx.ok("a nonexistent certificate file is refused", err is not None,
+           "CONFIG SET accepted a path that does not exist")
+    ctx.ok("the server keeps serving the old certificate after a refusal",
+           _peer_fingerprint(tls_port) == fp_now,
+           "a failed build must leave the live context untouched")
+    cur = cmd(p, "CONFIG", "GET", "tls-cert-file")
+    cur = cur[1] if isinstance(cur, list) and len(cur) >= 2 else None
+    ctx.ok("[REG] a rejected CONFIG SET rolls the path back",
+           cur == live_cert,
+           f"tls-cert-file is left as {cur!r} — the next CONFIG REWRITE would "
+           f"persist a path the server never loaded, and the boot after that "
+           f"fails")
+    ctx.ok("the server is still serving plaintext too", cmd(p, "PING") == "PONG")
+    p.close()
+    srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: UNIT — the incremental-rehash invariant, below the protocol
+#
+#  A server-level test cannot see this: a hash map that never finishes draining
+#  still answers every query correctly, it just degrades toward O(n) and never
+#  frees the old table. The source is written out and compiled against the
+#  repo's own hashtable.cpp, so it tests the real implementation.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+HASHTABLE_UNIT_SRC = r"""
+// HMap rehash unit test. What it proves: after a rehash completes, migrate_pos
+// is left at the end of the drained table, and the NEXT rehash must restart the
+// drain from bucket 0. If it does not, the low buckets of `older` are stranded
+// forever, older.tab is never freed, and hm_insert can never trigger a resize
+// again. Several full rehash cycles are driven and the draining table must
+// always empty out.
+#include <cstdio>
+#include <cstdint>
+#include <cstddef>
+#include "hashtable.h"
+
+static int g_pass = 0, g_fail = 0;
+
+static void check(const char *name, bool ok, const char *detail = ""){
+    if (ok){ g_pass++; printf("  ok   %s\n", name); }
+    else   { g_fail++; printf("  FAIL %s %s\n", name, detail); }
+}
+
+struct TestNode {
+    HNode node;
+    uint64_t key = 0;
+};
+
+static uint64_t hash_key(uint64_t k){
+    return k * 0x9E3779B97F4A7C15ULL;   // Fibonacci spread, deterministic
+}
+
+static TestNode *container_of_test(HNode *n){
+    return (TestNode *)((char *)n - offsetof(TestNode, node));
+}
+
+static bool node_eq(HNode *a, HNode *b){
+    return container_of_test(a)->key == container_of_test(b)->key;
+}
+
+static TestNode *lookup(HMap *m, uint64_t key){
+    TestNode probe;
+    probe.key = key;
+    probe.node.hcode = hash_key(key);
+    HNode *hit = hm_lookup(m, &probe.node, node_eq);
+    return hit ? container_of_test(hit) : nullptr;
+}
+
+int main(){
+    // enough nodes for several doublings: 4 -> 8 -> 16 -> 32 -> 64 buckets
+    constexpr size_t N = 600;
+    static TestNode nodes[N];
+
+    HMap map{};
+
+    printf("phase 1: insert %zu keys (drives ~5 rehash cycles)\n", N);
+    for (size_t i = 0; i < N; ++i){
+        nodes[i].key = i;
+        nodes[i].node.hcode = hash_key(i);
+        hm_insert(&map, &nodes[i].node);
+        (void)lookup(&map, i / 2);   // incremental-drain opportunities
+    }
+    check("all keys inserted (hm_size)", hm_size(&map) == N);
+
+    printf("phase 2: give the drain every chance to finish\n");
+    for (int round = 0; round < 1000; ++round){
+        (void)lookup(&map, (uint64_t)round % N);
+    }
+
+    check("draining table fully emptied (older.size == 0)",
+          map.older.size == 0);
+    check("draining table released (older.tab == NULL)",
+          map.older.tab == nullptr,
+          "-- stranded entries: the rehash never completes");
+
+    printf("phase 3: every key still reachable\n");
+    size_t found = 0;
+    for (size_t i = 0; i < N; ++i){
+        TestNode *t = lookup(&map, i);
+        if (t && t->key == i){ found++; }
+    }
+    check("all keys found after rehash cycles", found == N);
+
+    printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
+"""
+
+
+def repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def phase_hashtable_unit(ctx: "PhaseCtx"):
+    ctx.section("Unit: HMap incremental rehash")
+    root = repo_root()
+    impl = os.path.join(root, "hashtable.cpp")
+    header = os.path.join(root, "hashtable.h")
+    if not (os.path.exists(impl) and os.path.exists(header)):
+        ctx.skip("HMap rehash", f"hashtable.cpp/.h not found under {root}")
+        return
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if not cxx:
+        ctx.skip("HMap rehash", "no g++ or clang++ on PATH")
+        return
+
+    d = ctx.dir("unit")
+    src = os.path.join(d, "test_hashtable.cpp")
+    with open(src, "w") as f:
+        f.write(HASHTABLE_UNIT_SRC)
+    exe = os.path.join(d, "test_hashtable")
+    build = subprocess.run(
+        [cxx, "-std=c++17", "-O1", "-I", root, "-o", exe, src, impl],
+        capture_output=True, text=True, timeout=180)
+    if build.returncode != 0:
+        ctx.ok("the unit test compiles against hashtable.cpp", False,
+               (build.stderr or build.stdout).strip()[-800:])
+        return
+    ctx.ok("the unit test compiles against hashtable.cpp", True)
+
+    run = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+    for line in (run.stdout or "").splitlines():
+        if line.strip():
+            print("    " + line)
+    ctx.ok("[REG] the incremental rehash always finishes draining",
+           run.returncode == 0,
+           "a rehash that never completes strands the low buckets of the old "
+           "table forever: lookups stay correct, the table is never freed, and "
+           "no later insert can trigger a resize")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RUN SUMMARY — the machine-readable half of a run
+#
+#  The markdown log is for reading; this is for comparing. Two runs of the same
+#  build on different machines differ in exactly one interesting way, and it is
+#  a number, so the numbers get written somewhere a diff can reach them.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def write_summary(path: str, payload: dict):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def print_bench_table(results: dict):
+    if not results:
+        return
+    print(f"\n{BOLD}{BLUE}-- Throughput summary {'-' * 34}{RESET}")
+    print(f"  {'test':<16} {'ops/sec':>14}  {'p50 ms':>8}")
+    for name in sorted(results, key=lambda k: -results[k].get("rps", 0)):
+        row = results[name]
+        p50 = row.get("p50")
+        print(f"  {name:<16} {row.get('rps', 0):>14,.0f}  "
+              f"{(f'{p50:.3f}' if p50 is not None else '-'):>8}")
+
+
+def compare_summaries(old_path: str, new_path: str) -> int:
+    """Diff the throughput of two summary files — typically the same build on
+    two different machines.
+
+    No verdict column, on purpose. Each side is a single run, so there is no
+    noise floor to judge a delta against; what the table is good for is the
+    large, structural difference (a VM's network stack against bare metal),
+    not a few percent either way.
+    """
+    try:
+        with open(old_path) as f:
+            old = json.load(f)
+        with open(new_path) as f:
+            new = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"{RED}cannot read a summary: {e}{RESET}")
+        return 2
+
+    def tag(d):
+        p = d.get("platform", {})
+        return (f"{p.get('env', '?')} / {p.get('kernel', '?')} / "
+                f"{(p.get('cpu_model') or '?')[:40]}")
+
+    print(f"{BOLD}A{RESET}  {old_path}\n   {tag(old)}")
+    print(f"{BOLD}B{RESET}  {new_path}\n   {tag(new)}")
+    ob, nb = old.get("bench") or {}, new.get("bench") or {}
+    if ob.get("params") and nb.get("params") and ob["params"] != nb["params"]:
+        print(f"\n{RED}refusing to compare: the benchmark parameters differ{RESET}")
+        print(f"  A: {ob['params']}")
+        print(f"  B: {nb['params']}")
+        print("  Throughput scales with -n/-c/-P, so a mismatch here "
+              "manufactures whatever result you want.")
+        return 2
+
+    oa, na = ob.get("tests") or {}, nb.get("tests") or {}
+    shared = sorted(set(oa) & set(na))
+    if not shared:
+        print(f"\n{YELLOW}neither summary carries benchmark results "
+              f"(run with --bench){RESET}")
+    else:
+        print(f"\n  {'test':<10} {'A ops/sec':>14} {'B ops/sec':>14} {'B/A':>8}")
+        for k in shared:
+            a, b = oa[k].get("rps", 0), na[k].get("rps", 0)
+            ratio = (b / a) if a else 0.0
+            print(f"  {k:<10} {a:>14,.0f} {b:>14,.0f} {ratio:>7.2f}x")
+        ratios = [na[k].get("rps", 0) / oa[k]["rps"]
+                  for k in shared if oa[k].get("rps")]
+        if ratios:
+            ratios.sort()
+            print(f"\n  median B/A across {len(ratios)} tests: "
+                  f"{BOLD}{ratios[len(ratios) // 2]:.2f}x{RESET}")
+
+    for label, d in (("A", old), ("B", new)):
+        bt = (d.get("build") or {}).get("cmake_build_type")
+        if bt and bt.lower() not in OPTIMIZED_BUILD_TYPES:
+            print(f"  {YELLOW}note{RESET} {label} was a {bt} build — its "
+                  f"throughput is not a result")
+    print(f"\n  {YELLOW}note{RESET} one run per side: there is no noise floor "
+          f"here, so read the structural differences and ignore small ones.")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE REGISTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def phase_table():
+    """(name, description, fn). Ordered cheapest-first so a failure that is
+    going to happen anyway happens early; replication runs last because it is by
+    far the slowest and it stops its own master on the way out."""
+    return [
+        ("unit",        "HMap incremental rehash (compiles hashtable.cpp)",
+         phase_hashtable_unit),
+        ("memory",      "per-type accounting, maxmemory, incremental eviction",
+         phase_memory),
+        ("config",      "CONFIG REWRITE survives a restart",
+         phase_config_roundtrip),
+        ("auth",        "async AUTH: pipelining, lockout, loop latency",
+         phase_async_auth),
+        ("security",    "ACL enforcement, renamed commands, audit log",
+         phase_security),
+        ("persistence", "AOF gating, rewrite, hybrid, RDB, restart matrix",
+         phase_persistence),
+        ("tls",         "TLS handshake and live certificate rotation",
+         phase_tls),
+        ("replication", "resync paths, durability floor, failover, promotion",
+         phase_replication),
+    ]
+
+
+def select_phases(spec: str):
+    """Resolve --phases into a list of (name, fn). 'all' or '' means every one."""
+    table = phase_table()
+    if not spec or spec == "all":
+        return [(n, f) for n, _, f in table]
+    if spec == "none":
+        return []
+    known = {n: f for n, _, f in table}
+    chosen, unknown = [], []
+    for name in [p.strip() for p in spec.split(",") if p.strip()]:
+        if name in known:
+            chosen.append((name, known[name]))
+        else:
+            unknown.append(name)
+    if unknown:
+        print(f"{RED}unknown phase(s): {', '.join(unknown)}{RESET}")
+        print(f"  known: {', '.join(n for n, _, _ in table)}")
+        sys.exit(2)
+    return chosen
+
+
+def run_spawned_phases(r: "TestRunner", args, phases) -> dict:
+    """Run the phases that manage their own servers. Returns per-phase results."""
+    root = tempfile.mkdtemp(prefix="myred-suite-")
+    ctx = PhaseCtx(r, os.path.abspath(args.server), root, args.base_port,
+                   destructive=args.destructive)
+    print(f"\n{BOLD}{'═' * 55}{RESET}")
+    print(f"{BOLD}  Managed-instance phases{RESET}")
+    print(f"{'═' * 55}")
+    print(f"  Binary:   {ctx.server_bin}")
+    print(f"  Workdir:  {root}")
+    print(f"  Ports:    from {args.base_port}")
+    print(f"  Phases:   {', '.join(n for n, _ in phases)}")
+    if not args.destructive:
+        print(f"  {YELLOW}note{RESET} --destructive adds the SIGKILL crash-recovery "
+              f"and protocol-abuse checks")
+
+    results = {}
+    any_failed = False
+    for name, fn in phases:
+        p0, f0, s0 = r.passed, r.failed, ctx.skipped
+        t0 = time.perf_counter()
+        crashed = None
+        try:
+            fn(ctx)
+        except Exception as e:
+            crashed = f"{type(e).__name__}: {e}"
+            ctx.ok(f"phase '{name}' ran to completion", False, crashed)
+        finally:
+            # A phase that dies partway leaves instances running; they own ports
+            # the next phase wants.
+            ctx.stop_all()
+            ctx.instances = [] if not (r.failed - f0) else ctx.instances
+        results[name] = {
+            "passed": r.passed - p0,
+            "failed": r.failed - f0,
+            "skipped": ctx.skipped - s0,
+            "duration": round(time.perf_counter() - t0, 2),
+            "error": crashed,
+        }
+        if r.failed - f0:
+            any_failed = True
+            ctx.dump_evidence()
+            ctx.instances = []
+
+    if any_failed or args.keep:
+        print(f"\n{YELLOW}workdir kept for inspection: {root}{RESET}")
+    else:
+        shutil.rmtree(root, ignore_errors=True)
+    if ctx.skipped:
+        print(f"{YELLOW}{ctx.skipped} check(s) skipped: this binary predates "
+              f"them{RESET}")
+    results["_skipped_total"] = ctx.skipped
+    return results
+
+
+def spawn_primary(args, workdir: str):
+    """Spawn the instance the live-server sections run against, so the whole
+    suite is one command with no manual setup. Returns (Instance, host, port)."""
+    plain_port = args.base_port + 90
+    lines = [f"port {plain_port}",
+             "appendonly no",
+             # No requirepass: k_max_auth_inflight is 4 against Argon2id's
+             # memory bound, and redis-benchmark opens 50 connections that all
+             # AUTH at once and never retry BUSY. Auth is covered by its own
+             # phase, on its own instance.
+             'save ""']
+    port = plain_port
+    if args.tls:
+        crt, key = _selfsigned(workdir, "myred-primary")
+        if not crt:
+            print(f"{YELLOW}openssl not found: running the primary instance in "
+                  f"plaintext despite --tls{RESET}")
+            args.tls = False
+        else:
+            port = args.base_port + 91
+            lines += [f"tls-port {port}", f'tls-cert-file "{crt}"',
+                      f'tls-key-file "{key}"']
+    conf = write_conf(os.path.join(workdir, "primary.conf"), lines)
+    inst = Instance(os.path.abspath(args.server), workdir, conf, "primary",
+                    plain_port)
+    return inst, "127.0.0.1", port
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3474,16 +7103,19 @@ def run_redis_benchmark(host: str, port: int, password: Optional[str],
 def main():
     global G_PASSWORD, G_TLS, G_TLS_INSECURE, G_TLS_CA, G_TLS_CERT, G_TLS_KEY
 
-    ap = argparse.ArgumentParser(description="Redis server RESP stress test")
+    ap = argparse.ArgumentParser(
+        description="MYRED regression, stress and speed suite")
     ap.add_argument("--host",             default=DEFAULT_HOST)
-    ap.add_argument("--port",             default=DEFAULT_PORT, type=int)
+    ap.add_argument("--port",             default=None, type=int,
+                    help=f"server port (default {DEFAULT_PORT}; ignored when "
+                         f"--server spawns its own instance)")
     ap.add_argument("--password",         default=None,
                     help="server password (if auth is enabled)")
     ap.add_argument("--tls",              action="store_true",
-                    help="connect over TLS (wraps client sockets, passes --tls to redis-benchmark); "
-                         "point --port at the tls-port")
+                    help="connect over TLS (wraps client sockets, passes --tls to "
+                         "redis-benchmark); point --port at the tls-port")
     ap.add_argument("--tls-insecure",     action="store_true",
-                    help="skip server certificate verification (for self-signed test certs)")
+                    help="skip server certificate verification (self-signed test certs)")
     ap.add_argument("--tls-ca",           default=None,
                     help="CA cert file to verify the server (omit with --tls-insecure)")
     ap.add_argument("--tls-cert",         default=None,
@@ -3506,15 +7138,52 @@ def main():
                     help="parallel clients for redis-benchmark")
     ap.add_argument("--bench-pipeline",   default=16, type=int,
                     help="pipeline depth for redis-benchmark")
+
+    ap.add_argument("--server",           default=None,
+                    help="path to the server binary. Enables the phases that "
+                         "manage their own instances (restarts, crashes, "
+                         "replication, TLS rotation) and, unless --host/--port "
+                         "say otherwise, spawns the instance the rest of the "
+                         "suite runs against — so one command runs everything")
+    ap.add_argument("--phases",           default="all",
+                    help="which managed-instance phases to run: 'all' (default), "
+                         "'none', or a comma-separated list. --list-phases prints them")
+    ap.add_argument("--list-phases",      action="store_true",
+                    help="print the managed-instance phases and exit")
+    ap.add_argument("--destructive",      action="store_true",
+                    help="also run the SIGKILL crash-recovery and protocol-abuse "
+                         "checks")
+    ap.add_argument("--base-port",        default=12500, type=int,
+                    help="first private port for spawned instances")
+    ap.add_argument("--keep",             action="store_true",
+                    help="keep the temp workdir even when everything passes")
+
     ap.add_argument("--log",              default="auto",
                     help="write a copy of all output here (ANSI stripped). "
-                         "'auto' (default) derives docs/<kind>_<plain|tls>.md so a "
-                         "TLS run never overwrites the plaintext one; "
+                         "'auto' (default) derives "
+                         "<log-dir>/<WSL|Native>/<kind>_<plain|tls>.md, so a run "
+                         "from a VM never overwrites one from bare metal; "
                          "pass --log '' to disable")
+    ap.add_argument("--log-dir",          default=os.path.join("docs", "logs"),
+                    help="root for the per-environment log directories")
+    ap.add_argument("--compare",          nargs=2, metavar=("A.json", "B.json"),
+                    default=None,
+                    help="diff the throughput of two summary files and exit")
     args = ap.parse_args()
 
-    host, port  = args.host, args.port
-    G_PASSWORD  = args.password
+    if args.list_phases:
+        print("Managed-instance phases (need --server <binary>):\n")
+        for name, desc, _ in phase_table():
+            print(f"  {name:<12} {desc}")
+        print("\n  --phases a,b,c   run only these      "
+              "--phases none    skip them all")
+        return 0
+    if args.compare:
+        return compare_summaries(args.compare[0], args.compare[1])
+
+    host = args.host
+    port = args.port if args.port is not None else DEFAULT_PORT
+    G_PASSWORD     = args.password
     G_TLS          = args.tls
     G_TLS_INSECURE = args.tls_insecure
     G_TLS_CA       = args.tls_ca
@@ -3523,151 +7192,232 @@ def main():
 
     if bool(args.tls_cert) != bool(args.tls_key):
         print(f"{RED}--tls-cert and --tls-key must be given together{RESET}")
-        sys.exit(2)
+        return 2
     if (args.tls_ca or args.tls_cert or args.tls_insecure) and not args.tls:
         print(f"{RED}--tls-* options require --tls{RESET}")
-        sys.exit(2)
-    if args.tls and not (args.tls_insecure or args.tls_ca):
-        print(f"{YELLOW}note: --tls without --tls-ca or --tls-insecure verifies against the "
-              f"system CA store and will reject a self-signed cert — use --tls-insecure "
-              f"for local test certs{RESET}")
-
+        return 2
     if args.stress_threads < 1 or args.stress_ops < 1 or args.metrics_top < 1:
-        print(f"{RED}--stress-threads, --stress-ops, and --metrics-top must be >= 1{RESET}")
-        sys.exit(2)
+        print(f"{RED}--stress-threads, --stress-ops and --metrics-top must be "
+              f">= 1{RESET}")
+        return 2
+    if args.server and not os.path.exists(args.server):
+        print(f"{RED}server binary not found: {args.server}{RESET}")
+        return 2
 
-    # mirror everything to a shareable markdown log, named per transport+mode
-    log_path = default_log_path(args) if args.log == "auto" else args.log
+    # Does this run spawn the instance the live sections talk to? Only when the
+    # caller named a binary and did NOT name a server to talk to.
+    spawn_own = bool(args.server) and args.port is None and host == DEFAULT_HOST
+    if spawn_own and args.tls:
+        G_TLS_INSECURE = args.tls_insecure = True     # self-signed test material
+
+    facts = platform_facts()
+    bf = build_facts(args.server)
+
+    log_path = default_log_path(args, facts) if args.log == "auto" else args.log
     if log_path:
         start_logging(log_path, run_label(args, host, port))
-        print(f"(logging output to {log_path})")
 
     print(f"{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  MYRED — {run_label(args, host, port)}{RESET}")
     print(f"{'═' * 55}")
-    print(f"  Target:    {host}:{port}")
-    print(f"  Transport: {'TLS' + (' (insecure — cert not verified)' if G_TLS_INSECURE else '') if G_TLS else 'plaintext'}")
-    print(f"  Auth:      {'password' if G_PASSWORD else 'none'}")
+    print_platform(facts)
+    if args.server:
+        warn_if_unmeasurable(bf, args.bench)
     if log_path:
-        print(f"  Log:       {log_path}")
-    print(f"{'═' * 55}")
+        print(f"  Log:          {log_path}")
 
-    # reachability check
+    primary = None
+    primary_dir = None
+    started = time.time()
     try:
-        s = make_conn(host, port)
-        s.close()
-        print(f"{GREEN}✓ Server is reachable{RESET}")
-    except RespError as e:
-        print(f"{RED}✗ Auth failed: {e}{RESET}")
-        print("  Check your --password value")
-        sys.exit(1)
-    except Exception as e:
-        print(f"{RED}✗ Cannot connect: {e}{RESET}")
-        print("  Start the server first:  ./server")
-        sys.exit(1)
+        if spawn_own:
+            primary_dir = tempfile.mkdtemp(prefix="myred-primary-")
+            try:
+                primary, host, port = spawn_primary(args, primary_dir)
+            except RuntimeError as e:
+                print(f"{RED}could not start the primary instance: {e}{RESET}")
+                return 1
+            print(f"\n{GREEN}✓ Spawned the primary instance on "
+                  f"{host}:{port}{RESET}  ({primary_dir})")
+        else:
+            print(f"\n  Target:       {host}:{port}")
 
-    all_ok = True
+        print(f"  Transport:    "
+              f"{'TLS' + (' (cert not verified)' if G_TLS_INSECURE else '') if G_TLS else 'plaintext'}")
+        print(f"  Auth:         {'password' if G_PASSWORD else 'none'}")
 
-    # ── correctness ────────────────────────────────────────────────────────────
-    if not args.stress_only:
-        r    = TestRunner(host, port)
-        sock = make_conn(host, port)
-        try:
-            test_string_commands(r,       sock)
-            test_numeric_commands(r,      sock)
-            test_setvariant_commands(r,   sock)
-            test_multikey_commands(r,     sock)
-            test_bulkrange_commands(r,    sock)
-            test_keys_command(r,          sock)
-            test_ttl_commands(r,          sock)
-            test_zset_commands(r,         sock)
-            test_zquery_commands(r,       sock)
-            test_zset_extended(r,         sock)
-            test_list_commands(r,         sock)
-            test_hash_commands(r,                  sock)
-            test_extended_hash_commands(r,         sock)
-            test_generic_commands(r,               sock)
-            test_scan_command(r,                   sock)
-            test_extended_generic_commands(r,      sock)
-            test_unlink_command(r,                 sock)
-            test_set_commands(r,                   sock)
-            test_set_random_semantics(r,           sock)
-            test_edge_cases(r,            sock)
-            test_ping_command(r,          sock)
-            test_config_command(r,        sock)
-            test_acl_commands(r,          sock, host, port)
-            test_pubsub_channel_acl(r,    sock, host, port)
-            test_info_command(r,          sock)
-            test_info_keyspace_stats(r,   sock)
-            test_flushdb_command(r,       sock)
-            test_save_command(r,          sock)
-            test_bgsave_command(r,        sock)
-            test_bgrewriteaof_command(r,  sock)
-            test_memory_commands(r,       sock)
-        except Exception as e:
-            print(f"\n{RED}Unexpected error: {e}{RESET}")
-            all_ok = False
-        finally:
-            sock.close()
-
-        # tests that manage their own connections
-        try:
-            test_echo_and_inline(r,       host, port)
-            test_auth_command(r,          host, port)
-            test_pubsub_commands(r,       host, port)
-            test_pubsub_patterns(r,       host, port)
-            test_keyspace_notifications(r, host, port)
-            test_transactions(r,          host, port)
-            test_transaction_watch(r,     host, port)
-            test_persistence_roundtrip(r, host, port)
-        except Exception as e:
-            print(f"\n{RED}Unexpected error: {e}{RESET}")
-            all_ok = False
-
-        all_ok = r.summary() and all_ok
-
-    # ── concurrent safety ──────────────────────────────────────────────────────
-    if not args.stress_only and not args.correctness_only:
-        all_ok = test_concurrent_writes(host, port) and all_ok
-        rp = TestRunner(host, port)
-        try:
-            test_pubsub_fanout_concurrency(rp, host, port)
-        except Exception as e:
-            print(f"\n{RED}Unexpected error: {e}{RESET}")
-            all_ok = False
-        all_ok = rp.summary() and all_ok
-
-    # ── stress ─────────────────────────────────────────────────────────────────
-    if not args.correctness_only:
-        all_ok = run_stress_test(host, port, args.stress_threads,
-                                 args.stress_ops, args.metrics_top) and all_ok
-        cleanup_stress_keys(host, port)
-
-    # ── speed baseline (redis-benchmark) ───────────────────────────────────────
-    if args.bench:
-        all_ok = run_redis_benchmark(host, port, G_PASSWORD, args.bench_requests,
-                                     args.bench_clients, args.bench_pipeline) and all_ok
         try:
             s = make_conn(host, port)
-            cmd(s, "flushall")              # benchmark keys are junk
             s.close()
-        except Exception:
-            pass
+            print(f"{GREEN}✓ Server is reachable{RESET}")
+        except RespError as e:
+            print(f"{RED}✗ Auth failed: {e}{RESET}  — check --password")
+            return 1
+        except Exception as e:
+            print(f"{RED}✗ Cannot connect: {e}{RESET}")
+            print("  Start a server first, or pass --server <binary> to have "
+                  "this suite start one.")
+            return 1
 
-    COMMAND_METRICS.report(args.metrics_top)
+        # Named parts rather than one bare bool. Three things here fail OUTSIDE
+        # the TestRunner — the concurrency probe, the stress phase and the
+        # benchmark — so a run could print "1022/1022 passed" and then "SOME
+        # TESTS FAILED" with nothing anywhere saying which of them it was.
+        failed_parts = []
 
-    # ── final verdict ──────────────────────────────────────────────────────────
-    print(f"\n{BOLD}{'═' * 55}{RESET}")
-    if all_ok:
-        print(f"{BOLD}{GREEN}  ALL TESTS PASSED{RESET}")
-    else:
-        print(f"{BOLD}{RED}  SOME TESTS FAILED{RESET}")
-    print(f"  {run_label(args, host, port)}")
-    if log_path:
-        print(f"  {BOLD}Results saved to {log_path}{RESET}")
-    print(f"{'═' * 55}\n")
-    sys.exit(0 if all_ok else 1)
+        def note(part: str, ok) -> bool:
+            if not ok:
+                failed_parts.append(part)
+            return bool(ok)
+
+        r = TestRunner(host, port)
+        phase_results = {}
+
+        # ── correctness ─────────────────────────────────────────────────────
+        if not args.stress_only:
+            sock = make_conn(host, port)
+            try:
+                test_string_commands(r,       sock)
+                test_numeric_commands(r,      sock)
+                test_setvariant_commands(r,   sock)
+                test_multikey_commands(r,     sock)
+                test_bulkrange_commands(r,    sock)
+                test_keys_command(r,          sock)
+                test_ttl_commands(r,          sock)
+                test_zset_commands(r,         sock)
+                test_zquery_commands(r,       sock)
+                test_zset_extended(r,         sock)
+                test_list_commands(r,         sock)
+                test_hash_commands(r,                  sock)
+                test_extended_hash_commands(r,         sock)
+                test_generic_commands(r,               sock)
+                test_scan_command(r,                   sock)
+                test_extended_generic_commands(r,      sock)
+                test_unlink_command(r,                 sock)
+                test_set_commands(r,                   sock)
+                test_set_random_semantics(r,           sock)
+                test_edge_cases(r,            sock)
+                test_ping_command(r,          sock)
+                test_config_command(r,        sock)
+                test_acl_commands(r,          sock, host, port)
+                test_pubsub_channel_acl(r,    sock, host, port)
+                test_info_command(r,          sock)
+                test_info_keyspace_stats(r,   sock)
+                test_flushdb_command(r,       sock)
+                test_save_command(r,          sock)
+                test_bgsave_command(r,        sock)
+                test_bgrewriteaof_command(r,  sock)
+                test_memory_commands(r,       sock)
+            except Exception as e:
+                print(f"\n{RED}Unexpected error: {e}{RESET}")
+                note("correctness (unexpected error)", False)
+            finally:
+                sock.close()
+
+            # tests that manage their own connections
+            try:
+                test_echo_and_inline(r,       host, port)
+                test_auth_command(r,          host, port)
+                test_pubsub_commands(r,       host, port)
+                test_pubsub_patterns(r,       host, port)
+                test_keyspace_notifications(r, host, port)
+                test_transactions(r,          host, port)
+                test_transaction_watch(r,     host, port)
+                test_persistence_roundtrip(r, host, port)
+            except Exception as e:
+                print(f"\n{RED}Unexpected error: {e}{RESET}")
+                note("correctness (unexpected error)", False)
+
+        # ── concurrent safety ───────────────────────────────────────────────
+        if not args.stress_only and not args.correctness_only:
+            note("concurrent writes", test_concurrent_writes(host, port))
+            try:
+                test_pubsub_fanout_concurrency(r, host, port)
+            except Exception as e:
+                print(f"\n{RED}Unexpected error: {e}{RESET}")
+                note("pub/sub fan-out concurrency", False)
+
+        # ── managed-instance phases ─────────────────────────────────────────
+        # These own their servers, so they run against --server rather than
+        # against whatever the live sections were pointed at.
+        phases = select_phases(args.phases)
+        if args.server and phases and not (args.stress_only or args.correctness_only):
+            phase_results = run_spawned_phases(r, args, phases)
+        elif phases and not args.server:
+            print(f"\n{YELLOW}note{RESET} the phases that manage their own "
+                  f"instances (restart, crash recovery, replication, TLS "
+                  f"rotation, ACL round-trip) need the server binary — re-run "
+                  f"with --server build-rel/server to include them.")
+
+        note("assertions", r.summary())
+
+        # ── stress ──────────────────────────────────────────────────────────
+        if not args.correctness_only:
+            note("stress phase", run_stress_test(host, port, args.stress_threads,
+                                                args.stress_ops, args.metrics_top))
+            cleanup_stress_keys(host, port)
+
+        # ── speed baseline ──────────────────────────────────────────────────
+        if args.bench:
+            note("redis-benchmark", run_redis_benchmark(
+                host, port, G_PASSWORD, args.bench_requests, args.bench_clients,
+                args.bench_pipeline))
+            try:
+                s = make_conn(host, port)
+                cmd(s, "flushall")            # benchmark keys are junk
+                s.close()
+            except Exception:
+                pass
+            print_bench_table(BENCH_RESULTS["tests"])
+
+        COMMAND_METRICS.report(args.metrics_top)
+
+        # ── artifacts ───────────────────────────────────────────────────────
+        summary_path = None
+        if log_path:
+            summary_path = os.path.splitext(log_path)[0] + ".json"
+            write_summary(summary_path, {
+                "generated":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "run_kind":    run_kind(args),
+                "transport":   "tls" if G_TLS else "plain",
+                "authed":      bool(G_PASSWORD),
+                "duration_s":  round(time.time() - started, 1),
+                "platform":    facts,
+                "build":       bf,
+                "server":      {"host": host, "port": port,
+                                "mode": "spawned" if spawn_own else "live"},
+                "phases":      phase_results,
+                "totals":      {"passed": r.passed, "failed": r.failed},
+                "failed_parts": failed_parts,
+                "bench":       BENCH_RESULTS if args.bench else None,
+            })
+
+        print(f"\n{BOLD}{'═' * 55}{RESET}")
+        if not failed_parts:
+            print(f"{BOLD}{GREEN}  ALL TESTS PASSED{RESET}")
+        else:
+            print(f"{BOLD}{RED}  SOME TESTS FAILED{RESET}")
+            for part in failed_parts:
+                print(f"    {RED}•{RESET} {part}")
+        print(f"  {run_label(args, host, port)}")
+        print(f"  {facts['env']} — {facts.get('kernel')}")
+        if log_path:
+            print(f"  {BOLD}Log:     {log_path}{RESET}")
+        if summary_path:
+            print(f"  {BOLD}Summary: {summary_path}{RESET}")
+            print(f"  Compare two machines with: "
+                  f"--compare <A.json> <B.json>")
+        print(f"{'═' * 55}\n")
+        return 0 if not failed_parts else 1
+    finally:
+        if primary is not None:
+            primary.stop()
+        if primary_dir:
+            if args.keep:
+                print(f"{YELLOW}primary workdir kept: {primary_dir}{RESET}")
+            else:
+                shutil.rmtree(primary_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

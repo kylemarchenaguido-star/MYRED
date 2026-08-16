@@ -164,11 +164,12 @@ split out to V12 on 2026-08-12.
 ### V11 - Testing Hardening → moved to `ROADMAP.md`
 
 **Promoted to `ROADMAP.md` → Current Focus on 2026-08-16**, when V10.6.1 closed
-and it became the active milestone. Its Step 0 (fold every local suite back into
-one runnable regression surface) is the next work. V10.6e below is still gated
-behind it.
+and it became the active milestone. **Step 0 closed 2026-08-15**: one command
+(`stress_test.py --server <binary>`) now runs 1022 checks across eight
+managed-instance phases with no setup, so the gate V10.6e was waiting on is met.
+The differential, fuzz and adversarial work is what remains.
 
-### V10.6e - Automatic failover, Sentinel-compatible [Unscoped, after V11 Step 0]
+### V10.6e - Automatic failover, Sentinel-compatible [Unscoped, entry conditions met]
 
 **Moved here from `ROADMAP.md` → Current Focus on 2026-08-14**, and the placement
 *after* V11 is the decision, not an accident of ordering: this is the one
@@ -191,11 +192,13 @@ exactly nothing.
 
 Entry conditions, in order:
 
-1. **V11 Step 0** (above) — one runnable regression surface, with the existing
-   replication phases folded in. The three shapes `test_replication.py` already
-   needs (a freezable link, stderr-based assertions, a phase that spawns its own
-   pair of instances) are all prerequisites for testing an election too, and a
-   fourth arrives with it: killing a master and asserting on *who* won.
+1. ~~**V11 Step 0** — one runnable regression surface.~~ **Done 2026-08-15.**
+   The three shapes an election also needs are all in `stress_test.py`'s
+   `replication` phase now: a freezable link, stderr-based assertions, and a
+   phase that spawns its own instances from `PhaseCtx`. A fourth arrives with the
+   election itself — killing a master and asserting on *who* won — and the
+   promotion-history phase already stops a master and interrogates the survivors,
+   so it is the place to build it.
 2. Decide the scope: Sentinel-compatible (a separate process speaking the real
    Sentinel protocol, so `redis-cli --sentinel` and existing clients work) versus
    an in-process gossip between MYRED instances. The first is more work and far
@@ -458,10 +461,317 @@ New data types (biggest lift, least urgent): HyperLogLog (`PF*`), Streams
 
 ## Platform Work
 
-- Portable background snapshot design without `fork()`.
-- Windows socket layer using `WSAPoll`; `WSAStartup`/`WSACleanup`.
-- `FlushFileBuffers` replacement for `fdatasync`.
-- Path handling and config path portability.
+Everything below is grounded in what the code actually calls today (checked by
+grep across `server.cpp`, `transport.cpp`, `thread_pool.cpp`/`.h`, `rdb.cpp`,
+`aof.cpp`, `client.cpp`, `state.cpp`, `cred.cpp`, `commands.cpp`, and
+`CMakeLists.txt`), not a generic POSIX-porting checklist. CMake is already the
+build system, so the build graph itself is not the hard part — the runtime API
+surface and (per Difficulty 15) provisioning its Windows dependencies are.
+
+### Possibilities
+
+- **Native Windows binary, no WSL2.** Every perf baseline on record so far
+  (`docs/tls_metrics.md`, and the WSL2 numbers noted in the roadmap) is
+  measured under WSL2's syscall-translation layer; a native build is the only
+  way to know MYRED's real Windows-kernel numbers instead of WSL2's.
+- **Two viable routes, and they don't dodge the same wall:**
+  - *MinGW-w64*, keeping `pthread_*`, `poll()`, and most `<sys/*.h>` headers
+    via its POSIX-compatible layer. Smallest source diff, but it does **not**
+    make `fork()` real — MinGW has no kernel-level `fork()` either, so the
+    background-save redesign (Difficulty 1 below) is required under this
+    route too.
+  - *Native MSVC + Winsock2*, replacing the socket/thread layer outright.
+    Bigger diff, but it's the version that can eventually plug into IOCP
+    instead of `WSAPoll`, which matters if the Event Loop and Connection
+    Scaling work (above) ever wants a real Windows-native backend rather
+    than the portable-fallback `poll()`/`WSAPoll()` path.
+- **`std::thread`/`std::mutex`/`std::condition_variable` instead of
+  `pthread_*`.** `thread_pool.cpp`/`thread_pool.h` and the `g_loop_mu` mutex
+  in `server.cpp` are the only `pthread_*` call sites in the codebase
+  (create, join, mutex lock/unlock, cond wait/signal/broadcast — nothing
+  exotic like `pthread_rwlock` or thread-specific keys). Since the project
+  is already C++17, swapping these for the standard-library equivalents
+  removes the Windows-thread problem *entirely* instead of translating it —
+  one thread API for both platforms, no `#ifdef` needed for this part.
+
+### Difficulties (ranked by how far they are from a 1:1 API swap)
+
+1. **`fork()` for background persistence has no structural Windows
+   equivalent — this is a redesign, not a translation.** `rdb.cpp:939`
+   (bgsave) and `aof.cpp:133` (AOF rewrite) both rely on `fork()` giving the
+   child an implicit, atomic, copy-on-write snapshot of the *entire* heap
+   for free. `CreateProcess` on Windows starts a fresh address space with
+   nothing shared — there is no API that reproduces "child sees a frozen
+   copy of parent memory at the instant of the call." This is what the
+   existing BACKLOG bullet "portable background snapshot design without
+   `fork()`" is actually asking for, and it has to be solved once, for both
+   platforms, not per-OS. Note for whoever designs it: MYRED forks from a
+   process that already has thread-pool workers running (`aof_fsync_job` is
+   queued from `server.cpp:870`) — `fork()` only duplicates the calling
+   thread, so the child never has to worry about the other workers touching
+   memory mid-copy. A non-`fork()` design (worker thread + explicit copy, or
+   a stop-the-world serialize) has to preserve that same "exactly one
+   execution context observes the data during the snapshot" invariant
+   itself; the fork model got it for free, a thread-based one won't.
+2. **`waitpid()`/`WIFEXITED`/`WEXITSTATUS` fall with `fork()`, not
+   separately.** `rdb.cpp:965,974` and `aof.cpp:151,206,216` all reap the
+   bgsave/AOF child this way. Once (1) is redesigned as a thread instead of
+   a process, these calls disappear rather than needing a Windows
+   equivalent — there's no child process left to wait on.
+3. **Sockets are used as plain fds, not through socket-specific calls.**
+   `client.cpp:19,49,51,93` (`write(fd, ...)`/`read(fd, ...)`) and every
+   `close(fd)`/`close(connfd)` on a socket in `server.cpp`
+   (207,214,572,584,645,649,655 — accept/connect/bind paths) call the raw
+   POSIX I/O functions directly. A Winsock `SOCKET` is *not* a CRT file
+   descriptor — `read()`/`write()`/`close()` do not work on it at all.
+   Every one of these call sites becomes `recv()`/`send()`/`closesocket()`,
+   and every adjacent `errno` check becomes `WSAGetLastError()`, a
+   different, non-overlapping error-code space (see the table below). This
+   is the most *invasive* change even though each individual swap is
+   simple, because the call sites are scattered rather than centralized
+   behind one wrapper — worth centralizing into `transport.cpp` as part of
+   the port rather than patching in place. **This does not apply to every
+   `read`/`write`/`close` in the codebase, only the ones holding a `SOCKET`**
+   — `rdb.cpp:902-918`'s forked-snapshot writer and `commands.cpp:1213`'s
+   audit-log fd (`open`+`write`+`close`, no socket involved) work unmodified
+   through the MSVC/MinGW CRT's plain-file I/O and must be left alone; a
+   mechanical find-replace across every `read`/`write`/`close` call site
+   would wrongly rewrite these too.
+4. **`eventfd()` is Linux-only — not even POSIX — and has no Winsock
+   analogue.** `server.cpp` uses `eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)`
+   (line 1243) to let `aof_fsync_job` (run on the thread pool) wake the main
+   `poll()` loop via `notify_loop()`/`loop_drain()` (lines 117-129) by
+   writing to `g_loop_efd`, which sits in the same `poll_args` vector as
+   the listen sockets (line 1266). `WSAPoll` can wait on sockets only —
+   there is no fd-like kernel object it can poll that a background thread
+   can signal the way `eventfd` does. The Windows replacement is a
+   loopback socket pair (Winsock has no `socketpair()` either; the usual
+   trick is a connected pair of local TCP sockets, or switching this one
+   wakeup to `WSAPoll` + a dedicated Win32 event via `WSAEventSelect`).
+   This needs its own small design, not a header swap.
+5. **Non-blocking mode and "would block" checks are set/read through
+   different mechanisms entirely.**
+   - `server.cpp:95,98` sets `O_NONBLOCK` via `fcntl(fd, F_SETFL, ...)`.
+     Winsock sockets have no `fcntl`; the equivalent is
+     `ioctlsocket(fd, FIONBIO, &mode)` — a different function, not a flag
+     rename.
+   - `transport.cpp:138,168`, `server.cpp:556,760,1279` check
+     `errno == EAGAIN`/`EINTR`. Winsock reports "would block" as
+     `WSAEWOULDBLOCK` from `WSAGetLastError()`, a separate call from
+     reading `errno`, and Windows has no signal-driven syscall
+     interruption at all, so the `EINTR` half of every one of these checks
+     simply has nothing to correspond to. Expect a `#ifdef _WIN32` at each
+     of these sites, not a shared constant.
+6. **`fsync`/`fdatasync` assume a POSIX fd; `FlushFileBuffers` wants a
+   Win32 `HANDLE`.** Call sites: `state.cpp:848`, `rdb.cpp:387,918`,
+   `aof.cpp:110,169`, `server.cpp:785,1328,1342` (the last three are the
+   `appendfsync` `always`/`everysec` paths off the `Aoffsync` enum,
+   `state.h:91`). Since the code mixes `FILE*` (`fileno(fp)`) and raw `fd`
+   at these sites, the Windows path needs `_get_osfhandle(fd)` to bridge to
+   a `HANDLE` before calling `FlushFileBuffers` — an extra conversion step
+   at every call site, not a drop-in rename. `fdatasync` (data only, no
+   metadata) has no metadata/data distinction on Windows either;
+   `FlushFileBuffers` always flushes both, so the `always` vs `everysec`
+   distinction in `Aoffsync` keeps its meaning but the syscall itself gets
+   slightly more expensive per call on Windows than on Linux.
+7. **`clock_gettime` doesn't exist on MSVC at all, and its two POSIX clock
+   IDs map to two unrelated Windows APIs.** `get_monotonic_msec()`/
+   `get_wall_msec()` (`state.cpp:1028-1039`) are the server's *only* time
+   source — 44 call sites across `server.cpp`, `commands.cpp`, `rdb.cpp`
+   and `aof.cpp`, covering every TTL check, the expire heap,
+   `next_timer_ms()`'s scheduling, and — per the function's own comment —
+   wall-clock values that get **persisted to disk** as TTL deadlines.
+   MSVC's `<time.h>` defines neither `CLOCK_MONOTONIC`/`CLOCK_REALTIME` nor
+   `clock_gettime` itself, so a naive port is a hard compile error, not a
+   warning (MinGW-w64 does ship a shim through its pthreads layer, but it
+   just wraps the same two Win32 primitives below, so it doesn't remove the
+   need to know them).
+   - `CLOCK_MONOTONIC` → `QueryPerformanceCounter()`/
+     `QueryPerformanceFrequency()` for full precision, or the cheaper
+     `GetTickCount64()` (millisecond resolution, ~15.6ms default timer
+     granularity) — `get_monotonic_msec()` already truncates to
+     milliseconds, so the simpler call loses nothing this codebase reads.
+   - `CLOCK_REALTIME` → `GetSystemTimePreciseAsFileTime()` (Windows 8+;
+     `GetSystemTimeAsFileTime()` on older targets), which counts 100ns
+     ticks since 1601-01-01, not 1970-01-01 — every value needs the fixed
+     116444736000000000-tick epoch offset subtracted before dividing by
+     10000 for Unix milliseconds. Get this conversion reviewed, not just
+     compiled: because `get_wall_msec()` writes straight into on-disk TTL
+     fields, an off-by-epoch bug here doesn't crash, it silently mis-dates
+     every expiry loaded on Windows.
+8. **`/proc/self/status` doesn't exist on Windows at all — `INFO memory`'s
+   RSS reading needs a different API, not a different path.**
+   `get_memory_usage()` (`commands.cpp:762-782`) opens
+   `/proc/self/status` and greps the `VmRSS:` line for resident set size;
+   on open failure it already returns `0` rather than erroring
+   (`commands.cpp:765-767`), which is the dangerous part — a straight port
+   compiles, boots, and answers every `INFO memory` query with
+   `used_memory:0` on Windows instead of failing loudly. `/proc` is a
+   Linux-only pseudo-filesystem (not even POSIX), so there is no path
+   variant to swap in. The Windows replacement is `GetProcessMemoryInfo()`
+   (`<psapi.h>`, `PROCESS_MEMORY_COUNTERS`, dynamically available as
+   `K32GetProcessMemoryInfo` with no extra linking since Vista) reading
+   `WorkingSetSize`, the direct RSS analogue.
+9. **`WSAStartup`/`WSACleanup` are pure additions with nothing to
+   translate from.** POSIX has no per-process socket-subsystem
+   init/teardown step at all, so this isn't a translation of an existing
+   call — it's new code that has to run once before the first `socket()`
+   call and once at shutdown, near the same place `server.cpp:1074-1077`
+   installs the `SIGINT`/`SIGTERM`/`SIGXFSZ`/`SIGPIPE` handlers today.
+10. **Signal handling only partially maps.** `server.cpp:1077` ignores
+    `SIGPIPE` so a write to a closed socket returns an error instead of
+    killing the process, and `server.cpp:1076` ignores `SIGXFSZ` (file-size
+    limit exceeded) — on Windows both lines can simply be deleted, since
+    neither concept exists for Winsock sockets or Windows file I/O; the
+    error paths that already check the return value of `send()`/`write()`
+    cover the same cases. `SIGINT`/`SIGTERM` (`server.cpp:1074-1075`) do
+    exist in the Windows CRT, but nothing external delivers `SIGTERM` the
+    way POSIX `kill(pid, SIGTERM)` does — a Windows service or another
+    process asking MYRED to shut down gracefully needs a different trigger
+    (`SetConsoleCtrlHandler`, a named event, or a service-control callback),
+    which is new plumbing, not a signal-name rename.
+11. **Near-drop-in, low-risk swaps** (worth calling out separately so they
+    don't get lumped in with the hard problems above):
+    - `poll()`/`struct pollfd`/`POLLIN`/`POLLOUT`/`POLLERR`
+      (`server.cpp:1247-1321`) → `WSAPoll()` uses the *same* `struct pollfd`
+      shape and the same flag names. This is the one place the existing
+      BACKLOG note ("future Windows `WSAPoll` port is a third backend" in
+      Event Loop and Connection Scaling) is accurate as a near-literal swap.
+    - `inet_pton`/`sockaddr_in` (`client.cpp:145,148`; `state.cpp:994`;
+      `server.cpp:203,206,551,641,644`) → identical signatures via
+      `<ws2tcpip.h>`, once `<winsock2.h>` is included *before* `<windows.h>`
+      (order matters — `<windows.h>` alone pulls in the older WinSock 1
+      headers and conflicts) and the binary links `ws2_32.lib`.
+    - `setsockopt(..., IPPROTO_TCP, TCP_NODELAY, ...)` and
+      `setsockopt(..., SOL_SOCKET, SO_REUSEADDR, ...)`
+      (`server.cpp:210,638,639`) → same constants exist on Windows, but flag
+      this for testing, not just compiling: Windows' `SO_REUSEADDR` is
+      looser than Linux's (it can let a second process silently rebind a
+      port still in use by the first), so the port needs a behavioral check
+      here, not just a green build.
+    - `getpid()` (`rdb.cpp:357,900`, used only to uniquify bgsave/rewrite
+      temp filenames) → `_getpid()` from `<process.h>`, or
+      `GetCurrentProcessId()`. Cosmetic; no behavior to verify.
+    - `stat`/`access`/`unlink` (`rdb.cpp:332-333,876,884,912,918`;
+      `aof.cpp:107,110,195`; `server.cpp:1140,1141,1167`; `state.cpp:850`) →
+      `_stat`/`_access`/`_unlink` from `<sys/stat.h>`/`<io.h>` under strict
+      MSVC, or the identically-named functions unmodified under MinGW (which
+      provides them directly). `F_OK` isn't defined by MSVC's headers — pass
+      the literal `0` or `#define F_OK 0` alongside `_access`. **`rename` is
+      the one call in this family that is NOT a drop-in — see Difficulty 13.**
+    - `O_CLOEXEC` on the audit-log fd (`commands.cpp:1213`) has nothing to
+      protect once Difficulty 1's redesign removes `fork()`: the flag exists
+      to keep an fd from leaking into a child across `exec()`, and Windows'
+      handle-inheritance model (`bInheritHandles` at process-creation time,
+      no per-fd flag) doesn't have the same shape at all. Drop it rather than
+      hunt for an equivalent.
+    - The `0644`/`0640` mode argument on every `open(..., O_CREAT, mode)`
+      call (`aof.cpp:101,180`; `rdb.cpp:902`; `server.cpp:1162`;
+      `commands.cpp:1214`) compiles under the MSVC/MinGW CRT but silently
+      stops meaning what it says: `_open`'s `pmode` only distinguishes
+      `_S_IREAD`/`_S_IWRITE`, with no owner/group/other split at all, so
+      `commands.cpp:1214`'s `0640` on the **audit log** — deliberately
+      unreadable by "other" on Linux — becomes whatever ACL the parent
+      directory hands out by inheritance on Windows, typically far more
+      permissive. Same "compiles clean, quietly does less" shape as
+      `SO_REUSEADDR` above, but security-relevant rather than cosmetic; a
+      real Windows port needs an explicit `SECURITY_ATTRIBUTES`/ACL on this
+      file, not just a mode-bits rename.
+12. **Path handling is lighter than it looks.** There's no `realpath`,
+    `getcwd`, `opendir`/`readdir`, or `PATH_MAX` use anywhere in the code —
+    config/cert paths are plain strings joined with `'/'` (`state.cpp`
+    config parsing). Windows accepts `/` as a path separator in its own
+    APIs, so this is likely a non-issue in practice; the real risk is a
+    future contributor hand-rolling a `\\`-based join instead of reusing
+    the existing string path, which would silently break the Linux build.
+    Worth a one-line convention note when this work actually starts, not a
+    design task on its own.
+13. **`rename()` for atomic replace is not atomic replace on Windows — a
+    silent correctness gap, not a build error, and structurally as serious
+    as `fork()` above.** MYRED's entire durability model is "write `.tmp`,
+    `fsync`, `rename(tmp, target)`" so a crash mid-write can never corrupt
+    the live file. That exact pattern is duplicated independently in three
+    subsystems: `SAVE`/RDB (`rdb.cpp:399` rotates the previous dump to
+    `.bak`, `rdb.cpp:401` commits the new one; the forked `BGSAVE` child
+    repeats it at `rdb.cpp:920`), `BGREWRITEAOF` (`aof.cpp:175`), and
+    `CONFIG REWRITE` (`state.cpp:854`). POSIX specifies that `rename()`
+    atomically replaces an existing destination; the Windows CRT `rename()`
+    — identical under MinGW and MSVC — instead **fails with `EEXIST`
+    whenever the destination already exists**, which on this codebase is
+    every call after the very first one, since replacing an existing file
+    is the entire point. A naive header-swap port compiles clean, passes a
+    first-boot smoke test (no `dump.rdb` yet), and then silently fails
+    every `SAVE`/rewrite after that — the dangerous kind of gap, because
+    nothing catches it until a real run with real data. The correct
+    primitive is Win32 `MoveFileExW(tmp, target,
+    MOVEFILEEX_REPLACE_EXISTING | MOVEFILEEX_WRITE_THROUGH)`, not the CRT
+    `rename()` wrapper — same "new code, not a translation" shape as
+    `WSAStartup` above, and it has to replace all four live call sites
+    (the fifth, inside the forked `BGSAVE` child, disappears along with
+    `fork()` itself per Difficulty 1, but its replacement path needs the
+    same fix).
+14. **The one CSPRNG call site has no Windows syscall equivalent — it needs
+    the Windows crypto API, not a libc header swap.** `cred.cpp:26`'s
+    `fill_random()` wraps `getrandom(buf, n, 0)` (`<sys/random.h>`) and is
+    the sole source of security-grade randomness in the codebase — Argon2id
+    password-hash salts and `cred_random_hex()` (`ACL GENPASS`) both go
+    through it; `rand_idx()`/mt19937 deliberately stays non-crypto for hot
+    paths and is out of scope here. Nothing in MinGW's POSIX-compatibility
+    headers shims this one. The Windows-native replacement is
+    `BCryptGenRandom()` from CNG (`<bcrypt.h>`, links `bcrypt.lib`), called
+    with the `BCRYPT_USE_SYSTEM_PREFERRED_RNG` flag so no algorithm-provider
+    handle needs opening/closing around it — a different API family
+    entirely, not a renamed function. Get this one reviewed, not just
+    compiled: a fallback to a non-CSPRNG source here would silently
+    downgrade every password hash and generated credential on Windows only,
+    while the Linux build stayed correct.
+15. **Dependency provisioning has no Windows equivalent to
+    `apt install libargon2-dev`, and blocks the build before any port code
+    even runs.** `CMakeLists.txt:18` (`find_package(ZLIB)`), `:23`
+    (`find_package(Threads REQUIRED)`) and `:29` (`find_package(OpenSSL)`)
+    all assume dev packages a Linux package manager already provides. ZLIB
+    and OpenSSL both have maintained vcpkg ports and real CMake config
+    packages once installed through vcpkg's toolchain file
+    (`-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`) —
+    the closest thing to a 1:1 swap anywhere in this section. libargon2 does
+    not: `CMakeLists.txt:43-44`'s `find_path(ARGON2_INCLUDE_DIR argon2.h)` /
+    `find_library(ARGON2_LIBRARY argon2)` pair exists in the first place
+    because upstream libargon2 ships no CMake config even on Linux, and it
+    has no vcpkg port either. A Windows build either hand-builds libargon2
+    (its upstream repo does build under MSVC) and points
+    `-DARGON2_INCLUDE_DIR=`/`-DARGON2_LIBRARY=` at the result, or ships the
+    first port with `-DMYRED_ARGON2=OFF` (already a supported flag,
+    documented SHA-256 fallback) and promotes Argon2id in a follow-up.
+    `find_package(Threads REQUIRED)` becomes unnecessary the moment the
+    `std::thread` swap from Possibilities above lands — nothing
+    pthread-shaped is left to find, so the Windows CMake path can drop the
+    requirement rather than satisfy it.
+
+### POSIX → Windows translation table
+
+| Used for | POSIX call (file:line) | Windows equivalent | 1:1 swap? |
+|---|---|---|---|
+| bgsave / AOF rewrite child | `fork()` (`rdb.cpp:939`, `aof.cpp:133`) | *(none — needs redesign, see Difficulty 1)* | No |
+| reap bgsave/AOF child | `waitpid`/`WIFEXITED`/`WEXITSTATUS` (`rdb.cpp:965,974`; `aof.cpp:151,206,216`) | *(removed along with `fork()`)* | No |
+| thread pool | `pthread_create/join/mutex_*/cond_*` (`thread_pool.cpp`/`.h`; `server.cpp` `g_loop_mu`) | `std::thread`/`std::mutex`/`std::condition_variable` (recommended — see Possibilities) | Yes, via stdlib |
+| socket read/write/close | `read`/`write`/`close` on a socket fd (`client.cpp:19,49,51,93`; `server.cpp:207,214,572,584,645,649,655`) | `recv`/`send`/`closesocket` | Rename + scattered call sites |
+| cross-thread loop wakeup | `eventfd()` (`server.cpp:21,57,117-129,1243`) | loopback socket pair, or `WSAEventSelect` + `WSAPoll` | No — needs its own design |
+| non-blocking mode | `fcntl(fd, F_SETFL, O_NONBLOCK)` (`server.cpp:95,98`) | `ioctlsocket(fd, FIONBIO, &mode)` | Different function |
+| "would block" / interrupted | `errno == EAGAIN || EINTR` (`transport.cpp:138,168`; `server.cpp:556,760,1279`) | `WSAGetLastError() == WSAEWOULDBLOCK`; no `EINTR` equivalent | No — different error space |
+| durability sync | `fsync`/`fdatasync` (`state.cpp:848`; `rdb.cpp:387,918`; `aof.cpp:110,169`; `server.cpp:785,1328,1342`) | `FlushFileBuffers(HANDLE)` via `_get_osfhandle(fd)` | Needs a `HANDLE` conversion step |
+| monotonic + wall clock | `clock_gettime(CLOCK_MONOTONIC / CLOCK_REALTIME)` (`state.cpp:1028-1039`, 44 call sites) | `QueryPerformanceCounter`/`GetTickCount64` (monotonic); `GetSystemTimePreciseAsFileTime` + epoch offset (wall) | No — different API per clock, see Difficulty 7 |
+| process memory (RSS) for `INFO memory` | `fopen("/proc/self/status")` + parse `VmRSS:` (`commands.cpp:762-782`) | `GetProcessMemoryInfo()` (`<psapi.h>`, `WorkingSetSize`) | No — no Windows filesystem equivalent, see Difficulty 8 |
+| socket subsystem lifecycle | *(none — nothing to translate)* | `WSAStartup`/`WSACleanup` | New code, not a translation |
+| ignore SIGPIPE / SIGXFSZ | `signal(SIGPIPE, SIG_IGN)`, `signal(SIGXFSZ, SIG_IGN)` (`server.cpp:1076,1077`) | *(delete — neither condition exists on Windows)* | N/A |
+| graceful shutdown signal | `signal(SIGTERM, ...)` (`server.cpp:1075`) | CRT `SIGTERM` exists but nothing external delivers it; needs `SetConsoleCtrlHandler` or a service callback | No — different delivery mechanism |
+| event loop | `poll()`/`struct pollfd`/`POLLIN`/`POLLOUT`/`POLLERR` (`server.cpp:1247-1321`) | `WSAPoll()` — same struct, same flags | Yes |
+| address parsing | `inet_pton`/`sockaddr_in` (`client.cpp:145,148`; `state.cpp:994`; `server.cpp:203,206,551,641,644`) | Identical via `<ws2tcpip.h>` (include order matters) | Yes |
+| socket tuning | `setsockopt(IPPROTO_TCP, TCP_NODELAY)` / `(SOL_SOCKET, SO_REUSEADDR)` (`server.cpp:210,638,639`) | Same constants; `SO_REUSEADDR` semantics differ | Compiles, behavior needs testing |
+| file-creation permissions | `open(..., O_CREAT, 0644/0640)` (`aof.cpp:101,180`; `rdb.cpp:902`; `server.cpp:1162`; `commands.cpp:1214`) | CRT `_open` `pmode` (`_S_IREAD`/`_S_IWRITE` only) | Compiles, permission semantics silently narrower |
+| temp-file uniquifier | `getpid()` (`rdb.cpp:357,900`) | `_getpid()` (`<process.h>`) or `GetCurrentProcessId()` | Yes |
+| existence/removal checks | `stat`/`access`/`unlink` (`rdb.cpp:332,876,884,912,918`; `aof.cpp:107,110,195`; `server.cpp:1140,1141,1167`; `state.cpp:850`) | `_stat`/`_access`/`_unlink` (`<sys/stat.h>`/`<io.h>`), or unmodified under MinGW | Yes |
+| atomic file replace | `rename(tmp, target)` (`rdb.cpp:399,401,920`; `aof.cpp:175`; `state.cpp:854`) | `MoveFileExW(tmp, target, MOVEFILEEX_REPLACE_EXISTING \| MOVEFILEEX_WRITE_THROUGH)` | **No — CRT `rename()` fails on an existing destination, see Difficulty 13** |
+| CSPRNG for credential material | `getrandom()` (`cred.cpp:26`, via `fill_random`/`cred_random_hex`) | `BCryptGenRandom()` (`<bcrypt.h>`, `bcrypt.lib`, `BCRYPT_USE_SYSTEM_PREFERRED_RNG`) | No — different API family, see Difficulty 14 |
 
 ## Event Loop and Connection Scaling
 

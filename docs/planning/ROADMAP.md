@@ -20,10 +20,21 @@ Primary commands:
 cmake -B build && cmake --build build          # build/ is a DEBUG build
 cmake -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j
 ./build/server myred.conf
+
+# the whole suite, no server needed first — it starts its own (V11 Step 0)
+python3 scripts/stress_test.py --server build-rel/server --destructive --bench
+python3 scripts/stress_test.py --server build-rel/server --tls
+python3 scripts/stress_test.py --list-phases
+
+# against a server you started yourself
 python3 scripts/stress_test.py --password <pass>
 python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <pass>   # over TLS
-python3 scripts/test_tls.py --server build-rel/server          # TLS metrics
+python3 scripts/test_tls.py --server build-rel/server          # TLS metrics (measurement, not pass/fail)
 ```
+
+Results land in `docs/logs/<WSL|Native>/` — the environment is read from the
+kernel, and the split exists so a VM number is never mistaken for a bare-metal
+one. `--compare A.json B.json` diffs two machines.
 
 **`build/` is Debug and `build-rel/` is Release** (corrected 2026-08-14 — this
 file previously claimed the opposite). Never benchmark `build/`: `commands.cpp`
@@ -68,58 +79,103 @@ surface this is aimed at. Bundled into one milestone number the same way Pub/Sub
 and Transactions shared V8 — for convenience, not because the pieces depend on
 each other.
 
-**Step 0 is the next work, and it is the whole reason V10.6e is still parked
-behind this milestone**: an automatic failover you cannot regression-test is a
-liability, and right now there is no single command that runs the coverage which
-already exists.
+### Step 0 - One runnable regression surface [Done 2026-08-15]
 
-**Step 0, before any of the below: fold every local suite back into
-`stress_test.py`.** As of 2026-08-09 only `scripts/stress_test.py` is tracked;
-`test_pubsub.py`, `test_security.py`, `test_restart_matrix.py`,
-`test_replication.py`, `test_memory.py`, `test_async_auth.py`,
-`test_aof_restart.py`, `test_tls.py`, `myred_testlib.py`, the `test_*.sh`
-scripts and the `diag_*.sh` helpers are gitignored and exist only in a working
-copy. That was a
-deliberate call — the test surface had grown faster than the fix list and no
-single command ran it all — but it means **their coverage is one `rm -rf` from
-gone**, and much of it pins bugs that really shipped:
+**`scripts/stress_test.py` is now the whole suite**, and one command runs it:
 
-- Every check tagged `[REG]` in those files marks a real defect. Port them with
-  their comments intact; a `[REG]` without its story is just an assertion.
-- **`test_tls.py` is the exception and should not be folded in.** It is a
-  measurement harness (V10.6.1 Step 0), not a regression suite — it has no
-  assertions to port, it deliberately fails only on a broken measurement, and
-  its durable output is the `docs/tls_metrics_<tag>.json` artifact rather than a
-  pass count. What it needs from this step is the opposite: the baseline JSON it
-  produces should be **tracked**, because a comparison against a file that only
-  ever existed in one working copy is not a comparison.
-- The suites that manage their own server (private ports 12401–12406, temp
-  workdirs, `myred_testlib.Server`) cannot become plain live-server sections —
-  restart, crash-recovery and replication tests need process control.
-  `stress_test.py` needs a "spawns its own instance" mode before those can move,
-  which is the real work of this step.
-- Highest-value coverage to preserve, in order: replication (whole milestone,
-  and both resync paths leave correct data so only its `sync_*` counter
-  assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
-  keyspace notifications, memory accounting invariants.
-- **`test_replication.py` grew again on 2026-08-13** and is now ~145 checks
-  across twelve phases, including the whole of V10.6c/d. Three shapes in it do
-  not exist anywhere in `stress_test.py` and are the real porting work: a
-  freezable proxy (a link that goes silent *without* closing), assertions read
-  from a server's **stderr file** rather than over the wire (polling `INFO` wakes
-  the loop and hides every missing-deadline bug), and phases that spawn a second
-  pair of instances because a handover swaps both roles. It is also the suite
-  that caught the `FORCE`-never-stored defect, which reads correctly and only
-  misbehaves at runtime.
-- **Known gap to close while porting: no `SPOP`-then-restart case anywhere.**
-  `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction `DEL`/
-  renamed-command frames but never `SPOP`, and `stress_test.py` does not restart
-  at all — which is why the empty-key `SREM` frame (fixed 2026-08-11) survived
-  from V9.6.4 until someone watched the replication stream by hand. Any command
-  carrying `CmdSpec::aof_self` needs a round-trip case, not just a live-reply one.
-- Do this *first*: the differential and fuzz work below is worth far more with
-  one runnable regression suite underneath it, and worth much less if the
-  existing coverage silently evaporates in the meantime.
+```bash
+python3 scripts/stress_test.py --server build-rel/server --destructive --bench
+```
+
+`--server` is the hinge. Naming the binary turns on the phases that need process
+control and, unless `--host`/`--port` say otherwise, starts the instance the rest
+of the suite talks to — so nothing has to be running first and nothing it touches
+belongs to anyone. **1022 checks, ~90 s, zero setup.**
+
+What made it possible was the piece this step existed to build: a managed-instance
+mode. `Instance` (spawn in a temp dir, SIGTERM, SIGKILL, keep stderr in a file)
+and `PhaseCtx` (bind-tested private ports from `--base-port`, per-phase workdirs,
+evidence dump, a `skip` that counts separately from a pass) are what let a
+restart, a crash and a two-node link live in the same file as the command tests.
+
+Eight phases, listable with `--list-phases`, selectable with `--phases`:
+`unit`, `memory`, `config`, `auth`, `security`, `persistence`, `tls`,
+`replication`.
+
+Notes worth keeping:
+
+- **Every `[REG]` came across with its story.** An assertion whose comment
+  explains which bug it pins survives a refactor; a bare assertion gets deleted
+  by the next person who finds it inconvenient.
+- **The replication phase ported whole — 153 checks — including all three shapes
+  that existed nowhere else**: the freezable proxy (a link that goes silent
+  *without* closing, which `poll()` cannot see), assertions read from a server's
+  **stderr file** rather than over the wire, and a phase that spawns its own pair
+  because a handover swaps both roles. That last one now allocates its ports from
+  the same `PhaseCtx`, so the fixed 12401–12410 block is gone.
+- **The `SPOP`-then-restart gap is closed**, and so is `SPOP <count>`-to-empty and
+  `SREM`-to-empty. The replication phase got the matching case: `SPOP` must
+  propagate *the member it removed*, not the command — a divergence where both
+  sides stay individually plausible.
+- **The shell scripts became assertions.** `test_aof.sh` only ever printed
+  `cat -A` output for a human to read; what it was really checking is now four
+  `[REG]`s (a read is never logged, a failed `SETNX` is not logged, a `DEL` of a
+  missing key is not logged, `SETEX` decomposes into `SET` + absolute
+  `PEXPIREAT`). Same for the hybrid and rewrite scripts — including the torn-tail
+  case, which is the only one of the three whose failure is loud.
+- **A boot-only directive needs a different probe.** `repl-backlog-size` and
+  `tls-handshake-timeout` refuse `CONFIG SET` by design, so the `config` phase
+  writes them into the file the server boots from and makes the value cross a
+  rewrite instead. Both own a hand-written emit, which is exactly the class
+  `config_selfcheck`'s round-trip skips.
+- **`test_tls.py` stays out**, as planned: it is a measurement harness, not a
+  regression suite. What crossed over is its assertable half — the handshake, the
+  hot reload, the `tls-key-file`-writes-the-key-field `[REG]`, and the rollback
+  on a refused swap. Its `docs/tls_metrics_<tag>.json` baselines are the durable
+  artifact and are tracked.
+- The old local suites are still on disk and still runnable; nothing in
+  `stress_test.py` reads them any more. `myred_testlib` is not imported at all —
+  the suite is one tracked file with no local-only dependency, which was the
+  point.
+
+**Two things the port itself found, both in the test rather than the server:**
+`evicted_keys` lives in INFO's *Memory* section, and asking for it under *Stats*
+returns a counter that reads as "never moved" — indistinguishable from a real
+result, which is how a section-scoped `INFO` read fails silently. And arming the
+AOF auto-trigger while measuring a *manual* rewrite lets a background rewrite land
+mid-measurement, so "the file did not shrink" turns out to mean "it had already
+been compacted".
+
+### Step 0b - Where the numbers go [Done 2026-08-15]
+
+Results are filed by **environment, decided by reading the kernel** rather than by
+a flag:
+
+```
+docs/logs/<WSL|Native>/<kind>_<plain|tls>.md     transcript
+docs/logs/<WSL|Native>/<kind>_<plain|tls>.json   platform + per-phase counts + throughput
+```
+
+WSL is detected from `/proc/sys/kernel/osrelease` and `/proc/version`, with
+`WSL_DISTRO_NAME`, `/proc/sys/fs/binfmt_misc/WSLInterop` and `/run/WSL` as
+independent fallbacks — a custom-built WSL2 kernel drops `microsoft` from its
+release string, so no single signal is enough. Everything else files under
+`Native`.
+
+The split is the whole point: **the WSL numbers in the Testing Matrix sit ~2.4x
+below the native ones**, and one filename for both makes that difference vanish
+the moment the second run finishes. The run banner also prints the CPU governor,
+the load average before the run started, and the build type — the three things
+that quietly invalidate a throughput comparison.
+
+`--compare A.json B.json` diffs two summaries. It refuses when `-n`/`-c`/`-P`
+differ, and it prints **no verdict column**: one run per side has no noise floor,
+which is the same lesson V10.6.1 Step 0 paid for.
+
+### The rest of V11
+
+With Step 0 done, the reason V10.6e stayed parked is answered — an automatic
+failover now has a regression surface to land on.
 
 Structured, not "point an agent at the live server and see what happens" — that
 finds less than the combination below, because an LLM-driven agent is strong at
@@ -290,8 +346,8 @@ TCP proxy**. Killing the master instead would destroy its backlog and mint a new
 `repl_id`, forcing a full resync and making every partial-resync assertion
 silently vacuous. `freeze()` is the other failure mode and the one V10.6b/d need:
 stop moving bytes while leaving every socket **open**, because a link that closes
-is already handled — `poll()` reports it immediately. Still gitignored like every
-suite but `stress_test.py`; see BACKLOG → V11 Step 0.
+is already handled — `poll()` reports it immediately. All of it now lives in
+`stress_test.py` as the `replication` phase (V11 Step 0, 2026-08-15).
 
 **Three lessons, each learned more than once.**
 
@@ -866,34 +922,49 @@ replies → bigger TLS hit) is the expected shape.
 benchmarks, and the pre-commit gate. This section records *what is covered and
 what the baselines are*; the runbook records *how to run it*.
 
-Primary harness (`--tls`-aware since 2026-07-21):
+Primary harness — `scripts/stress_test.py` is the suite, and `--server` runs all
+of it (V11 Step 0, 2026-08-15):
 ```bash
-python3 scripts/stress_test.py
-python3 scripts/stress_test.py --correctness-only
+python3 scripts/stress_test.py --server build-rel/server --destructive --bench
+python3 scripts/stress_test.py --server build-rel/server --tls
+python3 scripts/stress_test.py --server build-rel/server --phases replication
+python3 scripts/stress_test.py --list-phases
+
+python3 scripts/stress_test.py --correctness-only                        # live server
 python3 scripts/stress_test.py --stress-only --stress-threads 16 --stress-ops 2000
-python3 scripts/stress_test.py --bench                                   # + redis-benchmark
 python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <pass>
-python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench  # passwordless TLS bench
 ```
 
-**`stress_test.py` is the only tracked suite.** The per-milestone suites
-(restart matrix, security, pub/sub, replication, eviction, the AOF shell
-scripts) are gitignored and local-only as of 2026-08-09 — their coverage is
-being folded into `stress_test.py`, tracked in BACKLOG → V11. Ports 12401–12410
-are reserved for their private instances so they never collide with a live
-server. Anything a local suite proves that `stress_test.py` does not is coverage
-at risk of being lost.
+Naming the binary turns on the phases that need process control and starts the
+instance the rest of the suite talks to, so no server has to be running first.
+Private ports come from `--base-port` (default 12500) and are bind-tested, so two
+runs can share a machine. **1022 checks on a clean Release build, ~90 s.**
 
-Replication coverage lives in `scripts/test_replication.py` (~145 checks,
-capability-gated so it stays runnable while a milestone is half-applied): full
-and partial resync, the read-only gate, link loss, backlog overflow, automatic
-reconnect, `WAIT`, `repl-timeout` on a wedged link, the V10.6c durability floor,
-three-node promotion with a sibling partial-resync on the **second** reconnect,
-and the whole of `FAILOVER` on its own pair (12408–12410) — pause, `ABORT`,
-`TIMEOUT` on an idle server, `FORCE` and its full resync, and the clean handover
-that moves no RDB. Timer-deadline phases assert on the server's **stderr file**,
-never by polling `INFO`, because polling wakes the loop the test is trying to
-catch asleep.
+| Phase | Covers |
+|---|---|
+| `unit` | HMap incremental rehash, compiled against the repo's `hashtable.cpp` |
+| `memory` | per-type accounting drains to zero, both `maxmemory` policies, incremental eviction |
+| `config` | `CONFIG REWRITE` → restart → every directive holds its value, boot-only ones included |
+| `auth` | async AUTH: pipeline gating, lockout, concurrent completions, loop latency under storm |
+| `security` | ACL category + key gating, renamed/disabled commands, audit redaction, protocol abuse |
+| `persistence` | AOF write gating, rewrite, hybrid preamble + delta, torn tail, RDB round-trip, restart matrix |
+| `tls` | handshake on both listeners, live cert rotation, rollback on a refused swap |
+| `replication` | full/partial resync, `WAIT`, durability floor, wedged links, `FAILOVER`, promotion history |
+
+Replication is 153 of those checks, capability-gated so it stays runnable while a
+milestone is half-applied: full and partial resync, the read-only gate, link loss,
+backlog overflow, automatic reconnect, `WAIT`, `repl-timeout` on a wedged link,
+the V10.6c durability floor, three-node promotion with a sibling partial-resync on
+the **second** reconnect, and the whole of `FAILOVER` on its own pair — pause,
+`ABORT`, `TIMEOUT` on an idle server, `FORCE` and its full resync, and the clean
+handover that moves no RDB. Timer-deadline phases assert on the server's **stderr
+file**, never by polling `INFO`, because polling wakes the loop the test is trying
+to catch asleep.
+
+Results are filed under `docs/logs/<WSL|Native>/`, split by an environment read
+from the kernel, with a `.json` summary beside each transcript carrying the
+platform block, per-phase counts and parsed throughput. `--compare A.json B.json`
+diffs two machines and refuses mismatched benchmark parameters.
 
 **Benchmark only on a Release build** (`cmake -B build-rel -DCMAKE_BUILD_TYPE=Release`;
 Debug runs `mem_selfcheck`'s whole-keyspace walk per command and poisons numbers).

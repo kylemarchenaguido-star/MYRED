@@ -24,27 +24,60 @@ Start one:
 
 ## Which test am I running?
 
-Every `stress_test.py` run prints its identity in the banner and again at the end,
-and writes to a file named after itself — a TLS run never overwrites a plaintext one.
+Every run prints its identity in the banner and again at the end, and writes to a
+file named after itself — a TLS run never overwrites a plaintext one, and a run
+from one machine never overwrites a run from another.
 
 ```
 ═══════════════════════════════════════════════════════
-  MYRED — correctness + concurrency + stress over TLS (authenticated) → 127.0.0.1:1235
+  MYRED — correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:12590
 ═══════════════════════════════════════════════════════
-  Target:    127.0.0.1:1235
-  Transport: TLS (insecure — cert not verified)
-  Auth:      password
-  Log:       docs/stress_results_tls.md
+
+-- Platform (read from the kernel) ---------------------
+  Environment:  WSL (WSL2)
+  Kernel:       6.6.87.2-microsoft-standard-WSL2
+  CPU:          AMD Ryzen 5 3600X 6-Core Processor
+  Threads:      12 (usable by this process: 12)
+  Memory:       12209364 kB  swap 3145728 kB
+  Governor:     n/a
+  Load average: 0.15 0.07 0.05 1/441 27995
+  somaxconn:    4096   nofile=1048576   tcp_ulp=tls
+  Build:        release  [build-rel/]
+  Log:          docs/logs/WSL/full_plain.md
 ```
 
-| Flags | Log file (plaintext / TLS) |
+### Where the results land
+
+```
+docs/logs/<WSL|Native>/<kind>_<plain|tls>.md      readable transcript
+docs/logs/<WSL|Native>/<kind>_<plain|tls>.json    machine-comparable summary
+```
+
+The environment directory is decided by reading the kernel, not by a flag:
+`/proc/sys/kernel/osrelease` and `/proc/version` (plus `WSL_DISTRO_NAME`,
+`/proc/sys/fs/binfmt_misc/WSLInterop` and `/run/WSL` as independent fallbacks,
+because a custom-built WSL2 kernel drops `microsoft` from its release string).
+Anything that is not WSL files under `Native`.
+
+**That split is the point.** A VM's syscall and network costs are not the host's,
+so a throughput number from WSL and one from bare metal are two different
+measurements. Filing them under one name makes the difference vanish the moment
+the second run finishes.
+
+| Flags | `<kind>` |
 |---|---|
-| *(none)* | `docs/stress_results_plain.md` / `stress_results_tls.md` |
-| `--bench` | `docs/bench_plain.md` / `bench_tls.md` |
-| `--stress-only` | `docs/stress_plain.md` / `stress_tls.md` |
-| `--correctness-only` | `docs/correctness_plain.md` / `correctness_tls.md` |
+| `--server <binary>` | `full` |
+| *(none)* | `stress_results` |
+| `--bench` | `bench` |
+| `--stress-only` | `stress` |
+| `--correctness-only` | `correctness` |
 
-Override with `--log path.md`, disable with `--log ''`.
+Override the path with `--log path.md`, move the root with `--log-dir`, disable
+with `--log ''`. The JSON always sits beside the markdown.
+
+The JSON carries the platform block, the build type, per-phase pass/fail/skip
+counts, and the parsed `redis-benchmark` throughput — everything a comparison
+needs and nothing that requires re-reading a transcript.
 
 ---
 
@@ -81,11 +114,16 @@ redis-cli -p 1336 set k v && redis-cli -p 1338 get k     # v
 redis-cli -p 1338 set k v            # READONLY ... (V10.3a)
 ```
 
-`replicaof` in that config file needs **V10.3b**; before it lands, drop the line
-and use `redis-cli -p 1338 replicaof 127.0.0.1 1336` after boot. Either way the
-role is what `INFO replication` reports — check `master_link_status:up` *first*,
-since every other assertion below is meaningless without it, and a restarted
-replica silently comes back a writable master until V10.3b.
+This pair is for looking at a live link by hand. Nothing needs to be set up to
+*test* replication — `--phases replication` runs a master, a replica, a second
+replica and two failover instances behind a killable proxy, all on private ports:
+
+```bash
+python3 scripts/stress_test.py --server build-rel/server --phases replication
+```
+
+The role is what `INFO replication` reports — check `master_link_status:up`
+*first*, since every other assertion is meaningless without it.
 
 Two reads that localise a broken link fast: `master_replid` on the replica must be
 byte-identical to the master's (if it still shows its own boot id, the
@@ -101,20 +139,24 @@ does not invalidate its own `WATCH`ers — see ROADMAP → V10.2b known limitati
 ## Build
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j   # normal + benchmarks
-cmake -B build-dbg -DCMAKE_BUILD_TYPE=Debug && cmake --build build-dbg -j
+cmake -B build && cmake --build build -j                                # DEBUG
+cmake -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j   # RELEASE
 ```
 
-`build-dbg/` runs a whole-keyspace memory check per command — use it to catch
-accounting drift, never to measure speed.
+**`build/` is the Debug build and `build-rel/` is the Release one.** Debug runs
+`mem_selfcheck()` after every command and it walks the whole keyspace, so it is
+O(keyspace) per operation. Use it to catch accounting drift; never to measure
+speed. The suite prints the build type it found and says so.
 
 ---
 
 ## The suite
 
-`scripts/stress_test.py` is **the** harness — the only one tracked in the repo,
-and the one every other suite is being folded into (BACKLOG → V11). Needs a
-running server.
+`scripts/stress_test.py` is **the** harness. It has two halves.
+
+The **live-server half** talks to a server you already started, and covers the
+command surface, transactions, pub/sub, ACLs, memory accounting and the
+concurrent-write stress phase:
 
 ```bash
 ./build/server myred.conf     # in another terminal
@@ -125,9 +167,51 @@ python3 scripts/stress_test.py --password <PASS> --stress-only --stress-threads 
 python3 scripts/stress_test.py --password <PASS> --bench
 ```
 
-Other `scripts/test_*.py` / `test_*.sh` files may exist in a working copy —
-they are gitignored, local-only, and not documented here on purpose. Anything
-worth keeping belongs inside `stress_test.py`.
+The **managed-instance half** needs process control — a restart, a crash, a
+second instance, a link that can be cut — so it spawns and reaps its own servers
+on private high ports in temp directories. Give it the binary:
+
+```bash
+python3 scripts/stress_test.py --server build-rel/server
+```
+
+That one command is the whole suite: it starts an instance for the live half too,
+so nothing has to be running first, and nothing it touches is yours. Add
+`--destructive` for the SIGKILL crash-recovery and protocol-abuse checks.
+
+```bash
+python3 scripts/stress_test.py --server build-rel/server --destructive        # everything
+python3 scripts/stress_test.py --server build-rel/server --bench              # ... plus speed
+python3 scripts/stress_test.py --server build-rel/server --tls                # ... over TLS
+python3 scripts/stress_test.py --server build-rel/server --phases replication # just one phase
+python3 scripts/stress_test.py --list-phases
+```
+
+| Phase | Covers |
+|---|---|
+| `unit` | HMap incremental rehash — compiled against the repo's `hashtable.cpp` |
+| `memory` | per-type accounting drains to zero, `maxmemory` under both policies, incremental eviction |
+| `config` | `CONFIG REWRITE` → restart → every directive still holds its value |
+| `auth` | async AUTH: pipeline gating, lockout, concurrent completions, loop latency |
+| `security` | ACL category and key gating, renamed/disabled commands, audit redaction, protocol abuse |
+| `persistence` | AOF write gating, rewrite, hybrid preamble + delta, torn tails, RDB round-trip, restart matrix |
+| `tls` | handshake on both listeners, live certificate rotation, rollback on a refused swap |
+| `replication` | full/partial resync, `WAIT`, durability floor, wedged links, failover, promotion history |
+
+Run against your own instance instead by naming it — `--host`/`--port` keep the
+live half pointed where you say while the managed phases still use their own
+private ports:
+
+```bash
+python3 scripts/stress_test.py --server build-rel/server --port 1234 --password <PASS>
+```
+
+Ports come from `--base-port` (default 12500) and are bind-tested before use, so
+two runs can share a machine: `--base-port 12700` for the second.
+
+When something fails, the temp workdir is kept and every instance's stderr tail
+is printed with it — a failure without the server's own words is unusable.
+`--keep` keeps the workdir even on a clean run.
 
 ---
 
@@ -140,17 +224,24 @@ redis-cli --tls --insecure -p 1235 -a <PASS> ping
 openssl s_client -connect 127.0.0.1:1235 -tls1_3 </dev/null 2>&1 | head -20
 ```
 
-**The V9.7 close-out gate** (V9.7 itself is closed — 603/603 green over both
-transports, 2026-07-25 — this pair of runs is the regression check, not an
-open item):
+Against your own instance, over TLS:
 
 ```bash
 ./build/server myred.conf
-python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <PASS>   # ~555 checks
+python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <PASS>
 
 ./build/server bench.conf
-python3 scripts/stress_test.py --tls --tls-insecure --port 1337                     # ~551 checks
+python3 scripts/stress_test.py --tls --tls-insecure --port 1337
 ```
+
+Or with no setup at all — this generates a throwaway self-signed pair, boots an
+instance with `tls-port`, and runs the whole suite over it:
+
+```bash
+python3 scripts/stress_test.py --server build-rel/server --tls
+```
+
+Don't rely on a remembered check count; run it and read the number.
 
 Session resumption — `s_client -reconnect` is a **false negative** on TLS 1.3
 (the ticket is post-handshake and our protocol is client-speaks-first), so use
@@ -170,39 +261,68 @@ Real certs instead of `--tls-insecure`: `--tls-ca ca.pem`, plus
 
 ## Benchmarks
 
-Release build, `bench.conf`, cool machine, one at a time. **A `GET` slower than
+Release build, no password, cool machine, one at a time. **A `GET` slower than
 `SET` means the machine is throttling and the numbers are junk.**
 
 ```bash
+python3 scripts/stress_test.py --server build-rel/server --bench
+python3 scripts/stress_test.py --server build-rel/server --tls --bench
+```
+
+The instance it spawns is already the right shape for this — passwordless, AOF
+off, `save ""` — so the KDF, an fsync and a stray BGSAVE fork all stay out of the
+numbers. Against `bench.conf` by hand instead:
+
+```bash
 ./build/server bench.conf
-python3 scripts/stress_test.py --port 1336 --bench                    # -> docs/bench_plain.md
-python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench  # -> docs/bench_tls.md
+python3 scripts/stress_test.py --port 1336 --bench
+python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench
 ```
 
 Tuning: `--bench-requests`, `--bench-clients`, `--bench-pipeline`.
 Baselines live in `planning/ROADMAP.md` → Testing Matrix.
+
+### Comparing two machines
+
+Each `--bench` run writes its throughput into the summary JSON next to its log.
+Diff two of them:
+
+```bash
+python3 scripts/stress_test.py --compare docs/logs/WSL/full_plain.json \
+                                         docs/logs/Native/full_plain.json
+```
+
+It prints per-test ops/sec for both sides and the ratio, and **refuses outright**
+when the two runs used different `-n`/`-c`/`-P` — throughput scales with all
+three, so a mismatch manufactures whatever result you want.
+
+There is no verdict column and there will not be one: a single run per side has
+no noise floor to judge a delta against. Read the structural differences (a VM's
+syscall path against bare metal) and ignore the small ones. Two runs on the same
+machine are the way to find out how small "small" is.
 
 ---
 
 ## Full pre-commit gate
 
 ```bash
-cmake --build build -j && cmake --build build-dbg -j
+cmake --build build -j && cmake --build build-rel -j
 
+# everything, on the Release build: correctness, concurrency, every managed
+# phase, crash recovery, protocol abuse, stress, speed
+python3 scripts/stress_test.py --server build-rel/server --destructive --bench
+python3 scripts/stress_test.py --server build-rel/server --destructive --tls
+
+# drift check — Debug audits the whole keyspace after every command, which is
+# what catches accounting bugs Release silently tolerates
+python3 scripts/stress_test.py --server build/server --phases memory,persistence
+#   any "[mem] drift" line in the kept stderr is a real bug
+
+# and against the config you actually ship
 ./build/server myred.conf &
 python3 scripts/stress_test.py --password <PASS>
 python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <PASS>
 kill %1
-
-./build/server bench.conf &
-python3 scripts/stress_test.py --port 1336 --bench
-python3 scripts/stress_test.py --tls --tls-insecure --port 1337 --bench
-kill %1
-
-# drift check — catches accounting bugs Release silently tolerates
-./build-dbg/server myred.conf &
-python3 scripts/stress_test.py --password <PASS> --correctness-only
-kill %1        # any "[mem] drift" line in stderr is a real bug
 ```
 
 ---
@@ -217,4 +337,8 @@ kill %1        # any "[mem] drift" line in stderr is a real bug
 | `Server closed the connection` in `redis-cli subscribe` | usually redis-cli exiting on stdin EOF; confirm with `printf ... \| nc` |
 | benchmark `GET` < `SET` | thermal throttling — cool down and re-run |
 | `ULLONG_MAX` undefined | GCC 13+ dropped transitive includes; add the explicit header |
-| need failure evidence | re-run with `--keep`, read the temp workdir's `stderr-*.log` |
+| need failure evidence | the workdir is kept on any failure; read its `stderr-*.log`. `--keep` keeps it on a clean run too |
+| `warning: this is a Debug build` | you pointed `--server` at `build/`; benchmark `build-rel/` |
+| a phase reports `skip` | the binary predates that directive or command — skips are counted separately and never pass as green |
+| `server never opened port N` | a stale instance from an interrupted run holds it; pick another `--base-port` |
+| results overwrote each other | two runs of the same kind, transport and environment share a path — `--log` to separate them |
