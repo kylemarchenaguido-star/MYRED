@@ -3,6 +3,7 @@
 #include "hash.h"
 #include "sha256.h"
 #include "cred.h"
+#include "transport.h"
 #include <arpa/inet.h>  
 #include <cstddef>
 #include <time.h>
@@ -178,6 +179,17 @@ struct ConfigDirective {
   void (*emit) (FILE *fp);
 };
 
+// tls-cert-file / tls-key-file are the only TLS directive that may change in runtime
+static CfgResult tls_material_set(std::string &field, const std::string &val, std::string &e){
+  std::string prev = field;
+  field = val;
+  if (!tr_tls_reload(e)){
+    field = prev;
+    return CfgResult::BADVALUE;
+  }
+  return CfgResult::OK;
+}
+
 static const ConfigDirective k_config_table[] = {
   { "port", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -292,12 +304,12 @@ static const ConfigDirective k_config_table[] = {
     } },
 
   { "tls-cert-file", 1, 1,
-    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
-      g_config.tls_cert_file = a[0]; return CfgResult::OK;
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      return tls_material_set(g_config.tls_cert_file, a[0], e);
     },
     [](std::string &o) -> bool { o = g_config.tls_cert_file; return true; },
     // tls-cert-file
-    /*boot_only*/ true, /*masked*/ false,
+    /*boot_only*/ false, /*masked*/ false,
     /*emit*/ [](FILE *fp){
       if (!g_config.tls_cert_file.empty()){
         fprintf(fp, "tls-cert-file \"%s\"\n", g_config.tls_cert_file.c_str());
@@ -305,12 +317,12 @@ static const ConfigDirective k_config_table[] = {
     } },
 
   { "tls-key-file", 1, 1,
-    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
-      g_config.tls_key_file = a[0]; return CfgResult::OK;
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      return tls_material_set(g_config.tls_key_file, a[0], e);
     },
     [](std::string &o) -> bool { o = g_config.tls_key_file; return true; },
     // tls-key-file
-    /*boot_only*/ true, /*masked*/ false,
+    /*boot_only*/ false, /*masked*/ false,
     /*emit*/ [](FILE *fp){
       if (!g_config.tls_key_file.empty()){
         fprintf(fp, "tls-key-file \"%s\"\n", g_config.tls_key_file.c_str());

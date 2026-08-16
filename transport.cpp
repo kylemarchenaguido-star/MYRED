@@ -7,6 +7,8 @@
 #include "transport.h"
 
 #include <errno.h>
+#include <openssl/prov_ssl.h>
+#include <openssl/types.h>
 #include <unistd.h>
 
 // OpenSSL stays private to this TU. Without MYRED_HAVE_TLS the TLS branches
@@ -23,62 +25,83 @@ static std::string tls_err_string(const std::string &what){
     return what + ": " + buf;
 }
 
+static SSL_CTX *tls_ctx_build(std::string &err){
+  if (g_config.tls_cert_file.empty() || g_config.tls_key_file.empty()){
+    err = "tls-port is set but tls_cert_file/tls_key_file are missing";
+    return nullptr;
+  }
+  if (g_config.tls_auth_clients != TlsAuthClients::NO && g_config.tls_ca_cert_file.empty()){
+    err = "tls_auth_clients needs tls_ca_cert_file to verify client certs";
+    return nullptr;
+  }
+  
+  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+  if (!ctx){ err = tls_err_string("SSL_CTX_new"); return nullptr; }
+
+  // Session resumption: cache sessions server-side so reconnecting is faster
+  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1){
+    err = tls_err_string("SSL_CTX_set_min_proto_version");
+    SSL_CTX_free(ctx);
+    return nullptr;
+  }
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+
+  SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS);
+
+  if (SSL_CTX_use_certificate_chain_file(ctx, g_config.tls_cert_file.c_str()) != 1){
+      err = tls_err_string("loading tls-cert-file '" + g_config.tls_cert_file + "'");
+      SSL_CTX_free(ctx);
+      return nullptr;
+  }
+
+  if (SSL_CTX_use_PrivateKey_file(ctx, g_config.tls_key_file.c_str(), SSL_FILETYPE_PEM) != 1){
+      err = tls_err_string("loading tls-key-file '" + g_config.tls_key_file + "'");
+      SSL_CTX_free(ctx);
+      return nullptr;
+  }
+
+  if (SSL_CTX_check_private_key(ctx) != 1){
+      err = "tls-key-file does not match tls-cert-file";
+      SSL_CTX_free(ctx);
+      return nullptr;
+  }
+
+  if (!g_config.tls_ca_cert_file.empty()){
+      if (SSL_CTX_load_verify_locations(ctx, g_config.tls_ca_cert_file.c_str(), nullptr) != 1){
+          err = tls_err_string("loading tls-ca-cert-file '" + g_config.tls_ca_cert_file + "'");
+          SSL_CTX_free(ctx);
+          return nullptr;
+      }
+  }
+  int vmode = SSL_VERIFY_NONE;
+  if (g_config.tls_auth_clients == TlsAuthClients::YES){
+      vmode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+  } else if (g_config.tls_auth_clients == TlsAuthClients::OPTIONAL){
+      vmode = SSL_VERIFY_PEER;
+  }
+  SSL_CTX_set_verify(ctx, vmode, nullptr);
+  return ctx;
+}
+
 bool tr_tls_init(std::string &err){
-    if (g_config.tls_port == 0){ return true; } // TLS disable
-    if (g_config.tls_cert_file.empty() || g_config.tls_key_file.empty()){
-        err = "tls-port is set but tls-cert-file/tls-key-file are missing";
-        return false;
-    }
-    if (g_config.tls_auth_clients != TlsAuthClients::NO && g_config.tls_ca_cert_file.empty()){
-        err = "tls-auth-clients needs tls-ca-cert-file to verify client certs";
-        return false;
-    }
-    
-    g_tls_ctx = SSL_CTX_new(TLS_server_method());
-    if (!g_tls_ctx){ err = tls_err_string("SSL_CTX_new"); return false; }
+  if (g_config.tls_port == 0){ return true; }
+  SSL_CTX *ctx = tls_ctx_build(err);
+  if (!ctx){ return false; }
+  g_tls_ctx = ctx;
+  return true;
+}
 
-    // Session resumption: cache sessions server-side so reconnecting is faster
-    SSL_CTX_set_session_cache_mode(g_tls_ctx, SSL_SESS_CACHE_SERVER);
-
-    if (SSL_CTX_set_min_proto_version(g_tls_ctx, TLS1_2_VERSION) != 1){
-        err = tls_err_string("SSL_CTX_set_min_proto_version"); return false;
-    }
-    SSL_CTX_set_options(g_tls_ctx, SSL_OP_NO_RENEGOTIATION);
-    // ACCEPT_MOVING_WRITE_BUFFER: Buffer slides/reallocs between write retries
-    // (buf_consume/buf_append); vanilla OpenSSL aborts a retried SSL_write whose
-    // buffer address changed. PARTIAL_WRITE matches write()'s short-write contract.
-    SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS);
-
-    if (SSL_CTX_use_certificate_chain_file(g_tls_ctx, g_config.tls_cert_file.c_str()) != 1){
-        err = tls_err_string("loading tls-cert-file '" + g_config.tls_cert_file + "'");
-        return false;
-    }
-
-    if (SSL_CTX_use_PrivateKey_file(g_tls_ctx, g_config.tls_key_file.c_str(), SSL_FILETYPE_PEM) != 1){
-        err = tls_err_string("loading tls-key-file '" + g_config.tls_key_file + "'");
-        return false;
-    }
-
-
-    if (SSL_CTX_check_private_key(g_tls_ctx) != 1){
-        err = "tls-key-file does not match tls-cert-file";
-        return false;
-    }
-
-    if (!g_config.tls_ca_cert_file.empty()){
-        if (SSL_CTX_load_verify_locations(g_tls_ctx, g_config.tls_ca_cert_file.c_str(), nullptr) != 1){
-            err = tls_err_string("loading tls-ca-cert-file '" + g_config.tls_ca_cert_file + "'");
-            return false;            
-        }
-    }
-    int vmode = SSL_VERIFY_NONE;
-    if (g_config.tls_auth_clients == TlsAuthClients::YES){
-        vmode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-    } else if (g_config.tls_auth_clients == TlsAuthClients::OPTIONAL){
-        vmode = SSL_VERIFY_PEER;
-    }
-    SSL_CTX_set_verify(g_tls_ctx, vmode, nullptr);
-    return true;
+bool tr_tls_reload(std::string &err){
+  if (!g_tls_ctx){ return true; }
+  SSL_CTX *fresh = tls_ctx_build(err);
+  if (!fresh){ return false; } // old ctx untouched, still serving everything
+  
+  SSL_CTX *old = g_tls_ctx;
+  g_tls_ctx = fresh; // new connections handshake on the new material, every other reference frees itself
+  SSL_CTX_free(old);
+  return true;
 }
 
 bool tr_tls_attach(Conn *c){
@@ -103,6 +126,8 @@ bool tr_tls_init(std::string &err){
           "(install libssl-dev and re-run cmake, or unset tls-port)";
     return false;
 }
+
+bool tr_tls_reload(std::string &){ return true; }
 
 bool tr_tls_attach(Conn *c){ (void)c; return false; }
 

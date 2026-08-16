@@ -13,16 +13,23 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-08-13.
+Date: 2026-08-16.
 
 Primary commands:
 ```bash
-cmake -B build
-cmake --build build
+cmake -B build && cmake --build build          # build/ is a DEBUG build
+cmake -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j
 ./build/server myred.conf
 python3 scripts/stress_test.py --password <pass>
 python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password <pass>   # over TLS
+python3 scripts/test_tls.py --server build-rel/server          # TLS metrics
 ```
+
+**`build/` is Debug and `build-rel/` is Release** (corrected 2026-08-14 — this
+file previously claimed the opposite). Never benchmark `build/`: `commands.cpp`
+runs `mem_selfcheck()` after every command when `NDEBUG` is unset and it walks
+the keyspace, so a Debug binary is O(keyspace) per command. `test_tls.py`
+refuses to measure one.
 
 Runtime assumptions:
 - Default plaintext port `1234`; TLS via `tls-port` (see `myred.conf`).
@@ -41,7 +48,7 @@ Implemented command families:
 | Memory accounting and eviction | Implemented |
 | Config file + password hashing (Argon2id) | Implemented |
 | ACL foundation and hardening | Implemented (V9.4–V9.5) |
-| **TLS** | **Implemented (V9.7)** |
+| **TLS** | **Implemented (V9.7)** — live cert rotation without restart (V10.6.1c) |
 | **Pub/Sub (+ patterns, channel ACL, keyspace notifications)** | **Implemented (V8)** |
 | **Transactions** | **Implemented (V8.4–V8.7)** |
 | **Replication + coordinated failover** | **Implemented (V10.1–V10.6d)** — V10.6e (automatic election) unscoped, cluster → V12 |
@@ -50,84 +57,219 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V10.6e - Automatic failover, Sentinel-compatible [Next, unscoped]
+### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security [ACTIVE]
 
-**V10.1 through V10.6d are closed — see Completed Milestones.** What is left of
-V10 is the one part of it that is not deterministic: deciding, *without a human*,
-that the master is gone, and agreeing on who takes over.
+**Promoted from `BACKLOG.md` on 2026-08-16**, when V10.6.1 closed and its gate —
+"do not start until V10 ships" — was met. V10.1-V10.6d shipped 2026-08-13 and
+the TLS detour closed 2026-08-16, so this is the active milestone. It was always
+a scheduling choice rather than a hard dependency: nothing below needs
+replication to exist, and auth, ACL, TLS and transactions are the real attack
+surface this is aimed at. Bundled into one milestone number the same way Pub/Sub
+and Transactions shared V8 — for convenience, not because the pieces depend on
+each other.
 
-Everything closed so far runs on one box and is driven by a command somebody
-typed. This is distributed consensus — quorum, config epochs, leader election,
-the `__sentinel__:hello` bus, `SENTINEL is-master-down-by-addr`. It was worth
-refusing to start it until a-d were solid, because a correct election that then
-performs an *incorrect* handover buys exactly nothing. The handover it would
-drive is `FAILOVER`, which now exists, is coordinated, loses no writes, and has
-35 checks standing on it.
+**Step 0 is the next work, and it is the whole reason V10.6e is still parked
+behind this milestone**: an automatic failover you cannot regression-test is a
+liability, and right now there is no single command that runs the coverage which
+already exists.
 
-**Gate, unchanged: V11 Step 0** — fold the local suites back into one runnable
-regression surface (BACKLOG). An automatic failover you cannot regression-test is
-a liability, not a feature: it is the one subsystem that acts on its own, at
-night, unattended. So the honest running order from here is V10.6.1 below
-(bounded, unrelated, already scheduled as a detour), then V11 Step 0, then scope
-V10.6e against a suite that can prove it.
+**Step 0, before any of the below: fold every local suite back into
+`stress_test.py`.** As of 2026-08-09 only `scripts/stress_test.py` is tracked;
+`test_pubsub.py`, `test_security.py`, `test_restart_matrix.py`,
+`test_replication.py`, `test_memory.py`, `test_async_auth.py`,
+`test_aof_restart.py`, `test_tls.py`, `myred_testlib.py`, the `test_*.sh`
+scripts and the `diag_*.sh` helpers are gitignored and exist only in a working
+copy. That was a
+deliberate call — the test surface had grown faster than the fix list and no
+single command ran it all — but it means **their coverage is one `rm -rf` from
+gone**, and much of it pins bugs that really shipped:
 
-Two residuals inherited from V10.6, both filed in BACKLOG → Open Bugs, neither
-blocking: the master's own keepalive deadline is still nested inside the replica
-branch of `next_timer_ms()`, and `INFO` renders a never-acked replica as
-`state=online,lag=0`.
+- Every check tagged `[REG]` in those files marks a real defect. Port them with
+  their comments intact; a `[REG]` without its story is just an assertion.
+- **`test_tls.py` is the exception and should not be folded in.** It is a
+  measurement harness (V10.6.1 Step 0), not a regression suite — it has no
+  assertions to port, it deliberately fails only on a broken measurement, and
+  its durable output is the `docs/tls_metrics_<tag>.json` artifact rather than a
+  pass count. What it needs from this step is the opposite: the baseline JSON it
+  produces should be **tracked**, because a comparison against a file that only
+  ever existed in one working copy is not a comparison.
+- The suites that manage their own server (private ports 12401–12406, temp
+  workdirs, `myred_testlib.Server`) cannot become plain live-server sections —
+  restart, crash-recovery and replication tests need process control.
+  `stress_test.py` needs a "spawns its own instance" mode before those can move,
+  which is the real work of this step.
+- Highest-value coverage to preserve, in order: replication (whole milestone,
+  and both resync paths leave correct data so only its `sync_*` counter
+  assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
+  keyspace notifications, memory accounting invariants.
+- **`test_replication.py` grew again on 2026-08-13** and is now ~145 checks
+  across twelve phases, including the whole of V10.6c/d. Three shapes in it do
+  not exist anywhere in `stress_test.py` and are the real porting work: a
+  freezable proxy (a link that goes silent *without* closing), assertions read
+  from a server's **stderr file** rather than over the wire (polling `INFO` wakes
+  the loop and hides every missing-deadline bug), and phases that spawn a second
+  pair of instances because a handover swaps both roles. It is also the suite
+  that caught the `FORCE`-never-stored defect, which reads correctly and only
+  misbehaves at runtime.
+- **Known gap to close while porting: no `SPOP`-then-restart case anywhere.**
+  `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction `DEL`/
+  renamed-command frames but never `SPOP`, and `stress_test.py` does not restart
+  at all — which is why the empty-key `SREM` frame (fixed 2026-08-11) survived
+  from V9.6.4 until someone watched the replication stream by hand. Any command
+  carrying `CmdSpec::aof_self` needs a round-trip case, not just a live-reply one.
+- Do this *first*: the differential and fuzz work below is worth far more with
+  one runnable regression suite underneath it, and worth much less if the
+  existing coverage silently evaporates in the meantime.
 
-### V10.6.1 - Deferred TLS Optimizations (V9.7.5 tail) [Detour, after V10.6]
+Structured, not "point an agent at the live server and see what happens" — that
+finds less than the combination below, because an LLM-driven agent is strong at
+reasoning about logic bugs and weak at raw byte-level crash-finding compared to
+a real fuzzer.
 
-Moved here from `BACKLOG.md` on 2026-08-12 and scheduled as a short detour
-**after V10.6 closes**, not before — it is bounded, unrelated work, and the
-failover steps above have a dependency chain that is worth finishing without an
-interruption in the middle of it.
-
-The body of V9.7.5 shipped (see V9.7). These three are intentionally NOT done —
-each is gated on a measured need, not implemented speculatively. Escalate only
-when a metric demands it. **That gate survives the move**: arriving here does not
-mean "now implement all three", it means "now go take the measurement that says
-whether any of them is warranted."
-
-- **Handshake CPU under an accept storm** — escalate in this exact order, and
-  re-measure accept-to-first-command latency under a connection burst after each
-  step before moving to the next:
-  1. Session resumption (done, V9.7.5) — already reduces how many *full* handshakes occur.
-  2. Cap accepts per poll tick: change the unbounded
-     `while (handle_accept(listeners[i].fd, listeners[i].is_tls) == 0) {}`
-     (`server.cpp:1148`) to a bounded loop (e.g. `k_max_accepts_per_tick`) so one
-     connection burst can't monopolize a tick and starve already-established
-     connections' read/write readiness. Cheapest, and helps plaintext too.
-  3. Last resort only, if 1-2 don't hold up: move the `SSL_do_handshake` call
-     (`tr_handshake`) onto `g_data.thread_pool`, posting the result back through
-     the same completion-channel pattern the Argon2 auth path uses (V9.6.2) —
-     including its conn-id liveness check, since the conn can be destroyed (client
-     gave up, `tls-handshake-timeout` fired) while the handshake CPU work is in
-     flight on a worker thread.
-- **kTLS** (`SSL_OP_ENABLE_KTLS`): do not implement speculatively — requires a
-  measured before/after on MYRED's actual small-message workload showing it
-  matters first. Not planned until that measurement exists.
-- **Cert reload without restart** (operability, not perf; explicitly last, only
-  once everything above is done and stable):
-  1. Add a trigger — a dedicated command or `CONFIG SET` support for
-     `tls-cert-file`/`tls-key-file` specifically (reversing V9.7.2's boot-only
-     decision for just those two directives).
-  2. Build a **new** `SSL_CTX` by re-running `tr_tls_init`'s sequence — do not
-     mutate `g_tls_ctx` in place, so a bad cert/key is rejected without disturbing
-     the live context.
-  3. On success only, atomically repoint `g_tls_ctx = new_ctx;` — do **not**
-     `SSL_CTX_free` the old one. OpenSSL refcounts it (every live conn's `SSL*`
-     holds a reference via `tr_tls_attach`), so it frees itself once the last
-     connection using it closes. On validation failure, keep serving on the old
-     ctx and report the error — never leave the server without a working `SSL_CTX`.
-
-**Carry-overs: all clear.** V9.7 TLS closed 2026-07-25 (603/603 both transports),
-V8 Pub/Sub, V8 Transactions, V8.8 and V9.8 all closed. The two bugs that were
-carried past V10 — the 🔴 `SPOP` empty-key `SREM` frame and the 🟡 `ACL GENPASS`
-PRNG — were both **fixed 2026-08-11**; root causes in `CODE_REVIEW.md` →
-Post-V10 Carry-overs. No open bugs in the data path.
+- **Differential harness**: drive the same randomized operation stream through
+  redis-py against both a real `redis-server` and MYRED, diff replies, with a
+  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
+  rule). Catches semantics drift of the "SET should discard TTL" class that
+  hand-written assertions miss.
+- **libFuzzer/AFL harnesses** for `parse_resp_request` and `rdb_load_buffer` —
+  both pure functions over byte buffers, so harnesses are ~20 lines each. Corpus
+  seeds: real AOF/RDB files from the test scripts. Extend the same harness
+  toward adversarial protocol fuzzing specifically (malformed bulk lengths,
+  negative sizes, truncated frames) rather than building a second one.
+- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI lane
+  that runs `stress_test.py --correctness-only` under it. The `container_of`
+  pattern and manual `Buffer` management are exactly where sanitizers pay off —
+  and it's the same build anything found during the adversarial pass below
+  should be reproduced under, for a real stack trace instead of "the server died."
+- **Static/code-level security review** — no live server needed. Auth, ACL
+  logic, RESP parsing bounds, the TLS handshake state machine, and AOF/RDB
+  loading from untrusted files: bounds issues, integer overflow on size fields,
+  logic bypasses.
+- **Targeted logic-level attacks** — the part an agent is actually good at:
+  hypothesize specific abuse cases (case-aliasing around ACL deny, subscribe-mode
+  gate bypass, key names containing RESP control bytes, TLS handshake state
+  confusion, races around the `fork()`-based BGSAVE) and write concrete Python
+  repro scripts against the real server for each one.
+- **One running document** (e.g. `docs/SECURITY_TESTING.md`) logging every
+  attempt, outcome, and repro steps — same evidence-preservation habit as the
+  rest of the test suite.
+- Run the adversarial/live-server pieces against a disposable local instance
+  only, never anything that matters if it crashes or hangs.
 
 ## Completed Milestones
+
+### V10.6.1 - Deferred TLS Optimizations (V9.7.5 tail) [Done 2026-08-16]
+
+Opened 2026-08-14 as a bounded detour, closed 2026-08-16. Three deferred items,
+each gated on "escalate only when a metric demands it" — and none of those
+metrics existed, so the milestone opened by building the instrument. Outcome:
+**one reverted, one declined, one shipped.** That spread is the point; a
+measurement pass where everything ships was not measuring.
+
+**Step 0 — `scripts/test_tls.py`, the measurement harness.** Spawns its own
+passwordless instance on private ports, emits four blocks (handshake, accept
+storm, redis-benchmark throughput, cert rotation) into a machine-comparable
+`docs/tls_metrics_<tag>.json`, and `--compare` diffs two runs. Baselines
+committed: `baseline` (workers 8), `baseline-w300`, `cert-reload`. Release build,
+WSL2 — absolute numbers sit ~2.4x below the native figures in the Testing Matrix
+and compare only to runs on the same box.
+
+Constraints it encodes, each one silent when violated: **it refuses a Debug
+build** (`mem_selfcheck()` runs after every command when `NDEBUG` is unset and
+walks the keyspace — and `build/` *is* Debug, `build-rel/` is the Release one);
+passwordless, because `k_max_auth_inflight` is 4 against Argon2id's 76MiB bound
+and an authed benchmark measures the KDF; `save ""`, so no BGSAVE fork lands
+mid-measurement; throughput only ever from `redis-benchmark`, never from the
+harness's own client-bound Python; every metric repeated with the spread across
+repeats reported as **the noise floor**, and `--compare` refuses to render a
+verdict when either side ran `--repeat 1`, because a floor of 0% turns jitter
+into a result. The established-connection pinger runs in its own **process** —
+from a thread, GIL contention would be reported as server stall.
+
+Baseline, for anything later: TLS handshake **1.10 ms of server CPU per
+connection** (±3.0%) against 0.37 ms for the plaintext accept path, giving a
+~900 new-TLS-connections/s ceiling on one core — confirmed twice over, since
+`cpu_per_conn × conns_per_s` = 1.00 means the storm saturates exactly one core.
+Session resumption works (rate 1.000, saves 40.8%). TLS/plaintext throughput
+0.59 at `-P 16`, 0.76 at `-P 1`.
+
+**V10.6.1a — bound handshake work per tick: APPLIED, MEASURED, REVERTED.**
+`k_max_accepts_per_tick = 4` moved nothing: established-connection p99 43.84 →
+36.19 ms against a predicted ~4.4 ms, every row inside a ±135-225% noise floor.
+Reverted by this milestone's own rule — kept only if the number moves. Three
+explanations were tested and rejected, which is what makes the leftover finding
+worth trusting: it is **not** client-side CPU contention (pinning the server,
+victim and burst workers to separate cores changed nothing), **not** the
+per-accept `fprintf(stderr)` (<0.033 ms/conn), and **not** the 128 KB/conn
+buffer allocation (3-6 minor faults per connection, versus the 32 pages a
+touched allocation would show).
+
+Two durable facts survive it. First, **the accept loop is not where the cost
+is** — `handle_accept` does accept + `Conn` alloc + `tr_tls_attach`, while the
+RSA signature happens in `handle_tls_handshake` (`server.cpp:1309`) on a later
+tick, driven by poll readiness. Second, **the stall scales with total burst size
+while CPU per connection stays flat** (44/34/51 ms at burst 300 vs 68/81/95 ms
+at burst 1500, CPU/conn 1.13-1.27 ms throughout), which no accept-rate cap can
+explain, and flat CPU/conn across a 5x burst also rules out an O(N²) event loop.
+Leading hypothesis for whoever picks this up: OpenSSL flushes its server session
+cache automatically every 256 handshakes (`ssl_update_cache` →
+`SSL_CTX_flush_sessions`, an O(cache size) walk), V9.7.5 turned that cache on
+(`SSL_SESS_CACHE_SERVER`), and the storm mints a fresh session per connection —
+which fits both the burst scaling and the stall growing run-over-run (68 → 81 →
+95). Test it by capping the cache before writing any code, and **do not go to
+the thread pool until the cause is identified.**
+
+**V10.6.1b — kTLS: DECLINED, measured.** It removes the userspace copy and moves
+record crypto into the kernel; it removes no syscalls. MYRED's records are ~50
+bytes, so the copy is on the order of ten nanoseconds against a measured TLS
+overhead of **4.50 µs/op** at `-P 1` and 0.68 µs/op at `-P 16` — microseconds are
+not recovered by eliminating nanoseconds. kTLS earns its keep on bulk transfer
+via `sendfile()`, the opposite end of the workload axis. Two supporting facts:
+the `perf` decomposition this was gated on **cannot run on this machine**
+(`perf` absent, `perf_event_paranoid` 2), and kTLS engages silently or not at
+all, so a naive before/after can measure nothing and report success. Falsifiable
+cheaply — ~5 lines plus a `BIO_get_ktls_send()` assertion, against a bench metric
+that resolves ±3.5% — but the expected effect is ~0.3%. **Reading trap recorded:
+the TLS/plaintext *ratio* inverts this conclusion** (0.59 pipelined vs 0.76 not),
+because pipelining packs 16 messages into one record and amortizes exactly the
+per-record cost. Compare absolute per-op deltas, never the ratio.
+
+**V10.6.1c — cert reload without restart: SHIPPED.** `tls-cert-file` and
+`tls-key-file` are no longer `boot_only`; their `apply` stages the value,
+rebuilds, and rolls back on failure. **1.09 ms with every established connection
+surviving, against 62.07 ms and all of them dropped** — 57x, and non-disruptive,
+which matters because replica links are ordinary TLS connections since V10.
+
+- **`SSL_CTX_free(old)` on the swap is REQUIRED, and an earlier draft of this
+  plan said the opposite.** OpenSSL refcounts the context, but `SSL_CTX_new`
+  hands you refcount 1 and *that reference is yours*; each `SSL_new()` takes its
+  own and each `SSL_free()` returns it. Dropping the pointer without freeing
+  floors the count at 1 and leaks one whole context, session cache included, per
+  rotation. Freeing drops only our reference; live connections keep theirs.
+- **`tls_ctx_build()` never touches the global.** It returns a complete context
+  or frees the half-built one on every error path, and both `tr_tls_init` and
+  `tr_tls_reload` go through it. That is the entire reason a failed reload is
+  harmless: the live context is never the thing being mutated.
+- `tr_tls_reload` returns true as a **no-op when no context exists yet** —
+  `config_apply` walks the config file before `tr_tls_init` runs, and the
+  cert/key pair is not fully read at that point.
+- **Rotation is in-place, by design.** `CONFIG SET` takes a single pair and a
+  cert must swap together with its key, so changing both *paths* at once is
+  impossible; overwrite the files and use `CONFIG SET tls-cert-file <same path>`
+  as the trigger, which re-reads both atomically. A path change fails cleanly and
+  mutates nothing. Multi-pair `CONFIG SET` is in BACKLOG.
+- A reload starts with an **empty session cache**, so clients full-handshake once.
+
+**The harness found two boot-bricking slips before it measured anything**, both
+clean under `-Wall -Wextra`: `tr_tls_init`'s "TLS is off" early-out returned
+`false` instead of `true`, so every *plaintext-only* config died at boot through
+an unguarded `fatal_exit` with an empty message; and the `tls-key-file` row's
+`apply` was wired to `g_config.tls_cert_file`, so `tls_key_file` was never
+assigned and every *TLS* config died on the emptiness check. The second is the
+V9.8 wrong-field bug one level down — a setter, not a getter — and the boot
+round-trip check cannot see it, because it skips any row that owns an `emit`.
+`test_tls.py` pins it with a `[REG]` check that sets `tls-key-file` and reads the
+field back.
 
 ### V10 - Replication and High Availability [Done]
 
@@ -137,9 +279,10 @@ full-resync handshake on both sides, read-only replicas that survive restarts,
 partial resync off the backlog, automatic reconnect, ack tracking and `WAIT`,
 detection of a link that goes silent without closing, a durability floor, and
 `FAILOVER`. **V10.6e** (automatic, Sentinel-style election) is the only piece
-left and sits in Current Focus. Cluster/hash-slot sharding was split out to
-**V12** on 2026-08-12 — it shares no code and no design with failover, which is
-precisely why bundling them under one number left this unscoped for three weeks.
+left; it moved to `BACKLOG.md` on 2026-08-14, deliberately behind V11's testing
+work. Cluster/hash-slot sharding was split out to **V12** on 2026-08-12 — it
+shares no code and no design with failover, which is precisely why bundling them
+under one number left this unscoped for three weeks.
 
 Regression coverage is `scripts/test_replication.py`: its own master, two
 replicas, a separate pair for `FAILOVER`, and a **killable, freezable in-process
@@ -286,153 +429,100 @@ so the bug vanished under observation. Also fixed: `REPLCONF listening-port`
 validated `p > 65536` instead of `p < 65536`, so `replica_port` was never
 assigned and every `slave0:` line reported `port=0`.
 
-#### V10.6a - Promotion that works in the case you actually promote in [Done 2026-08-13]
+#### V10.6 - Failover [Done 2026-08-13]
 
-Four defects, all found by reading (and then running) the promotion path against
-the failover scenario rather than the happy path.
+Four steps in dependency order — each is a prerequisite for the *correctness* of
+the next, not just its convenience — all deterministic and testable on one box
+with no second process. Design rationale in `DECISIONS.md` → Replication and
+Failover; **V10.6e** (automatic election) is in `BACKLOG.md`, behind V11.
 
-- **`REPLICAOF NO ONE` was a silent no-op on a replica whose master is down** —
-  gated on `repl_state != NONE`, the *link phase*, but `repl_link_lost` sets that
-  to `NONE` while deliberately keeping `replica_mode = true`. So in the only
-  situation anyone types the command, it returned `+OK` and did nothing. The gate
-  must be the role flag.
-- **Promotion threw the history away.** `repl_new_id()` overwrites `repl_id`
-  outright, so every sibling repointed at the new master fails `id_ok` and takes a
-  full resync — one synchronous `rdb_build_image()` each, at the moment the
-  deployment is already a node down. Replaced with `repl_shift_id()`: keep the old
-  identity as `repl_id2` with `second_repl_offset`, and let `do_psync` honour a
-  replica naming it.
-- **…except a replica never fed its own backlog**, because `repl_backlog_feed`'s
-  only call site is inside `propagate()`, which `propagate_enabled()` gates off
-  while `g_loading` is set. The ring has to be warm *before* the promotion; it
-  cannot be backfilled after. The `STREAMING` branch now feeds the master's bytes
-  **verbatim** — a re-encode could differ in length and drift every later offset.
-  Two traps, both of which bit on first application: `repl_backlog_feed` advances
-  `master_repl_offset` **itself**, so it replaces the manual `+=` rather than
-  joining it (keeping both double-counts every byte and corrupts `REPLCONF ACK`
-  and `WAIT`), and the feed must precede the `buf_consume`.
-- **Site 10: the replica never adopted the replid `+CONTINUE` carries**, so the
-  partial resync worked exactly once — see lesson 3 above.
+**a. Promotion that works in the case you actually promote in.** Four defects,
+found by reading the promotion path against the failover scenario, then running it:
 
-A function that is declared, defined and never called draws no warning at
-`-Wall -Wextra`; that is how `repl_shift_id()` sat unused after "eight sites
-applied".
+- `REPLICAOF NO ONE` was gated on `repl_state` (the *link phase*) instead of
+  `replica_mode` (the role), making it a silent `+OK` no-op on exactly the
+  replica whose master had died — the only case anyone types it in.
+- `repl_new_id()` discarded the history, full-resyncing every sibling at the
+  moment the deployment is already a node down. Now `repl_shift_id()`: retire the
+  old identity into `repl_id2`/`second_repl_offset` and let `do_psync` honour it.
+- **A replica never fed its own backlog** — `repl_backlog_feed`'s only call site
+  is inside `propagate()`, gated off under `g_loading` — so the ring was empty at
+  the instant of promotion and cannot be backfilled after. It now feeds the
+  master's bytes **verbatim** (a re-encode could differ in length and drift every
+  later offset), *replacing* the manual `master_repl_offset +=` rather than
+  joining it (the feed advances the offset itself; both = every byte counted
+  twice, corrupting `REPLCONF ACK` and `WAIT`), and *before* the `buf_consume`.
+- Site 10: the replica never adopted the replid `+CONTINUE` carries, so the
+  partial resync worked exactly once — lesson 3 above.
 
-#### V10.6b - Detect a master that stops talking without closing [Done 2026-08-13]
+A function declared, defined and never called draws no warning at `-Wall
+-Wextra`; that is how `repl_shift_id()` sat unused after "eight sites applied".
 
-A wedged or black-holed master left the replica in `STREAMING` indefinitely,
-serving stale reads and reporting `master_link_status:up`, because nothing was
-watching the clock. Added `repl-timeout` (runtime-settable, seconds on the wire
-and ms in `Config`), `master_last_io_ms` stamped on **any** byte from the master,
-`master_last_io_seconds_ago` in `INFO`, and the mirror image on the master side —
-a replica that stops acking is dropped, since a dead one otherwise counts toward
-`WAIT` and toward V10.6c's quorum.
+**b. Detect a master that stops talking without closing.** `repl-timeout`
+(runtime-settable, seconds on the wire, ms in `Config`), `master_last_io_ms`
+stamped on **any** inbound byte, `master_last_io_seconds_ago` in `INFO`, and the
+mirror image on the master side — a replica that stops acking is dropped.
 
-- **The replica check is phase-independent, not `STREAMING`-only.** The master
-  link sits in no idle/io list on purpose, which also means nothing had ever
-  reaped it: a master that accepts the socket and never sends `+FULLRESYNC` had
-  stranded replicas in `HANDSHAKE` since V10.2b.
-- **Only replicas that have acked at least once are reaped.** `ack_time_ms == 0`
-  means "still doing its initial resync"; reaping those would kill exactly the
-  big-dataset replicas the timeout was never meant to touch. They hold
-  `ack_offset` 0, so they can satisfy no `WAIT` and inflate no quorum.
-- **A keepalive is not optional here, it is the other half of the timeout.**
-  Nothing travels master→replica on an idle link (`REPLCONF ACK` is
-  replica→master only and is never answered), so a timeout measured on inbound
-  bytes expires on a perfectly healthy master: at `repl-timeout 5` the replica
-  dropped a healthy master twice in 13 seconds and forced three resyncs. The
-  master now feeds a `PING` every `repl-ping-replica-period` (10s) through
-  `repl_backlog_feed` + `repl_feed_replicas` — **deliberately not `propagate()`**,
-  which would grow an idle server's AOF without bound — and it *does* advance
-  `master_repl_offset`, because the replica counts every byte it consumes.
-  `ping-period << repl-timeout` is the real contract between the two directives.
-- **A cached deadline outlives the setting it came from.** `repl_ping_at_ms` is
-  written only when a ping fires, so lowering the directive at runtime didn't
-  take effect for one full *old* interval — precisely when someone is lowering
-  it. The apply lambda now re-arms from `get_monotonic_msec()`. `repl-timeout`
-  stores no deadline and applies instantly.
-- `config_selfcheck`'s get→apply→get probe **cannot** catch a seconds/ms
-  mis-wiring: a getter missing its `/1000` still round-trips against itself. Same
-  shape as the V9.8 `appendonly` bug. Only an external `CONFIG SET 5` → `GET`
-  catches it.
+- The replica check is **phase-independent**: the master link sits in no idle
+  list, so nothing had ever reaped it, and a master that accepts the socket then
+  never sends `+FULLRESYNC` had stranded replicas in `HANDSHAKE` since V10.2b.
+- Only replicas that acked **at least once** are reaped; `ack_time_ms == 0` means
+  "still doing its initial resync", and reaping those kills exactly the
+  big-dataset replicas the timeout was never meant to touch.
+- **The keepalive is the other half of the timeout.** Nothing travels
+  master→replica on an idle link, so a timeout on inbound bytes expires on a
+  *healthy* master (measured: two drops and three resyncs in 13s at
+  `repl-timeout 5`). The `PING` goes through `repl_backlog_feed` +
+  `repl_feed_replicas`, **not `propagate()`** (which would grow an idle server's
+  AOF without bound), and it *does* advance the offset. `ping-period <<
+  repl-timeout` is the contract between the two directives.
+- `repl_ping_at_ms` is written only when a ping fires, so lowering the directive
+  at runtime didn't apply for one full *old* interval; the apply lambda now
+  re-arms. `config_selfcheck` cannot catch a seconds/ms mix-up — a getter missing
+  its `/1000` round-trips against itself.
 
-#### V10.6c - `min-replicas-to-write` / `min-replicas-max-lag` [Done 2026-08-13]
+**c. `min-replicas-to-write` / `min-replicas-max-lag`.** `good_replicas()` counts
+replicas that acked within `max-lag` seconds, riding the existing `spec.is_write`
+gate beside the read-only check; `-NOREPLICAS`, reads untouched.
 
-The write-safety knob, and the one that decides whether a failover loses data: an
-isolated old master that keeps accepting writes is *how* split-brain costs you
-writes, and this makes it stop on its own without needing to know it has been
-superseded. `good_replicas()` is a loop over `g_data.replicas` counting those
-that acked within `max-lag` seconds, riding the existing `spec.is_write` gate
-beside the read-only check. Refuses with `-NOREPLICAS`; reads are untouched.
+- **Master side only, never under `g_loading`**: a replica that drops a write it
+  was *sent* has silently forked from its master.
+- **No "is it alive" stamp at attach** (where the first draft went) —
+  `ack_time_ms == 0` already means "attached, never heard from", and stamping
+  would start a `repl-timeout` clock against replicas legitimately mid-image.
+- `max-lag 0` counts replicas still loading their image: the documented meaning
+  of 0, and weaker than the default 10.
 
-- **Master side only, and never under `g_loading`.** On a replica the read-only
-  gate has already turned the client away, and the master's own stream must never
-  be refused — a replica that drops a write it was *sent* has silently forked.
-- **No new "is it alive" stamp at attach**, which is where the first draft went.
-  `ack_time_ms == 0` already means "attached, never heard from", and requiring it
-  non-zero is what keeps a still-loading replica out of the quorum; stamping at
-  attach would have started a `repl-timeout` clock against replicas that are
-  legitimately mid-image, reversing V10.6b's third decision without noticing it
-  was a decision.
-- `min-replicas-max-lag 0` means "do not judge on lag", so it counts replicas
-  still loading their image. That is the documented meaning of 0 and a weaker
-  guarantee than the default 10.
-
-#### V10.6d - `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT ms]` [Done 2026-08-13]
-
-Coordinated, zero-data-loss, planned handover — **no second process, no quorum,
-no election.** The master already knows every replica's acked offset, so it
-pauses writes, waits for the chosen replica to reach `master_repl_offset`, then
-hands over. `do_failover` only sets state; `failover_cron` does the work, because
-the demotion has to destroy connections and that is `server.cpp`'s job.
+**d. `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT ms]`.** Zero-data-loss
+planned handover with **no second process, no quorum, no election**: pause writes,
+wait for the target to ack `master_repl_offset`, demote, hand over. `do_failover`
+sets state; `failover_cron` does the work, since the demotion destroys connections.
 
 - **The offsets line up for free, and that is the whole trick.** The target is
   promoted by `PSYNC ... FAILOVER` *before* the resync logic runs, so `repl_id2`
-  is exactly the history it shared with the sender — which the sender named in
-  that very PSYNC — and `second_repl_offset` is where the sender stopped writing.
-  It asks for `second_repl_offset` and is owed **zero bytes**. This only works
-  because step 1 paused writes; without the pause the finish line moves every
-  time a client writes and the target never arrives. Verified by the suite: a
-  clean handover moves **no RDB at all** (`sync_full` unchanged,
-  `sync_partial_ok` +1).
-- **Demoting must drop every replica first.** This server does not relay a stream
-  it is itself receiving, so after the handover its replicas would sit on a link
-  that never feeds them again — and the target is *among* them, which would loop
-  its own writes back at it. Collect before destroying: `conn_destroy` erases
-  from the set being iterated.
-- **`repl_start` had to learn about it.** `have_history` derives from
-  `replica_mode`, still false mid-demotion, so the handover would have sent
-  `PSYNC ? -1` and pulled a full image — losing the entire point of the command.
-- **`ABORT` is refused once `IN_PROGRESS`.** We have already demoted and asked the
-  target to take over; it may have promoted a millisecond ago. Redis allows it;
-  this does not, and the narrower rule is the defensible one.
-- **The write pause refuses rather than blocks** (`-FAILOVER`). Same correctness
-  property — no write survives past the offset snapshot — but a client sees an
-  error instead of a delay. Doing it properly means routing writes through the
-  deferred-reply path `WAIT` uses; filed in BACKLOG.
-- **`FORCE` pays for its lost bytes with a full resync, and must.** The demoted
-  master is *ahead* of the offset the target promoted at, so serving it a
-  `+CONTINUE` would keep writes the new master never saw: two instances, one
-  replid, different data. The suite pins the full resync as the correct outcome.
+  is the history it shared with the sender and `second_repl_offset` is where the
+  sender stopped — it asks for that offset and is owed **zero bytes**. Only the
+  pause makes it true. Verified: a clean handover moves **no RDB at all**.
+- **Demoting drops every replica first** (collect before `conn_destroy`, which
+  erases from the set): this server does not relay a stream it is receiving, and
+  the target is among them, which would loop its own writes back at it.
+- `repl_start`'s `have_history` had to learn `IN_PROGRESS`, or the handover sends
+  `PSYNC ? -1` and pulls a full image — losing the point of the command.
+- **`FORCE` pays for its lost bytes with a full resync, and must**: the demoted
+  master is *ahead* of the offset the target promoted at, so a `+CONTINUE` would
+  keep writes the new master never saw.
+- Two deliberate Redis divergences: `ABORT` refused once `IN_PROGRESS`, and paused
+  writes **refused** (`-FAILOVER`) rather than blocked (deferred version in BACKLOG).
 
-**Five slips landed while applying V10.6c/d by hand, and four were invisible to
-the compiler.** Worth keeping as the shape of this failure mode:
-
-- The `NOREPLICAS` gate **replaced** the `READONLY` gate instead of following it,
-  so every replica in the tree was writable and V10.3a was silently undone. A
-  snippet that says "insert after" can land as "replace" — grep that the *anchor*
-  still exists, not just that the new line does.
-- `port < 1 || port < 65535` rejected every usable port in `FAILOVER TO`. **The
-  same inverted comparison as V10.5's `p > 65536`, in the same subsystem, four
-  days apart.**
-- `g_data.failover_force = force;` was never written, so `FORCE` parsed, passed
-  validation and did nothing — `failover_cron` always took the abort branch. Only
-  a *runtime* test could see this one; it reads fine.
-- `failover_state` was emitted inside `if (replica)`, i.e. invisible in
-  `WAIT_FOR_SYNC`, the one state that only ever exists on a master (and a
-  duplicated `master_replid` line came with it).
-- `min-replicas-max-lag` defaulted to 0 instead of 10, quietly turning the lag
-  half of V10.6c off.
+**Five slips landed while applying c/d by hand, four invisible to the compiler**
+(writeups in `CODE_REVIEW.md` → V10.6c/d Apply Slips): the `NOREPLICAS` gate
+**replaced** the `READONLY` gate instead of following it; `port < 1 || port <
+65535` rejected every usable port — **the same inverted comparison as V10.5's
+`p > 65536`, four days apart**; `failover_force` was never assigned, so `FORCE`
+did nothing; `failover_state` was emitted inside `if (replica)`, invisible in the
+one state that only exists on a master; `min-replicas-max-lag` defaulted to 0.
+The rule: **grep the anchor a snippet was supposed to leave alone**, and remember
+that an assignment nobody typed reads perfectly — only a runtime test finds it.
 
 ### V9.8 - Config refactor: one directive table [Done]
 

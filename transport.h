@@ -27,6 +27,9 @@ void tr_close(Conn *c);
 bool tr_tls_init(std::string &err);
 bool tr_tls_attach(Conn *c);
 
+// rebuild the global SSL_CTX from the current g_config so a certificate can be rotated without restart
+bool tr_tls_reload(std::string &err);
+
 // OK = done, WANT_* = poll and come back,
 // ERR = fatal (audit + destroy). Only called while Conn::tls_handshaking.
 IoResult tr_handshake(Conn *c);

@@ -97,6 +97,26 @@ Recently resolved (terse; detail in CODE_REVIEW / git):
 - SPOP nondeterministic but AOF-logged verbatim — `CmdSpec::aof_self` + `do_spop`
   feeds synthetic `SREM` of popped members via `aof_feed` (2026-07-16).
 
+## Multi-pair `CONFIG SET` (Redis 7 semantics)
+
+Filed 2026-08-16, out of V10.6.1c. `do_config`'s `set` branch reads exactly
+`cmd[2]`/`cmd[3]` and ignores anything after, so only one directive can be set
+per call. That is a Redis 7 compatibility gap on its own, but the concrete cost
+is in TLS: a certificate and its private key must swap **together**
+(`SSL_CTX_check_private_key` rejects a new cert against the old key, in either
+order), so rotating to genuinely *new paths* is impossible today. In-place
+rotation — new bytes at the same paths, then `CONFIG SET tls-cert-file <same
+path>` as the trigger — covers how certbot, cert-manager and mounted secrets
+actually work, which is why V10.6.1c shipped without this.
+
+Doing it properly means `CONFIG SET p1 v1 p2 v2 ...` applying as a transaction:
+validate every pair first, then commit, so a bad second pair cannot leave the
+first applied. Note that shape is already solved once in this codebase — V8.8's
+`ACL SETUSER` stages onto a `User` copy and commits with `std::move` only on
+full success. The same reasoning applies, with the extra wrinkle that a TLS
+directive's apply() has a side effect (rebuilding the `SSL_CTX`), so the commit
+step has to be "stage all values, then rebuild once", not "apply each in turn".
+
 ## Open Decisions
 
 Not bugs and not scheduled work — deliberate choices worth revisiting if the
@@ -136,101 +156,69 @@ Completed Milestones.
 Completed Milestones: bookkeeping, handshake and full resync, read-only replicas,
 partial resync, automatic reconnect, `WAIT`, silent-link detection, the
 `min-replicas-*` durability floor, and coordinated `FAILOVER`. The only V10 work
-left is **V10.6e** (automatic, Sentinel-style election), which is `ROADMAP.md` →
-Current Focus and gated on V11 Step 0 below. Cluster/hash-slot sharding split out
-to V12 on 2026-08-12. Nothing V10 is left here.
+left is **V10.6e** (automatic, Sentinel-style election) — moved *here* on
+2026-08-14 and filed below, after V11, because it does not get built until there
+is a suite that can prove it against a running server. Cluster/hash-slot sharding
+split out to V12 on 2026-08-12.
 
-### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security (post-1.0)
+### V11 - Testing Hardening → moved to `ROADMAP.md`
 
-Gate: do not start until V10 (Replication and High Availability) ships. This is
-explicitly a "first real version is done" milestone. Scheduling choice, not a
-hard technical dependency — nothing below actually needs replication to exist;
-auth, ACL, TLS, and transactions are the real attack surface this is aimed at.
-Bundled into one milestone number the same way Pub/Sub and Transactions shared
-V8 — for scheduling convenience, not because the pieces depend on each other.
+**Promoted to `ROADMAP.md` → Current Focus on 2026-08-16**, when V10.6.1 closed
+and it became the active milestone. Its Step 0 (fold every local suite back into
+one runnable regression surface) is the next work. V10.6e below is still gated
+behind it.
 
-**Step 0, before any of the below: fold every local suite back into
-`stress_test.py`.** As of 2026-08-09 only `scripts/stress_test.py` is tracked;
-`test_pubsub.py`, `test_security.py`, `test_restart_matrix.py`,
-`test_replication.py`, `test_memory.py`, `test_async_auth.py`,
-`test_aof_restart.py`, `myred_testlib.py`, the `test_*.sh` scripts and the
-`diag_*.sh` helpers are gitignored and exist only in a working copy. That was a
-deliberate call — the test surface had grown faster than the fix list and no
-single command ran it all — but it means **their coverage is one `rm -rf` from
-gone**, and much of it pins bugs that really shipped:
+### V10.6e - Automatic failover, Sentinel-compatible [Unscoped, after V11 Step 0]
 
-- Every check tagged `[REG]` in those files marks a real defect. Port them with
-  their comments intact; a `[REG]` without its story is just an assertion.
-- The suites that manage their own server (private ports 12401–12406, temp
-  workdirs, `myred_testlib.Server`) cannot become plain live-server sections —
-  restart, crash-recovery and replication tests need process control.
-  `stress_test.py` needs a "spawns its own instance" mode before those can move,
-  which is the real work of this step.
-- Highest-value coverage to preserve, in order: replication (whole milestone,
-  and both resync paths leave correct data so only its `sync_*` counter
-  assertions can tell them apart), restart/crash recovery, ACL + audit, pub/sub
-  keyspace notifications, memory accounting invariants.
-- **`test_replication.py` grew again on 2026-08-13** and is now ~145 checks
-  across twelve phases, including the whole of V10.6c/d. Three shapes in it do
-  not exist anywhere in `stress_test.py` and are the real porting work: a
-  freezable proxy (a link that goes silent *without* closing), assertions read
-  from a server's **stderr file** rather than over the wire (polling `INFO` wakes
-  the loop and hides every missing-deadline bug), and phases that spawn a second
-  pair of instances because a handover swaps both roles. It is also the suite
-  that caught the `FORCE`-never-stored defect, which reads correctly and only
-  misbehaves at runtime.
-- **Known gap to close while porting: no `SPOP`-then-restart case anywhere.**
-  `test_restart_matrix.py` covers `GETEX`/`GETDEL`/`ZPOPMIN`/eviction `DEL`/
-  renamed-command frames but never `SPOP`, and `stress_test.py` does not restart
-  at all — which is why the empty-key `SREM` frame (fixed 2026-08-11) survived
-  from V9.6.4 until someone watched the replication stream by hand. Any command
-  carrying `CmdSpec::aof_self` needs a round-trip case, not just a live-reply one.
-- Do this *first*: the differential and fuzz work below is worth far more with
-  one runnable regression suite underneath it, and worth much less if the
-  existing coverage silently evaporates in the meantime.
+**Moved here from `ROADMAP.md` → Current Focus on 2026-08-14**, and the placement
+*after* V11 is the decision, not an accident of ordering: this is the one
+subsystem that acts on its own, at night, unattended. It gets built once there is
+a suite that can be run against a server and prove it, not before. An automatic
+failover you cannot regression-test is a liability, not a feature.
 
-Structured, not "point an agent at the live server and see what happens" — that
-finds less than the combination below, because an LLM-driven agent is strong at
-reasoning about logic bugs and weak at raw byte-level crash-finding compared to
-a real fuzzer.
+The last piece of V10, and the only part of it that is not deterministic:
+deciding, **without a human**, that the master is gone, and agreeing on who takes
+over. Everything V10.1–V10.6d does runs on one box and is driven by a command
+somebody typed. This is distributed consensus — quorum, config epochs, leader
+election, the `__sentinel__:hello` bus, `SENTINEL is-master-down-by-addr`.
 
-- **Differential harness**: drive the same randomized operation stream through
-  redis-py against both a real `redis-server` and MYRED, diff replies, with a
-  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
-  rule). Catches semantics drift of the "SET should discard TTL" class that
-  hand-written assertions miss.
-- **libFuzzer/AFL harnesses** for `parse_resp_request` and `rdb_load_buffer` —
-  both pure functions over byte buffers, so harnesses are ~20 lines each. Corpus
-  seeds: real AOF/RDB files from the test scripts. Extend the same harness
-  toward adversarial protocol fuzzing specifically (malformed bulk lengths,
-  negative sizes, truncated frames) rather than building a second one.
-- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI lane
-  that runs `stress_test.py --correctness-only` under it. The `container_of`
-  pattern and manual `Buffer` management are exactly where sanitizers pay off —
-  and it's the same build anything found during the adversarial pass below
-  should be reproduced under, for a real stack trace instead of "the server died."
-- **Static/code-level security review** — no live server needed. Auth, ACL
-  logic, RESP parsing bounds, the TLS handshake state machine, and AOF/RDB
-  loading from untrusted files: bounds issues, integer overflow on size fields,
-  logic bypasses.
-- **Targeted logic-level attacks** — the part an agent is actually good at:
-  hypothesize specific abuse cases (case-aliasing around ACL deny, subscribe-mode
-  gate bypass, key names containing RESP control bytes, TLS handshake state
-  confusion, races around the `fork()`-based BGSAVE) and write concrete Python
-  repro scripts against the real server for each one.
-- **One running document** (e.g. `docs/SECURITY_TESTING.md`) logging every
-  attempt, outcome, and repro steps — same evidence-preservation habit as the
-  rest of the test suite.
-- Run the adversarial/live-server pieces against a disposable local instance
-  only, never anything that matters if it crashes or hangs.
+What it can now build on, which is why refusing to start it earlier was right:
+the handover itself is **done**. `FAILOVER` (V10.6d) is coordinated, pauses
+writes, waits for the target's ack, loses nothing, moves no RDB, and has 35
+checks standing on it. An election is only worth writing on top of a handover
+that is already correct — a correct election driving an incorrect handover buys
+exactly nothing.
 
-## Deferred TLS Optimizations (V9.7.5 tail) → moved to `ROADMAP.md` as V10.6.1
+Entry conditions, in order:
 
-Scheduled 2026-08-12 as a short detour **after V10.6 (failover) closes**, and the
-full text moved with it — ROADMAP → Current Focus → **V10.6.1**. All three items
-(accept-storm handshake CPU, kTLS, cert reload without restart) keep the gate they
-had here: measure first, implement only what a metric demands. Nothing TLS is left
-in this file.
+1. **V11 Step 0** (above) — one runnable regression surface, with the existing
+   replication phases folded in. The three shapes `test_replication.py` already
+   needs (a freezable link, stderr-based assertions, a phase that spawns its own
+   pair of instances) are all prerequisites for testing an election too, and a
+   fourth arrives with it: killing a master and asserting on *who* won.
+2. Decide the scope: Sentinel-compatible (a separate process speaking the real
+   Sentinel protocol, so `redis-cli --sentinel` and existing clients work) versus
+   an in-process gossip between MYRED instances. The first is more work and far
+   more useful; the second is tempting and strands you on a private protocol.
+3. Only then scope the steps. Nothing below V10.6d needs to change for it —
+   `repl_id2`/`second_repl_offset`, per-replica `ack_offset`, `min-replicas-*`
+   and `FAILOVER` are the full mechanical surface an election needs to drive.
+
+## Deferred TLS Optimizations (V9.7.5 tail) → CLOSED as V10.6.1, 2026-08-16
+
+All three resolved, writeup in `ROADMAP.md` → Completed Milestones → **V10.6.1**.
+The gate they carried here — measure first, implement only what a metric demands
+— is what produced the spread: the bounded accept loop was **applied, measured
+and reverted** (no effect outside the noise floor), kTLS was **declined on
+arithmetic** (it removes a ~10ns copy against a 4.50 µs/op overhead), and cert
+reload **shipped** (1.09 ms with connections surviving, against a 62 ms restart
+that dropped them all). Nothing TLS is left in this file.
+
+One lead was left open rather than closed, in case the accept-storm stall is
+ever worth chasing again: the established-connection stall scales with total
+burst size while CPU per connection stays flat, and the leading hypothesis is
+OpenSSL's automatic session-cache flush every 256 handshakes. Detail under
+V10.6.1a in ROADMAP.
 
 ## V12 - Cluster / hash-slot sharding [Unscoped]
 
