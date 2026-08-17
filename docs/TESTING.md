@@ -318,9 +318,23 @@ bare socket), not of MYRED. Compare it across runs of the *same* transport, and
 never between transports.
 
 There is no verdict column and there will not be one: a single run per side has
-no noise floor to judge a delta against. Read the structural differences (a VM's
-syscall path against bare metal) and ignore the small ones. Two runs on the same
-machine are the way to find out how small "small" is.
+no noise floor to judge a delta against.
+
+**The noise floor is measured, and it is large.** Two runs of the same binary on
+the same box with a fixed governor:
+
+| | median deviation | worst |
+|---|---|---|
+| plaintext, small ops | **13.7%** | 32.7% (`rpop`) |
+| plaintext, bulk LRANGE | ~1% | 2.4% |
+| **TLS, all ops** | **1.3%** | 28% |
+
+So a single small-op plaintext delta supports no claim finer than about 30%, and
+two findings have already been retracted for ignoring that. **TLS and bulk
+LRANGE are the reproducible numbers** — bounded by deterministic crypto and
+memory work rather than by whatever the host scheduler did — so prefer them for
+regression tracking, and run three times and take a median before believing any
+small-op plaintext difference.
 
 ---
 

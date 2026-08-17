@@ -6,6 +6,7 @@
 #include "ctype.h"
 #include "fcntl.h"
 #include "hash.h"
+#include "hashtable.h"
 #include "math.h"
 #include "rdb.h"
 #include "resp.h"
@@ -16,9 +17,14 @@
 #include "stdlib.h"
 #include "string.h"
 #include <algorithm>
+#include <any>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <unistd.h>
+#include <cstring>
+#include <cctype>
 // #include <random>
 #include <cerrno>
 #include <cstdarg>
@@ -48,16 +54,75 @@ static void die(const char *msg) {
 
 enum class Lookup { OK, MISSING, WRONGTYPE };
 
+// strict double parse, we matching redis again :(
 static bool str2dbl(const std::string &s, double &out) {
+  if (s.empty()){ return false; }
+  errno = 0;
   char *endp = NULL;
-  out = strtod(s.c_str(), &endp); // endp points to the first wrong character
-  return endp == s.c_str() + s.size() && !isnan(out); // NaN = not a number
+  out = strtod(s.c_str(), &endp);
+  if (isspace((unsigned char)s[0]) || endp != s.c_str() + s.size()){ return false; }
+  if (errno == ERANGE && (out == HUGE_VAL || out == -HUGE_VAL || fpclassify(out) == FP_ZERO)) {
+    return false;
+  }
+  return !isnan(out);
 }
 
-static bool str2int(const std::string &s, int64_t &out) {
+// INCRBYFLOAT accumulates in long double, not double 
+static bool str2ld(const std::string &s, long double &out){
+  if (s.empty()){ return false; }
+  errno = 0;
   char *endp = NULL;
-  out = strtoll(s.c_str(), &endp, 10);
-  return endp == s.c_str() + s.size();
+  out = strtold(s.c_str(), &endp);
+  if (isspace((unsigned char)s[0]) || endp != s.c_str() + s.size()){ return false; }
+  if (errno == ERANGE && (out == HUGE_VALL || out == -HUGE_VALL ||  fpclassify(out) == FP_ZERO)) {
+    return false;
+  }
+  return !isnan(out);
+}
+
+// redis ld2string, fixed-point with 17 decimals
+static std::string ld2str_human(long double v){
+  char buf[5120];
+  int len = snprintf(buf, sizeof(buf), "%.17Lf", v);
+  if (len < 0 || len >= (int)sizeof(buf)){ return "0"; }
+  if (strchr(buf, '.') != NULL){
+    char *p = buf + len - 1;
+    while (*p == '0') { p--; len--; }
+    if (*p == '.') { len--; }
+  }
+  if (len == 2 && buf[0] == '-' && buf[1] == '0'){ buf[0] = '0'; len = 1; }
+  return std::string(buf, (size_t)len);
+}
+
+// strict decimal parse, we are matching redis string2ll 
+static bool str2int(const std::string &s, int64_t &out) {
+  const char *p = s.data();
+  const size_t n = s.size();
+  if (n == 0){ return false; }
+  if (n == 1 && p[0] == '0'){ out = 0; return true; } // the only leading zero
+
+  size_t i = 0;
+  bool neg =  false;
+  if (p[0] == '-'){ neg = true; i = 1; if (n == 1) {return false; } }
+
+  if (p[i] < '1' || p[i] > '9'){ return false; } // rejects ' ', '+', '0...'
+
+  uint64_t v = 0;
+  for (; i < n; i++) {
+    if (p[i] < '0' || p[i] > '9'){ return false; }
+    const uint64_t d = (uint64_t)(p[i] - '0');
+    if (v > (UINT64_MAX - d) / 10){ return false; } // overflow != number
+    v = v * 10 + d;
+  }
+
+  if (neg) {
+    if (v > (uint64_t)INT64_MAX + 1){ return false; }
+    out = (v == (uint64_t)INT64_MAX + 1) ? INT64_MIN : -(int64_t)v;
+  } else {
+    if (v > (uint64_t)INT64_MAX){ return false; }
+    out = (int64_t)v;
+  }
+  return true;
 }
 
 // LFU and LRU helpers for lookup_entry
@@ -68,7 +133,7 @@ static uint16_t lfu_now_minutes() {
   return (uint16_t)((g_data.g_lru_clock / 60) & 0xFFFF);
 }
 
-// halve-ish decay: drop the counter by one per lfu_decay_time minutes of
+// halve-ish decay:drop the counter by one per lfu_decay_time minutes of
 // idleness
 static uint8_t lfu_decay(uint32_t lru) {
   uint16_t last = (uint16_t)(lru >> 8);
@@ -129,7 +194,7 @@ void entry_touch_access(Entry *ent) {
 // call. If you need cmd[i] after the call, use a non-destructive hm_lookup copy
 // instead.
 static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
-                           Entry **out_ent) {
+                           Entry **out_ent, bool replace = false) {
   LookupKey key;
   key.key.swap(keystr);
   key.node.hcode = str_hash((const uint8_t *)key.key.data(), key.key.size());
@@ -138,13 +203,17 @@ static Lookup lookup_entry(std::string &keystr, uint32_t want_type, bool create,
   if (node) {
     Entry *ent = container_of(node, &Entry::node);
     if (!expire_if_needed(ent)) { // alive
-      if (ent->type != want_type)
-        return Lookup::WRONGTYPE;
-      // we stamp on every hit
-      entry_touch_access(ent);
-      if (out_ent)
-        *out_ent = ent;
-      return Lookup::OK;
+      if (ent->type != want_type){
+        if (!replace){ return Lookup::WRONGTYPE; }
+        hm_delete(&g_data.db, &ent->node, &entry_eq);
+        entry_del(ent);
+        node = NULL;
+      } else {
+        // we stamp on every hit
+        entry_touch_access(ent);
+        if (out_ent){ *out_ent = ent; }
+        return Lookup::OK;
+      }
     }
     // expired & deleted -> fall through as missing
   }
@@ -250,8 +319,7 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out) {
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out) {
   Entry *ent;
-  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
-    return resp_err(out, "WRONGTYPE wrong type");
+  if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
     return resp_err(out, "WRONGTYPE wrong type");
   }
   entry_str(ent).swap(cmd[2]);
@@ -269,7 +337,7 @@ static void setex_generic(std::vector<std::string> &cmd, Buffer *out,
     return resp_err(out, "ERR invalid expire time in setex command");
   }
   Entry *ent;
-  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
+  if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
     return resp_err(out, MSG_WRONGTYPE);
   }
   entry_str(ent).swap(cmd[3]);
@@ -476,6 +544,11 @@ static void do_strlen(std::vector<std::string> &cmd, Buffer *out) {
 
 // GETRANGE key start end -> bulk string
 static void do_getrange(std::vector<std::string> &cmd, Buffer *out) {
+  int64_t start, end;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], end)) {
+    return resp_err(out, MSG_NOT_INT);
+  }
+
   Entry *ent;
   switch (lookup_entry(cmd[1], T_STR, false, &ent)) {
   case Lookup::WRONGTYPE:
@@ -486,12 +559,13 @@ static void do_getrange(std::vector<std::string> &cmd, Buffer *out) {
     break;
   }
 
-  int64_t start, end;
-  if (!str2int(cmd[2], start) || !str2int(cmd[3], end)) {
-    return resp_err(out, MSG_NOT_INT);
-  }
-
   int64_t len = (int64_t)entry_str(ent).size();
+  // Both indices negative AND start > end is empty, and Redis decides that
+  // BEFORE converting to positive offsets. Without it, -1 -3 on a 1-byte value
+  // converts to 0 and -2, clamps both to 0, and wrongly returns that byte.
+  if (start < 0 && end < 0 && start > end) {
+    return resp_str(out, "", 0);
+  }
   // resolve negatives (Redis: -1 = last byte and .....)
   if (start < 0) {
     start += len;
@@ -504,8 +578,8 @@ static void do_getrange(std::vector<std::string> &cmd, Buffer *out) {
     start = 0;
   }
   if (end < 0) {
-    return resp_str(out, "", 0);
-  } // still negative negative -> empty
+    end = 0;   // Redis clamps a still-negative end to 0; it does not bail out.
+  }            // GETRANGE k -100 -100 on a 19-byte value is the first byte.
   if (end >= len) {
     end = len - 1;
   }
@@ -532,6 +606,18 @@ static void do_setrange(std::vector<std::string> &cmd, Buffer *out) {
     return resp_err(out, "ERR string exceeds maximun allowed size (512MB)");
   }
 
+  // Setting NOTHING never creates a key and never pads: Redis answers 0 for a
+  // missing key and the current length for an existing one, leaving it alone.
+  if (cmd[3].empty()) {
+    std::string keycopy = cmd[1];   // lookup_entry swaps its key argument away
+    Entry *e0;
+    Lookup lk0 = lookup_entry(keycopy, T_STR, false, &e0);
+    if (lk0 == Lookup::WRONGTYPE) {
+      return resp_err(out, MSG_WRONGTYPE);
+    }
+    return resp_int(out, lk0 == Lookup::OK ? (int64_t)entry_str(e0).size() : 0);
+  }
+
   Entry *ent;
   if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
     return resp_err(out, MSG_WRONGTYPE);
@@ -554,25 +640,12 @@ static void do_mset(std::vector<std::string> &cmd, Buffer *out) {
   if (cmd.size() < 3 || (cmd.size() & 1) == 0) {
     return resp_err(out, "ERR wrong number of arguments for 'mset' command");
   }
-  // pre-scan: non-destructive check (copy, not swap) so cmd[i] survives for
-  // write pass
-  for (size_t i = 1; i < cmd.size(); i += 2) {
-    LookupKey lk;
-    lk.key = cmd[i];
-    lk.node.hcode = str_hash((uint8_t *)lk.key.data(), lk.key.size());
-    HNode *node = hm_lookup(&g_data.db, &lk.node, &entry_eq);
-    if (node) {
-      Entry *e = container_of(node, &Entry::node);
-      if (!expire_if_needed(e) && e->type != T_STR) {
-        return resp_err(out, MSG_WRONGTYPE);
-      }
-    }
-  }
   // write pass: lookup_entry consumes cmd[i] here, that's fine
   for (size_t i = 1; i < cmd.size(); i += 2) {
     Entry *ent;
-    lookup_entry(cmd[i], T_STR, true, &ent);
+    lookup_entry(cmd[i], T_STR, true, &ent, true);
     entry_str(ent).swap(cmd[i + 1]);
+    entry_set_ttl(ent, -1);   // a plain write DISCARDS the TTL, as in do_set
     mem_reaccount(ent);
   }
   g_data.g_writes_since_save += (uint32_t)((cmd.size() - 1) / 2);
@@ -611,12 +684,19 @@ static void do_msetnx(std::vector<std::string> &cmd, Buffer *out) {
 // delta already carries the correct sign (+1, -1, +N, -N)
 static void incr_generic(std::vector<std::string> &cmd, Buffer *out,
                          int64_t delta) {
+  // A MISSING key counts as 0; an EXISTING empty string does NOT — Redis
+  // rejects that one. lookup_entry(create=true) cannot tell them apart, because
+  // it manufactures an empty entry for the miss and the old `.empty()` guard
+  // then read both as zero. So the read-only lookup goes first and the entry is
+  // created only once the value is known to be good.
+  std::string keycopy = cmd[1];   // lookup_entry SWAPS its key argument away
   Entry *ent;
-  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
+  Lookup lk = lookup_entry(keycopy, T_STR, false, &ent);
+  if (lk == Lookup::WRONGTYPE) {
     return resp_err(out, MSG_WRONGTYPE);
   }
   int64_t cur = 0;
-  if (!entry_str(ent).empty() && !str2int(entry_str(ent), cur)) {
+  if (lk == Lookup::OK && !str2int(entry_str(ent), cur)) {
     return resp_err(out, MSG_NOT_INT);
   }
   if ((delta > 0 && cur > INT64_MAX - delta) ||
@@ -624,6 +704,9 @@ static void incr_generic(std::vector<std::string> &cmd, Buffer *out,
     return resp_err(out, "ERR increment or decrement would overflow");
   }
   cur += delta;
+  if (lk == Lookup::MISSING) {
+    lookup_entry(cmd[1], T_STR, true, &ent);   // now consumes cmd[1]
+  }
   entry_str(ent) = std::to_string(cur);
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
@@ -659,25 +742,33 @@ static void do_decrby(std::vector<std::string> &cmd, Buffer *out) {
 }
 
 static void do_incrbyfloat(std::vector<std::string> &cmd, Buffer *out) {
-  double delta;
-  if (!str2dbl(cmd[2], delta)) {
-    return resp_err(out, "ERR value is not a float or out of range");
-  }
+  // Type check BEFORE parsing the increment: incrbyfloatCommand looks the key
+  // up and calls checkType() first, so WRONGTYPE outranks a malformed
+  // increment. LRANGE and friends are the other way round — the precedence is
+  // per-command in Redis, not a rule that generalizes.
+  std::string keycopy = cmd[1];   // lookup_entry SWAPS its key argument away
   Entry *ent;
-  if (lookup_entry(cmd[1], T_STR, true, &ent) == Lookup::WRONGTYPE) {
+  Lookup lk = lookup_entry(keycopy, T_STR, false, &ent);
+  if (lk == Lookup::WRONGTYPE) {
     return resp_err(out, MSG_WRONGTYPE);
   }
-  double cur = 0.0;
-  if (!entry_str(ent).empty() && !str2dbl(entry_str(ent), cur)) {
-    return resp_err(out, "ERR value is not a float or out of range");
+  long double cur = 0.0L;
+  // as in incr_generic: missing is 0, an existing empty string is an error
+  if (lk == Lookup::OK && !str2ld(entry_str(ent), cur)) {
+    return resp_err(out, "ERR value is not a valid float");
   }
-  double result = cur + delta;
+  long double delta;
+  if (!str2ld(cmd[2], delta)) {
+    return resp_err(out, "ERR value is not a valid float");
+  }
+  long double result = cur + delta;
   if (isinf(result) || isnan(result)) {
     return resp_err(out, "ERR increment would produce NaN or infinity");
   }
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%.17g", result);
-  entry_str(ent) = buf;
+  if (lk == Lookup::MISSING) {
+    lookup_entry(cmd[1], T_STR, true, &ent);   // now consumes cmd[1]
+  }
+  entry_str(ent) = ld2str_human(result);
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
   resp_str(out, entry_str(ent).data(), entry_str(ent).size());
@@ -1774,6 +1865,12 @@ void do_lindex(std::vector<std::string> &cmd, Buffer *out) {
 
 // LRANGE key start stop
 void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
+  // we parse first, following redis semantics
+  int64_t start, stop;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
+    return resp_err(out, MSG_NOT_INT);
+  }
+
   Entry *ent;
   switch (lookup_entry(cmd[1], T_DLIST, false, &ent)) {
   case Lookup::WRONGTYPE:
@@ -1782,11 +1879,6 @@ void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
     return resp_arr(out, 0);
   case Lookup::OK:
     break;
-  }
-
-  int64_t start = 0, stop = 0;
-  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
-    return resp_err(out, "ERR invalid range");
   }
 
   int64_t n = (int64_t)entry_deque(ent).count;
@@ -1956,6 +2048,16 @@ void do_linsert(std::vector<std::string> &cmd, Buffer *out) {
 
 // LREM key count value
 void do_lrem(std::vector<std::string> &cmd, Buffer *out) {
+  // Redis parses the count before it looks the key up, so a bad count outranks
+  // a wrong type. This moves LREM's OWN parse up; it is not the shared block
+  // that got pasted into a dozen functions and read past the end of cmd in the
+  // ones where these indices mean something else. LREM is arity 4/4, so cmd[2]
+  // always exists.
+  int64_t count = 0;
+  if (!str2int(cmd[2], count)) {
+    return resp_err(out, "ERR invalid count");
+  }
+
   Entry *ent;
   switch (lookup_entry(cmd[1], T_DLIST, false, &ent)) {
   case Lookup::WRONGTYPE:
@@ -1964,11 +2066,6 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out) {
     return resp_int(out, 0);
   case Lookup::OK:
     break;
-  }
-
-  int64_t count = 0;
-  if (!str2int(cmd[2], count)) {
-    return resp_err(out, "ERR invalid count");
   }
 
   const std::string &value = cmd[3];
@@ -2026,6 +2123,10 @@ void do_lrem(std::vector<std::string> &cmd, Buffer *out) {
 
 // LTRIM key start stop
 void do_ltrim(std::vector<std::string> &cmd, Buffer *out) {
+  int64_t start, stop;
+  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
+    return resp_err(out, MSG_NOT_INT);
+  }
   Entry *ent;
   switch (lookup_entry(cmd[1], T_DLIST, false, &ent)) {
   case Lookup::WRONGTYPE:
@@ -2034,11 +2135,6 @@ void do_ltrim(std::vector<std::string> &cmd, Buffer *out) {
     return resp_ok(out);
   case Lookup::OK:
     break;
-  }
-
-  int64_t start = 0, stop = 0;
-  if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
-    return resp_err(out, "ERR invalid range");
   }
 
   int64_t n = (int64_t)entry_deque(ent).count;
@@ -2687,7 +2783,10 @@ static int rename_key(const std::string &src, const std::string &dst, bool nx) {
     return -1;
   } // source expired
   if (src == dst) {
-    return 1;
+    // Renaming a key to itself: RENAME succeeds, but RENAMENX must answer 0 —
+    // the destination exists, and it happens to be the source. This sits above
+    // the NX check below, so it has to make the distinction itself.
+    return nx ? 0 : 1;
   } // rename to self
 
   LookupKey dk;
@@ -2863,17 +2962,19 @@ static bool sinter_impl(std::vector<std::string> &cmd, size_t start,
                         std::vector<std::string> &result) {
   bool wt = false;
   std::vector<Entry *> sets;
+  bool any_empty = false;
   for (size_t i = start; i < cmd.size(); ++i) {
     Entry *e = lookup_set_ro(cmd[i], &wt);
     if (wt) {
       return false;
     }
     if (!e) {
-      result.clear();
-      return true;
+      any_empty = true;
+      continue;
     } // intersection with empty = empty
     sets.push_back(e);
   }
+  if (any_empty){ result.clear(); return true; }
   size_t smallest_idx = 0;
   for (size_t i = 1; i < sets.size(); ++i) {
     if (hm_size(&entry_set(sets[i])) <
@@ -2925,24 +3026,17 @@ static bool sdiff_impl(std::vector<std::string> &cmd, size_t start,
                        std::vector<std::string> &result) {
   bool wt = false;
   Entry *base = lookup_set_ro(cmd[start], &wt);
-  if (wt) {
-    return false;
-  }
-  if (!base) {
-    return true;
-  } // empty base, empty diff
+  if (wt) { return false; }
 
   std::vector<Entry *> others;
   for (size_t i = start + 1; i < cmd.size(); ++i) {
     Entry *e = lookup_set_ro(cmd[i], &wt);
-    if (wt) {
-      return false;
-    }
-    if (e) {
-      others.push_back(e);
-    }
+    if (wt) { return false; }
+    if (e) { others.push_back(e); }
   }
 
+  if (!base) { return true; } // empty base, empty diff
+ 
   std::vector<std::string> candidates;
   hm_foreach(&entry_set(base), cb_collect_members, &candidates);
   for (auto &m : candidates) {
@@ -3710,15 +3804,17 @@ static void do_smove(std::vector<std::string> &cmd, Buffer *out) {
   case Lookup::OK:
     break;
   }
-  if (!set_is_member(&entry_set(src_ent), cmd[3])) {
-    return resp_int(out, 0);
-  }
-
-  // type check dst before modifying src
+  // Type-check the destination BEFORE the membership test. Redis checks both
+  // keys up front, so a wrong-type destination outranks "the member is not in
+  // the source" — returning 0 there hides a type error the caller needs.
   bool wt = false;
   Entry *dst_ent = lookup_set_ro(cmd[2], &wt);
   if (wt) {
     return resp_err(out, "WRONGTYPE wrong type");
+  }
+
+  if (!set_is_member(&entry_set(src_ent), cmd[3])) {
+    return resp_int(out, 0);
   }
 
   if (src_name == cmd[2]) {

@@ -1000,7 +1000,11 @@ def test_bulkrange_commands(r: TestRunner, sock: socket.socket):
     r.check("getrange 0 999 → full",    cmd(sock, "getrange", "br3", "0",   "999"),  "Hello, World!")
     r.check("getrange 5 3 → ''",        cmd(sock, "getrange", "br3", "5",   "3"),    "")
     r.check("getrange 99 100 → ''",     cmd(sock, "getrange", "br3", "99",  "100"),  "")
-    r.check("getrange -99 -99 → ''",    cmd(sock, "getrange", "br3", "-99", "-99"),  "")
+    # a start/end below -len clamps to 0 — it does NOT collapse to empty.
+    # This asserted "" until the differential harness showed Redis returns the
+    # first byte; the test was encoding MYRED's own bug.
+    r.check("getrange -99 -99 → 'H' (clamped)",
+            cmd(sock, "getrange", "br3", "-99", "-99"), "H")
 
     # missing key → empty string (not nil)
     r.check("getrange missing → ''",    cmd(sock, "getrange", "no_such_key", "0", "-1"), "")
@@ -1027,11 +1031,18 @@ def test_bulkrange_commands(r: TestRunner, sock: socket.socket):
     r.check("setrange missing key → 5", cmd(sock, "setrange", "br3", "0", "hello"), 5)
     r.check("get br3 → hello",          cmd(sock, "get", "br3"), "hello")
 
-    # setrange with empty value on missing → creates zero-padded key
+    # Setting NOTHING never creates a key and never pads: a missing key answers
+    # 0 and stays missing. This asserted 3 with a comment claiming a zero-padded
+    # key was created — MYRED's behaviour written down as if it were the spec.
     cmd(sock, "del", "br3")
-    r.check("setrange empty val offset=3 → 3",
-            cmd(sock, "setrange", "br3", "3", ""), 3)
-    r.check("strlen br3 → 3", cmd(sock, "strlen", "br3"), 3)
+    r.check("setrange empty val on missing → 0",
+            cmd(sock, "setrange", "br3", "3", ""), 0)
+    r.check("...and the key was not created", cmd(sock, "exists", "br3"), 0)
+    # on an EXISTING key it answers the current length, unchanged
+    cmd(sock, "set", "br3", "hello")
+    r.check("setrange empty val on existing → 5",
+            cmd(sock, "setrange", "br3", "3", ""), 5)
+    r.check("strlen br3 → 5", cmd(sock, "strlen", "br3"), 5)
 
     # error cases
     r.expect_error("setrange offset -1 → error", sock, "setrange", "br3", "-1", "v")
@@ -4083,11 +4094,19 @@ class PhaseCtx:
     """
 
     def __init__(self, r: "TestRunner", server_bin: str, root: str,
-                 base_port: int, destructive: bool = False):
+                 base_port: int, destructive: bool = False,
+                 diff_rounds: int = 8, diff_ops: int = 150,
+                 diff_seed: Optional[int] = None):
         self.r = r
         self.server_bin = server_bin
         self.root = root
         self.destructive = destructive
+        self.diff_rounds = diff_rounds
+        self.diff_ops = diff_ops
+        # A run with no seed picks one and PRINTS it, so a failure found by a
+        # random stream is always replayable with --diff-seed.
+        self.diff_seed = (random.randrange(1 << 30) if diff_seed is None
+                          else diff_seed)
         self._next_port = base_port
         self.instances = []          # [(tag, Instance)]
         self.skipped = 0
@@ -4119,8 +4138,15 @@ class PhaseCtx:
         return d
 
     # -- instances ---------------------------------------------------------
-    def start(self, tag: str, workdir: str, conf: str, port: int) -> Instance:
-        inst = Instance(self.server_bin, workdir, conf, tag, port)
+    def start(self, tag: str, workdir: str, conf: str, port: int,
+              binary: Optional[str] = None) -> Instance:
+        """Spawn an instance and register it for the evidence dump.
+
+        `binary` overrides the binary under test — the differential phase needs
+        a real redis-server standing beside MYRED, and everything else about
+        the lifecycle (boot wait, SIGTERM, stderr kept in a file) is identical.
+        """
+        inst = Instance(binary or self.server_bin, workdir, conf, tag, port)
         self.instances.append((tag, inst))
         return inst
 
@@ -7068,6 +7094,660 @@ def phase_hashtable_unit(ctx: "PhaseCtx"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: DIFFERENTIAL — the same operations against MYRED and against Redis
+#
+#  Hand-written assertions can only check what somebody thought to check. This
+#  phase checks against an oracle instead: run an operation on both servers and
+#  require the replies to agree. It catches the "SET should discard the TTL"
+#  class — where MYRED is self-consistent, every existing test passes, and the
+#  behaviour is simply not what Redis does.
+#
+#  Two rules make the comparison meaningful rather than noisy:
+#
+#  1. **Only send what MYRED accepts.** MYRED splits what Redis overloads —
+#     `SET` is arity 3 with no EX/NX/XX (those are `setex`/`setnx`/`getex`),
+#     `LPOP` takes no count, `EXPIRE` no NX|XX|GT|LT. Generating Redis-shaped
+#     commands would produce a wall of "divergences" that are feature gaps, not
+#     semantic differences. The interesting question is the narrower one: for
+#     input MYRED accepts, does it answer what Redis answers?
+#
+#  2. **Normalize the differences that are deliberate**, and nothing else. Every
+#     entry in the tables below is a decision that MYRED is allowed to make
+#     differently; anything not listed is compared exactly.
+#
+#  `ZQUERY`/`ZREVQUERY` have no Redis equivalent at all, so the zset range path
+#  has no oracle here and keeps relying on its hand-written assertions.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Error TEXT is implementation-defined; the error CLASS is the contract. Redis
+# says "WRONGTYPE Operation against a key holding the wrong kind of value",
+# MYRED says "WRONGTYPE wrong type" — those agree on everything that matters.
+# Answering ERR where Redis answers WRONGTYPE does not.
+def _diff_err_class(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    return text.split()[0].upper()
+
+
+# Float formatting is deliberate: MYRED prints through %g, Redis emits 17
+# significant digits. Applied by REPLY POSITION rather than to anything that
+# looks numeric — normalizing every numeric-looking string would also hide a
+# GET that returned "1" for a stored "1.0", which is a real corruption.
+FLOAT_REPLY = {"zscore", "incrbyfloat"}
+FLOAT_AT_ODD_INDEX = {"zpopmin"}          # [member, score, member, score, ...]
+
+# Replies whose ORDER is implementation-defined. Redis makes no ordering promise
+# for any of these, so a different order is not a divergence.
+UNORDERED_REPLY = {"smembers", "sdiff", "sinter", "sunion", "keys",
+                   "hkeys", "hvals"}
+PAIRED_UNORDERED_REPLY = {"hgetall"}       # sort by field, keep pairs together
+
+# TTL replies cannot match to the millisecond across two processes. The contract
+# is the three-way distinction: -2 no key, -1 no TTL, positive alive.
+TTL_REPLY = {"ttl", "pttl"}
+
+
+def _diff_float(v):
+    try:
+        return round(float(v), 9)
+    except (TypeError, ValueError):
+        return v
+
+
+def _diff_norm(name: str, reply):
+    """Apply the deliberate-divergence table to one reply."""
+    name = name.lower()
+
+    if name in TTL_REPLY and isinstance(reply, int):
+        # -2 and -1 mean different things and must stay distinct; any positive
+        # value means the same thing on both servers.
+        return reply if reply < 0 else ("alive" if reply > 0 else 0)
+
+    if name in FLOAT_REPLY:
+        return _diff_float(reply)
+
+    if name in FLOAT_AT_ODD_INDEX and isinstance(reply, list):
+        return [v if i % 2 == 0 else _diff_float(v) for i, v in enumerate(reply)]
+
+    if name in UNORDERED_REPLY and isinstance(reply, list):
+        return sorted(reply, key=lambda x: (x is None, x))
+
+    if name in PAIRED_UNORDERED_REPLY and isinstance(reply, list):
+        pairs = sorted(zip(reply[0::2], reply[1::2]))
+        return [x for pair in pairs for x in pair]
+
+    return reply
+
+
+def _diff_cmd(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
+              *args) -> bool:
+    """Run one command on both servers and require the replies to agree."""
+    name = str(args[0])
+    m_rep, m_err = reply_or_err(my, *args)
+    r_rep, r_err = reply_or_err(rd, *args)
+    shown = " ".join(str(a) for a in args)
+
+    if m_err or r_err:
+        ok = _diff_err_class(m_err) == _diff_err_class(r_err)
+        return ctx.ok(f"= {shown}", ok,
+                      f"MYRED: {m_err or ('reply ' + repr(m_rep))}\n"
+                      f"    redis: {r_err or ('reply ' + repr(r_rep))}")
+
+    m, r = _diff_norm(name, m_rep), _diff_norm(name, r_rep)
+    return ctx.ok(f"= {shown}", m == r,
+                  f"MYRED: {m_rep!r}\n    redis: {r_rep!r}"
+                  + (f"\n    (normalized: {m!r} vs {r!r})" if m != m_rep or r != r_rep
+                     else ""))
+
+
+def _diff_dump(sock: socket.socket, myred: bool) -> dict:
+    """Whole-keyspace snapshot, in a form comparable across implementations.
+
+    Replies can agree op by op while the two states drift apart — that is the
+    shape of the SPOP-propagation bug — so the states get compared directly too.
+    """
+    out = {}
+    # Second asymmetric read: MYRED's KEYS takes no pattern, Redis's requires
+    # one. Like the zset dump below, each side is read with the command it has.
+    everything = cmd(sock, "KEYS") if myred else cmd(sock, "KEYS", "*")
+    for k in sorted(everything or []):
+        t = cmd(sock, "TYPE", k)
+        if t == "string":
+            v = cmd(sock, "GET", k)
+        elif t == "list":
+            v = cmd(sock, "LRANGE", k, "0", "-1")
+        elif t == "set":
+            v = sorted(cmd(sock, "SMEMBERS", k) or [])
+        elif t == "hash":
+            flat = cmd(sock, "HGETALL", k) or []
+            v = sorted(zip(flat[0::2], flat[1::2]))
+        elif t == "zset":
+            # The one asymmetric read: MYRED has no ZRANGE and Redis has no
+            # ZQUERY, so each side is dumped with the command it actually has.
+            if myred:
+                # "-inf", not a large negative literal: a member scored -inf
+                # sorts BELOW -1e308, so seeding the seek with a finite score
+                # silently omits it and reports a phantom state divergence.
+                flat = cmd(sock, "ZQUERY", k, "-inf", "", "0", "10000") or []
+            else:
+                flat = cmd(sock, "ZRANGE", k, "0", "-1", "WITHSCORES") or []
+            v = sorted((m, _diff_float(s))
+                       for m, s in zip(flat[0::2], flat[1::2]))
+        else:
+            v = f"<{t}>"
+        ttl = cmd(sock, "PTTL", k)
+        out[k] = (t, v, ttl if ttl < 0 else "alive")
+    return out
+
+
+def _diff_state(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
+                label: str, reported: set):
+    """Compare the two keyspaces, reporting each diverged key exactly once.
+
+    Then DELETE the diverged keys from both servers. Without that, one early
+    divergence is re-reported by every later group — the first run of this phase
+    turned two root causes into nine failures — and worse, every subsequent
+    operation touching that key inherits the difference, so the noise grows.
+    Deleting re-converges the two states and lets the rest of the stream keep
+    testing what it was written to test.
+    """
+    m, r = _diff_dump(my, True), _diff_dump(rd, False)
+
+    only_m = sorted(k for k in set(m) - set(r) if k not in reported)
+    only_r = sorted(k for k in set(r) - set(m) if k not in reported)
+    ctx.ok(f"[state] {label}: same key set", not only_m and not only_r,
+           f"only in MYRED: {only_m[:8]}\n    only in redis: {only_r[:8]}")
+
+    diff = [k for k in sorted(set(m) & set(r))
+            if m[k] != r[k] and k not in reported]
+    ctx.ok(f"[state] {label}: same value for every shared key", not diff,
+           "\n    ".join(f"{k}: MYRED {m[k]!r} vs redis {r[k]!r}"
+                         for k in diff[:5]))
+
+    for k in only_m + only_r + diff:
+        reported.add(k)
+        for sock in (my, rd):
+            try:
+                cmd(sock, "DEL", k)
+            except RespError:
+                pass
+
+
+# ─── the operation stream ─────────────────────────────────────────────────────
+#
+# Hand-written for now, deliberately. Randomized generation comes next, and
+# going straight there would mean debugging the normalization table and the
+# generator at the same time, on ground where nobody knows the right answer.
+# These are the categories where the two implementations are most likely to
+# disagree, and where I already know what the answer should be.
+#
+# Deliberately absent: SPOP/SRANDMEMBER/RANDOMKEY (they pick a different victim
+# on each server, so the states diverge on the first call and everything after
+# is noise) and MULTI/EXEC (EXEC's reply is an array that needs normalizing per
+# queued command — worth doing, but not while the plumbing is unproven).
+
+DIFF_OPS = [
+    ("strings", [
+        ("SET", "s", "hello"), ("GET", "s"), ("STRLEN", "s"),
+        ("APPEND", "s", " world"), ("GET", "s"), ("STRLEN", "s"),
+        ("APPEND", "fresh", "made-by-append"), ("GET", "fresh"),
+        ("GETRANGE", "s", "0", "4"), ("GETRANGE", "s", "-5", "-1"),
+        ("GETRANGE", "s", "0", "-1"), ("GETRANGE", "s", "5", "3"),
+        ("GETRANGE", "s", "99", "200"), ("GETRANGE", "missing", "0", "-1"),
+        ("SETRANGE", "s", "6", "WORLD"), ("GET", "s"),
+        ("SETRANGE", "padded", "5", "x"), ("GET", "padded"),
+        ("STRLEN", "padded"),
+        ("GETSET", "s", "replaced"), ("GET", "s"),
+        ("GETSET", "brand_new", "first"), ("GET", "brand_new"),
+        ("SETNX", "s", "nope"), ("GET", "s"),
+        ("SETNX", "setnx_new", "yes"), ("GET", "setnx_new"),
+        ("GETDEL", "setnx_new"), ("EXISTS", "setnx_new"),
+        ("GETDEL", "never_existed"),
+        ("SET", "empty", ""), ("GET", "empty"), ("STRLEN", "empty"),
+        ("GET", "definitely_missing"),
+    ]),
+    ("numeric edges", [
+        ("SET", "n", "10"), ("INCR", "n"), ("DECR", "n"), ("INCRBY", "n", "40"),
+        ("DECRBY", "n", "15"), ("GET", "n"),
+        ("INCRBY", "n", "-5"), ("DECRBY", "n", "-5"), ("GET", "n"),
+        ("INCR", "counter_from_nothing"), ("GET", "counter_from_nothing"),
+        ("SET", "notnum", "abc"), ("INCR", "notnum"), ("INCRBY", "notnum", "1"),
+        # str2int() is strtoll() with only an end-of-string check, so it accepts
+        # everything strtoll skips or tolerates: leading whitespace, a '+' sign,
+        # and leading zeros. Redis's string2ll rejects all three. Every failure
+        # in this block is the same root cause, at commands.cpp:57.
+        ("SET", "spacey", " 1"), ("INCR", "spacey"),
+        ("SET", "plussed", "+1"), ("INCR", "plussed"),
+        ("SET", "leadzero", "01"), ("INCR", "leadzero"),
+        ("SET", "tabbed", "\t3"), ("INCR", "tabbed"),
+        # ...and strtoll SATURATES on overflow while errno is never checked, so
+        # a 20-digit value parses as INT64_MIN and increments to a number that
+        # has nothing to do with what was stored. The positive side is caught
+        # only by accident, when INCR's own overflow check trips on INT64_MAX+1.
+        ("SET", "huge_neg", "-99999999999999999999"), ("INCR", "huge_neg"),
+        ("SET", "huge_pos", "99999999999999999999"), ("INCR", "huge_pos"),
+        ("SET", "floaty", "1.5"), ("INCR", "floaty"),
+        # int64 boundaries: the classic overflow pair
+        ("SET", "maxi", "9223372036854775807"), ("INCR", "maxi"),
+        ("SET", "mini", "-9223372036854775808"), ("DECR", "mini"),
+        ("SET", "maxi2", "9223372036854775806"), ("INCRBY", "maxi2", "2"),
+        ("INCRBY", "n", "9223372036854775807"),
+        ("SET", "f", "10.5"), ("INCRBYFLOAT", "f", "0.1"),
+        ("INCRBYFLOAT", "f", "-3.5"), ("INCRBYFLOAT", "f", "0"),
+        ("INCRBYFLOAT", "float_from_nothing", "1.5"),
+        ("INCRBYFLOAT", "f", "abc"),
+        ("INCRBYFLOAT", "notnum", "1"),
+    ]),
+    ("expiry", [
+        ("SET", "e", "v"), ("TTL", "e"), ("PTTL", "e"),
+        ("EXPIRE", "e", "100"), ("TTL", "e"),
+        ("PERSIST", "e"), ("TTL", "e"), ("PERSIST", "e"),
+        ("TTL", "no_such_key"), ("PTTL", "no_such_key"),
+        ("PERSIST", "no_such_key"),
+        # a past deadline deletes the key; both must agree it is gone
+        ("SET", "e2", "v"), ("EXPIRE", "e2", "0"), ("EXISTS", "e2"),
+        ("SET", "e3", "v"), ("EXPIRE", "e3", "-1"), ("EXISTS", "e3"),
+        ("SET", "e4", "v"), ("PEXPIRE", "e4", "-1"), ("EXISTS", "e4"),
+        ("EXPIRE", "no_such_key", "100"),
+        # the same lax str2int, on the ARGUMENT side: 34 call sites parse
+        # counts, indices, offsets and TTLs through it, so MYRED accepts
+        # commands Redis refuses outright
+        ("SET", "argp", "v"), ("EXPIRE", "argp", " 100"), ("TTL", "argp"),
+        ("SET", "e5", "v"), ("EXPIREAT", "e5", "1"), ("EXISTS", "e5"),
+        ("SET", "e6", "v"), ("PEXPIREAT", "e6", "1"), ("EXISTS", "e6"),
+        ("SETEX", "sx", "100", "v"), ("GET", "sx"), ("TTL", "sx"),
+        ("SETEX", "sx_bad", "0", "v"), ("SETEX", "sx_bad", "-1", "v"),
+        ("PSETEX", "px", "100000", "v"), ("TTL", "px"),
+        # SET must discard an existing TTL — the class this phase exists for
+        ("SET", "sx", "overwritten"), ("TTL", "sx"),
+    ]),
+    ("lists", [
+        ("RPUSH", "l", "a", "b", "c"), ("LLEN", "l"),
+        ("LPUSH", "l", "z"), ("LRANGE", "l", "0", "-1"),
+        ("LINDEX", "l", "0"), ("LINDEX", "l", "-1"), ("LINDEX", "l", "99"),
+        ("LRANGE", "l", "0", "0"), ("LRANGE", "l", "-2", "-1"),
+        ("LRANGE", "l", "5", "1"), ("LRANGE", "l", "-100", "100"),
+        ("LRANGE", "no_list", "0", "-1"),
+        ("LRANGE", "l", "+0", "-1"), ("LINDEX", "l", "01"),
+        ("LSET", "l", "1", "B"), ("LRANGE", "l", "0", "-1"),
+        ("LSET", "l", "99", "nope"), ("LSET", "no_list", "0", "x"),
+        ("LINSERT", "l", "BEFORE", "B", "beforeB"),
+        ("LINSERT", "l", "AFTER", "B", "afterB"),
+        ("LINSERT", "l", "BEFORE", "absent", "nope"),
+        ("LINSERT", "no_list", "BEFORE", "a", "x"),
+        ("LRANGE", "l", "0", "-1"),
+        ("RPUSH", "dups", "x", "x", "y", "x"),
+        ("LREM", "dups", "2", "x"), ("LRANGE", "dups", "0", "-1"),
+        ("LREM", "dups", "0", "x"), ("LRANGE", "dups", "0", "-1"),
+        ("RPUSH", "trim", "1", "2", "3", "4", "5"),
+        ("LTRIM", "trim", "1", "3"), ("LRANGE", "trim", "0", "-1"),
+        ("LTRIM", "trim", "5", "1"), ("EXISTS", "trim"),
+        ("LPOP", "l"), ("RPOP", "l"), ("LRANGE", "l", "0", "-1"),
+        ("LPOP", "no_list"), ("RPOP", "no_list"),
+        # draining a list to empty must drop the key on both
+        ("RPUSH", "drain", "only"), ("LPOP", "drain"), ("EXISTS", "drain"),
+    ]),
+    ("hashes", [
+        ("HSET", "h", "f1", "v1", "f2", "v2"), ("HLEN", "h"),
+        ("HGET", "h", "f1"), ("HGET", "h", "absent"), ("HGET", "no_hash", "f"),
+        ("HEXISTS", "h", "f1"), ("HEXISTS", "h", "absent"),
+        ("HSET", "h", "f1", "changed"), ("HGET", "h", "f1"),
+        ("HSETNX", "h", "f1", "nope"), ("HGET", "h", "f1"),
+        ("HSETNX", "h", "f3", "yes"), ("HGET", "h", "f3"),
+        ("HSTRLEN", "h", "f1"), ("HSTRLEN", "h", "absent"),
+        ("HKEYS", "h"), ("HVALS", "h"), ("HGETALL", "h"),
+        ("HKEYS", "no_hash"), ("HVALS", "no_hash"), ("HGETALL", "no_hash"),
+        ("HMGET", "h", "f1", "absent", "f2"),
+        ("HMGET", "no_hash", "a", "b"),
+        ("HSET", "hn", "num", "10"), ("HINCRBY", "hn", "num", "5"),
+        ("HINCRBY", "hn", "num", "-15"), ("HGET", "hn", "num"),
+        ("HINCRBY", "hn", "fresh", "7"), ("HGET", "hn", "fresh"),
+        ("HSET", "hn", "notnum", "abc"), ("HINCRBY", "hn", "notnum", "1"),
+        ("HDEL", "h", "f1"), ("HDEL", "h", "absent"), ("HLEN", "h"),
+        # emptying a hash must drop the key
+        ("HSET", "hdrain", "only", "v"), ("HDEL", "hdrain", "only"),
+        ("EXISTS", "hdrain"),
+    ]),
+    ("sets", [
+        ("SADD", "st", "a", "b", "c"), ("SCARD", "st"),
+        ("SADD", "st", "a"), ("SCARD", "st"),
+        ("SISMEMBER", "st", "a"), ("SISMEMBER", "st", "zzz"),
+        ("SISMEMBER", "no_set", "a"),
+        ("SMISMEMBER", "st", "a", "zzz", "b"),
+        ("SMEMBERS", "st"), ("SMEMBERS", "no_set"),
+        ("SREM", "st", "a"), ("SREM", "st", "absent"), ("SMEMBERS", "st"),
+        ("SADD", "s2", "b", "c", "d"),
+        ("SDIFF", "st", "s2"), ("SINTER", "st", "s2"), ("SUNION", "st", "s2"),
+        ("SDIFF", "st", "no_set"), ("SINTER", "st", "no_set"),
+        ("SUNION", "no_set", "no_set2"),
+        ("SDIFFSTORE", "d_dst", "st", "s2"), ("SMEMBERS", "d_dst"),
+        ("SINTERSTORE", "i_dst", "st", "s2"), ("SMEMBERS", "i_dst"),
+        ("SUNIONSTORE", "u_dst", "st", "s2"), ("SMEMBERS", "u_dst"),
+        # a store whose result is empty must not leave an empty key behind
+        ("SINTERSTORE", "empty_dst", "st", "no_set"), ("EXISTS", "empty_dst"),
+        ("SMOVE", "st", "s2", "c"), ("SMEMBERS", "st"), ("SMEMBERS", "s2"),
+        ("SMOVE", "st", "s2", "absent"),
+        ("SMOVE", "no_set", "s2", "x"),
+        ("SADD", "sdrain", "only"), ("SREM", "sdrain", "only"),
+        ("EXISTS", "sdrain"),
+    ]),
+    ("sorted sets", [
+        ("ZADD", "z", "1", "a", "2", "b", "3", "c"),
+        ("ZSCORE", "z", "a"), ("ZSCORE", "z", "absent"),
+        ("ZSCORE", "no_zset", "a"),
+        ("ZADD", "z", "1.5", "a"), ("ZSCORE", "z", "a"),
+        ("ZRANK", "z", "a"), ("ZRANK", "z", "c"), ("ZRANK", "z", "absent"),
+        ("ZRANK", "no_zset", "a"),
+        ("ZADD", "z", "notanumber", "bad"),
+        ("ZADD", "z", "1"),
+        ("ZREM", "z", "a"), ("ZREM", "z", "absent"), ("ZSCORE", "z", "a"),
+        ("ZPOPMIN", "z"), ("ZPOPMIN", "z", "2"), ("ZPOPMIN", "no_zset"),
+        ("ZADD", "zdrain", "1", "only"), ("ZPOPMIN", "zdrain"),
+        ("EXISTS", "zdrain"),
+        ("ZADD", "zneg", "-1.5", "neg", "0", "zero"),
+        ("ZSCORE", "zneg", "neg"), ("ZSCORE", "zneg", "zero"),
+    ]),
+    ("wrong types", [
+        ("SET", "wt_str", "v"), ("RPUSH", "wt_list", "v"),
+        ("HSET", "wt_hash", "f", "v"), ("SADD", "wt_set", "v"),
+        ("ZADD", "wt_zset", "1", "v"),
+        ("GET", "wt_list"), ("GET", "wt_hash"), ("GET", "wt_set"),
+        ("GET", "wt_zset"),
+        ("LPUSH", "wt_str", "x"), ("LRANGE", "wt_str", "0", "-1"),
+        ("LLEN", "wt_hash"),
+        ("HGET", "wt_str", "f"), ("HGETALL", "wt_list"),
+        ("SADD", "wt_str", "x"), ("SMEMBERS", "wt_hash"),
+        ("SCARD", "wt_zset"),
+        ("ZADD", "wt_str", "1", "m"), ("ZSCORE", "wt_list", "m"),
+        ("INCR", "wt_list"), ("APPEND", "wt_set", "x"),
+        ("STRLEN", "wt_hash"), ("GETRANGE", "wt_set", "0", "-1"),
+        ("SETRANGE", "wt_list", "0", "x"),
+        ("EXPIRE", "wt_list", "100"), ("TTL", "wt_list"),
+        ("TYPE", "wt_str"), ("TYPE", "wt_list"), ("TYPE", "wt_hash"),
+        ("TYPE", "wt_set"), ("TYPE", "wt_zset"), ("TYPE", "no_such_key"),
+        # [FUZZ] found by the randomized rounds, pinned here so they reproduce
+        # without a seed. The SET family REPLACES a key of any type in Redis —
+        # refusing with WRONGTYPE makes SET unusable on a key an application
+        # reused for something else. GETSET is correctly WRONGTYPE on both,
+        # because it has to return the old value as a string.
+        ("SET", "wt_list", "replaced"), ("GET", "wt_list"),
+        ("SETEX", "wt_hash", "100", "replaced"), ("GET", "wt_hash"),
+        ("PSETEX", "wt_set", "100000", "replaced"), ("GET", "wt_set"),
+        ("MSET", "wt_zset", "replaced"), ("GET", "wt_zset"),
+        # [FUZZ] Redis validates numeric ARGUMENTS before it looks the key up,
+        # so a bad index outranks both a wrong type and a missing key
+        ("RPUSH", "wt_list2", "a"),
+        ("LRANGE", "wt_str", "abc", "1"), ("LTRIM", "no_such_key", "abc", "1"),
+        ("LRANGE", "no_such_key", "abc", "1"),
+        # [FUZZ] SDIFF/SINTER short-circuit on an empty or missing key and never
+        # type-check the rest. SUNION has to read every key, so it agrees.
+        ("SADD", "wt_realset", "m"),
+        ("SDIFF", "no_such_key", "wt_str"),
+        ("SINTER", "wt_realset", "no_such_key", "wt_str"),
+        ("SDIFFSTORE", "wt_dst", "no_such_key", "wt_str"),
+        ("SUNION", "no_such_key", "wt_str"),
+    ]),
+    ("multi-key and generic", [
+        ("MSET", "m1", "a", "m2", "b", "m3", "c"),
+        ("MGET", "m1", "m2", "m3"), ("MGET", "m1", "absent", "m3"),
+        ("MGET", "absent1", "absent2"),
+        ("MSETNX", "m4", "d", "m5", "e"), ("MGET", "m4", "m5"),
+        ("MSETNX", "m1", "clobber", "m6", "f"), ("GET", "m1"), ("EXISTS", "m6"),
+        ("EXISTS", "m1"), ("EXISTS", "m1", "m2", "absent"),
+        ("EXISTS", "m1", "m1"),
+        ("TOUCH", "m1", "absent"), ("DBSIZE",),
+        ("RENAME", "m1", "m1_renamed"), ("GET", "m1_renamed"), ("EXISTS", "m1"),
+        ("RENAME", "absent_src", "whatever"),
+        ("RENAMENX", "m2", "m3"), ("RENAMENX", "m2", "m2_new"),
+        ("GET", "m2_new"),
+        ("DEL", "m3"), ("DEL", "m3"), ("DEL", "m4", "m5", "absent"),
+        ("UNLINK", "m2_new"), ("EXISTS", "m2_new"),
+        ("ECHO", "round-trip"), ("PING",), ("PING", "custom"),
+    ]),
+]
+
+
+# ─── randomized generation ────────────────────────────────────────────────────
+#
+# The hand-written list above only checks what somebody thought of. This part
+# generates operation streams instead, from a small pool of keys so that type
+# collisions, overwrites and drains happen constantly — those are where the
+# implementations disagree, not in long runs of unrelated keys.
+#
+# Everything the generator emits must be DETERMINISTIC across two processes, so
+# three families are excluded by construction:
+#   - value-nondeterministic mutations (SPOP without a member, SRANDMEMBER,
+#     RANDOMKEY) pick a different victim on each server, and the states diverge
+#     on the first call,
+#   - short TTLs, because a key can expire between the two sends,
+#   - anything implementation-defined (INFO/CONFIG/OBJECT/MEMORY/SCAN cursors)
+#     or connection-scoped (MULTI, SUBSCRIBE).
+
+DIFF_KEYS = [f"k{i}" for i in range(6)]
+DIFF_FIELDS = ["f0", "f1", "f2", ""]
+DIFF_MEMBERS = ["m0", "m1", "m2", "a", "z", ""]
+DIFF_VALUES = [
+    "", "0", "1", "-1", "10", "007", "+7", " 1", "1 ", "3.14", "-0",
+    "abc", "a b", "x" * 200, "\x01\x02", "héllo",
+    "9223372036854775807", "-9223372036854775808", "99999999999999999999",
+]
+DIFF_INTS = ["0", "1", "-1", "2", "3", "-3", "100", "-100",
+             "9223372036854775807", "-9223372036854775808", "01", " 1", "abc"]
+DIFF_SCORES = ["0", "1", "-1", "1.5", "-2.5", "3e3", "inf", "-inf", "abc"]
+DIFF_TTLS = ["100", "10000", "0", "-1"]      # 0 and -1 delete, deterministically
+
+
+def _diff_gen(rng: "random.Random"):
+    """One random operation, always within MYRED's own arity."""
+    k = rng.choice(DIFF_KEYS)
+    k2 = rng.choice(DIFF_KEYS)
+    v = rng.choice(DIFF_VALUES)
+    f = rng.choice(DIFF_FIELDS)
+    m = rng.choice(DIFF_MEMBERS)
+    i = rng.choice(DIFF_INTS)
+    sc = rng.choice(DIFF_SCORES)
+
+    shapes = [
+        # strings
+        ("SET", k, v), ("GET", k), ("APPEND", k, v), ("STRLEN", k),
+        ("GETSET", k, v), ("SETNX", k, v), ("GETDEL", k),
+        ("GETRANGE", k, i, rng.choice(DIFF_INTS)),
+        ("SETRANGE", k, rng.choice(["0", "1", "5", "-1"]), v),
+        # numeric
+        ("INCR", k), ("DECR", k), ("INCRBY", k, i), ("DECRBY", k, i),
+        ("INCRBYFLOAT", k, sc),
+        # expiry — long TTLs only, plus the deterministic past deadlines
+        ("EXPIRE", k, rng.choice(DIFF_TTLS)), ("TTL", k), ("PERSIST", k),
+        ("PEXPIRE", k, rng.choice(["100000", "-1"])), ("PTTL", k),
+        ("SETEX", k, rng.choice(["100", "0", "-1"]), v),
+        # lists
+        ("RPUSH", k, v), ("LPUSH", k, v), ("LPOP", k), ("RPOP", k),
+        ("LLEN", k), ("LINDEX", k, i), ("LRANGE", k, i, rng.choice(DIFF_INTS)),
+        ("LSET", k, i, v), ("LREM", k, i, v),
+        ("LTRIM", k, i, rng.choice(DIFF_INTS)),
+        ("LINSERT", k, rng.choice(["BEFORE", "AFTER"]), v, rng.choice(DIFF_VALUES)),
+        # hashes
+        ("HSET", k, f, v), ("HGET", k, f), ("HDEL", k, f), ("HEXISTS", k, f),
+        ("HLEN", k), ("HSTRLEN", k, f), ("HSETNX", k, f, v),
+        ("HINCRBY", k, f, i), ("HKEYS", k), ("HVALS", k), ("HGETALL", k),
+        ("HMGET", k, f, rng.choice(DIFF_FIELDS)),
+        # sets — SREM with a chosen member, never SPOP
+        ("SADD", k, m), ("SREM", k, m), ("SCARD", k), ("SISMEMBER", k, m),
+        ("SMEMBERS", k), ("SMISMEMBER", k, m, rng.choice(DIFF_MEMBERS)),
+        ("SMOVE", k, k2, m),
+        ("SDIFF", k, k2), ("SINTER", k, k2), ("SUNION", k, k2),
+        ("SDIFFSTORE", k2, k, rng.choice(DIFF_KEYS)),
+        ("SINTERSTORE", k2, k, rng.choice(DIFF_KEYS)),
+        ("SUNIONSTORE", k2, k, rng.choice(DIFF_KEYS)),
+        # sorted sets (ZQUERY/ZREVQUERY have no Redis equivalent, so no oracle)
+        ("ZADD", k, sc, m), ("ZSCORE", k, m), ("ZRANK", k, m), ("ZREM", k, m),
+        ("ZPOPMIN", k), ("ZPOPMIN", k, rng.choice(["1", "2"])),
+        # generic
+        ("EXISTS", k), ("EXISTS", k, k2), ("TYPE", k), ("DEL", k),
+        ("UNLINK", k), ("TOUCH", k, k2), ("DBSIZE",),
+        ("RENAME", k, k2), ("RENAMENX", k, k2),
+        ("MSET", k, v, k2, rng.choice(DIFF_VALUES)), ("MGET", k, k2),
+        ("MSETNX", k, v, k2, rng.choice(DIFF_VALUES)),
+    ]
+    return rng.choice(shapes)
+
+
+def _diff_signature(my: socket.socket, rd: socket.socket, ops) -> Optional[tuple]:
+    """Replay `ops` on both servers from empty and return the FIRST divergence
+    as a comparable signature, or None if the two agreed throughout.
+
+    The signature is what makes shrinking honest: a smaller op list that
+    diverges for a *different* reason is not a reduction of this failure, it is
+    a second bug wearing the first one's clothes.
+    """
+    cmd(my, "FLUSHALL")
+    cmd(rd, "FLUSHALL")
+    for args in ops:
+        name = str(args[0])
+        m_rep, m_err = reply_or_err(my, *args)
+        r_rep, r_err = reply_or_err(rd, *args)
+        if m_err or r_err:
+            if _diff_err_class(m_err) != _diff_err_class(r_err):
+                return ("reply", name, _diff_err_class(m_err),
+                        _diff_err_class(r_err))
+            continue
+        m, r = _diff_norm(name, m_rep), _diff_norm(name, r_rep)
+        if m != r:
+            return ("reply", name, repr(m), repr(r))
+
+    dm, dr = _diff_dump(my, True), _diff_dump(rd, False)
+    if set(dm) != set(dr):
+        return ("state-keys", tuple(sorted(set(dm) ^ set(dr))[:4]))
+    bad = [k for k in sorted(set(dm) & set(dr)) if dm[k] != dr[k]]
+    if bad:
+        return ("state-value", bad[0], repr(dm[bad[0]]), repr(dr[bad[0]]))
+    return None
+
+
+def _diff_shrink(my: socket.socket, rd: socket.socket, ops, signature):
+    """Delta-debug the op list down to a minimal sequence that still produces
+    the SAME divergence. A 200-op repro is a curiosity; a 3-op repro is a bug
+    report."""
+    n = max(len(ops) // 2, 1)
+    while n >= 1:
+        i = 0
+        while i < len(ops):
+            candidate = ops[:i] + ops[i + n:]
+            if candidate and _diff_signature(my, rd, candidate) == signature:
+                ops = candidate           # still fails the same way: keep it off
+            else:
+                i += n
+        if n == 1:
+            break
+        n //= 2
+    return ops
+
+
+def _diff_random_rounds(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
+                        rounds: int, per_round: int, seed: int):
+    ctx.section(f"Differential: randomized streams (seed {seed})")
+    print(f"  {rounds} rounds x {per_round} ops, pool of {len(DIFF_KEYS)} keys")
+    found = 0
+    for r_i in range(rounds):
+        rng = random.Random(seed + r_i)
+        ops = [_diff_gen(rng) for _ in range(per_round)]
+        sig = _diff_signature(my, rd, ops)
+        if sig is None:
+            ctx.ok(f"round {r_i} ({per_round} ops, seed {seed + r_i}) agrees", True)
+            continue
+        found += 1
+        minimal = _diff_shrink(my, rd, ops, sig)
+        repro = "\n      ".join(" ".join(str(a) for a in o) for o in minimal)
+        ctx.ok(f"round {r_i} ({per_round} ops, seed {seed + r_i}) agrees", False,
+               f"{sig[0]} divergence, shrunk from {len(ops)} ops to "
+               f"{len(minimal)}:\n      {repro}\n"
+               f"    MYRED {sig[-2]}  vs  redis {sig[-1]}"
+               if len(sig) >= 3 else f"{sig}")
+    if not found:
+        print(f"  {YELLOW}info{RESET} no divergence in "
+              f"{rounds * per_round} generated operations")
+    # Leave both servers empty so the caller's state is what it expects.
+    cmd(my, "FLUSHALL")
+    cmd(rd, "FLUSHALL")
+
+
+def phase_differential(ctx: "PhaseCtx"):
+    ctx.section("Differential: MYRED against a real redis-server")
+
+    redis_bin = shutil.which("redis-server")
+    if not redis_bin:
+        ctx.skip("differential",
+                 "no redis-server on PATH — there is no oracle to diff against "
+                 "(apt install redis-server)")
+        return
+
+    d = ctx.dir("differential")
+    my_port, rd_port = ctx.ports(2)
+
+    my_conf = write_conf(os.path.join(d, "myred.conf"), [
+        f"port {my_port}", "appendonly no", 'save ""',
+    ])
+    # Matched on everything that could change a reply: no persistence, no
+    # eviction, no auth, no notifications. RESP2 on both, because neither side
+    # is ever sent HELLO.
+    rd_dir = ctx.dir("differential/redis")
+    rd_conf = write_conf(os.path.join(rd_dir, "redis.conf"), [
+        f"port {rd_port}", "bind 127.0.0.1", "protected-mode no",
+        'save ""', "appendonly no", "maxmemory 0",
+        'notify-keyspace-events ""', f"dir {rd_dir}", 'logfile ""',
+    ])
+
+    my_srv = ctx.start("myred-diff", d, my_conf, my_port)
+    try:
+        rd_srv = ctx.start("redis-ref", rd_dir, rd_conf, rd_port,
+                           binary=redis_bin)
+    except RuntimeError as e:
+        ctx.ok("reference redis-server starts", False, str(e))
+        my_srv.stop()
+        return
+
+    ver = "?"
+    try:
+        out = subprocess.run([redis_bin, "--version"], capture_output=True,
+                             text=True, timeout=10).stdout
+        ver = out.split("v=")[1].split()[0] if "v=" in out else out.strip()
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    print(f"  oracle: redis-server {ver} on :{rd_port}   "
+          f"MYRED on :{my_port}")
+
+    my = raw_conn(my_port)
+    rd = raw_conn(rd_port)
+    cmd(my, "FLUSHALL")
+    cmd(rd, "FLUSHALL")
+
+    total = 0
+    reported = set()
+    for group, ops in DIFF_OPS:
+        ctx.section(f"Differential: {group}")
+        for args in ops:
+            _diff_cmd(ctx, my, rd, *args)
+            total += 1
+        # State is compared per group so a divergence names the group that
+        # caused it rather than the whole run.
+        _diff_state(ctx, my, rd, group, reported)
+
+    print(f"  {YELLOW}info{RESET} {total} operations compared against "
+          f"redis-server {ver}"
+          + (f"; {len(reported)} key(s) diverged and were re-synced: "
+             f"{sorted(reported)}" if reported else ""))
+
+    if ctx.diff_rounds > 0:
+        _diff_random_rounds(ctx, my, rd, ctx.diff_rounds, ctx.diff_ops,
+                            ctx.diff_seed)
+
+    my.close()
+    rd.close()
+    rd_srv.stop()
+    my_srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  RUN SUMMARY — the machine-readable half of a run
 #
 #  The markdown log is for reading; this is for comparing. Two runs of the same
@@ -7205,6 +7885,8 @@ def phase_table():
          phase_tls),
         ("replication", "resync paths, durability floor, failover, promotion",
          phase_replication),
+        ("differential", "same ops against MYRED and a real redis-server",
+         phase_differential),
     ]
 
 
@@ -7233,7 +7915,9 @@ def run_spawned_phases(r: "TestRunner", args, phases) -> dict:
     """Run the phases that manage their own servers. Returns per-phase results."""
     root = tempfile.mkdtemp(prefix="myred-suite-")
     ctx = PhaseCtx(r, os.path.abspath(args.server), root, args.base_port,
-                   destructive=args.destructive)
+                   destructive=args.destructive,
+                   diff_rounds=args.diff_rounds, diff_ops=args.diff_ops,
+                   diff_seed=args.diff_seed)
     print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  Managed-instance phases{RESET}")
     print(f"{'═' * 55}")
@@ -7371,6 +8055,15 @@ def main():
                          "checks")
     ap.add_argument("--base-port",        default=12500, type=int,
                     help="first private port for spawned instances")
+    ap.add_argument("--diff-rounds",      default=8, type=int,
+                    help="randomized operation streams the differential phase "
+                         "runs against a real redis-server (0 disables)")
+    ap.add_argument("--diff-ops",         default=150, type=int,
+                    help="operations per randomized differential round")
+    ap.add_argument("--diff-seed",        default=None, type=int,
+                    help="seed for the randomized differential rounds; a run "
+                         "without one picks a seed and prints it, so any "
+                         "failure is replayable")
     ap.add_argument("--keep",             action="store_true",
                     help="keep the temp workdir even when everything passes")
 

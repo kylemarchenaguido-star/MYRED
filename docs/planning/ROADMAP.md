@@ -90,7 +90,7 @@ python3 scripts/stress_test.py --server build-rel/server --destructive --bench
 `--server` is the hinge. Naming the binary turns on the phases that need process
 control and, unless `--host`/`--port` say otherwise, starts the instance the rest
 of the suite talks to — so nothing has to be running first and nothing it touches
-belongs to anyone. **1022 checks, ~90 s, zero setup.**
+belongs to anyone. **1023 checks, ~60 s, zero setup.**
 
 What made it possible was the piece this step existed to build: a managed-instance
 mode. `Instance` (spawn in a temp dir, SIGTERM, SIGKILL, keep stderr in a file)
@@ -169,8 +169,53 @@ the load average before the run started, and the build type — the three things
 that quietly invalidate a throughput comparison.
 
 `--compare A.json B.json` diffs two summaries. It refuses when `-n`/`-c`/`-P`
-differ, and it prints **no verdict column**: one run per side has no noise floor,
-which is the same lesson V10.6.1 Step 0 paid for.
+differ — but **not** on a differing transport, which is the one difference
+somebody legitimately wants to measure. It prints **no verdict column**: one run
+per side has no noise floor, which is the same lesson V10.6.1 Step 0 paid for.
+
+### Step 0c - Characterising the instrument [Done 2026-08-16]
+
+The first four-run matrix was measured, and two of the findings drawn from it did
+not survive a second run. Both failures were the same failure, and it is the one
+this project keeps paying for: **a difference taken from one run per side.**
+
+- **The harness's own client was distorting every large reply.** `_recv_line`
+  read *one byte per `recv()`*, so a 100k-element `KEYS` cost over a million
+  syscalls: **1422 ms client-side against 19 ms of real server CPU**, and the
+  distortion scaled with the host's syscall cost — 26x between two machines the C
+  client puts 2.3x apart. Fixed with a per-socket buffer
+  (`weakref.WeakKeyDictionary`, so the sockets opened and closed all over that
+  file clean themselves up). KEYS 1422->253 ms; the stress phase 145->3450
+  ops/sec on WSL and 3742->22957 on native. **The asymmetry is the proof**: 1.41x
+  off the total WSL runtime and 1.01x off native, exactly proportional to syscall
+  cost. It also fixed a latent bug — the old reader accumulated into a *local*
+  buffer, so a timeout mid-line discarded bytes already taken from the kernel and
+  desynchronised the stream, which the pub/sub push readers were quietly relying
+  on not happening.
+- **What survived the fix matters more.** The stress phase still reports TLS ~13%
+  *faster* than plaintext on WSL, and five runs per side (spreads 2.5% and 5.4%)
+  put that outside the noise. It is real, and it is the client: `ssl` releases the
+  GIL across longer C sections than a bare socket, which helps a GIL-bound client
+  running 8 threads. So the standing rule "never compare transports with the
+  Python stress number" is correct for a completely different reason than
+  syscalls, and did not go away. **The caveat is now printed next to the number**,
+  because having it only in a doc failed to stop two readings of it as a server
+  measurement.
+- **The platform block now records `crypto_isa`.** A WSL/native comparison came
+  back with the TLS gap 20% *wider* than the plaintext gap; the explanation
+  offered was Tiger Lake's `vaes` against Zen 2's plain `aes` — a fact that was
+  nowhere in the summary and had to be dug out of `/proc/cpuinfo` by hand. It is
+  in the block and in the `--compare` label now. **And the finding it was invented
+  to explain did not reproduce**: the second matrix put plaintext at 2.38x and TLS
+  at 2.37x. The gap was noise; the mechanism was a story told about noise. VAES is
+  real and present on exactly one of the two machines, and it makes no measurable
+  difference to MYRED's TLS cost — which is the useful result, and the same
+  conclusion V10.6.1 reached about kTLS.
+- **A stress-mix race, not a server bug.** `random_key()` draws from 201 names
+  shared by all 8 workers, so `OBJECT ENCODING` on a key another worker had just
+  deleted failed about one run in three. Answering "ERR no such key" there is
+  correct Redis behaviour; the expectation was wrong. That op now uses a
+  worker-private key.
 
 ### The rest of V11
 
@@ -183,32 +228,147 @@ reasoning about logic bugs and weak at raw byte-level crash-finding compared to
 a real fuzzer.
 
 - **Differential harness**: drive the same randomized operation stream through
-  redis-py against both a real `redis-server` and MYRED, diff replies, with a
+  `redis-py` against both a real `redis-server` and MYRED, diff replies, with a
   normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
   rule). Catches semantics drift of the "SET should discard TTL" class that
-  hand-written assertions miss.
-- **libFuzzer/AFL harnesses** for `parse_resp_request` and `rdb_load_buffer` —
-  both pure functions over byte buffers, so harnesses are ~20 lines each. Corpus
-  seeds: real AOF/RDB files from the test scripts. Extend the same harness
-  toward adversarial protocol fuzzing specifically (malformed bulk lengths,
-  negative sizes, truncated frames) rather than building a second one.
-- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI lane
-  that runs `stress_test.py --correctness-only` under it. The `container_of`
-  pattern and manual `Buffer` management are exactly where sanitizers pay off —
-  and it's the same build anything found during the adversarial pass below
-  should be reproduced under, for a real stack trace instead of "the server died."
-- **Static/code-level security review** — no live server needed. Auth, ACL
-  logic, RESP parsing bounds, the TLS handshake state machine, and AOF/RDB
-  loading from untrusted files: bounds issues, integer overflow on size fields,
-  logic bypasses.
+  hand-written assertions miss. **Neither dependency is on this box yet** —
+  `python3 -c "import redis"` and `which redis-server` both come back empty —
+  so provisioning (`pip install redis`, plus a real Redis build or
+  `apt install redis-server` for the reference oracle) is step 0 here, the same
+  shape as `stress_test.py`'s own `--server` bootstrap was for Step 0 above.
+  Generate the op stream from the command table already in `k_cmd_table`
+  (`commands.cpp`) rather than hand-listing commands, so newly implemented
+  commands enter the differential net automatically instead of by remembering
+  to add them each time.
+- **libFuzzer/AFL harnesses** for `parse_resp_request` (`resp.cpp:9`) and
+  `rdb_load_buffer` (`rdb.cpp:766`) — both pure functions over byte buffers, so
+  harnesses are ~20 lines each (`LLVMFuzzerTestOneInput(data, size)` calling
+  straight into the function with a scratch `Buffer`/output vector, no server
+  or event loop needed). Corpus seeds: the real AOF/RDB files already produced
+  by `scripts/test_aof*.sh` and sitting under `docs/logs/`. **libFuzzer itself
+  needs Clang, and this box only has GCC** (`which clang++` comes back empty;
+  `g++` is 13.3.0) — either provision Clang for `-fsanitize=fuzzer`, or fuzz
+  with AFL++ in GCC mode (`afl-gcc-fast`/`afl-g++-fast`), which needs no Clang
+  at all and gets the same persistent-mode, coverage-guided loop. Extend the
+  same harness toward adversarial protocol fuzzing specifically (malformed
+  bulk lengths, negative sizes, truncated frames) rather than building a
+  second one. **One concrete finding to seed the corpus with, found by reading
+  the two loops side by side**: `parse_resp_request`'s length checks aren't
+  symmetric — the `n_args` loop guards overflow *before* the multiply
+  (`if (n_args > k_max_args / 10) return -1;`, resp.cpp:53), but the `str_len`
+  loop only checks `str_len > k_max_msg` *after* it (resp.cpp:75-76). It
+  doesn't actually overflow today only because `k_max_msg` (32 MiB) is small
+  enough relative to `INT32_MAX` that the post-check always fires before a
+  second multiply could wrap past it — an incidental property of the two
+  constants' current values, not a structural guarantee. A fuzzer won't know
+  that distinction; a reviewer reading both loops does. Worth hardening to the
+  same pre-check shape as `n_args` regardless, since "safe only because of an
+  unstated relationship between two constants" is exactly the kind of
+  invariant that breaks quietly when one of them changes.
+- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI
+  lane that runs `stress_test.py --correctness-only` under it. **`CMakeLists.txt`
+  has no sanitizer build type today** — just the `Debug`/`Release` split
+  covered by the Current Snapshot's `build/` vs `build-rel/` warning above —
+  so this is new CMake plumbing (a third `CMAKE_BUILD_TYPE`, or a
+  `-DMYRED_SANITIZE=ON` option threaded into compile+link flags), not a flag
+  flip on an existing target. It needs no Clang: GCC 13 (the toolchain already
+  on this box) has shipped `-fsanitize=address,undefined` since GCC 4.9/6.0
+  respectively. The `container_of` pattern and manual `Buffer` management are
+  exactly where sanitizers pay off — and it's the build anything found during
+  the adversarial pass below should be reproduced under, for a real stack
+  trace instead of "the server died." **There is no CI at all yet** (no
+  `.github/` in the repo) — "a CI lane" here means standing one up, most
+  naturally on top of this build type, not adding a job to an existing
+  pipeline.
+- **Static/code-level security review** — no live server needed. Concrete
+  starting points per area, not a generic checklist:
+  - **Auth/ACL**: `cred.cpp` (password hashing, `fill_random`), and the
+    `ACL SETUSER` staged-apply pattern in `commands.cpp` (stage onto a `User`
+    copy, commit only on full success — the thing worth checking is whether
+    *every* mutating ACL path actually goes through that pattern, not just the
+    one that already had a bug there in V8.8).
+  - **RESP parsing bounds**: `resp.cpp`'s two length loops — see the fuzz
+    bullet above for the concrete asymmetry already found by inspection alone.
+    Static review and fuzzing are cross-checking the same ~90 lines here,
+    which is the point of running both.
+  - **TLS handshake state machine**: `tr_handshake()` (`transport.cpp:213-223`)
+    driven from `server.cpp:965-974`, gated by `Conn::tls_handshaking` (set at
+    `server.cpp:624`, cleared at `974`, branched on in the poll loop at
+    `1308`) and bounded by `tls-handshake-timeout` (`server.cpp:680,821-826`,
+    default 10s). The timeout path exists and looks correct by inspection; the
+    open review question is whether every exit from the handshake state
+    (success, `SSL_ERROR_SSL`, timeout, and a plaintext RESP frame arriving on
+    a TLS port instead of a ClientHello) leaves exactly one owner of the fd
+    and the `SSL*` — a double-free or fd leak here is adversary-triggerable,
+    since the attacker picks which of those exits fires.
+  - **AOF/RDB loading from untrusted files**: `rdb_load_buffer` (`rdb.cpp:766`)
+    and the AOF replay path — the same functions the fuzz harnesses above
+    target, so a manual read-through first is what tells the fuzzer where to
+    bias its mutations (length-prefixed fields, type tags, the `k_cmd_table`
+    fallback used under `g_loading`).
 - **Targeted logic-level attacks** — the part an agent is actually good at:
-  hypothesize specific abuse cases (case-aliasing around ACL deny, subscribe-mode
-  gate bypass, key names containing RESP control bytes, TLS handshake state
-  confusion, races around the `fork()`-based BGSAVE) and write concrete Python
-  repro scripts against the real server for each one.
+  hypothesize specific abuse cases and write concrete Python repro scripts
+  against a real, disposable server for each one. Six concrete starting cases
+  — the first found by inspection while drafting this list, not hypothesized
+  in the abstract:
+  - **Audit-log injection via an unescaped field.** `audit_write`
+    (`commands.cpp:1223-1246`) builds each line by string concatenation —
+    `ts=... event=... peer=... user=<uname>...` — with no escaping, and writes
+    it verbatim plus one trailing `\n`. On the two-argument `AUTH <user>
+    <pass>` path, `uname` is `cmd[1]` unmodified (`commands.cpp:1356`), a RESP
+    bulk string that — per `resp.cpp`'s length-prefixed parsing — can legally
+    *contain* `\n`; there is no username character validation anywhere in
+    `cred.cpp`/`commands.cpp` (checked by grep). A username of `evil\nts=2099-
+    01-01T00:00:00Z event=admin_command user=root ...` sent on a failed
+    `AUTH` forges a fake audit-log line indistinguishable from a real one to
+    anything that greps the file (the write happens at `commands.cpp:1318`).
+    This is the concrete repro to write first, not a hypothetical.
+  - **Case-aliasing around ACL deny** — already narrower than it sounds:
+    `do_request` lowercases `cmd[0]` and resolves it through `g_dispatch` to a
+    canonical name before any ACL check runs (`commands.cpp:5227-5240`), so a
+    bare-case bypass looks closed by inspection. The sharper version of this
+    test is enforcement through a **renamed** command (`rename-command`),
+    since that same canonicalization path already produced two real,
+    already-fixed bugs elsewhere (the AOF-restart brick and the V9.5.1
+    admin-category mistagging) — a third bug in the same mechanism, this time
+    in ACL enforcement, is a reasonable bet worth a targeted test even with no
+    specific lead yet.
+  - **Subscribe-mode gate bypass** — `cmd_ok_in_subscribe`
+    (`commands.cpp:5200-5205`) is checked against the canonical name
+    (`5262-5266`), the same resolution path as above; test it specifically
+    through a renamed alias of both an allowed and a blocked command.
+  - **Key names containing RESP control bytes** — legal today, since bulk
+    strings are length-prefixed rather than delimiter-scanned. The productive
+    question isn't "does the parser choke" (it doesn't), it's "does anything
+    downstream re-scan a key as if it were delimiter-bounded" — the audit-log
+    case above is one instance of that general shape; AOF's re-encode path
+    (`aof_feed`) and RDB load/save are the other places a length-prefixed
+    value could get treated as text and truncated or misparsed on the way
+    back out.
+  - **TLS handshake state confusion** — send a plaintext RESP frame
+    (`*1\r\n$4\r\nPING\r\n`) at a `tls-port` instead of a ClientHello, and
+    separately, a truncated ClientHello followed by silence past
+    `tls-handshake-timeout`; confirm both hit the same clean `tr_close` path
+    (`transport.cpp:242-248`) rather than one of them hanging past the
+    timeout or double-freeing the `SSL*`.
+  - **Races around the `fork()`-based BGSAVE** — `rdb_save_background()`
+    (`rdb.cpp:925-956`) serializes fully in the parent before forking, and the
+    child only ever calls `_exit()` (`rdb_write_snapshot`, `rdb.cpp:898-921`),
+    so the child never re-enters the event loop — that part checks out clean
+    by reading it. What's untested: no socket fd anywhere in `server.cpp` is
+    opened with `SOCK_CLOEXEC`/`accept4` (grepped — only the eventfd and the
+    audit-log fd set `CLOEXEC`), so the forked child inherits every live
+    listening, client, and replica socket fd for however long it takes to
+    write the snapshot. On a large dataset, does a client disconnecting
+    mid-`BGSAVE` actually finish tearing down (`TIME_WAIT`, freeing the port
+    for a new `accept()`) while the child still holds a duplicate fd
+    reference, or does teardown stall until the child's `_exit()` runs?
 - **One running document** (e.g. `docs/SECURITY_TESTING.md`) logging every
   attempt, outcome, and repro steps — same evidence-preservation habit as the
-  rest of the test suite.
+  rest of the test suite. The audit-log-injection case and the RESP
+  overflow-guard asymmetry above are the first two entries it should open
+  with, since both were found by inspection before either a fuzzer or an
+  adversarial script existed to find them independently.
 - Run the adversarial/live-server pieces against a disposable local instance
   only, never anything that matters if it crashes or hangs.
 
@@ -971,36 +1131,65 @@ Debug runs `mem_selfcheck`'s whole-keyspace walk per command and poisons numbers
 Same-machine comparisons only. Benchmark TLS against a **passwordless** instance —
 `redis-benchmark`'s 50-client AUTH storm hits `k_max_auth_inflight=4`.
 
-Recorded baselines (`-n 100000 -c 50 -P 16`, ops/sec):
-- **WSL2 Release** (2026-07-18, plaintext): PING 1.01M · SET 1.06M · GET 1.02M ·
-  INCR 1.00M · LPUSH 870k · SADD 917k · HSET 926k · SPOP 1.02M · ZADD 917k ·
-  ZPOPMIN 1.06M · MSET(10) 327k · LRANGE 100/300/500/600 103k/41.5k/25.5k/16.9k.
-- **Native Linux** (2026-07-18, plaintext, ~2.2–2.5× WSL): PING 2.78M · SET
-  2.22M · GET 2.50M · SPOP 2.63M · ZADD 1.92M · MSET 833k. Cool-machine reference;
-  a warm back-to-back run throttles ~½ (watch for a GET<SET anomaly = throttled).
-- **Native Linux TLS** (2026-07-21, passwordless :1337): PING_MBULK 1.02M · SET
-  901k · GET 971k · SADD 826k · SPOP 926k · HSET 833k · MSET(10) 412k · LRANGE
-  100/300/500/600 133k/34k/11.4k/9.0k.
+Recorded baselines (`-n 100000 -c 50 -P 16`, ops/sec).
 
-**Current reference pair — 2026-07-25, native Linux, `bench.conf`, back-to-back,
-both 603/603 green.** The plaintext half matches the cool-machine baseline above
-(PING/SET/SPOP at or above it), so this is the first trustworthy plaintext↔TLS
-ratio recorded:
+**Re-baselined 2026-08-16 from four runs** (2 machines x 2 transports, every one
+1023/1023 green) produced by `stress_test.py --server build-rel/server --bench`.
+Unlike every earlier entry in this file these carry their own provenance — the
+`.json` beside each log records CPU, kernel, governor, crypto ISA and build type,
+so a number can be checked against the machine that produced it instead of being
+trusted.
 
-| | plaintext :1336 | TLS :1337 | TLS % |
+**Native** — Arch 6.18.35-lts, i7-1165G7, `governor=performance`,
+crypto ISA `aes vaes pclmulqdq vpclmulqdq sha_ni avx2 avx512f avx512vl`:
+
+| | plaintext | TLS | TLS % |
 |---|---|---|---|
-| PING_MBULK | 2.86M | 1.52M | 53% |
-| SET | 2.22M | 1.41M | 63% |
-| GET | 2.04M | 1.43M | 70% |
-| INCR | 2.17M | 1.14M | 52% |
-| LPUSH | 2.00M | 1.19M | 60% |
-| SADD | 2.08M | 1.16M | 56% |
-| HSET | 1.96M | 1.16M | 59% |
-| MSET(10) | 870k | 637k | 73% |
-| LRANGE 100/300/500/600 | 213k/73k/45k/38k | 185k/56k/28k/22k | 87/77/62/59% |
+| PING_MBULK | 3.03M | 1.56M | 52% |
+| SET | 2.38M | 1.39M | 58% |
+| GET | 2.33M | 1.43M | 61% |
+| INCR | 2.13M | 1.28M | 60% |
+| LPUSH | 2.00M | 1.25M | 63% |
+| SADD | 2.04M | 1.01M | 50% |
+| HSET | 1.96M | 1.25M | 64% |
+| MSET(10) | 840k | 588k | 70% |
+| LRANGE 100/300/500/600 | 215k/76.5k/46.6k/38.6k | 188k/55.6k/27.7k/22.3k | 88/73/59/58% |
 
-**TLS costs ~30–50% of throughput**, worst on the smallest ops (per-record
-overhead dominates) and recovering on bulk ranges where bytes amortize it.
+**WSL2** — Ryzen 5 3600X, governor unreadable (the Windows host owns the
+P-states), crypto ISA `aes pclmulqdq sha_ni avx2` — **no `vaes`**:
+PING_MBULK 901k / 565k · SET 909k / 543k · GET 901k / 549k · MSET(10) 265k / 199k.
+
+**TLS costs ~40%, and it is the SAME on both machines**: plain->TLS is 0.59x
+native and 0.61x on WSL. One of those CPUs has VAES and the other does not, and
+it makes no measurable difference — so MYRED's TLS cost is dominated by
+per-record framing and syscalls, not by the AES math. That is the V10.6.1 kTLS
+conclusion reached a second time, from measurement rather than arithmetic.
+
+Cross-machine is 2.38x (plaintext) and 2.37x (TLS). It conflates virtualization
+with microarchitecture — different CPUs, different core counts, laptop vs
+desktop — so treat it as an upper bound on the cost of WSL2, never a measurement
+of it. A real answer needs the same box booted both ways.
+
+**The noise floor, measured, and it is large.** Two runs of the same binary on
+the same machine with the same governor:
+
+| | median deviation | worst |
+|---|---|---|
+| plaintext, small ops | **13.7%** | 32.7% (`rpop`) |
+| plaintext, bulk LRANGE | ~1% | 2.4% |
+| **TLS, all ops** | **1.3%** | 28% |
+
+Small-op plaintext throughput cannot support any claim finer than about 30%, and
+this file has twice recorded a confident finding inside that band. **TLS numbers
+are the reproducible instrument** — 13 of 19 within 3%, several identical to the
+digit — because they are bounded by deterministic crypto work rather than by
+whatever the host scheduler did that afternoon. Prefer TLS and bulk numbers for
+regression tracking; treat a single small-op plaintext delta as nothing at all.
+
+Benchmark only on a Release build (`build-rel/`; `build/` is Debug and runs
+`mem_selfcheck`'s whole-keyspace walk per command). Passwordless instances only —
+`redis-benchmark`'s 50-client AUTH storm hits `k_max_auth_inflight=4`. The suite's
+spawned primary is already the right shape (no auth, `appendonly no`, `save ""`).
 
 Two reading traps in these logs, both measurement artifacts rather than server
 behaviour:
