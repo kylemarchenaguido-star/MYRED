@@ -4096,13 +4096,14 @@ class PhaseCtx:
     def __init__(self, r: "TestRunner", server_bin: str, root: str,
                  base_port: int, destructive: bool = False,
                  diff_rounds: int = 8, diff_ops: int = 150,
-                 diff_seed: Optional[int] = None):
+                 diff_seed: Optional[int] = None, fuzz_runs: int = 200000):
         self.r = r
         self.server_bin = server_bin
         self.root = root
         self.destructive = destructive
         self.diff_rounds = diff_rounds
         self.diff_ops = diff_ops
+        self.fuzz_runs = fuzz_runs
         # A run with no seed picks one and PRINTS it, so a failure found by a
         # random stream is always replayable with --diff-seed.
         self.diff_seed = (random.randrange(1 << 30) if diff_seed is None
@@ -7671,6 +7672,188 @@ def _diff_random_rounds(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
     cmd(rd, "FLUSHALL")
 
 
+# ─── transactions and cursor iteration ────────────────────────────────────────
+#
+# Two shapes the plain op-by-op diff cannot express.
+#
+# EXEC returns an ARRAY of replies, one per queued command, so normalizing it
+# needs to know which command produced each element — the per-command tables
+# above are indexed by name, and by the time EXEC answers, the names are gone
+# unless they were recorded on the way in.
+#
+# SCAN's cursor values are implementation-defined and will never match, so
+# comparing a single call is meaningless. What IS comparable is the set of
+# elements a full iteration yields, which is the actual contract.
+
+def _diff_txn(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
+              label: str, queued):
+    """MULTI, queue commands, EXEC — comparing EXEC's array element by element.
+
+    Only commands that succeed are queued here: a runtime error inside EXEC
+    arrives as a `-ERR` element mid-array, and recv_response raises on it, which
+    would desynchronise the stream rather than report a difference. The abort
+    paths are compared separately, at the top level, where an error is the whole
+    reply.
+    """
+    for sock in (my, rd):
+        cmd(sock, "MULTI")
+    ok = True
+    for args in queued:
+        m_rep, m_err = reply_or_err(my, *args)
+        r_rep, r_err = reply_or_err(rd, *args)
+        if (m_err is None) != (r_err is None) or m_rep != r_rep:
+            ok = ctx.ok(f"[txn {label}] queued {' '.join(map(str, args))}", False,
+                        f"MYRED: {m_err or m_rep!r}\n    redis: {r_err or r_rep!r}"
+                        ) and ok
+    m_exec, m_err = reply_or_err(my, "EXEC")
+    r_exec, r_err = reply_or_err(rd, "EXEC")
+
+    if m_err or r_err:
+        return ctx.ok(f"[txn {label}] EXEC",
+                      _diff_err_class(m_err) == _diff_err_class(r_err),
+                      f"MYRED: {m_err or m_exec!r}\n    redis: {r_err or r_exec!r}")
+
+    if not isinstance(m_exec, list) or not isinstance(r_exec, list):
+        return ctx.ok(f"[txn {label}] EXEC returns an array",
+                      type(m_exec) is type(r_exec),
+                      f"MYRED: {m_exec!r}\n    redis: {r_exec!r}")
+    if len(m_exec) != len(r_exec):
+        return ctx.ok(f"[txn {label}] EXEC returns one reply per queued command",
+                      False, f"MYRED {len(m_exec)} vs redis {len(r_exec)} "
+                             f"for {len(queued)} queued")
+
+    bad = []
+    for args, m_el, r_el in zip(queued, m_exec, r_exec):
+        name = str(args[0])
+        if _diff_norm(name, m_el) != _diff_norm(name, r_el):
+            bad.append(f"{' '.join(map(str, args))}: MYRED {m_el!r} vs redis {r_el!r}")
+    return ctx.ok(f"[txn {label}] every element of EXEC agrees ({len(queued)})",
+                  not bad, "\n    ".join(bad[:4])) and ok
+
+
+def _diff_scan_all(sock: socket.socket, name: str, *prefix) -> list:
+    """Drive a SCAN-family cursor to completion and return everything it yielded.
+
+    The cursor values themselves are implementation-defined — Redis's are
+    reverse-binary increments over its table size, MYRED's are its own — so a
+    per-call comparison is meaningless. The set of elements a full iteration
+    produces is the part that is actually promised.
+    """
+    seen, cursor, guard = [], "0", 0
+    while True:
+        reply = cmd(sock, name, *prefix, cursor, "COUNT", "7")
+        if not isinstance(reply, list) or len(reply) != 2:
+            raise RespError(f"{name} did not return [cursor, items]: {reply!r}")
+        cursor, items = reply[0], reply[1] or []
+        seen.extend(items)
+        guard += 1
+        if cursor == "0":
+            return seen
+        if guard > 2000:
+            raise RespError(f"{name} cursor never returned to 0 after {guard} calls")
+
+
+def _diff_scan_cmp(ctx: "PhaseCtx", my: socket.socket, rd: socket.socket,
+                   label: str, name: str, *prefix):
+    try:
+        m = _diff_scan_all(my, name, *prefix)
+        r = _diff_scan_all(rd, name, *prefix)
+    except RespError as e:
+        return ctx.ok(f"[scan] {label}: full iteration completes", False, str(e))
+    # SCAN may return an element more than once across calls; what it promises
+    # is that everything present throughout is returned at least once.
+    ctx.ok(f"[scan] {label}: same elements over a full iteration",
+           sorted(set(m)) == sorted(set(r)),
+           f"only in MYRED: {sorted(set(m) - set(r))[:6]}\n"
+           f"    only in redis: {sorted(set(r) - set(m))[:6]}")
+
+
+def _diff_transactions_and_scan(ctx: "PhaseCtx", my: socket.socket,
+                                rd: socket.socket):
+    ctx.section("Differential: transactions")
+    for sock in (my, rd):
+        cmd(sock, "FLUSHALL")
+        cmd(sock, "SET", "t:str", "v")
+        cmd(sock, "RPUSH", "t:list", "a", "b", "c")
+        cmd(sock, "HSET", "t:hash", "f", "v")
+        cmd(sock, "SADD", "t:set", "m1", "m2")
+        cmd(sock, "ZADD", "t:zset", "1", "a", "2", "b")
+
+    _diff_txn(ctx, my, rd, "mixed reads", [
+        ("GET", "t:str"), ("LLEN", "t:list"), ("HGET", "t:hash", "f"),
+        ("SCARD", "t:set"), ("ZSCORE", "t:zset", "a"), ("TYPE", "t:list"),
+        ("EXISTS", "t:str"), ("TTL", "t:str"),
+    ])
+    _diff_txn(ctx, my, rd, "writes", [
+        ("SET", "t:new", "v"), ("INCR", "t:ctr"), ("APPEND", "t:new", "!"),
+        ("RPUSH", "t:list", "d"), ("LRANGE", "t:list", "0", "-1"),
+        ("HSET", "t:hash", "f2", "v2"), ("HGETALL", "t:hash"),
+        ("SADD", "t:set", "m3"), ("SMEMBERS", "t:set"),
+        ("DEL", "t:new"),
+    ])
+    # A reply that is an ERROR inside EXEC is the interesting shape, and it is
+    # exactly what the array parser cannot read — so it is checked one command
+    # at a time rather than through _diff_txn.
+    for sock in (my, rd):
+        cmd(sock, "MULTI")
+    m_q, _ = reply_or_err(my, "LPUSH", "t:str", "x")     # queues fine, fails later
+    r_q, _ = reply_or_err(rd, "LPUSH", "t:str", "x")
+    ctx.ok("[txn] a command that will fail still QUEUEs", m_q == r_q,
+           f"MYRED {m_q!r} vs redis {r_q!r}")
+    m_line = _raw_reply(my, "EXEC")
+    r_line = _raw_reply(rd, "EXEC")
+    ctx.ok("[txn] EXEC with a failing element still returns an array",
+           m_line[0] == r_line[0] == "*",
+           f"MYRED {m_line!r} vs redis {r_line!r}")
+    for sock in (my, rd):                    # drain the one element
+        try:
+            _recv_line(sock)
+        except OSError:
+            pass
+
+    for sock in (my, rd):
+        cmd(sock, "MULTI")
+    m_rep, m_err = reply_or_err(my, "DISCARD")
+    r_rep, r_err = reply_or_err(rd, "DISCARD")
+    ctx.ok("[txn] DISCARD inside MULTI", m_rep == r_rep and
+           (m_err is None) == (r_err is None), f"{m_rep!r} vs {r_rep!r}")
+    m_err = err_of(my, "EXEC")
+    r_err = err_of(rd, "EXEC")
+    ctx.ok("[txn] EXEC without MULTI is refused",
+           _diff_err_class(m_err) == _diff_err_class(r_err),
+           f"MYRED {m_err!r} vs redis {r_err!r}")
+    m_err = err_of(my, "DISCARD")
+    r_err = err_of(rd, "DISCARD")
+    ctx.ok("[txn] DISCARD without MULTI is refused",
+           _diff_err_class(m_err) == _diff_err_class(r_err),
+           f"MYRED {m_err!r} vs redis {r_err!r}")
+
+    _diff_state(ctx, my, rd, "transactions", set())
+
+    ctx.section("Differential: cursor iteration")
+    for sock in (my, rd):
+        cmd(sock, "FLUSHALL")
+        for i in range(97):                  # not a round number, on purpose
+            cmd(sock, "SET", f"sc:{i}", "v")
+        cmd(sock, "HSET", "sc:hash", *sum(([f"f{i}", f"v{i}"] for i in range(53)), []))
+        cmd(sock, "SADD", "sc:set", *[f"m{i}" for i in range(61)])
+
+    _diff_scan_cmp(ctx, my, rd, "SCAN over the keyspace", "SCAN")
+    _diff_scan_cmp(ctx, my, rd, "HSCAN over a 53-field hash", "HSCAN", "sc:hash")
+    _diff_scan_cmp(ctx, my, rd, "SSCAN over a 61-member set", "SSCAN", "sc:set")
+
+    # The property that makes SCAN usable: a full iteration returns every key
+    # that was present throughout, no matter how the cursor is chunked.
+    everything = set(cmd(my, "KEYS") or [])
+    scanned = set(_diff_scan_all(my, "SCAN"))
+    ctx.ok("[scan] a full iteration yields every key KEYS reports",
+           everything <= scanned,
+           f"missed by SCAN: {sorted(everything - scanned)[:6]}")
+
+    for sock in (my, rd):
+        cmd(sock, "FLUSHALL")
+
+
 def phase_differential(ctx: "PhaseCtx"):
     ctx.section("Differential: MYRED against a real redis-server")
 
@@ -7737,6 +7920,8 @@ def phase_differential(ctx: "PhaseCtx"):
           + (f"; {len(reported)} key(s) diverged and were re-synced: "
              f"{sorted(reported)}" if reported else ""))
 
+    _diff_transactions_and_scan(ctx, my, rd)
+
     if ctx.diff_rounds > 0:
         _diff_random_rounds(ctx, my, rd, ctx.diff_rounds, ctx.diff_ops,
                             ctx.diff_seed)
@@ -7745,6 +7930,259 @@ def phase_differential(ctx: "PhaseCtx"):
     rd.close()
     rd_srv.stop()
     my_srv.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE: FUZZ — libFuzzer against the two functions that read untrusted bytes
+#
+#  `parse_resp_request` and `rdb_load_buffer` are the only places MYRED consumes
+#  a byte buffer it did not produce: one from the network, one from a file that
+#  may be truncated, corrupt, or hostile. Both are pure functions over (data,
+#  size), which is exactly the shape libFuzzer wants.
+#
+#  Built under AddressSanitizer and UndefinedBehaviorSanitizer, because a parser
+#  bug that does not crash outright is the dangerous kind — a read one byte past
+#  a buffer is silent on a normal build and loud under ASan.
+#
+#  The harness sources live here as strings, the same way the HMap unit test
+#  does, so the whole suite stays one tracked file.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FUZZ_RESP_SRC = r"""
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <vector>
+#include "buffer.h"
+#include "resp.h"
+
+// One RESP frame parsed out of an arbitrary byte string. parse_resp_request
+// reads a declared length off the wire and has to survive it being a lie:
+// negative, enormous, or longer than what actually arrived.
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  Buffer buf = buf_create(size + 16);
+  buf_append(&buf, data, size);
+  std::vector<std::string> cmd;
+  parse_resp_request(&buf, cmd);
+  buf_destroy(&buf);
+  return 0;
+}
+"""
+
+FUZZ_RDB_SRC = r"""
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include "state.h"
+#include "rdb.h"
+#include "commands.h"
+
+// state.cpp calls into commands.cpp for ACL, audit and notification work, and
+// commands.cpp in turn needs the event loop that lives in server.cpp. Linking
+// all of that in would drag a network stack into a file-format fuzzer, so the
+// six symbols are stubbed instead. They ABORT rather than return: if
+// rdb_load_buffer ever grows a path that reaches one, that is a real change in
+// what the loader does and the fuzzer should report it, not paper over it.
+static void unreachable(const char *who) {
+  fprintf(stderr, "fuzz stub reached: %s\n", who);
+  abort();
+}
+std::string acl_format_user(const std::string &, const User &, bool) {
+  unreachable("acl_format_user"); return std::string();
+}
+bool acl_apply_rule(User &, const std::string &) {
+  unreachable("acl_apply_rule"); return false;
+}
+void audit_open(const std::string &) { unreachable("audit_open"); }
+bool command_is_known(const std::string &) {
+  unreachable("command_is_known"); return false;
+}
+void notify_keyspace_event(int, const char *, const std::string &) {
+  unreachable("notify_keyspace_event");
+}
+void do_request(std::vector<std::string> &, Buffer *, Conn *, const char *,
+                size_t) { unreachable("do_request"); }
+
+// A whole RDB image, loaded straight into the keyspace. Every length, type tag
+// and compressed block in it is attacker-controlled if the file is.
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  rdb_load_buffer(data, size);
+  return 0;
+}
+"""
+
+# Seed frames for the RESP target. A corpus of VALID inputs is what lets the
+# mutator reach the interesting branches — from scratch it spends its budget
+# rediscovering that a frame starts with '*'.
+FUZZ_RESP_SEEDS = {
+    "ping":       b"*1\r\n$4\r\nPING\r\n",
+    "set":        b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+    "inline":     b"PING\r\n",
+    "null_array": b"*-1\r\n",
+    "null_bulk":  b"$-1\r\n",
+    "empty_bulk": b"*1\r\n$0\r\n\r\n",
+    "nested":     b"*2\r\n$3\r\nGET\r\n$100\r\n" + b"x" * 100 + b"\r\n",
+    "big_len":    b"*1\r\n$2147483647\r\n",
+    "neg_len":    b"*1\r\n$-5\r\n",
+    "huge_count": b"*99999999\r\n",
+}
+
+# The symbolizer is installed as llvm-symbolizer-NN, and the sanitizer runtime
+# looks for a bare `llvm-symbolizer`. When it cannot find one it spends a FIXED
+# ~90 seconds hunting for it at exit — the same 90s whether the run did 3k or
+# 50k iterations, with the process asleep the whole time. ASan takes the
+# external path fine; UBSan does not, and only symbolize=0 avoids the stall.
+# A UBSan report still names the file and line, which is enough to act on.
+FUZZ_ENV = {
+    "UBSAN_OPTIONS": "symbolize=0:halt_on_error=1",
+}
+
+
+def _fuzz_symbolizer() -> Optional[str]:
+    for name in ("llvm-symbolizer", "llvm-symbolizer-18", "llvm-symbolizer-17",
+                 "llvm-symbolizer-16", "llvm-symbolizer-15"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def _fuzz_build(ctx: "PhaseCtx", cxx: str, root: str, d: str, name: str,
+                src: str, sources) -> Optional[str]:
+    path = os.path.join(d, f"{name}.cc")
+    with open(path, "w") as f:
+        f.write(src)
+    exe = os.path.join(d, f"fuzz_{name}")
+    argv = [cxx, "-std=c++17", "-g", "-O1",
+            "-fsanitize=fuzzer,address,undefined",
+            # clang is stricter than gcc about transitive includes and
+            # state.cpp relies on gcc's: ULLONG_MAX wants <climits>, fsync and
+            # unlink want <unistd.h>. Forced in here so the fuzz build does not
+            # depend on that being fixed first.
+            "-include", "climits", "-include", "unistd.h",
+            "-I", root, "-o", exe, path] + \
+           [os.path.join(root, s) for s in sources] + ["-lz"]
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+    if res.returncode != 0:
+        ctx.ok(f"[fuzz] {name} harness builds", False,
+               (res.stderr or res.stdout).strip()[-900:])
+        return None
+    ctx.ok(f"[fuzz] {name} harness builds", True)
+    return exe
+
+
+def _fuzz_run(ctx: "PhaseCtx", exe: str, name: str, corpus: str, runs: int,
+              max_len: int, env: dict) -> None:
+    art = os.path.join(os.path.dirname(exe), f"crash-{name}-")
+    argv = [exe, corpus, f"-runs={runs}", f"-max_len={max_len}",
+            f"-artifact_prefix={art}", "-print_final_stats=1"]
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=900,
+                             env=env)
+    except subprocess.TimeoutExpired:
+        ctx.ok(f"[fuzz] {name}: {runs} runs find no crash", False,
+               "the fuzzer timed out — a hang is a finding too; the input is "
+               f"under {art}*")
+        return
+    out = (res.stdout or "") + (res.stderr or "")
+    execs = ""
+    for line in out.splitlines():
+        if "exec/s:" in line and "DONE" in line:
+            execs = line.strip()[:110]
+    ok = res.returncode == 0
+    ctx.ok(f"[fuzz] {name}: {runs:,} runs find no crash", ok,
+           "\n    ".join(out.strip().splitlines()[-14:]))
+    if ok and execs:
+        print(f"    {YELLOW}info{RESET} {execs}")
+    crashers = [f for f in os.listdir(os.path.dirname(exe))
+                if f.startswith(f"crash-{name}-")]
+    if crashers:
+        print(f"    {RED}artifacts kept:{RESET} "
+              f"{[os.path.join(os.path.dirname(exe), c) for c in crashers]}")
+
+
+def phase_fuzz(ctx: "PhaseCtx"):
+    ctx.section("Fuzz: RESP and RDB parsers under ASan + UBSan")
+
+    cxx = shutil.which("clang++")
+    if not cxx:
+        ctx.skip("fuzz", "no clang++ on PATH — libFuzzer needs it "
+                         "(apt install clang)")
+        return
+    root = repo_root()
+    probe = os.path.join(ctx.dir("fuzz"), "probe.cc")
+    with open(probe, "w") as f:
+        f.write("extern \"C\" int LLVMFuzzerTestOneInput"
+                "(const unsigned char*d,unsigned long s){return 0;}\n")
+    if subprocess.run([cxx, "-fsanitize=fuzzer", "-o", probe + ".out", probe],
+                      capture_output=True, timeout=300).returncode != 0:
+        ctx.skip("fuzz", f"{cxx} cannot link -fsanitize=fuzzer "
+                         f"(libFuzzer runtime not installed)")
+        return
+
+    d = ctx.dir("fuzz")
+    env = dict(os.environ)
+    env.update(FUZZ_ENV)
+    sym = _fuzz_symbolizer()
+    if sym:
+        env["ASAN_OPTIONS"] = f"external_symbolizer_path={sym}"
+    runs = ctx.fuzz_runs
+
+    # ── RESP: needs almost nothing linked ────────────────────────────────────
+    exe = _fuzz_build(ctx, cxx, root, d, "resp", FUZZ_RESP_SRC,
+                      ["resp.cpp", "buffer.cpp"])
+    if exe:
+        corpus = os.path.join(d, "corpus-resp")
+        os.makedirs(corpus, exist_ok=True)
+        for nm, blob in FUZZ_RESP_SEEDS.items():
+            with open(os.path.join(corpus, nm), "wb") as f:
+                f.write(blob)
+        _fuzz_run(ctx, exe, "resp", corpus, runs, 8192, env)
+
+    # ── RDB: everything except the files that own main() and the event loop ──
+    sources = [s for s in sorted(os.listdir(root))
+               if s.endswith(".cpp") and s not in
+               ("server.cpp", "client.cpp", "commands.cpp")]
+    exe = _fuzz_build(ctx, cxx, root, d, "rdb", FUZZ_RDB_SRC, sources)
+    if exe:
+        corpus = os.path.join(d, "corpus-rdb")
+        os.makedirs(corpus, exist_ok=True)
+        # Seed with an image the server itself wrote, covering every type plus a
+        # TTL and a value long enough to be compressed. A corpus of real files
+        # is what gets the mutator past the header into the type handlers.
+        seed_dir = ctx.dir("fuzz/seed")
+        port = ctx.port()
+        conf = write_conf(os.path.join(seed_dir, "seed.conf"), [
+            f"port {port}", "appendonly no", 'save ""', "dbfilename dump.rdb",
+        ])
+        try:
+            srv = ctx.start("fuzz-seed", seed_dir, conf, port)
+            s = raw_conn(port)
+            cmd(s, "SET", "s", "hello")
+            cmd(s, "EXPIRE", "s", "9000")
+            cmd(s, "RPUSH", "l", "a", "b", "c")
+            cmd(s, "HSET", "h", "f1", "v1", "f2", "v2")
+            cmd(s, "SADD", "st", "m1", "m2", "m3")
+            cmd(s, "ZADD", "z", "1", "a", "2.5", "b", "-inf", "c")
+            cmd(s, "SET", "big", "x" * 4000)      # long enough to compress
+            cmd(s, "SAVE")
+            s.close()
+            srv.stop()
+            made = os.path.join(seed_dir, "dump.rdb")
+            if os.path.exists(made):
+                shutil.copyfile(made, os.path.join(corpus, "real.rdb"))
+                ctx.ok("[fuzz] seeded the RDB corpus from a real image",
+                       os.path.getsize(made) > 0)
+            else:
+                ctx.ok("[fuzz] seeded the RDB corpus from a real image", False,
+                       "SAVE produced no dump.rdb")
+        except Exception as e:
+            ctx.ok("[fuzz] seeded the RDB corpus from a real image", False,
+                   f"{type(e).__name__}: {e}")
+        _fuzz_run(ctx, exe, "rdb", corpus, runs, 8192, env)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7887,6 +8325,8 @@ def phase_table():
          phase_replication),
         ("differential", "same ops against MYRED and a real redis-server",
          phase_differential),
+        ("fuzz", "libFuzzer on the RESP and RDB parsers under ASan+UBSan",
+         phase_fuzz),
     ]
 
 
@@ -7917,7 +8357,7 @@ def run_spawned_phases(r: "TestRunner", args, phases) -> dict:
     ctx = PhaseCtx(r, os.path.abspath(args.server), root, args.base_port,
                    destructive=args.destructive,
                    diff_rounds=args.diff_rounds, diff_ops=args.diff_ops,
-                   diff_seed=args.diff_seed)
+                   diff_seed=args.diff_seed, fuzz_runs=args.fuzz_runs)
     print(f"\n{BOLD}{'═' * 55}{RESET}")
     print(f"{BOLD}  Managed-instance phases{RESET}")
     print(f"{'═' * 55}")
@@ -8060,6 +8500,9 @@ def main():
                          "runs against a real redis-server (0 disables)")
     ap.add_argument("--diff-ops",         default=150, type=int,
                     help="operations per randomized differential round")
+    ap.add_argument("--fuzz-runs",        default=200000, type=int,
+                    help="libFuzzer iterations per target in the fuzz phase; "
+                         "raise it for a real campaign (1M takes ~30s)")
     ap.add_argument("--diff-seed",        default=None, type=int,
                     help="seed for the randomized differential rounds; a run "
                          "without one picks a seed and prints it, so any "
