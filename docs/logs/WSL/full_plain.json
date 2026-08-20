@@ -1,0 +1,199 @@
+{
+  "authed": false,
+  "bench": {
+    "params": {
+      "clients": 50,
+      "pipeline": 16,
+      "requests": 100000,
+      "transport": "plain"
+    },
+    "tests": {
+      "get": {
+        "p50": 0.487,
+        "rps": 900900.88
+      },
+      "hset": {
+        "p50": 0.623,
+        "rps": 900900.88
+      },
+      "incr": {
+        "p50": 0.735,
+        "rps": 869565.19
+      },
+      "lpop": {
+        "p50": 0.527,
+        "rps": 884955.75
+      },
+      "lpush": {
+        "p50": 0.663,
+        "rps": 840336.12
+      },
+      "lrange_100": {
+        "p50": 8.159,
+        "rps": 92850.51
+      },
+      "lrange_300": {
+        "p50": 19.567,
+        "rps": 37835.79
+      },
+      "lrange_500": {
+        "p50": 32.063,
+        "rps": 23391.81
+      },
+      "lrange_600": {
+        "p50": 38.367,
+        "rps": 19425.02
+      },
+      "mset": {
+        "p50": 2.703,
+        "rps": 265252.0
+      },
+      "ping_inline": {
+        "p50": 0.439,
+        "rps": 934579.44
+      },
+      "ping_mbulk": {
+        "p50": 0.455,
+        "rps": 900900.88
+      },
+      "rpop": {
+        "p50": 0.527,
+        "rps": 892857.12
+      },
+      "rpush": {
+        "p50": 0.727,
+        "rps": 793650.75
+      },
+      "sadd": {
+        "p50": 0.575,
+        "rps": 884955.75
+      },
+      "set": {
+        "p50": 0.535,
+        "rps": 909090.94
+      },
+      "spop": {
+        "p50": 0.447,
+        "rps": 925925.88
+      },
+      "zadd": {
+        "p50": 0.655,
+        "rps": 917431.19
+      },
+      "zpopmin": {
+        "p50": 0.495,
+        "rps": 934579.44
+      }
+    }
+  },
+  "build": {
+    "binary": "/home/kyled/projects/testfiles/build-rel/server",
+    "cmake_build_type": "release",
+    "debug_info": false,
+    "optimized": true
+  },
+  "duration_s": 72.2,
+  "failed_parts": [],
+  "generated": "2026-08-15T23:47:09",
+  "phases": {
+    "_skipped_total": 0,
+    "auth": {
+      "duration": 0.92,
+      "error": null,
+      "failed": 0,
+      "passed": 9,
+      "skipped": 0
+    },
+    "config": {
+      "duration": 0.34,
+      "error": null,
+      "failed": 0,
+      "passed": 37,
+      "skipped": 0
+    },
+    "memory": {
+      "duration": 2.53,
+      "error": null,
+      "failed": 0,
+      "passed": 35,
+      "skipped": 0
+    },
+    "persistence": {
+      "duration": 6.13,
+      "error": null,
+      "failed": 0,
+      "passed": 75,
+      "skipped": 0
+    },
+    "replication": {
+      "duration": 26.04,
+      "error": null,
+      "failed": 0,
+      "passed": 153,
+      "skipped": 0
+    },
+    "security": {
+      "duration": 6.25,
+      "error": null,
+      "failed": 0,
+      "passed": 43,
+      "skipped": 0
+    },
+    "tls": {
+      "duration": 0.49,
+      "error": null,
+      "failed": 0,
+      "passed": 17,
+      "skipped": 0
+    },
+    "unit": {
+      "duration": 0.96,
+      "error": null,
+      "failed": 0,
+      "passed": 2,
+      "skipped": 0
+    }
+  },
+  "platform": {
+    "container": null,
+    "cpu_affinity": 12,
+    "cpu_mhz": "3792.896",
+    "cpu_model": "AMD Ryzen 5 3600X 6-Core Processor",
+    "cpu_threads": 12,
+    "crypto_isa": [
+      "aes",
+      "pclmulqdq",
+      "sha_ni",
+      "avx2"
+    ],
+    "env": "WSL",
+    "governor": null,
+    "init": "systemd",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "kernel_build": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37)",
+    "loadavg": "0.06 0.14 0.17 1/380 57306",
+    "mem_total": "12209364 kB",
+    "no_turbo": null,
+    "nofile_soft": 10240,
+    "overcommit": "0",
+    "product": null,
+    "python": "3.12.3",
+    "somaxconn": "4096",
+    "swap_total": "3145728 kB",
+    "tcp_ulp": "tls",
+    "uname": "Linux DESKTOP-4KRDJ2U 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64",
+    "virtualized": true,
+    "wsl_version": "WSL2"
+  },
+  "run_kind": "full",
+  "server": {
+    "host": "127.0.0.1",
+    "mode": "spawned",
+    "port": 12590
+  },
+  "totals": {
+    "failed": 0,
+    "passed": 1023
+  },
+  "transport": "plain"
+}

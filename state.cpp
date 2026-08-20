@@ -204,6 +204,23 @@ static const ConfigDirective k_config_table[] = {
     [](std::string &o) -> bool { o = std::to_string(g_config.port); return true; },
     /*boot_only*/ false, /*masked*/ false, /*emit*/ nullptr },
 
+  { "maxclients", 1, 1,
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      long n = 0;
+      if (!parse_int_strict(a[0].c_str(), &n) || n < 1 || n > 1000000){
+        e = "invalid maxclients (1-1000000)"; return CfgResult::BADVALUE;
+      }
+      g_config.maxclients = (int)n; return CfgResult::OK;
+     },
+    [](std::string &o) -> bool { o = std::to_string(g_config.maxclients); return true; },
+    // maxclients
+    /*boot_only*/ false, /*masked*/ false,
+    /*emit*/ [](FILE *fp){
+      if (g_config.maxclients != 10000){
+        fprintf(fp, "maxclients %d\n", g_config.maxclients);
+      }
+  } },
+
   { "protected-mode", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
       bool b = false;

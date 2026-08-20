@@ -2,6 +2,7 @@
 build/
 build-debug/
 build-rel/
+build-asan/
 
 # compiled binaries (now produced under build/)
 /server
@@ -35,6 +36,8 @@ __pycache__/
 # editor / IDE
 .vs/
 .vscode/c_cpp_properties.json
+
+# documentation
 
 tls/
 # local-only: extracted Claude session transcripts

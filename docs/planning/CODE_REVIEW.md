@@ -18,6 +18,154 @@ Severity legend:
 
 ---
 
+## V11 Static Security Review — 2026-08-19 [OPEN]
+
+Scope: the five areas the ROADMAP named for this pass — auth/ACL (`cred.cpp`,
+the `ACL SETUSER` staged apply), RESP parsing bounds (`resp.cpp`), the TLS
+handshake state machine (`transport.cpp` + the poll loop), RDB/AOF loading from
+untrusted files (`rdb.cpp`), and the audit-log path. Read at the code level, no
+live server needed to *find* any of these.
+
+**Every finding below was then reproduced against a disposable server**, because
+"by inspection" has been wrong here before. The measured numbers are in each
+item. Repro scripts are throwaway; the permanent home for them is the
+`security` phase of `stress_test.py`.
+
+The four that reproduced, in fix order:
+
+- 🔴 **The accept loop spins at 100% CPU once the process runs out of fds, and
+  there is no `maxclients` to stop it getting there.** `grep -n "maxclients"`
+  across the tree returns nothing: the only bound on concurrent connections is
+  `RLIMIT_NOFILE`. When `accept()` fails with `EMFILE`, `handle_accept`
+  (`server.cpp:557-560`) logs and returns -1, the drain loop at `server.cpp:1288`
+  exits, and the listening socket is *still* readable because the pending
+  connection is still in the kernel's accept queue — so `poll()` returns
+  immediately, forever. **Measured** with `RLIMIT_NOFILE=64`: ~55 established
+  connections were enough to take the server from 0 CPU ticks/2s idle to **96% of
+  one core**, emitting **416,509 `[errno:accept() error]` lines / 9.6 MB of
+  stderr in ~5 seconds** (≈2 MB/s, i.e. it fills a disk as well as a core). With
+  a stock `ulimit -n 1024` this costs an attacker ~1020 idle TCP connections and
+  no bandwidth at all. Remote, unauthenticated, and it degrades service for every
+  existing client. Fix has two halves: a `maxclients` config that accepts-and-
+  immediately-closes past the limit with `-ERR max number of clients reached`
+  (so the backlog still drains and poll goes back to sleep), and rate-limiting
+  the accept-error log so a failure can never be the loudest thing in the file.
+- 🟠 **Unauthenticated audit-log forgery through the `AUTH` username.**
+  `audit_write` (`commands.cpp:1314-1337`) builds `ts=… event=… peer=… user=…`
+  by concatenation with no escaping and appends one `\n`. `do_auth` takes
+  `uname = cmd[1]` verbatim (`commands.cpp:1447`) — a RESP bulk string, which is
+  length-prefixed and may therefore legally contain `\n` — and `auth_complete`
+  interpolates it into `" target=" + job->uname` (`commands.cpp:1409`). No
+  username validation exists anywhere in `cred.cpp`/`commands.cpp`. **Measured**:
+  one failed `AUTH` produced two log lines, the second being
+  `ts=2099-01-01T00:00:00Z event=auth_success peer=10.0.0.9:1 user=default …`,
+  byte-identical in shape to a genuine success record. This needs no credentials
+  — a *failed* auth writes it, which is the point: the one thing an attacker can
+  always reach is the failure path. Same shape at `commands.cpp:1399`, `4637`,
+  `4663` (`target=` built from `cmd[2]`). Fix: escape `\n \r \t \\` and space plus
+  anything outside printable ASCII in every attacker-reachable field, with the
+  `peer`/`user` escaping inside `audit_write` itself so a new call site cannot
+  forget it.
+- 🟠 **The inline-command path has no argument cap, giving 16x memory
+  amplification.** The `*`-prefixed path caps arguments at `k_max_args` (65536,
+  `resp.cpp:53-55`); the inline path (`resp.cpp:31-39`) splits on whitespace with
+  no limit of any kind, and its only bail is a `size > k_max_msg` check that fires
+  *only when no newline is present at all* (`resp.cpp:23`). So one inline line up
+  to `k_max_incoming` (64 MiB) becomes ~32M `std::string`s. **Measured**: a single
+  32.5 MB write of `"a "` pairs took the server from 25.4 MB to **520.3 MB peak
+  RSS — 16.0x — and it stayed alive afterwards**, so it is repeatable and
+  multiplies by connection count (which finding 1 leaves unbounded). Fix: cap the
+  inline line the way Redis does with `PROTO_INLINE_MAX_SIZE`, at 64 KiB; one
+  check on `eol` replaces the existing `k_max_msg` bail and covers both the
+  runaway-line and the too-many-args cases.
+- 🟠 **`tls-handshake-timeout` is an inactivity timeout, not a handshake
+  deadline, so it never fires against a slow attacker.** The poll loop refreshes
+  every ready connection's timer at `server.cpp:1308`
+  (`conn_set_timer(conn, conn->timer_type)`) *before* the `tls_handshaking`
+  branch at `1310`, and `conn_set_timer` rewrites `last_active_ms` and moves the
+  conn to the back of `hs_list` (`server.cpp:907-920`). Any byte therefore resets
+  the deadline the config exists to enforce. **Measured** with
+  `tls-handshake-timeout 2`: a connection sending a TLS record header and then
+  **one byte per second was still open and un-reaped after 8.7 seconds**, 4x the
+  configured timeout. Each held slot is a `Conn` plus 128 KB of buffers and,
+  with no `maxclients`, a step toward finding 1. Fix: make the handshake deadline
+  absolute from accept — skip the refresh at `1308` when
+  `conn->timer_type == ConnTimer::HANDSHAKE`. Insertion order into `hs_list` is
+  already accept order, so the reaper's "break on the first unexpired" scan stays
+  correct with no other change.
+
+Hardening found in the same pass, none of them currently exploitable — recorded
+because each is safe today only by an unstated relationship, which is the class
+that breaks quietly later:
+
+- 🟡 `resp.cpp:75-76` — the `str_len` accumulator checks `> k_max_msg` *after*
+  the multiply, where the `n_args` loop checks *before* it (`resp.cpp:53`). It
+  cannot overflow today only because 32 MiB × 10 + 9 still fits in `int32_t`;
+  raise `k_max_msg` past ~214 MB and it is signed overflow (UB). The ROADMAP
+  flagged this by inspection before the fuzzer existed; 1M libFuzzer iterations
+  under UBSan agree it does not fire today. Make it match the `n_args` shape.
+- 🟡 `rdb.cpp:421,446` — `if (c->pos + len > c->end)` forms a pointer past
+  one-past-the-end before comparing, which is UB even when it happens to work.
+  With `len` a `uint32_t` it cannot wrap a 64-bit pointer, so it is correct in
+  practice on this target. `if (len > (size_t)(c->end - c->pos))` is the same
+  check without the UB.
+- 🟡 `rdb.cpp:533-542` — the *live* zset loader reads `n_members` and loops with
+  no sanity cap, while the expired-zset skip path six lines above it (`516`) and
+  the list, hash and set loaders (`599`, `653`, `700`) all have one. Damage is
+  bounded because each iteration is a bounds-checked `cursor_read` that fails on
+  the first short read, so it is an inconsistency rather than a hole — but it is
+  the only type missing the guard.
+- 🟡 `aof.cpp:262` — replay dispatches through a stack-allocated `Conn fake{}`
+  that never passes through `conn_destroy`, so any command that registers a
+  `Conn*` in a global (`pubsub_remove_conn`, `watch_clear_conn`,
+  `repl_remove_conn` are the three teardowns it would need) would leave a
+  dangling pointer to a dead stack frame once `aof_load` returns. Not reachable
+  today because `aof_feed` logs only write commands and SUBSCRIBE/WATCH are not
+  writes — the hazard is that the safety is a property of what the *writer*
+  chooses to log, enforced nowhere on the *reader*. Its `fd` is also 0 (stdin).
+  Cheapest guard is an assert-or-skip on the registering commands during
+  `g_loading`.
+- 🟡 `transport.cpp:180` — `SSL_write(c->ssl, buf, (int)len)` truncates a
+  `size_t`. A >2 GiB `outgoing` buffer would pass a negative length; OpenSSL 3
+  rejects it with `SSL_R_BAD_LENGTH` so the failure mode is a spurious connection
+  close, not corruption. Clamp to a chunk size instead.
+- ⚪ Build-config note, no action needed — recorded only so it is not
+  re-discovered as a finding: with `MYRED_ARGON2=OFF` or libargon2 missing,
+  `cred_hash_new` stores unsalted SHA-256 and `cred_needs_rehash` returns
+  `false`, so those credentials never upgrade. That path is already loud at both
+  ends — `CMakeLists.txt:49` warns at configure time and `server.cpp:1128-1130`
+  warns at every boot — and `build-rel/server` has Argon2id linked in (verified
+  in the binary), so it is not current behaviour.
+
+Checked in the named areas and found **correct** — recorded so the next pass does
+not re-derive them:
+
+- `ACL SETUSER`'s staged apply (`commands.cpp:4618-4640`) does hold: every
+  modifier is applied to a `User` copy and committed only after all of them
+  succeed, and `g_config.users` is a `std::unordered_map` (`state.h:332`), so the
+  commit cannot invalidate the `Conn::user` pointers other connections hold.
+- The unguarded `conn->user->name` in `ACL WHOAMI` (`commands.cpp:4572`) is
+  unreachable with a null user: `do_request` gates on `if (!conn->user)` at
+  `commands.cpp:5353` before dispatch, and `EXEC` re-enters through `do_request`
+  rather than calling handlers directly, so the queued path is gated too. The
+  `ACL DELUSER` teardown that sets `c->user = nullptr` (`4658`) is therefore safe.
+- The poll loop re-resolves `Conn *conn = g_data.fd2conn[poll_args[i].fd]` at
+  `server.cpp:1304` and `conn_destroy` nulls that slot, so a connection destroyed
+  earlier in the same iteration is skipped rather than used after free. `accept()`
+  runs at `1288`, before the dispatch loop, so no fd can be closed and reused
+  within one iteration either.
+- `rdb_load_buffer` is the strongest part of this review: CRC over the whole
+  image *before* any parsing (`rdb.cpp:777-779`), element-count caps on list,
+  hash and set, and a zlib decompression-bomb guard at `797`. Consistent with
+  1M fuzz iterations finding nothing.
+- `tr_close` nulls `c->ssl` after `SSL_free` (`transport.cpp:248`), and every
+  handshake exit — success, `SSL_ERROR_SSL`, timeout, and a plaintext frame
+  arriving at a `tls-port` — funnels through exactly one `conn_destroy`.
+- `ct_equal` (`sha256.h:152`) is constant-time past the length check, and
+  `cred_verify` delegates argon2id comparison to the library.
+
+---
+
 ## Consolidated Bug Audit — 2026-07-13 (V9.6.4 worklist)
 
 Scope: every open item from ROADMAP "Known Bugs and Correctness Follow-ups" (now moved

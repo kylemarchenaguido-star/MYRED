@@ -19,6 +19,7 @@
 #include <sys/wait.h>   // for waitpid
 #include <sys/stat.h>  // fstat
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 // C++
 #include <string>
 #include <vector>
@@ -108,7 +109,9 @@ static void conn_destroy(Conn *conn){
   repl_link_lost(conn);
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
-  delete conn;
+  // Buffer is a POD holding a raw new[] pointer, so delete conn frees the conn and orphans 64 kb arrays
+  buf_destroy(&conn->outgoing);
+  buf_destroy(&conn->incoming);
   g_data.connected_clients--;
 }
 
@@ -553,7 +556,15 @@ static int32_t handle_accept(int fd, bool is_tls){
 
   int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
   if (connfd < 0) {
-    if (errno != EAGAIN){ msg_errno("accept() error"); }
+    // EMFILE should be unreachable now the maxclients is clamped under RLIMIT_NOFILE
+    if (errno != EAGAIN){ 
+      static uint64_t last_log_ms = 0;
+      uint64_t now_ms = get_monotonic_msec();
+      if (now_ms - last_log_ms >= 1000){
+        last_log_ms = now_ms;
+        msg_errno("accept() error");
+      }
+    }
     return -1;
   }
 
@@ -564,6 +575,15 @@ static int32_t handle_accept(int fd, bool is_tls){
     (peer_host >> 24) & 255, (peer_host >> 16) & 255, (peer_host >> 8) & 255, peer_host & 255,
     ntohs(client_addr.sin_port));
   std::string peer = peerbuf;
+
+  // over the cap, accept and close immediately rather than refusing to accept 
+  if (g_data.connected_clients >= (uint32_t)g_config.maxclients){
+    static const char full[] = "-ERR max number of clients reached\r\n";
+    (void)!write(connfd, full, sizeof(full) - 1);
+    close(connfd);
+    audit_reject(peer, "maxclients");
+    return 0;
+  }
 
   // IP allowlist (loopback always allowed; empty list = allowed all)
   if (!ip_allowed(peer_host)){
@@ -1130,6 +1150,20 @@ int main(int argc, char **argv){
     fprintf(stderr, "startup: build without OpenSSL - TLS disabled (tls-port unavailable)\n");
   #endif
 
+  // maxclients must be reachable without accept() ever seing EMFILE
+  {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0){
+      int usable = (int)rl.rlim_cur - 32;
+      if (usable < 1){ usable = 1; }
+      if (g_config.maxclients > usable){
+        fprintf(stderr, "startup: maxclients %d lowered to %d by RLIMIT_NOFILE %ju\n",
+                g_config.maxclients, usable, (uintmax_t)rl.rlim_cur);
+        g_config.maxclients = usable;
+      }
+    }
+  }
+
   acl_bootstrap_default();
   acl_init_categories(); 
   metadata_selfcheck();    
@@ -1301,10 +1335,13 @@ int main(int argc, char **argv){
       // retrieve the object of every fd (in this case only i)
       Conn *conn = g_data.fd2conn[poll_args[i].fd];
       if (!conn){continue;}
-
-      // update the idle timer and putting the conn at the end of the list
-      conn_set_timer(conn, conn->timer_type);
-
+      
+      if (conn->timer_type != ConnTimer::HANDSHAKE){
+        // update the idle timer and putting the conn at the end of the list
+        // a handshake deadline is the exception, it must be absolute from accept
+        conn_set_timer(conn, conn->timer_type);
+      }
+     
       if (conn->tls_handshaking){
         if (ready & (POLLIN | POLLOUT)){ handle_tls_handshake(conn); }
         if ((ready & POLLERR) || conn->want_close){ conn_destroy(conn); }

@@ -1310,6 +1310,31 @@ void audit_open(const std::string &path) {
   g_audit_fd = fd;
 }
 
+// The audit line is space-separated key=value pairs, terminated by \n, so any of 
+// those bytes inside a value can forge a gield or a whole record 
+static std::string audit_escape(const std::string &s){
+  std::string out;
+  out.reserve(s.size());
+  for (unsigned char c : s){
+    switch (c) {
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\\': out += "\\\\"; break;
+      case ' ': out += "\\s"; break;
+      default:
+        if (c < 0x20 || c >= 0x7f){
+          char hex[5];
+          snprintf(hex, sizeof(hex), "\\x%02x", c);
+          out += hex;
+        } else {
+          out += (char)c;
+        }
+    }
+  }
+  return out;
+}
+
 // one write() per line: best-effort, recors a sticky error on failure
 static void audit_write(const char *event, const std::string &peer,
                         const std::string &user, const std::string &extra) {
@@ -1326,9 +1351,9 @@ static void audit_write(const char *event, const std::string &peer,
   line += " event=";
   line += event;
   line += " peer=";
-  line += peer;
-  line += " user=";
-  line += user;
+  line += audit_escape(peer);
+  line += " user="; 
+  line += audit_escape(user);
   line += extra;
   line += "\n";
   if (write(g_audit_fd, line.data(), line.size()) < 0) {
@@ -1396,7 +1421,7 @@ static void auth_complete(AuthJob *job) {
           // keep requirepass rewwrite in sync
           g_config.password = job->rehashed;
         }
-        audit_event("cred_rehash", c, " target=" + job->uname);
+        audit_event("cred_rehash", c, " target=" + audit_escape(job->uname));
       }
     }
     audit_event("auth_success", c, "");
@@ -1406,7 +1431,7 @@ static void auth_complete(AuthJob *job) {
     if (c->failed_attemps >= k_max_failed_auth) {
       c->want_close = true;
     }
-    audit_event("auth_fail", c, " target=" + job->uname + " result=wrongpass");
+    audit_event("auth_fail", c, " target=" + audit_escape(job->uname) + " result=wrongpass");
     resp_err(&c->outgoing,
              "WRONGPASS invalid username-password pair or user is disable");
   }
@@ -4634,7 +4659,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     // atomic
     g_config.users[cmd[2]] = std::move(staged);
     audit_event("acl_change", conn,
-                " sub=setuser target=" + cmd[2] +
+                " sub=setuser target=" + audit_escape(cmd[2]) +
                     " rules=" + std::to_string(cmd.size() - 3) +
                     " result=ok"); // we count the rules, do not show
     return resp_ok(out);
@@ -4660,7 +4685,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
       }
     }
     audit_event("acl_change", conn,
-                " sub=deluser target=" + cmd[2] + " result=ok");
+                " sub=deluser target=" + audit_escape(cmd[2]) + " result=ok");
     g_config.users.erase(it);
     return resp_int(out, 1);
   }

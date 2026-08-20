@@ -280,8 +280,18 @@ a real fuzzer.
   `.github/` in the repo) — "a CI lane" here means standing one up, most
   naturally on top of this build type, not adding a job to an existing
   pipeline.
-- **Static/code-level security review** — no live server needed. Concrete
-  starting points per area, not a generic checklist:
+- **Static/code-level security review** — **DONE 2026-08-19**, findings in
+  `CODE_REVIEW.md` → "V11 Static Security Review". All five areas below were
+  read; four issues reproduced against a disposable server (one 🔴: the accept
+  loop spins a core and writes 2 MB/s of log once fds run out, and there is no
+  `maxclients` anywhere in the tree to stop it getting there; three 🟠: audit-log
+  forgery through an unescaped `AUTH` username — exactly the case predicted
+  below — a missing argument cap on the inline-command path worth 16x measured
+  memory amplification, and a `tls-handshake-timeout` that any byte resets, so it
+  never reaps a slow peer). Five 🟡 hardening items and six *verified-correct*
+  results recorded alongside them. No live server was needed to find any of them;
+  the repros exist because "by inspection" has been wrong here before. Original
+  starting points, kept for the record:
   - **Auth/ACL**: `cred.cpp` (password hashing, `fill_random`), and the
     `ACL SETUSER` staged-apply pattern in `commands.cpp` (stage onto a `User`
     copy, commit only on full success — the thing worth checking is whether
@@ -323,6 +333,9 @@ a real fuzzer.
     `AUTH` forges a fake audit-log line indistinguishable from a real one to
     anything that greps the file (the write happens at `commands.cpp:1318`).
     This is the concrete repro to write first, not a hypothetical.
+    **CONFIRMED 2026-08-19** by the static review above: one failed `AUTH` wrote
+    two lines, the second a well-formed `event=auth_success user=default` record.
+    Fix in `CODE_REVIEW.md`; the five cases below are still open.
   - **Case-aliasing around ACL deny** — already narrower than it sounds:
     `do_request` lowercases `cmd[0]` and resolves it through `g_dispatch` to a
     canonical name before any ACL check runs (`commands.cpp:5227-5240`), so a

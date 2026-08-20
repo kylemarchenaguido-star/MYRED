@@ -7,6 +7,7 @@
 #include "thread_pool.h"
 #include "deque.h"
 #include "set.h"
+#include <cstddef>
 #include <cstdint>
 #include <variant>
 #include <atomic>
@@ -21,6 +22,7 @@
 
 // Constants
 constexpr size_t k_max_msg = 32 << 20;
+constexpr size_t k_max_inline = 64 * 1024; // inline commands are a telnet convenience, not a bulk transport
 constexpr uint64_t k_repl_rdb_reserve_max = 16 * 1024 * 1024;
 constexpr uint32_t k_repl_retry_min_ms = 1000; // first retry, matchings redis
 constexpr uint32_t k_repl_retry_max_ms = 8000; 
@@ -282,6 +284,7 @@ struct SaveCondition {
 //global config
 struct Config {
   int port = 1234;
+  int maxclients = 10000; // clamped down at boot to fit RLIMIT_NOFILE
   // TLS - all boot-only; CONFIG SET rejects tls-*
   int tls_port = 0; // 0 = disable; coexists with plaintext port
   std::string tls_cert_file;

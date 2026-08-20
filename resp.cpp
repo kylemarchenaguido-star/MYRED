@@ -17,13 +17,10 @@ int32_t parse_resp_request( Buffer *buf, std::vector<std::string> &cmd){
   if  (data[0] != '*') { 
     size_t eol = 0;
     while (eol < size && data[eol] != '\n'){ eol++; }
+   // one cap for both shapes
+    if (eol > k_max_inline){ return -1; }
     // no newline yet
-    if (eol == size){
-      //  runway line with no terminator -> bail
-      if (size > k_max_msg){ return -1; }
-      // we needs more data
-      return 0;
-    }
+    if (eol == size){ return 0; }
     size_t line_end = eol;
     // tolerate \r\n and \n
     if (line_end > 0 && data[line_end - 1] == '\r'){ line_end--; }
