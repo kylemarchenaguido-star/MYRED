@@ -1,9 +1,9 @@
 #include "rdb.h"
 #include "state.h"      
 #include "buffer.h"
-#include "common.h"
-#include "hash.h"
-#include "set.h"
+//#include "common.h"
+//#include "hash.h"
+//#include "set.h"
 #include "aof.h"
 #include "resp.h"
 #include "commands.h"
@@ -320,6 +320,11 @@ bool aof_load(const char *path){
     buf_destroy(&buf);
     buf_destroy(&sink);
     g_data.g_loading = false;
+    // fake is a stack Conn that never passes through conn_destroy
+    pubsub_remove_conn(&fake);
+    watch_clear_conn(&fake);
+    repl_remove_conn(&fake);
+    wait_remove_conn(&fake);
     // replay isn't "unsaved work"
     g_data.g_writes_since_save = 0;
 

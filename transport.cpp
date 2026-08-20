@@ -6,6 +6,8 @@
 #include "state.h"
 #include "transport.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <errno.h>
 #include <openssl/prov_ssl.h>
 #include <openssl/types.h>
@@ -177,7 +179,8 @@ IoResult tr_write(Conn *c, const uint8_t *buf, size_t len, size_t *n){
     // legal, so rv < len is fine - handle_writes consumes n and keeps want_write
     if (c->ssl){
         ERR_clear_error();
-        int rv = SSL_write(c->ssl, buf, (int)len);
+        size_t chunk = len > (size_t)INT32_MAX ? (size_t)INT32_MAX : len;
+        int rv = SSL_write(c->ssl, buf, (int)chunk);
         if (rv > 0){ *n = (size_t)rv; return IoResult::OK; }
         int e = SSL_get_error(c->ssl, rv);
         if (e == SSL_ERROR_WANT_READ){ c->tr_want_read = true; return IoResult::WANT_READ; }

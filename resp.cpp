@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <stdio.h>
 #include <stddef.h>
 #include <cstring>
@@ -69,8 +70,10 @@ for (size_t i = n_start; i < pos; ++i){
     int32_t  str_len = 0;
     for (size_t j = len_start; j < pos; ++j){
       if (data[j] < '0' || data[j] > '9') { return -1; }
+      // pre-check, checking only after the multiply
+      if (str_len > (int32_t)k_max_msg / 10){ return -1; }
       str_len = str_len * 10 + (data[j]- '0');
-      if (str_len > (int32_t)k_max_msg) { return -1;}
+      if (str_len > (int32_t)k_max_msg)  { return -1;}
     }
     pos += 2; // this skips the \r\n
 

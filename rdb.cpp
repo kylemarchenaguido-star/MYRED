@@ -4,6 +4,7 @@
 #include "common.h"
 #include "hash.h"
 #include "set.h"
+#include <cstddef>
 #include <zlib.h>  
 #include <stdio.h> 
 #include <string.h>
@@ -418,7 +419,7 @@ struct RDBCursor {
 
 // read len bytes into dst
 static bool cursor_read(RDBCursor *c, void *dst, size_t len){
-  if (c->pos + len > c->end){
+  if (len > (size_t)(c->end - c->pos)){
     fprintf(stderr, "rdb_load: unexpected end of file\n");
     return false;
   }
@@ -443,7 +444,7 @@ static bool cursor_read_str(RDBCursor *c, std::string *out){
     return false;
   }
 
-  if (c->pos + len > c->end){
+  if (len > (size_t)(c->end - c->pos)){
     fprintf(stderr, "rdb_load: string out of bounds\n");
     return false;
   }
@@ -532,6 +533,13 @@ static bool rdb_load_zset_entry(RDBCursor *c){
 
   uint32_t n_members = 0;
   if (!cursor_read_u32(c, &n_members)){ return false; }
+
+  // same guard the expired skip path above
+  if (n_members > (size_t)(c->end - c->pos) / 12){
+    fprintf(stderr, "rdb_load: zset member count %u too large\n",
+            n_members);
+    return false;
+  }
 
   // create the entry
   Entry *ent = entry_new(T_ZSET);

@@ -18,7 +18,31 @@ Severity legend:
 
 ---
 
-## V11 Static Security Review — 2026-08-19 [OPEN]
+## V11 Static Security Review — 2026-08-19
+
+**All four reproducing findings FIXED and re-verified 2026-08-19.** Each repro
+was re-run against the patched `build-rel/server` and no longer reproduces: the
+accept loop went from 96% of one core and 9.6 MB of log to **0% and nothing**
+(with `startup: maxclients 10000 lowered to 32 by RLIMIT_NOFILE 64` announcing
+the clamp), the forged audit record now lands escaped on a single line, the
+32.5 MB inline line moved RSS by **0.0 MB instead of +494.9 MB**, and the
+dribbling TLS peer is reaped on schedule.
+
+**Nine regression checks landed in `stress_test.py`** — seven in
+`phase_security` → "Security: V11 review regressions", two in `phase_tls`
+(which starts its own 1s-`tls-handshake-timeout` instance, since the directive
+is boot-only). Suite: **1401/1401**. Each check asserts against the *attack*
+rather than the fix — that the forged record does not appear, that the
+amplifying parse does not happen, that the refusal is explicit rather than a
+silent drop — so they survive a reimplementation. Validated in both directions:
+against a pre-fix binary all seven security-phase checks fail with the forged
+line printed in the diagnostic, and the phase still runs to completion because
+the `maxclients` group gates on `has_directive` instead of raising.
+
+**Nothing from this review is left open.** The original scope, findings and
+measurements are kept below as the record of what was looked at and what was
+ruled out — the verified-correct list at the end is the part that saves the next
+pass from re-deriving it.
 
 Scope: the five areas the ROADMAP named for this pass — auth/ACL (`cred.cpp`,
 the `ACL SETUSER` staged apply), RESP parsing bounds (`resp.cpp`), the TLS
@@ -96,25 +120,48 @@ The four that reproduced, in fix order:
 
 Hardening found in the same pass, none of them currently exploitable — recorded
 because each is safe today only by an unstated relationship, which is the class
-that breaks quietly later:
+that breaks quietly later. **All five ALSO FIXED 2026-08-19**; suite is
+1401/1401 on Release and identical under ASan+UBSan+LSan.
+
+Two things the hardening pass itself taught, both worth more than the items:
+
+- **The AOF teardown fix broke the RDB fuzz harness at link time.** `aof.cpp` is
+  linked into that harness for its RDB-preamble reader, so the four new
+  `*_remove_conn(&fake)` calls became undefined references to `commands.cpp`,
+  which the harness deliberately excludes. Fixed by stubbing them in
+  `FUZZ_RDB_SRC` with the same `abort()` convention as the other six stubs. The
+  general shape: **a fuzz harness that excludes a translation unit is coupled to
+  every call that TU makes**, so any new cross-TU call is a harness break — and
+  the harness is what tells you, which is the argument for keeping it in the
+  suite rather than running it by hand.
+- **A discarded `wait_until` result made an unrelated check the accused.**
+  `phase_persistence` disarms the AOF auto-rewrite and waits for the temp file to
+  disappear, but threw away the bool. Under a sanitizer build (several times
+  slower) the 10 s budget expired, the server was restarted mid-rewrite, and the
+  *TTL* regression check failed — reporting a TTL bug that did not exist, roughly
+  2 runs in 6. Now asserted with a 30 s budget; 6/6 clean after. Honest caveat:
+  the new assertion never fired in those 6 runs, so the timeout was never caught
+  in the act — 0/6 against 2/6 is consistent with the diagnosis, not proof of it.
+  The change stands on its own regardless, because discarding a wait result is
+  wrong whatever it was masking.
 
 - 🟡 `resp.cpp:75-76` — the `str_len` accumulator checks `> k_max_msg` *after*
   the multiply, where the `n_args` loop checks *before* it (`resp.cpp:53`). It
   cannot overflow today only because 32 MiB × 10 + 9 still fits in `int32_t`;
   raise `k_max_msg` past ~214 MB and it is signed overflow (UB). The ROADMAP
   flagged this by inspection before the fuzzer existed; 1M libFuzzer iterations
-  under UBSan agree it does not fire today. Make it match the `n_args` shape.
+  under UBSan agree it does not fire today. Make it match the `n_args` shape. **FIXED 2026-08-19.**
 - 🟡 `rdb.cpp:421,446` — `if (c->pos + len > c->end)` forms a pointer past
   one-past-the-end before comparing, which is UB even when it happens to work.
   With `len` a `uint32_t` it cannot wrap a 64-bit pointer, so it is correct in
   practice on this target. `if (len > (size_t)(c->end - c->pos))` is the same
-  check without the UB.
+  check without the UB. **FIXED 2026-08-19.**
 - 🟡 `rdb.cpp:533-542` — the *live* zset loader reads `n_members` and loops with
   no sanity cap, while the expired-zset skip path six lines above it (`516`) and
   the list, hash and set loaders (`599`, `653`, `700`) all have one. Damage is
   bounded because each iteration is a bounds-checked `cursor_read` that fails on
   the first short read, so it is an inconsistency rather than a hole — but it is
-  the only type missing the guard.
+  the only type missing the guard. **FIXED 2026-08-19.**
 - 🟡 `aof.cpp:262` — replay dispatches through a stack-allocated `Conn fake{}`
   that never passes through `conn_destroy`, so any command that registers a
   `Conn*` in a global (`pubsub_remove_conn`, `watch_clear_conn`,
@@ -122,13 +169,15 @@ that breaks quietly later:
   dangling pointer to a dead stack frame once `aof_load` returns. Not reachable
   today because `aof_feed` logs only write commands and SUBSCRIBE/WATCH are not
   writes — the hazard is that the safety is a property of what the *writer*
-  chooses to log, enforced nowhere on the *reader*. Its `fd` is also 0 (stdin).
-  Cheapest guard is an assert-or-skip on the registering commands during
-  `g_loading`.
+  chooses to log, enforced nowhere on the *reader*. Cheapest guard is to run the
+  four teardowns on `fake` after the replay loop. **FIXED 2026-08-19.**
+  (A claim in the first draft of this item — that `fake.fd` is 0 and so points at
+  stdin — was wrong: `Conn::fd` carries a default member initializer of `-1`
+  (`state.h:156`), so `Conn fake{}` already gets -1 and no fd guard was needed.)
 - 🟡 `transport.cpp:180` — `SSL_write(c->ssl, buf, (int)len)` truncates a
   `size_t`. A >2 GiB `outgoing` buffer would pass a negative length; OpenSSL 3
   rejects it with `SSL_R_BAD_LENGTH` so the failure mode is a spurious connection
-  close, not corruption. Clamp to a chunk size instead.
+  close, not corruption. Clamp to a chunk size instead. **FIXED 2026-08-19.**
 - ⚪ Build-config note, no action needed — recorded only so it is not
   re-discovered as a finding: with `MYRED_ARGON2=OFF` or libargon2 missing,
   `cred_hash_new` stores unsalted SHA-256 and `cred_needs_rehash` returns

@@ -1,10 +1,10 @@
-# MYRED stress test — 2026-08-15 23:45:56
+# MYRED stress test — 2026-08-20 00:14:12
 
-**Run:** correctness + concurrency + managed-instance phases + stress + redis-benchmark over plaintext (passwordless) → 127.0.0.1:1234
+**Run:** correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:1234
 
 ```
 ═══════════════════════════════════════════════════════
-  MYRED — correctness + concurrency + managed-instance phases + stress + redis-benchmark over plaintext (passwordless) → 127.0.0.1:1234
+  MYRED — correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:1234
 ═══════════════════════════════════════════════════════
 
 -- Platform (read from the kernel) ---------------------
@@ -15,12 +15,13 @@
   Crypto ISA:   aes pclmulqdq sha_ni avx2  (no vaes — one AES block per instruction)
   Memory:       12209364 kB  swap 3145728 kB
   Governor:     n/a
-  Load average: 0.06 0.14 0.17 1/380 57306
-  somaxconn:    4096   nofile=10240   tcp_ulp=tls
-  Build:        release  [build-rel/]
+  Load average: 0.82 0.74 0.50 2/410 15719
+  somaxconn:    4096   nofile=1048576   tcp_ulp=tls
+  Build:        Debug  [build-asan/]
+  warning this is a Debug build: mem_selfcheck() walks the whole keyspace after every command, so every timing below is O(keyspace) per op. Correctness is still valid — speed is not. Build with -DCMAKE_BUILD_TYPE=Release for numbers.
   Log:          docs/logs/WSL/full_plain.md
 
-✓ Spawned the primary instance on 127.0.0.1:12590  (/tmp/myred-primary-56wrwg0k)
+✓ Spawned the primary instance on 127.0.0.1:12590  (/tmp/myred-primary-s97pvq3q)
   Transport:    plaintext
   Auth:         none
 ✓ Server is reachable
@@ -55,10 +56,10 @@
   ✓ incr on set → WRONGTYPE
   ✓ incrby on set → WRONGTYPE
   ✓ incrbyfloat 0.1 → ~10.6 → 10.6
-  ✓ incrbyfloat -3.5 → ~7.1 → 7.0999999999999996
-  ✓ incrbyfloat 0 → ~7.1 → 7.0999999999999996
+  ✓ incrbyfloat -3.5 → ~7.1 → 7.1
+  ✓ incrbyfloat 0 → ~7.1 → 7.1
   ✓ incrbyfloat missing → 1.5 → 1.5
-  ✓ incrbyfloat returns str → '7.0999999999999996'
+  ✓ incrbyfloat returns str → '7.1'
   ✓ incrbyfloat inf → error
   ✓ incrbyfloat -inf → error
   ✓ incr at INT64_MAX → overflow
@@ -158,7 +159,7 @@
   ✓ getrange 0 999 → full
   ✓ getrange 5 3 → ''
   ✓ getrange 99 100 → ''
-  ✓ getrange -99 -99 → ''
+  ✓ getrange -99 -99 → 'H' (clamped)
   ✓ getrange missing → ''
   ✓ getrange on set → WRONGTYPE
   ✓ setrange offset 6 → 11
@@ -168,8 +169,10 @@
   ✓ setrange result length
   ✓ setrange missing key → 5
   ✓ get br3 → hello
-  ✓ setrange empty val offset=3 → 3
-  ✓ strlen br3 → 3
+  ✓ setrange empty val on missing → 0
+  ✓ ...and the key was not created
+  ✓ setrange empty val on existing → 5
+  ✓ strlen br3 → 5
   ✓ setrange offset -1 → error
   ✓ setrange on set → WRONGTYPE
 
@@ -181,10 +184,10 @@
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 5000
+  ✓ pttl returns int → 4999
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 5000ms
+  ℹ  remaining TTL: 4999ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -519,7 +522,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['port', '12590', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
+  ✓ config get * -> array → ['port', '12590', 'maxclients', '10000', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -577,7 +580,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:66830336\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2789\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:29823\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:27da9fd7ae81cc84e203adad3750c94c281cf8e8\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122299\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122299\r\n\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:151126016\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2792\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:3663\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:d3ba56fcb207b05df2735a0e8962ee9be5b8d67c\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122292\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122292\r\n\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -610,13 +613,13 @@
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:66830336
+    used_memory_rss:151126016
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
     evicted_keys:0
     # Stats
-    total_commands:2789
+    total_commands:2792
     sync_full:0
     sync_partial_ok:0
     sync_partial_err:0
@@ -625,7 +628,7 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:29823
+    rdb_last_save_time:3663
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -638,16 +641,16 @@
     # Replication
     role:master
     failover_state:no-failover
-    master_replid:27da9fd7ae81cc84e203adad3750c94c281cf8e8
+    master_replid:d3ba56fcb207b05df2735a0e8962ee9be5b8d67c
     master_replid2:0000000000000000000000000000000000000000
     second_repl_offset:-1
     connected_slaves:0
-    master_repl_offset:122299
+    master_repl_offset:122292
     repl_backlog_active:1
     repl_backlog_size:1048576
     repl_backlog_first_byte_offset:1
     min_slaves_good_slaves:0
-    repl_backlog_histlen:122299
+    repl_backlog_histlen:122292
 
 ── INFO: O(1) keyspace stats (heap-backed keys_with_ttl) 
   ✓ empty db → (0,0)
@@ -668,15 +671,15 @@
   ✓ save → OK
   ✓ dump.rdb exists
   ✓ dump.rdb not empty
-  ℹ  dump.rdb size: 119 bytes
+  ℹ  dump.rdb size: 19 bytes
   ✓ magic number correct
 
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 1.8ms: 'Background saving started'
+  ℹ  bgsave returned in 4.6ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 13.0ms
+  ℹ  100 ops during save took 16.4ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -728,7 +731,7 @@
 
 ── Memory: incremental eviction (EVICT_RUNNING semantics) 
   ✓ write admitted during overshoot
-  ✓ idle drain under cap (2268000 -> 523908 <= 524288)
+  ✓ idle drain under cap (2268000 -> 524090 <= 524288)
 
 ── ECHO + inline protocol ────────────────────────────
   ✓ echo roundtrip
@@ -848,15 +851,16 @@
 ── Pub/Sub: fan-out under concurrent publishers ──────
   ✓ no publisher/reader errors
   ✓ every subscriber received every message
-    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.61s (6,548 deliveries/s)
+    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.63s (6,379 deliveries/s)
 
 ═══════════════════════════════════════════════════════
   Managed-instance phases
 ═══════════════════════════════════════════════════════
-  Binary:   /home/kyled/projects/testfiles/build-rel/server
-  Workdir:  /tmp/myred-suite-2vg9h_nl
+  Binary:   /home/kyled/projects/testfiles/build-asan/server
+  Workdir:  /tmp/myred-suite-mozli8r2
   Ports:    from 12500
-  Phases:   unit, memory, config, auth, security, persistence, tls, replication
+  Phases:   unit, memory, config, auth, security, persistence, tls, replication, differential, fuzz
+  note --destructive adds the SIGKILL crash-recovery and protocol-abuse checks
 
 ── Unit: HMap incremental rehash ─────────────────────
   ✓ the unit test compiles against hashtable.cpp
@@ -909,7 +913,7 @@
 
 ── Memory: incremental eviction under a large overshoot 
   ✓ [REG] the write right after a 6x overshoot is admitted
-  ✓ the keyspace drains while completely idle (6000 keys -> 898)
+  ✓ the keyspace drains while completely idle (6000 keys -> 899)
 
 ── Config: CONFIG REWRITE survives a restart ─────────
   ✓ repl-backlog-size read its boot value from the config file
@@ -957,7 +961,7 @@
   ✓ the connection is closed after repeated auth failures
   ✓ all 8 concurrent AUTHs completed
   ✓ all 200 PINGs were answered during the AUTH storm
-  info PING during an AUTH storm: p50=0.16ms p99=0.62ms
+  info PING during an AUTH storm: p50=0.12ms p99=0.31ms
          a synchronous Argon2 verify would put p99 at 20-60ms+; that gap is the whole point of the async path.
   ✓ AUTH #1 accepted (the credential survives any rehash)
   ✓ AUTH #2 accepted (the credential survives any rehash)
@@ -1002,14 +1006,14 @@
   ✓ limited auth survives the round-trip
   ✓ limited is still denied the control plane after the round-trip
 
-── Security: protocol abuse (server must keep serving) 
-  ✓ server survives an absurd multibulk count
-  ✓ server survives a garbage array header
-  ✓ server survives a negative bulk length
-  ✓ server survives a bulk length that overflows int64
-  ✓ server survives an oversized inline line
-  ✓ server survives a key name full of RESP control bytes
-  ✓ the server process is still alive
+── Security: V11 review regressions ──────────────────
+  ✓ a newline in an AUTH username cannot forge an audit record
+  ✓ no audit line carries the forged timestamp
+  ✓ an inline line under the cap still parses as a command
+  ✓ an inline line over the cap is refused, not split into arguments
+  ✓ a connection past maxclients is refused with an explanation
+  ✓ the server keeps serving its existing clients at the cap
+  ✓ raising maxclients lets new connections in again
 
 ── Persistence: AOF write gating ─────────────────────
   ✓ AOF exists and is non-empty
@@ -1032,6 +1036,7 @@
   ✓ [REG] the rewrite leaves no temp file behind
   ✓ [REG] no misspelled AOF file was created
   ✓ the auto-trigger fired at the configured growth percentage
+  ✓ the in-flight rewrite settled before the restart
   ✓ the TTL is still live before the restart
   ✓ post-rewrite replay: stderr shows a replay happened
   ✓ post-rewrite replay: no replay-error WARNING in stderr
@@ -1094,11 +1099,6 @@
   ✓ [REG] the set SREM emptied stayed empty
   ✓ the alias still resolves after restart
 
-── Persistence: crash recovery (SIGKILL mid-traffic) ─
-  ✓ server boots after SIGKILL
-  ✓ the pre-crash keyspace is intact after the crash boot
-  info crash writes recovered: 50/50 (everysec fsync makes fewer than 50 correct)
-
 ── TLS: handshake and live certificate rotation ──────
   ✓ the server boots with TLS configured
   ✓ a TLS handshake completes on the tls-port
@@ -1111,7 +1111,7 @@
   ✓ the presented certificate can be fingerprinted
   ✓ CONFIG SET tls-cert-file is accepted
   ✓ [REG] new connections are served the NEW certificate
-  info hot reload took 1.29ms (a restart costs tens of ms and drops every connection)
+  info hot reload took 3.75ms (a restart costs tens of ms and drops every connection)
   ✓ CONFIG SET tls-key-file is accepted
   ✓ [REG] tls-key-file reads back the key path, not the cert path
   ✓ [REG] the connection established before the rotation still works
@@ -1119,7 +1119,9 @@
   ✓ the server keeps serving the old certificate after a refusal
   ✓ [REG] a rejected CONFIG SET rolls the path back
   ✓ the server is still serving plaintext too
-  master :12511   proxy :12513   replica :12512
+  ✓ a peer dribbling bytes is still reaped at the handshake timeout
+  ✓ a completed handshake is unaffected by the same timeout
+  master :12513   proxy :12515   replica :12514
 
 ── Replication: full resync ──────────────────────────
   ✓ the replica booted into the role from its config file
@@ -1306,19 +1308,428 @@
   ✓ the sibling re-dialled on its own
   ✓ [REG] every reconnect after the promotion is still partial
 
+── Differential: MYRED against a real redis-server ───
+  oracle: redis-server 7.0.15 on :12521   MYRED on :12520
+
+── Differential: strings ─────────────────────────────
+  ✓ = SET s hello
+  ✓ = GET s
+  ✓ = STRLEN s
+  ✓ = APPEND s  world
+  ✓ = GET s
+  ✓ = STRLEN s
+  ✓ = APPEND fresh made-by-append
+  ✓ = GET fresh
+  ✓ = GETRANGE s 0 4
+  ✓ = GETRANGE s -5 -1
+  ✓ = GETRANGE s 0 -1
+  ✓ = GETRANGE s 5 3
+  ✓ = GETRANGE s 99 200
+  ✓ = GETRANGE missing 0 -1
+  ✓ = SETRANGE s 6 WORLD
+  ✓ = GET s
+  ✓ = SETRANGE padded 5 x
+  ✓ = GET padded
+  ✓ = STRLEN padded
+  ✓ = GETSET s replaced
+  ✓ = GET s
+  ✓ = GETSET brand_new first
+  ✓ = GET brand_new
+  ✓ = SETNX s nope
+  ✓ = GET s
+  ✓ = SETNX setnx_new yes
+  ✓ = GET setnx_new
+  ✓ = GETDEL setnx_new
+  ✓ = EXISTS setnx_new
+  ✓ = GETDEL never_existed
+  ✓ = SET empty 
+  ✓ = GET empty
+  ✓ = STRLEN empty
+  ✓ = GET definitely_missing
+  ✓ [state] strings: same key set
+  ✓ [state] strings: same value for every shared key
+
+── Differential: numeric edges ───────────────────────
+  ✓ = SET n 10
+  ✓ = INCR n
+  ✓ = DECR n
+  ✓ = INCRBY n 40
+  ✓ = DECRBY n 15
+  ✓ = GET n
+  ✓ = INCRBY n -5
+  ✓ = DECRBY n -5
+  ✓ = GET n
+  ✓ = INCR counter_from_nothing
+  ✓ = GET counter_from_nothing
+  ✓ = SET notnum abc
+  ✓ = INCR notnum
+  ✓ = INCRBY notnum 1
+  ✓ = SET spacey  1
+  ✓ = INCR spacey
+  ✓ = SET plussed +1
+  ✓ = INCR plussed
+  ✓ = SET leadzero 01
+  ✓ = INCR leadzero
+  ✓ = SET tabbed 	3
+  ✓ = INCR tabbed
+  ✓ = SET huge_neg -99999999999999999999
+  ✓ = INCR huge_neg
+  ✓ = SET huge_pos 99999999999999999999
+  ✓ = INCR huge_pos
+  ✓ = SET floaty 1.5
+  ✓ = INCR floaty
+  ✓ = SET maxi 9223372036854775807
+  ✓ = INCR maxi
+  ✓ = SET mini -9223372036854775808
+  ✓ = DECR mini
+  ✓ = SET maxi2 9223372036854775806
+  ✓ = INCRBY maxi2 2
+  ✓ = INCRBY n 9223372036854775807
+  ✓ = SET f 10.5
+  ✓ = INCRBYFLOAT f 0.1
+  ✓ = INCRBYFLOAT f -3.5
+  ✓ = INCRBYFLOAT f 0
+  ✓ = INCRBYFLOAT float_from_nothing 1.5
+  ✓ = INCRBYFLOAT f abc
+  ✓ = INCRBYFLOAT notnum 1
+  ✓ [state] numeric edges: same key set
+  ✓ [state] numeric edges: same value for every shared key
+
+── Differential: expiry ──────────────────────────────
+  ✓ = SET e v
+  ✓ = TTL e
+  ✓ = PTTL e
+  ✓ = EXPIRE e 100
+  ✓ = TTL e
+  ✓ = PERSIST e
+  ✓ = TTL e
+  ✓ = PERSIST e
+  ✓ = TTL no_such_key
+  ✓ = PTTL no_such_key
+  ✓ = PERSIST no_such_key
+  ✓ = SET e2 v
+  ✓ = EXPIRE e2 0
+  ✓ = EXISTS e2
+  ✓ = SET e3 v
+  ✓ = EXPIRE e3 -1
+  ✓ = EXISTS e3
+  ✓ = SET e4 v
+  ✓ = PEXPIRE e4 -1
+  ✓ = EXISTS e4
+  ✓ = EXPIRE no_such_key 100
+  ✓ = SET argp v
+  ✓ = EXPIRE argp  100
+  ✓ = TTL argp
+  ✓ = SET e5 v
+  ✓ = EXPIREAT e5 1
+  ✓ = EXISTS e5
+  ✓ = SET e6 v
+  ✓ = PEXPIREAT e6 1
+  ✓ = EXISTS e6
+  ✓ = SETEX sx 100 v
+  ✓ = GET sx
+  ✓ = TTL sx
+  ✓ = SETEX sx_bad 0 v
+  ✓ = SETEX sx_bad -1 v
+  ✓ = PSETEX px 100000 v
+  ✓ = TTL px
+  ✓ = SET sx overwritten
+  ✓ = TTL sx
+  ✓ [state] expiry: same key set
+  ✓ [state] expiry: same value for every shared key
+
+── Differential: lists ───────────────────────────────
+  ✓ = RPUSH l a b c
+  ✓ = LLEN l
+  ✓ = LPUSH l z
+  ✓ = LRANGE l 0 -1
+  ✓ = LINDEX l 0
+  ✓ = LINDEX l -1
+  ✓ = LINDEX l 99
+  ✓ = LRANGE l 0 0
+  ✓ = LRANGE l -2 -1
+  ✓ = LRANGE l 5 1
+  ✓ = LRANGE l -100 100
+  ✓ = LRANGE no_list 0 -1
+  ✓ = LRANGE l +0 -1
+  ✓ = LINDEX l 01
+  ✓ = LSET l 1 B
+  ✓ = LRANGE l 0 -1
+  ✓ = LSET l 99 nope
+  ✓ = LSET no_list 0 x
+  ✓ = LINSERT l BEFORE B beforeB
+  ✓ = LINSERT l AFTER B afterB
+  ✓ = LINSERT l BEFORE absent nope
+  ✓ = LINSERT no_list BEFORE a x
+  ✓ = LRANGE l 0 -1
+  ✓ = RPUSH dups x x y x
+  ✓ = LREM dups 2 x
+  ✓ = LRANGE dups 0 -1
+  ✓ = LREM dups 0 x
+  ✓ = LRANGE dups 0 -1
+  ✓ = RPUSH trim 1 2 3 4 5
+  ✓ = LTRIM trim 1 3
+  ✓ = LRANGE trim 0 -1
+  ✓ = LTRIM trim 5 1
+  ✓ = EXISTS trim
+  ✓ = LPOP l
+  ✓ = RPOP l
+  ✓ = LRANGE l 0 -1
+  ✓ = LPOP no_list
+  ✓ = RPOP no_list
+  ✓ = RPUSH drain only
+  ✓ = LPOP drain
+  ✓ = EXISTS drain
+  ✓ [state] lists: same key set
+  ✓ [state] lists: same value for every shared key
+
+── Differential: hashes ──────────────────────────────
+  ✓ = HSET h f1 v1 f2 v2
+  ✓ = HLEN h
+  ✓ = HGET h f1
+  ✓ = HGET h absent
+  ✓ = HGET no_hash f
+  ✓ = HEXISTS h f1
+  ✓ = HEXISTS h absent
+  ✓ = HSET h f1 changed
+  ✓ = HGET h f1
+  ✓ = HSETNX h f1 nope
+  ✓ = HGET h f1
+  ✓ = HSETNX h f3 yes
+  ✓ = HGET h f3
+  ✓ = HSTRLEN h f1
+  ✓ = HSTRLEN h absent
+  ✓ = HKEYS h
+  ✓ = HVALS h
+  ✓ = HGETALL h
+  ✓ = HKEYS no_hash
+  ✓ = HVALS no_hash
+  ✓ = HGETALL no_hash
+  ✓ = HMGET h f1 absent f2
+  ✓ = HMGET no_hash a b
+  ✓ = HSET hn num 10
+  ✓ = HINCRBY hn num 5
+  ✓ = HINCRBY hn num -15
+  ✓ = HGET hn num
+  ✓ = HINCRBY hn fresh 7
+  ✓ = HGET hn fresh
+  ✓ = HSET hn notnum abc
+  ✓ = HINCRBY hn notnum 1
+  ✓ = HDEL h f1
+  ✓ = HDEL h absent
+  ✓ = HLEN h
+  ✓ = HSET hdrain only v
+  ✓ = HDEL hdrain only
+  ✓ = EXISTS hdrain
+  ✓ [state] hashes: same key set
+  ✓ [state] hashes: same value for every shared key
+
+── Differential: sets ────────────────────────────────
+  ✓ = SADD st a b c
+  ✓ = SCARD st
+  ✓ = SADD st a
+  ✓ = SCARD st
+  ✓ = SISMEMBER st a
+  ✓ = SISMEMBER st zzz
+  ✓ = SISMEMBER no_set a
+  ✓ = SMISMEMBER st a zzz b
+  ✓ = SMEMBERS st
+  ✓ = SMEMBERS no_set
+  ✓ = SREM st a
+  ✓ = SREM st absent
+  ✓ = SMEMBERS st
+  ✓ = SADD s2 b c d
+  ✓ = SDIFF st s2
+  ✓ = SINTER st s2
+  ✓ = SUNION st s2
+  ✓ = SDIFF st no_set
+  ✓ = SINTER st no_set
+  ✓ = SUNION no_set no_set2
+  ✓ = SDIFFSTORE d_dst st s2
+  ✓ = SMEMBERS d_dst
+  ✓ = SINTERSTORE i_dst st s2
+  ✓ = SMEMBERS i_dst
+  ✓ = SUNIONSTORE u_dst st s2
+  ✓ = SMEMBERS u_dst
+  ✓ = SINTERSTORE empty_dst st no_set
+  ✓ = EXISTS empty_dst
+  ✓ = SMOVE st s2 c
+  ✓ = SMEMBERS st
+  ✓ = SMEMBERS s2
+  ✓ = SMOVE st s2 absent
+  ✓ = SMOVE no_set s2 x
+  ✓ = SADD sdrain only
+  ✓ = SREM sdrain only
+  ✓ = EXISTS sdrain
+  ✓ [state] sets: same key set
+  ✓ [state] sets: same value for every shared key
+
+── Differential: sorted sets ─────────────────────────
+  ✓ = ZADD z 1 a 2 b 3 c
+  ✓ = ZSCORE z a
+  ✓ = ZSCORE z absent
+  ✓ = ZSCORE no_zset a
+  ✓ = ZADD z 1.5 a
+  ✓ = ZSCORE z a
+  ✓ = ZRANK z a
+  ✓ = ZRANK z c
+  ✓ = ZRANK z absent
+  ✓ = ZRANK no_zset a
+  ✓ = ZADD z notanumber bad
+  ✓ = ZADD z 1
+  ✓ = ZREM z a
+  ✓ = ZREM z absent
+  ✓ = ZSCORE z a
+  ✓ = ZPOPMIN z
+  ✓ = ZPOPMIN z 2
+  ✓ = ZPOPMIN no_zset
+  ✓ = ZADD zdrain 1 only
+  ✓ = ZPOPMIN zdrain
+  ✓ = EXISTS zdrain
+  ✓ = ZADD zneg -1.5 neg 0 zero
+  ✓ = ZSCORE zneg neg
+  ✓ = ZSCORE zneg zero
+  ✓ [state] sorted sets: same key set
+  ✓ [state] sorted sets: same value for every shared key
+
+── Differential: wrong types ─────────────────────────
+  ✓ = SET wt_str v
+  ✓ = RPUSH wt_list v
+  ✓ = HSET wt_hash f v
+  ✓ = SADD wt_set v
+  ✓ = ZADD wt_zset 1 v
+  ✓ = GET wt_list
+  ✓ = GET wt_hash
+  ✓ = GET wt_set
+  ✓ = GET wt_zset
+  ✓ = LPUSH wt_str x
+  ✓ = LRANGE wt_str 0 -1
+  ✓ = LLEN wt_hash
+  ✓ = HGET wt_str f
+  ✓ = HGETALL wt_list
+  ✓ = SADD wt_str x
+  ✓ = SMEMBERS wt_hash
+  ✓ = SCARD wt_zset
+  ✓ = ZADD wt_str 1 m
+  ✓ = ZSCORE wt_list m
+  ✓ = INCR wt_list
+  ✓ = APPEND wt_set x
+  ✓ = STRLEN wt_hash
+  ✓ = GETRANGE wt_set 0 -1
+  ✓ = SETRANGE wt_list 0 x
+  ✓ = EXPIRE wt_list 100
+  ✓ = TTL wt_list
+  ✓ = TYPE wt_str
+  ✓ = TYPE wt_list
+  ✓ = TYPE wt_hash
+  ✓ = TYPE wt_set
+  ✓ = TYPE wt_zset
+  ✓ = TYPE no_such_key
+  ✓ = SET wt_list replaced
+  ✓ = GET wt_list
+  ✓ = SETEX wt_hash 100 replaced
+  ✓ = GET wt_hash
+  ✓ = PSETEX wt_set 100000 replaced
+  ✓ = GET wt_set
+  ✓ = MSET wt_zset replaced
+  ✓ = GET wt_zset
+  ✓ = RPUSH wt_list2 a
+  ✓ = LRANGE wt_str abc 1
+  ✓ = LTRIM no_such_key abc 1
+  ✓ = LRANGE no_such_key abc 1
+  ✓ = SADD wt_realset m
+  ✓ = SDIFF no_such_key wt_str
+  ✓ = SINTER wt_realset no_such_key wt_str
+  ✓ = SDIFFSTORE wt_dst no_such_key wt_str
+  ✓ = SUNION no_such_key wt_str
+  ✓ [state] wrong types: same key set
+  ✓ [state] wrong types: same value for every shared key
+
+── Differential: multi-key and generic ───────────────
+  ✓ = MSET m1 a m2 b m3 c
+  ✓ = MGET m1 m2 m3
+  ✓ = MGET m1 absent m3
+  ✓ = MGET absent1 absent2
+  ✓ = MSETNX m4 d m5 e
+  ✓ = MGET m4 m5
+  ✓ = MSETNX m1 clobber m6 f
+  ✓ = GET m1
+  ✓ = EXISTS m6
+  ✓ = EXISTS m1
+  ✓ = EXISTS m1 m2 absent
+  ✓ = EXISTS m1 m1
+  ✓ = TOUCH m1 absent
+  ✓ = DBSIZE
+  ✓ = RENAME m1 m1_renamed
+  ✓ = GET m1_renamed
+  ✓ = EXISTS m1
+  ✓ = RENAME absent_src whatever
+  ✓ = RENAMENX m2 m3
+  ✓ = RENAMENX m2 m2_new
+  ✓ = GET m2_new
+  ✓ = DEL m3
+  ✓ = DEL m3
+  ✓ = DEL m4 m5 absent
+  ✓ = UNLINK m2_new
+  ✓ = EXISTS m2_new
+  ✓ = ECHO round-trip
+  ✓ = PING
+  ✓ = PING custom
+  ✓ [state] multi-key and generic: same key set
+  ✓ [state] multi-key and generic: same value for every shared key
+  info 331 operations compared against redis-server 7.0.15
+
+── Differential: transactions ────────────────────────
+  ✓ [txn mixed reads] every element of EXEC agrees (8)
+  ✓ [txn writes] every element of EXEC agrees (10)
+  ✓ [txn] a command that will fail still QUEUEs
+  ✓ [txn] EXEC with a failing element still returns an array
+  ✓ [txn] DISCARD inside MULTI
+  ✓ [txn] EXEC without MULTI is refused
+  ✓ [txn] DISCARD without MULTI is refused
+  ✓ [state] transactions: same key set
+  ✓ [state] transactions: same value for every shared key
+
+── Differential: cursor iteration ────────────────────
+  ✓ [scan] SCAN over the keyspace: same elements over a full iteration
+  ✓ [scan] HSCAN over a 53-field hash: same elements over a full iteration
+  ✓ [scan] SSCAN over a 61-member set: same elements over a full iteration
+  ✓ [scan] a full iteration yields every key KEYS reports
+
+── Differential: randomized streams (seed 799271525) ─
+  8 rounds x 150 ops, pool of 6 keys
+  ✓ round 0 (150 ops, seed 799271525) agrees
+  ✓ round 1 (150 ops, seed 799271526) agrees
+  ✓ round 2 (150 ops, seed 799271527) agrees
+  ✓ round 3 (150 ops, seed 799271528) agrees
+  ✓ round 4 (150 ops, seed 799271529) agrees
+  ✓ round 5 (150 ops, seed 799271530) agrees
+  ✓ round 6 (150 ops, seed 799271531) agrees
+  ✓ round 7 (150 ops, seed 799271532) agrees
+  info no divergence in 1200 generated operations
+
+── Fuzz: RESP and RDB parsers under ASan + UBSan ─────
+  ✓ [fuzz] resp harness builds
+  ✓ [fuzz] resp: 200,000 runs find no crash
+    info #200000	DONE   cov: 150 ft: 541 corp: 96/5649b lim: 1188 exec/s: 200000 rss: 206Mb
+  ✓ [fuzz] rdb harness builds
+  ✓ [fuzz] seeded the RDB corpus from a real image
+  ✓ [fuzz] rdb: 200,000 runs find no crash
+    info #200000	DONE   cov: 646 ft: 817 corp: 29/4109b lim: 2066 exec/s: 13333 rss: 135Mb
+
 ═══════════════════════════════════════════════════════
-Results: 1023/1023 passed
-Runtime: 59.74s (17.1 assertions/sec)
+Results: 1401/1401 passed
+Runtime: 104.12s (13.5 assertions/sec)
 All tests passed!
 Slowest sections:
-  7.94s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  34.91s  5/5  Fuzz: RESP and RDB parsers under ASan + UBSan
+  7.95s  11/11  Pub/Sub: keyspace notifications (V8.3)
   7.00s  3/3  Replication: an idle link must survive
-  5.39s  47/47  Replication: coordinated FAILOVER
-  5.37s  7/7  Security: protocol abuse (server must keep serving)
-  4.10s  14/14  Persistence: BGREWRITEAOF (manual + auto-trigger)
-  4.00s  9/9  Replication: REPLCONF ACK + WAIT
+  5.70s  47/47  Replication: coordinated FAILOVER
+  4.81s  15/15  Persistence: BGREWRITEAOF (manual + auto-trigger)
+  3.99s  9/9  Replication: REPLCONF ACK + WAIT
+  3.73s  9/9  Auth: async verify, pipelining, lockout, loop latency
   3.56s  15/15  Replication: min-replicas-to-write durability floor
-  3.11s  11/11  Replication: a wedged link (silent, not closed)
 ═══════════════════════════════════════════════════════
 
 ── Stress Test ────────────────────────────────────────
@@ -1326,198 +1737,83 @@ Slowest sections:
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    1.16s
-  Throughput: 3450 ops/sec
+  Elapsed:    1.19s
+  Throughput: 3351 ops/sec
   note client-bound (GIL-contended); never use this to compare transports — see --bench for server throughput
   Total ops:   4000
   Errors:      0
-  Latency avg: 2.21ms
-  Latency min: 0.15ms
-  Latency max: 14.23ms
-  Latency p50: 1.76ms
-  Latency p95: 5.72ms
-  Latency p99: 8.72ms
+  Latency avg: 2.26ms
+  Latency min: 0.13ms
+  Latency max: 15.41ms
+  Latency p50: 1.78ms
+  Latency p95: 5.89ms
+  Latency p99: 8.93ms
   No errors!
   Operation mix:
-    info                  126 ok     0 errors
-    strlen                118 ok     0 errors
-    smembers              118 ok     0 errors
-    zpopmin               116 ok     0 errors
-    append                115 ok     0 errors
-    ping                  114 ok     0 errors
-    hgetall               111 ok     0 errors
-    ttl_triplet           110 ok     0 errors
-    list_pop_trim         110 ok     0 errors
-    getdel                106 ok     0 errors
-    sismember             106 ok     0 errors
-    hscan                 106 ok     0 errors
+    list_pop_trim         132 ok     0 errors
+    config_get            124 ok     0 errors
+    ttl_triplet           117 ok     0 errors
+    zscore                115 ok     0 errors
+    object_encoding       115 ok     0 errors
+    sismember             115 ok     0 errors
+    lrange                114 ok     0 errors
+    smembers              111 ok     0 errors
+    incr                  111 ok     0 errors
+    mget                  110 ok     0 errors
+    srem                  110 ok     0 errors
+    keyspace_scan         109 ok     0 errors
   Slowest operations by average latency:
-    keyspace_scan          7.90ms avg over 99 ops
-    list_pop_trim          5.64ms avg over 110 ops
-    ttl_triplet            5.47ms avg over 110 ops
-    getex_px               3.64ms avg over 94 ops
-    object_encoding        3.63ms avg over 103 ops
-    keys                   2.21ms avg over 98 ops
-    hscan                  1.91ms avg over 106 ops
-    getdel                 1.89ms avg over 106 ops
-    get                    1.88ms avg over 100 ops
-    config_get             1.85ms avg over 99 ops
-    set                    1.84ms avg over 104 ops
-    setnx                  1.83ms avg over 87 ops
-  ℹ  cleaned 163 leftover keys
-
-═══════════════════════════════════════════════════════
-  Speed baseline (redis-benchmark)
-═══════════════════════════════════════════════════════
-  PING_INLINE: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  PING_INLINE: 934579.44 requests per second, p50=0.439 msec
-  PING_MBULK: 900900.88 requests per second, p50=0.455 msec
-  SET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  SET: 909090.94 requests per second, p50=0.535 msec
-  GET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  GET: 900900.88 requests per second, p50=0.487 msec
-  INCR: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  INCR: 869565.19 requests per second, p50=0.735 msec
-  LPUSH: rps=0.0 (overall: -nan) avg_msec=-nan (overall: -nan)
-  LPUSH: 840336.12 requests per second, p50=0.663 msec
-  RPUSH: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  RPUSH: 793650.75 requests per second, p50=0.727 msec
-  LPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  LPOP: 884955.75 requests per second, p50=0.527 msec
-  RPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  RPOP: 892857.12 requests per second, p50=0.527 msec
-  SADD: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  SADD: 884955.75 requests per second, p50=0.575 msec
-  HSET: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  HSET: 900900.88 requests per second, p50=0.623 msec
-  SPOP: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  SPOP: 925925.88 requests per second, p50=0.447 msec
-  ZADD: rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  ZADD: 917431.19 requests per second, p50=0.655 msec
-  ZPOPMIN: rps=0.0 (overall: -nan) avg_msec=-nan (overall: -nan)
-  ZPOPMIN: 934579.44 requests per second, p50=0.495 msec
-  LPUSH (needed to benchmark LRANGE): rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  LPUSH (needed to benchmark LRANGE): 787401.56 requests per second, p50=0.671 msec
-  LRANGE_100 (first 100 elements): rps=42135.5 (overall: 86688.5) avg_msec=8.773 (overall: 8.773)
-  LRANGE_100 (first 100 elements): rps=89472.0 (overall: 88559.1) avg_msec=8.843 (overall: 8.820)
-  LRANGE_100 (first 100 elements): rps=95872.0 (overall: 91498.4) avg_msec=8.306 (overall: 8.604)
-  LRANGE_100 (first 100 elements): rps=95490.0 (overall: 92646.0) avg_msec=8.280 (overall: 8.508)
-  LRANGE_100 (first 100 elements): 92850.51 requests per second, p50=8.159 msec
-  LRANGE_300 (first 300 elements): rps=5912.0 (overall: 34372.1) avg_msec=17.100 (overall: 17.100)
-  LRANGE_300 (first 300 elements): rps=40408.0 (overall: 39522.2) avg_msec=19.614 (overall: 19.293)
-  LRANGE_300 (first 300 elements): rps=39856.6 (overall: 39676.5) avg_msec=19.719 (overall: 19.491)
-  LRANGE_300 (first 300 elements): rps=38872.0 (overall: 39423.2) avg_msec=20.342 (overall: 19.755)
-  LRANGE_300 (first 300 elements): rps=36800.0 (overall: 38795.0) avg_msec=21.392 (overall: 20.127)
-  LRANGE_300 (first 300 elements): rps=37442.2 (overall: 38532.8) avg_msec=21.196 (overall: 20.328)
-  LRANGE_300 (first 300 elements): rps=36136.0 (overall: 38145.0) avg_msec=21.757 (overall: 20.547)
-  LRANGE_300 (first 300 elements): rps=36844.6 (overall: 37963.2) avg_msec=21.463 (overall: 20.672)
-  LRANGE_300 (first 300 elements): rps=37504.0 (overall: 37907.1) avg_msec=20.995 (overall: 20.711)
-  LRANGE_300 (first 300 elements): rps=36143.4 (overall: 37714.4) avg_msec=21.857 (overall: 20.831)
-  LRANGE_300 (first 300 elements): rps=38976.0 (overall: 37838.2) avg_msec=20.134 (overall: 20.760)
-  LRANGE_300 (first 300 elements): 37835.79 requests per second, p50=19.567 msec
-  LRANGE_500 (first 500 elements): rps=13376.0 (overall: 22293.3) avg_msec=31.342 (overall: 31.342)
-  LRANGE_500 (first 500 elements): rps=24135.5 (overall: 23446.4) avg_msec=32.564 (overall: 32.129)
-  LRANGE_500 (first 500 elements): rps=23844.0 (overall: 23599.1) avg_msec=32.860 (overall: 32.413)
-  LRANGE_500 (first 500 elements): rps=23552.0 (overall: 23586.0) avg_msec=33.894 (overall: 32.823)
-  LRANGE_500 (first 500 elements): rps=23374.5 (overall: 23539.9) avg_msec=33.166 (overall: 32.897)
-  LRANGE_500 (first 500 elements): rps=22804.0 (overall: 23408.7) avg_msec=34.771 (overall: 33.223)
-  LRANGE_500 (first 500 elements): rps=23440.0 (overall: 23413.4) avg_msec=33.959 (overall: 33.334)
-  LRANGE_500 (first 500 elements): rps=23332.0 (overall: 23402.7) avg_msec=33.404 (overall: 33.344)
-  LRANGE_500 (first 500 elements): rps=22259.0 (overall: 23269.4) avg_msec=35.739 (overall: 33.611)
-  LRANGE_500 (first 500 elements): rps=22976.0 (overall: 23238.9) avg_msec=34.419 (overall: 33.694)
-  LRANGE_500 (first 500 elements): rps=22336.0 (overall: 23153.8) avg_msec=35.218 (overall: 33.832)
-  LRANGE_500 (first 500 elements): rps=23063.7 (overall: 23146.0) avg_msec=34.323 (overall: 33.875)
-  LRANGE_500 (first 500 elements): rps=24440.0 (overall: 23248.6) avg_msec=32.216 (overall: 33.736)
-  LRANGE_500 (first 500 elements): rps=24256.0 (overall: 23322.6) avg_msec=32.609 (overall: 33.650)
-  LRANGE_500 (first 500 elements): rps=23649.4 (overall: 23345.0) avg_msec=33.042 (overall: 33.608)
-  LRANGE_500 (first 500 elements): rps=23380.0 (overall: 23347.2) avg_msec=33.750 (overall: 33.617)
-  LRANGE_500 (first 500 elements): rps=24541.8 (overall: 23419.4) avg_msec=31.837 (overall: 33.504)
-  LRANGE_500 (first 500 elements): 23391.81 requests per second, p50=32.063 msec
-  LRANGE_600 (first 600 elements): rps=9200.0 (overall: 17968.8) avg_msec=36.880 (overall: 36.880)
-  LRANGE_600 (first 600 elements): rps=19148.0 (overall: 18748.7) avg_msec=41.443 (overall: 39.962)
-  LRANGE_600 (first 600 elements): rps=18502.0 (overall: 18650.2) avg_msec=41.660 (overall: 40.634)
-  LRANGE_600 (first 600 elements): rps=18240.0 (overall: 18533.6) avg_msec=44.029 (overall: 41.585)
-  LRANGE_600 (first 600 elements): rps=17107.6 (overall: 18216.8) avg_msec=45.263 (overall: 42.352)
-  LRANGE_600 (first 600 elements): rps=20316.0 (overall: 18597.1) avg_msec=39.564 (overall: 41.800)
-  LRANGE_600 (first 600 elements): rps=19645.4 (overall: 18758.4) avg_msec=40.156 (overall: 41.535)
-  LRANGE_600 (first 600 elements): rps=20324.0 (overall: 18966.5) avg_msec=38.870 (overall: 41.156)
-  LRANGE_600 (first 600 elements): rps=20200.0 (overall: 19111.2) avg_msec=38.942 (overall: 40.881)
-  LRANGE_600 (first 600 elements): rps=20008.0 (overall: 19205.4) avg_msec=39.473 (overall: 40.727)
-  LRANGE_600 (first 600 elements): rps=20155.4 (overall: 19296.0) avg_msec=38.701 (overall: 40.525)
-  LRANGE_600 (first 600 elements): rps=20160.0 (overall: 19370.9) avg_msec=39.446 (overall: 40.428)
-  LRANGE_600 (first 600 elements): rps=20592.0 (overall: 19468.4) avg_msec=37.992 (overall: 40.222)
-  LRANGE_600 (first 600 elements): rps=20426.3 (overall: 19539.5) avg_msec=38.632 (overall: 40.099)
-  LRANGE_600 (first 600 elements): rps=20148.0 (overall: 19581.3) avg_msec=39.336 (overall: 40.045)
-  LRANGE_600 (first 600 elements): rps=19636.0 (overall: 19584.9) avg_msec=39.523 (overall: 40.011)
-  LRANGE_600 (first 600 elements): rps=20156.0 (overall: 19619.4) avg_msec=39.999 (overall: 40.010)
-  LRANGE_600 (first 600 elements): rps=19063.7 (overall: 19587.6) avg_msec=40.943 (overall: 40.062)
-  LRANGE_600 (first 600 elements): rps=17648.0 (overall: 19483.0) avg_msec=44.972 (overall: 40.302)
-  LRANGE_600 (first 600 elements): rps=18996.0 (overall: 19458.0) avg_msec=41.550 (overall: 40.365)
-  LRANGE_600 (first 600 elements): rps=18740.0 (overall: 19423.1) avg_msec=41.314 (overall: 40.409)
-  LRANGE_600 (first 600 elements): 19425.02 requests per second, p50=38.367 msec
-  MSET (10 keys): rps=0.0 (overall: 0.0) avg_msec=-nan (overall: -nan)
-  MSET (10 keys): rps=262912.0 (overall: 261864.6) avg_msec=3.004 (overall: 3.004)
-  MSET (10 keys): 265252.00 requests per second, p50=2.703 msec
-
--- Throughput summary ----------------------------------
-  test                    ops/sec    p50 ms
-  ping_inline             934,579     0.439
-  zpopmin                 934,579     0.495
-  spop                    925,926     0.447
-  zadd                    917,431     0.655
-  set                     909,091     0.535
-  ping_mbulk              900,901     0.455
-  get                     900,901     0.487
-  hset                    900,901     0.623
-  rpop                    892,857     0.527
-  lpop                    884,956     0.527
-  sadd                    884,956     0.575
-  incr                    869,565     0.735
-  lpush                   840,336     0.663
-  rpush                   793,651     0.727
-  mset                    265,252     2.703
-  lrange_100               92,851     8.159
-  lrange_300               37,836    19.567
-  lrange_500               23,392    32.063
-  lrange_600               19,425    38.367
+    keyspace_scan          8.00ms avg over 109 ops
+    ttl_triplet            5.60ms avg over 117 ops
+    list_pop_trim          5.34ms avg over 132 ops
+    object_encoding        3.70ms avg over 115 ops
+    getex_px               3.62ms avg over 84 ops
+    keys                   2.28ms avg over 99 ops
+    srandmember            1.96ms avg over 87 ops
+    rpush                  1.89ms avg over 90 ops
+    memory_usage           1.87ms avg over 93 ops
+    mget                   1.86ms avg over 110 ops
+    hgetall                1.85ms avg over 92 ops
+    set                    1.84ms avg over 91 ops
+  ℹ  cleaned 166 leftover keys
 
 -- Command Metrics -------------------------------------
-  Commands observed: 40326
-  RESP errors:       214 (expected negative tests included)
+  Commands observed: 45543
+  RESP errors:       1468 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.58ms
-  Latency p50/p95/p99: 0.12/2.29/3.80ms
-  Latency max:       1001.40ms
+  Latency avg:       0.63ms
+  Latency p50/p95/p99: 0.22/2.23/3.82ms
+  Latency max:       1003.66ms
   Most used commands:
-    set             26420 calls
-    zadd             2021 calls
-    rpush            1413 calls
-    get              1084 calls
+    set             26669 calls
+    zadd             2081 calls
+    get              1610 calls
+    rpush            1463 calls
+    type             1036 calls
     publish          1009 calls
-    del               720 calls
-    lpop              612 calls
-    sadd              443 calls
-    hset              408 calls
-    srem              408 calls
-    info              392 calls
-    type              360 calls
+    pttl              753 calls
+    del               746 calls
+    lpop              662 calls
+    sadd              511 calls
+    hset              474 calls
+    srem              460 calls
   Slowest commands by average latency:
-    wait             623.80ms avg over 4 calls
-    auth              47.87ms avg over 2 calls
-    save               5.33ms avg over 3 calls
-    acl                5.19ms avg over 36 calls
-    scan               2.15ms avg over 102 calls
-    keys               2.07ms avg over 105 calls
-    publish            1.92ms avg over 1009 calls
-    rpop               1.89ms avg over 111 calls
-    llen               1.84ms avg over 113 calls
-    hscan              1.84ms avg over 110 calls
-    getdel             1.82ms avg over 110 calls
-    setnx              1.76ms avg over 91 calls
+    wait             621.01ms avg over 4 calls
+    auth              36.00ms avg over 2 calls
+    save               9.61ms avg over 4 calls
+    acl                7.76ms avg over 36 calls
+    bgsave             4.51ms avg over 2 calls
+    bgrewriteaof       3.09ms avg over 4 calls
+    publish            1.99ms avg over 1009 calls
+    scan               1.97ms avg over 132 calls
+    getex              1.76ms avg over 93 calls
+    memory             1.73ms avg over 100 calls
+    object             1.72ms avg over 127 calls
+    hscan              1.70ms avg over 97 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
-  correctness + concurrency + managed-instance phases + stress + redis-benchmark over plaintext (passwordless) → 127.0.0.1:12590
+  correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:12590
   WSL — 6.6.87.2-microsoft-standard-WSL2
   Log:     docs/logs/WSL/full_plain.md
   Summary: docs/logs/WSL/full_plain.json

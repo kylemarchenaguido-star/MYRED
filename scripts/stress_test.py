@@ -4511,7 +4511,15 @@ def phase_aof_rewrite(ctx: "PhaseCtx"):
     # is a race between finalize and shutdown, and it belongs to a different test
     # than the one below.
     cmd(s, "CONFIG", "SET", "auto-aof-rewrite-min-size", "67108864")
-    wait_until(_no_tmp, 10.0)
+    # Assert the settle, do not just wait for it. Discarding this result let a
+    # still-running rewrite through the restart below, and the TTL check then
+    # failed reporting a TTL bug that did not exist — the reader chases the
+    # wrong subject entirely. The budget is generous because a sanitizer build
+    # rewrites several times slower than Release, which is where this bit.
+    ctx.ok("the in-flight rewrite settled before the restart",
+           wait_until(_no_tmp, 30.0),
+           f"still rewriting: {[f for f in os.listdir(d) if f.endswith('.tmp')]}"
+           f" — every check below would be measuring this race, not its subject")
 
     ttl_before = cmd(s, "TTL", "rw:ttl")
     ctx.ok("the TTL is still live before the restart",
@@ -5045,6 +5053,128 @@ def phase_security(ctx: "PhaseCtx"):
                "parsed rule disagree")
         lim.close()
         admin.close()
+
+    # ── regressions from the V11 static security review ──────────────────────
+    #
+    # Three of the four findings that pass live entirely through this phase's
+    # server. Each check is written against the ATTACK, not the fix, so it keeps
+    # working if the implementation changes: what is asserted is that the forged
+    # record does not appear, that the amplifying parse does not happen, and that
+    # the refusal is explicit rather than a silent drop.
+    ctx.section("Security: V11 review regressions")
+
+    # An audit line is space-separated key=value pairs terminated by \n, and a
+    # username is a length-prefixed RESP bulk string that may legally contain
+    # both. One FAILED auth used to write a second, well-formed record of the
+    # attacker's choosing — the failure path being the point, since that is the
+    # one an unauthenticated client can always reach.
+    def audit_lines():
+        try:
+            with open(audit_path, "r", errors="replace") as f:
+                return [ln for ln in f.read().splitlines() if ln.strip()]
+        except OSError:
+            return []
+
+    before = len(audit_lines())
+    forged = ("nobody\nts=2099-01-01T00:00:00Z event=auth_success "
+              "peer=10.0.0.9:1 user=default")
+    raw = socket.socket()
+    raw.settimeout(TIMEOUT_SEC)
+    try:
+        raw.connect(("127.0.0.1", port))
+        send_request(raw, "AUTH", forged, "wrong-password")
+        raw.recv(256)
+    except OSError:
+        pass
+    finally:
+        raw.close()
+    time.sleep(0.3)
+    after = audit_lines()
+    ctx.ok("a newline in an AUTH username cannot forge an audit record",
+           len(after) == before + 1,
+           f"one failed AUTH wrote {len(after) - before} lines:\n    " +
+           "\n    ".join(after[before:]))
+    ctx.ok("no audit line carries the forged timestamp",
+           not any(ln.startswith("ts=2099-") for ln in after),
+           "\n    ".join(ln for ln in after if ln.startswith("ts=2099-")))
+
+    # The inline splitter has no argument limit of its own, so the line length is
+    # what bounds it. Uncapped, one 64 MiB line became ~32M std::strings — 16x
+    # measured RSS amplification from a single unauthenticated write. Both
+    # directions matter: the cap has to bite, and it must not break telnet.
+    def inline_reply(payload: bytes) -> bytes:
+        s = socket.socket()
+        s.settimeout(TIMEOUT_SEC)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.sendall(payload)
+            return s.recv(256)
+        except OSError:
+            return b""
+        finally:
+            s.close()
+
+    # -NOAUTH is the *success* case here: it proves the line parsed into a
+    # command and was then rejected on authentication, not on framing.
+    ok_reply = inline_reply(b"PING\r\n")
+    ctx.ok("an inline line under the cap still parses as a command",
+           ok_reply.startswith(b"-NOAUTH"),
+           f"got {ok_reply[:80]!r} — a -ERR Protocol error here means the cap "
+           f"is too tight and telnet-style commands are broken")
+    over = inline_reply(b"a " * (48 * 1024) + b"\r\n")      # 96 KiB > 64 KiB cap
+    ctx.ok("an inline line over the cap is refused, not split into arguments",
+           over.startswith(b"-ERR") or over == b"",
+           f"got {over[:80]!r} — anything else means the splitter ran")
+
+    # Without maxclients the only bound was RLIMIT_NOFILE, and reaching it put
+    # the accept loop into a spin (measured: 96% of one core and ~2 MB/s of
+    # identical log lines from ~55 idle connections), because a peer that is
+    # never accepted stays in the backlog and keeps the listener readable.
+    # Its own connection: the ACL section above closes `admin` on its way out.
+    adm = raw_conn(port, SEC_ADMIN_PW)
+    if not has_directive(adm, "maxclients"):
+        ctx.ok("maxclients caps concurrent connections", False,
+               "the directive does not exist, so RLIMIT_NOFILE is the only "
+               "bound on connections and reaching it spins the accept loop at "
+               "100% CPU")
+    else:
+        prev = cmd(adm, "CONFIG", "GET", "maxclients")
+        prev_val = prev[1] if isinstance(prev, list) and len(prev) > 1 else "10000"
+        try:
+            # Setting the cap to headroom-plus-N and then opening N connections
+            # races the reaper: the probe sockets closed a few checks above are not
+            # decremented until the server processes their close. Capping AT the
+            # live count needs no arithmetic — every further connection is over the
+            # line by construction, whichever way the count is drifting.
+            time.sleep(0.3)
+            live = max(int(info_field(adm, "connected_clients") or 0), 1)
+            cmd(adm, "CONFIG", "SET", "maxclients", str(live))
+            over_sock = socket.socket()
+            over_sock.settimeout(TIMEOUT_SEC)
+            try:
+                over_sock.connect(("127.0.0.1", port))
+                refusal = over_sock.recv(128)
+            except OSError as e:
+                refusal = f"<{type(e).__name__}: {e}>".encode()
+            finally:
+                over_sock.close()
+            ctx.ok("a connection past maxclients is refused with an explanation",
+                   b"max number of clients" in refusal,
+                   f"got {refusal[:80]!r} — a silent drop leaves the client "
+                   f"guessing, and never accepting at all is what spun the loop")
+            ctx.ok("the server keeps serving its existing clients at the cap",
+                   cmd(adm, "PING") == "PONG")
+        finally:
+            try:
+                cmd(adm, "CONFIG", "SET", "maxclients", str(prev_val))
+            except Exception:
+                pass
+        back = raw_conn(port, SEC_ADMIN_PW)
+        ctx.ok("raising maxclients lets new connections in again",
+               cmd(back, "PING") == "PONG",
+               "the cap is refusing connections it should now allow")
+        back.close()
+    adm.close()
 
     if ctx.destructive:
         ctx.section("Security: protocol abuse (server must keep serving)")
@@ -6957,6 +7087,59 @@ def phase_tls(ctx: "PhaseCtx"):
     p.close()
     srv.stop()
 
+    # --- the handshake deadline is absolute, not an inactivity timer ---------
+    #
+    # From the V11 security review. The poll loop refreshed every ready
+    # connection's timer before branching on tls_handshaking, so any byte reset
+    # the very deadline the config exists to enforce: a peer dribbling 1 B/s was
+    # still un-reaped at 4x the configured timeout, holding a Conn and 128 KB of
+    # buffers each. Needs its own server because tls-handshake-timeout is
+    # boot-only, and a short one so the test costs ~3s instead of ~40s.
+    hs_plain, hs_tls = ctx.ports(2)
+    hs_conf = write_conf(os.path.join(d, "hs.conf"), [
+        f"port {hs_plain}",
+        f"tls-port {hs_tls}",
+        f'tls-cert-file "{live_cert}"',
+        f'tls-key-file "{live_key}"',
+        "tls-handshake-timeout 1",
+        "appendonly no",
+        'save ""',
+    ])
+    try:
+        hs_srv = ctx.start("tls-handshake", d, hs_conf, hs_plain)
+    except RuntimeError as e:
+        ctx.ok("the server boots with a 1s tls-handshake-timeout", False, str(e))
+        return
+    try:
+        s = socket.socket()
+        s.settimeout(1.0)
+        s.connect(("127.0.0.1", hs_tls))
+        s.sendall(b"\x16\x03\x01\x02\x00")     # a record header, never completed
+        deadline = time.time() + 5.0           # 5x the configured timeout
+        closed_at = None
+        while time.time() < deadline:
+            time.sleep(0.4)
+            try:
+                s.sendall(b"\x00")             # keep the connection "active"
+                if select.select([s], [], [], 0)[0] and s.recv(1) == b"":
+                    closed_at = time.time()
+                    break
+            except OSError:
+                closed_at = time.time()
+                break
+        s.close()
+        held = 5.0 if closed_at is None else closed_at - (deadline - 5.0)
+        ctx.ok("a peer dribbling bytes is still reaped at the handshake timeout",
+               closed_at is not None and held < 3.0,
+               f"held the slot for {held:.1f}s against a 1s timeout — the "
+               f"deadline is being refreshed by traffic instead of running from "
+               f"accept, so a slow peer holds a connection slot indefinitely")
+        ctx.ok("a completed handshake is unaffected by the same timeout",
+               cmd(_tls_conn(hs_tls), "PING") == "PONG",
+               "the absolute deadline is reaping connections that finished")
+    finally:
+        hs_srv.stop()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PHASE: UNIT — the incremental-rehash invariant, below the protocol
@@ -8005,6 +8188,14 @@ void notify_keyspace_event(int, const char *, const std::string &) {
 }
 void do_request(std::vector<std::string> &, Buffer *, Conn *, const char *,
                 size_t) { unreachable("do_request"); }
+// aof_load runs these four on its replay Conn so a registration cannot outlive
+// the stack frame (V11 hardening). aof.cpp is linked for its RDB preamble
+// reader, so the references have to resolve even though this harness only ever
+// enters through rdb_load_buffer and never through aof_load.
+void pubsub_remove_conn(Conn *) { unreachable("pubsub_remove_conn"); }
+void watch_clear_conn(Conn *) { unreachable("watch_clear_conn"); }
+void repl_remove_conn(Conn *) { unreachable("repl_remove_conn"); }
+void wait_remove_conn(Conn *) { unreachable("wait_remove_conn"); }
 
 // A whole RDB image, loaded straight into the keyspace. Every length, type tag
 // and compressed block in it is attacker-controlled if the file is.

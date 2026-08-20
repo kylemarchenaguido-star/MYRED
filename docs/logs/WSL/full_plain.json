@@ -1,153 +1,82 @@
 {
   "authed": false,
-  "bench": {
-    "params": {
-      "clients": 50,
-      "pipeline": 16,
-      "requests": 100000,
-      "transport": "plain"
-    },
-    "tests": {
-      "get": {
-        "p50": 0.487,
-        "rps": 900900.88
-      },
-      "hset": {
-        "p50": 0.623,
-        "rps": 900900.88
-      },
-      "incr": {
-        "p50": 0.735,
-        "rps": 869565.19
-      },
-      "lpop": {
-        "p50": 0.527,
-        "rps": 884955.75
-      },
-      "lpush": {
-        "p50": 0.663,
-        "rps": 840336.12
-      },
-      "lrange_100": {
-        "p50": 8.159,
-        "rps": 92850.51
-      },
-      "lrange_300": {
-        "p50": 19.567,
-        "rps": 37835.79
-      },
-      "lrange_500": {
-        "p50": 32.063,
-        "rps": 23391.81
-      },
-      "lrange_600": {
-        "p50": 38.367,
-        "rps": 19425.02
-      },
-      "mset": {
-        "p50": 2.703,
-        "rps": 265252.0
-      },
-      "ping_inline": {
-        "p50": 0.439,
-        "rps": 934579.44
-      },
-      "ping_mbulk": {
-        "p50": 0.455,
-        "rps": 900900.88
-      },
-      "rpop": {
-        "p50": 0.527,
-        "rps": 892857.12
-      },
-      "rpush": {
-        "p50": 0.727,
-        "rps": 793650.75
-      },
-      "sadd": {
-        "p50": 0.575,
-        "rps": 884955.75
-      },
-      "set": {
-        "p50": 0.535,
-        "rps": 909090.94
-      },
-      "spop": {
-        "p50": 0.447,
-        "rps": 925925.88
-      },
-      "zadd": {
-        "p50": 0.655,
-        "rps": 917431.19
-      },
-      "zpopmin": {
-        "p50": 0.495,
-        "rps": 934579.44
-      }
-    }
-  },
+  "bench": null,
   "build": {
-    "binary": "/home/kyled/projects/testfiles/build-rel/server",
-    "cmake_build_type": "release",
-    "debug_info": false,
-    "optimized": true
+    "binary": "/home/kyled/projects/testfiles/build-asan/server",
+    "cmake_build_type": "Debug",
+    "debug_info": true,
+    "optimized": false
   },
-  "duration_s": 72.2,
+  "duration_s": 102.3,
   "failed_parts": [],
-  "generated": "2026-08-15T23:47:09",
+  "generated": "2026-08-20T00:15:54",
   "phases": {
     "_skipped_total": 0,
     "auth": {
-      "duration": 0.92,
+      "duration": 3.73,
       "error": null,
       "failed": 0,
       "passed": 9,
       "skipped": 0
     },
     "config": {
-      "duration": 0.34,
+      "duration": 0.72,
       "error": null,
       "failed": 0,
       "passed": 37,
       "skipped": 0
     },
+    "differential": {
+      "duration": 1.17,
+      "error": null,
+      "failed": 0,
+      "passed": 370,
+      "skipped": 0
+    },
+    "fuzz": {
+      "duration": 34.9,
+      "error": null,
+      "failed": 0,
+      "passed": 5,
+      "skipped": 0
+    },
     "memory": {
-      "duration": 2.53,
+      "duration": 5.45,
       "error": null,
       "failed": 0,
       "passed": 35,
       "skipped": 0
     },
     "persistence": {
-      "duration": 6.13,
+      "duration": 8.52,
       "error": null,
       "failed": 0,
-      "passed": 75,
+      "passed": 74,
       "skipped": 0
     },
     "replication": {
-      "duration": 26.04,
+      "duration": 27.35,
       "error": null,
       "failed": 0,
       "passed": 153,
       "skipped": 0
     },
     "security": {
-      "duration": 6.25,
+      "duration": 1.99,
       "error": null,
       "failed": 0,
       "passed": 43,
       "skipped": 0
     },
     "tls": {
-      "duration": 0.49,
+      "duration": 2.15,
       "error": null,
       "failed": 0,
-      "passed": 17,
+      "passed": 19,
       "skipped": 0
     },
     "unit": {
-      "duration": 0.96,
+      "duration": 0.93,
       "error": null,
       "failed": 0,
       "passed": 2,
@@ -171,10 +100,10 @@
     "init": "systemd",
     "kernel": "6.6.87.2-microsoft-standard-WSL2",
     "kernel_build": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37)",
-    "loadavg": "0.06 0.14 0.17 1/380 57306",
+    "loadavg": "0.82 0.74 0.50 2/410 15719",
     "mem_total": "12209364 kB",
     "no_turbo": null,
-    "nofile_soft": 10240,
+    "nofile_soft": 1048576,
     "overcommit": "0",
     "product": null,
     "python": "3.12.3",
@@ -193,7 +122,7 @@
   },
   "totals": {
     "failed": 0,
-    "passed": 1023
+    "passed": 1401
   },
   "transport": "plain"
 }

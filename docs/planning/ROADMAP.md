@@ -290,8 +290,11 @@ a real fuzzer.
   memory amplification, and a `tls-handshake-timeout` that any byte resets, so it
   never reaps a slow peer). Five 🟡 hardening items and six *verified-correct*
   results recorded alongside them. No live server was needed to find any of them;
-  the repros exist because "by inspection" has been wrong here before. Original
-  starting points, kept for the record:
+  the repros exist because "by inspection" has been wrong here before.
+  **All nine issues fixed and re-verified 2026-08-19**, with nine regression
+  checks landed in `stress_test.py` — suite is **1401/1401 on Release and
+  identical under ASan+UBSan+LSan**. Nothing from this review is left open.
+  Original starting points, kept for the record:
   - **Auth/ACL**: `cred.cpp` (password hashing, `fill_random`), and the
     `ACL SETUSER` staged-apply pattern in `commands.cpp` (stage onto a `User`
     copy, commit only on full success — the thing worth checking is whether
