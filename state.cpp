@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <sys/resource.h>
 
 GlobalData g_data;
 Config g_config;
@@ -24,6 +25,13 @@ Config g_config;
 // forward declarations: defined lower in this file, used by entry_set_ttl
 static void heap_delete(std::vector<HeapItem> &a, size_t pos);
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t);
+
+// a forked child inherits every open fd
+// syscalls only: this runs in the child, where malloc is not allowed
+void child_close_inherited_fds(){
+  // everything above stderr
+  close_range(3, ~0U, 0);
+}
 
 // whole-string decimal integer, no trailing garbage, no silent overflow
 bool parse_int_strict(const char *s, long *out){
@@ -192,6 +200,17 @@ static CfgResult tls_material_set(std::string &field, const std::string &val, st
   return CfgResult::OK;
 }
 
+// Any string CONFIG REWRITE cam write back has to survive a line oriented reader.
+static bool cfg_printable(const std::string &v, const char *what, std::string &e){
+  for (unsigned char c : v){
+    if (c < 0x20 || c == 0x7f){
+      e = std::string(what) + ": value contains a control character";
+      return false;
+    }
+  }
+  return true;
+}
+
 static const ConfigDirective k_config_table[] = {
   { "port", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
@@ -278,6 +297,7 @@ static const ConfigDirective k_config_table[] = {
     
   { "requirepass", 1, 1,
     [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (!cfg_printable(a[0], "requirepass", e)){ return CfgResult::BADVALUE; }
       if (a[0].empty()){
         g_config.password.clear();
       } else if (a[0].size() == 65 && a[0][0] == '#'){
@@ -406,7 +426,8 @@ static const ConfigDirective k_config_table[] = {
 
 
   { "dbfilename", 1, 1, 
-    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (!cfg_printable(a[0], "dbfilename", e)){ return CfgResult::BADVALUE; }
       g_config.dump_path = a[0]; return CfgResult::OK;
     },
     [](std::string &o) -> bool { o = g_config.dump_path; return true; },
@@ -626,7 +647,8 @@ static const ConfigDirective k_config_table[] = {
     } },
 
   { "masterauth", 1, 1,
-    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (!cfg_printable(a[0], "masterauth", e)){ return CfgResult::BADVALUE; }
       g_config.masterauth = a[0]; return CfgResult::OK;
     },
     [](std::string &o) -> bool { o = g_config.masterauth.empty() ? "" : "<set>"; return true; },
@@ -702,7 +724,8 @@ static const ConfigDirective k_config_table[] = {
     } },
 
   { "auditlog", 1, 1,
-    [](const std::vector<std::string> &a, std::string &) -> CfgResult {
+    [](const std::vector<std::string> &a, std::string &e) -> CfgResult {
+      if (!cfg_printable(a[0], "auditlog", e)){ return CfgResult::BADVALUE; }
       g_config.auditlog_path = a[0];   // "" disables, "stderr", or a path
       audit_open(g_config.auditlog_path);
       return CfgResult::OK;

@@ -1,5 +1,6 @@
 // stdlib
 #include <assert.h>
+#include <cstddef>
 #include <cstdint>
 #include <stdint.h>
 #include <stdlib.h>
@@ -113,6 +114,7 @@ static void conn_destroy(Conn *conn){
   buf_destroy(&conn->outgoing);
   buf_destroy(&conn->incoming);
   g_data.connected_clients--;
+  delete conn;
 }
 
 // callable from any worker thread
@@ -200,7 +202,7 @@ bool repl_start(const std::string &host, int port, std::string &err){
   const std::string hist_id = g_data.repl_id;
   const uint64_t hist_off = g_data.master_repl_offset;
 
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0){ err = std::string("Socket (): ") + strerror(errno); return false; } 
 
   struct sockaddr_in a = {};
@@ -554,7 +556,7 @@ static int32_t handle_accept(int fd, bool is_tls){
   struct sockaddr_in client_addr =  {};
   socklen_t addrlen = sizeof(client_addr);
 
-  int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+  int connfd = accept4(fd, (struct sockaddr *)&client_addr, &addrlen, SOCK_CLOEXEC);
   if (connfd < 0) {
     // EMFILE should be unreachable now the maxclients is clamped under RLIMIT_NOFILE
     if (errno != EAGAIN){ 
@@ -651,7 +653,7 @@ static int32_t handle_accept(int fd, bool is_tls){
 }
 
 static int listen_on(const std::string &addr, int port){
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0){ fprintf(stderr, "socket(): %s\n", strerror(errno)); return -1; }
 
   int val = 1;
@@ -1391,5 +1393,10 @@ int main(int argc, char **argv){
 
   rdb_save(g_config.dump_path.c_str());
   fprintf(stderr, "Saved. Goodbye.\n");
+  // free whatever is still connected, the os would reclaim it either way, is for the sanitizer
+  for (size_t fd = 0; fd < g_data.fd2conn.size(); ++fd){
+    if (g_data.fd2conn[fd]){ conn_destroy(g_data.fd2conn[fd]); }
+  }
+  g_data.master_link = nullptr;
   return 0;
 }

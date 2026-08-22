@@ -4370,6 +4370,15 @@ static uint64_t acl_cat_bit(const std::string &n) {
   return 0;
 }
 
+// Written into the config file UNQUOTED by acl_format_user()
+static bool acl_token_ok(const std::string &s){
+  if (s.empty()){ return false; }
+  for (unsigned char c : s){
+    if (c <= 0x20 || c == 0x7f){ return false; }
+  }
+  return true;
+}
+
 // apply one SETUSER modifier; false on parse error
 bool acl_apply_rule(User &u, const std::string &t) {
 
@@ -4424,6 +4433,7 @@ bool acl_apply_rule(User &u, const std::string &t) {
     return true;
   }
   if (t.size() > 1 && t[0] == '&') {
+    if (!acl_token_ok(t.substr(1))){ return false; }
     u.channel_patterns.push_back(t.substr(1));
     return true;
   }
@@ -4479,6 +4489,7 @@ bool acl_apply_rule(User &u, const std::string &t) {
   }
 
   if (t.size() > 1 && t[0] == '~') {
+    if (!acl_token_ok(t.substr(1))){ return false; }
     u.key_patterns.push_back(t.substr(1));
     return true;
   }
@@ -4500,23 +4511,15 @@ bool acl_apply_rule(User &u, const std::string &t) {
     return true;
   }
 
-  if (t.size() > 1 && t[0] == '+') {
+  if (t.size() > 1 && (t[0] == '+' || t[0] == '-')){
     std::string c = t.substr(1);
-    for (char &ch : c) {
+    for (char &ch : c){
       ch = (char)tolower((unsigned char)ch);
     }
-    u.cmd_overrides[c] = true;
+    if (!command_is_known(c)){ return false; }
+    u.cmd_overrides[c] = (t[0] == '+');
     return true;
   }
-  if (t.size() > 1 && t[0] == '-') {
-    std::string c = t.substr(1);
-    for (char &ch : c) {
-      ch = (char)tolower((unsigned char)ch);
-    }
-    u.cmd_overrides[c] = false;
-    return true;
-  }
-
   return false;
 }
 
@@ -4638,6 +4641,9 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     if (cmd.size() < 3) {
       return resp_err(out, "ERR wrong number of arguments for 'acl|setuser'");
     }
+    if (!acl_token_ok(cmd[2])){
+        return resp_err(out, "ERR ACL username contains a space or control byte");
+    }
     // Stage onto a copy: a rejected modifier must not leave a half-configured
     // user behind, and must not create one at all if the command fails.
     auto it = g_config.users.find(cmd[2]);
@@ -4699,7 +4705,7 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
       return resp_nil(out);
     }
     const User &u = it->second;
-    resp_arr(out, 6);
+    resp_arr(out, 8);
     resp_str(out, "flags", 5);
     resp_str(out, u.enable ? "on" : "off", u.enable ? 2 : 3);
     resp_str(out, "commands", 8);
@@ -4707,6 +4713,11 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
       std::string c =
           (u.allow_cats == CAT_ALL ? "+@all"
                                    : (u.allow_cats ? "+<cats>" : "-@all"));
+      for (const auto &kv : u.cmd_overrides){
+        c += ' ';
+        c += (kv.second ? '+' : '-');
+        c += kv.first;
+      }
       resp_str(out, c.data(), c.size());
     }
     resp_str(out, "keys", 4);
@@ -4716,6 +4727,14 @@ static void do_acl(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
         k += (k.empty() ? "" : " ") + ("~" + p);
       }
       resp_str(out, k.data(), k.size());
+    }
+    resp_str(out, "channels", 8);
+    {
+      std::string ch = u.all_channels ? "&*" : "";
+      for (auto &p : u.channel_patterns) {
+        ch += (ch.empty() ? "" : " ") + ("&" + p);
+      }
+      resp_str(out, ch.data(), ch.size());
     }
     return;
   }

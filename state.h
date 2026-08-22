@@ -401,6 +401,9 @@ Entry *evict_pick_victim();
 void mem_reaccount(Entry *ent);
 bool hnode_same(HNode *node, HNode *key);
 
+// Called in a forked child only, Nothing else may run before it
+void child_close_inherited_fds();
+
 inline std::string &entry_str(Entry *e){ return std::get<std::string>(e->val); }
 inline ZSet &entry_zset(Entry *e){ return std::get<ZSet>(e->val); }
 inline Deque &entry_deque(Entry *e){ return std::get<Deque>(e->val); }

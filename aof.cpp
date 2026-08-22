@@ -7,6 +7,7 @@
 #include "aof.h"
 #include "resp.h"
 #include "commands.h"
+#include <cstdlib>
 #include <stdio.h> 
 #include <string.h>
 #include <unistd.h>
@@ -137,6 +138,7 @@ void aof_rewrite_background(){
     return;
   }
   if (pid == 0){
+    child_close_inherited_fds();
     aof_write_snapshot(&buf, tmp.c_str()); // never returns
   }
   buf_destroy(&buf);
@@ -148,7 +150,13 @@ void aof_rewrite_background(){
 static void aof_rewrite_reap(pid_t r, int status){
   std::string tmp = g_config.aof_path + ".tmp";
   bool ok = false;
-  if (r == g_aof_child_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0){
+  if (r != g_aof_child_pid){
+    fprintf(stderr, "aof_rewrite: waitpid failed: %s\n", strerror(errno));
+  } else if (!WIFEXITED(status)){
+    fprintf(stderr, "aof_rewrite: child killed by signal %d, keeping old AOF\n", WTERMSIG(status));
+  } else if (WEXITSTATUS(status) != 0){
+    fprintf(stderr, "aof_rewrite: child exited %d, keeping old AOF\n", WEXITSTATUS(status));
+  } else {
     int fd  = open(tmp.c_str(), O_WRONLY | O_APPEND);
     if (fd < 0){
       fprintf(stderr, "aof_rewrite: cannot open %s: %s\n", tmp.c_str(), strerror(errno));
@@ -157,7 +165,7 @@ static void aof_rewrite_reap(pid_t r, int status){
       size_t off = 0;
       bool werr = false;
       while (off < d.size()){
-        ssize_t n = write(fd, d.data(), d.size() - off);
+        ssize_t n = write(fd, d.data() + off, d.size() - off);
         if (n < 0){
           if (errno == EINTR){ continue; }
           fprintf(stderr, "aof_rewrite: delta write failed: %s\n", strerror(errno));
@@ -176,7 +184,7 @@ static void aof_rewrite_reap(pid_t r, int status){
           fprintf(stderr, "aof_rewrite: rename failed: %s\n", strerror(errno));
         } else {
           // swap done - rpoint the live fd at the new, compacted file
-          if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_current_size); }
+          if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_fd); }
           g_data.g_aof_fd = open(g_config.aof_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
           if (g_data.g_aof_fd < 0){
             fprintf(stderr, "aof_rewrite: cannot open %s: %s\n", g_config.aof_path.c_str(), strerror(errno));
@@ -189,15 +197,15 @@ static void aof_rewrite_reap(pid_t r, int status){
           ok = true;
           fprintf(stderr, "aof_rewrite: completed %zu delta bytes\n", d.size());
         }
-      } else {
-        fprintf(stderr, "aof_rewrite: child failed (status = %d), keeping old AOF\n", status);
       }
-      if (!ok){ unlink(tmp.c_str()); }
-      g_data.g_aof_last_rewrite_ok = ok;
-      g_data.g_aof_rewrite_buf.clear();
-      g_aof_child_pid = -1;
     }
   }
+  if (!ok){ unlink(tmp.c_str()); }
+  g_data.g_aof_last_rewrite_ok = ok;
+  g_data.g_aof_rewrite_buf.clear();
+  g_data.g_aof_rewrite_buf.shrink_to_fit();
+  g_aof_child_pid = -1;
+
 }
 
 void aof_check_background_rewrite(){

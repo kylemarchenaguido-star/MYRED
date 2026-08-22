@@ -215,6 +215,368 @@ not re-derive them:
 
 ---
 
+## 🔴 `conn_destroy` never deletes the Conn — 2026-08-22, FIXED
+
+432 bytes leaked per connection, measured linear (1/10/40 connect-disconnect
+cycles → 2/11/41 leaked allocations). `conn_destroy` (`server.cpp:103-116`)
+released everything the connection owned and never `delete`d the `Conn` itself.
+Pre-existing — HEAD built with the same sanitizer flags reproduced it and the
+function was byte-identical there — and the tail of the earlier V11 sanitizer
+fix, which added the two `buf_destroy` calls and dropped the `delete`. 128 KB
+became 432 bytes: 300x smaller, still unbounded.
+
+**Fixed, and the proof is arithmetic rather than a green light:** the
+replication master's leak went from 266,896 bytes in 15 allocations to 263,008
+in 6 — a drop of exactly 3,888 = 9 × 432 — and the three instances that leaked
+only `Conn` structs went completely clean.
+
+A second, pre-existing leak sat underneath it: **connections still open at
+shutdown were never freed**, because `main()` returned without walking
+`fd2conn`. It surfaced only in the replication phase, whose links the server
+itself holds open; every other phase's clients disconnect first. Measured on the
+master: 2 Conns + 4 buffers = 2 × (432 + 2 × 65,536) = 263,008 bytes exactly,
+with `fo-replica` leaking precisely half. Also fixed — a loop over `fd2conn` at
+the end of `main()`.
+
+**Both closed 2026-08-22: the sanitizer build now runs to completion with no
+ASan, LSan or UBSan output at all.**
+
+**Why they survived a sanitizer build for a week:** the suite had run under
+ASan+UBSan+LSan since V11 Step 0 and **nothing ever read the sanitizer's
+output**. Every phase asserted on protocol behaviour and left the server's
+stderr in a file on disk. `PhaseCtx.check_sanitizer_output()` now scans each
+instance's stderr after the phase stops it and fails one check per phase on any
+report — verified failing on the ASan build and passing on Release. **An
+instrument nobody reads is not instrumentation**, and that is the more useful
+half of this finding.
+
+---
+
+## V11 Targeted Logic-Level Attacks — 2026-08-21
+
+**FIX STATUS 2026-08-22 — six of the seven applied and verified; one is still
+open because the fix I specified was wrong.**
+
+Verified working against a rebuilt `build-rel/server`, each by the regression
+check written for it: the wedged-pid 🔴 (`aof_pending_rewrite` clears on both
+failure paths, the failure is logged, the next `BGREWRITEAOF` really forks, and
+the shadow copy is gone — 33 MB against a control's 33 MB where it used to be
+66 MB), the `close()`-on-a-byte-count 🔴 (fd count flat across three rewrites,
+zero bytes of superseded AOF left pinned), the delta pointer 🟠, all four
+config-injection payloads 🟠, the ACL rule validation 🟡 and the `ACL GETUSER`
+rendering 🟡. **Suite 1457/1458 on Release.**
+
+**Still open: 🟡 the fork children inherit every socket.** `SOCK_CLOEXEC` and
+`accept4` landed exactly as specified and the check still fails, because
+**`SOCK_CLOEXEC` fires on `exec()`, not on `fork()`** — and these children never
+exec; they write a snapshot and `_exit()`. The flag has nothing to fire on. That
+was my error in the write-up above, not a mis-application: the snippet could not
+have worked. The child has to close the fds itself, first thing after `fork()`
+returns 0 (`close_range(3, ~0U, 0)`, or a `getrlimit`-bounded loop), from one
+shared helper called at both fork sites. The `SOCK_CLOEXEC` change is harmless
+and worth keeping on its own terms; it simply does not address this finding.
+
+Worth the note because the failure mode was silent in the most ordinary way: the
+change was real, the grep confirmed it, the build was clean, and only the
+regression check knew it did nothing. A test written against the attack rather
+than the fix is what caught a *fix* that was wrong.
+
+⚪ **Surfaced by the ACL validation fix:** `auth` is not in `k_cmd_table` at all
+— `do_request` intercepts `AUTH` before dispatch and before `acl_check` — so
+`+auth`/`-auth` was always a rule that could not be enforced, and the new
+`command_is_known` check now rejects it. Consistent, and worth knowing because
+real Redis accepts `+auth`, so a pasted Redis ACL line will now error. `quit` and
+`reset` are in the same position: named in `cmd_ok_in_subscribe`, absent from
+`k_cmd_table`. No action taken.
+
+
+The last V11 item: hypothesize specific abuse cases, write a concrete repro
+against a disposable server for each, and record what happened either way. Five
+cases were named in the ROADMAP. **Three of them checked out clean. Two found
+bugs — and the second of those led, by following the machinery rather than the
+hypothesis, to the two most serious findings of the whole milestone**, neither
+of which was on the list.
+
+That ratio is the useful part of this pass. The two roadmap bets that were
+reasoned about most confidently (ACL enforcement through a rename, control bytes
+re-scanned downstream) both came back clean *in the place they were predicted*,
+and the real bug in the second one was one layer over. A hypothesis is worth
+writing down because it aims the search, not because it is likely right.
+
+### 🔴 The AOF rewrite child's pid is never cleared unless it exits 0
+
+`aof_rewrite_reap` (`aof.cpp:148-201`) only reaches `g_aof_child_pid = -1`
+inside its success branch — nested two levels deep, under
+`WIFEXITED(status) && WEXITSTATUS(status) == 0` and then under a successful
+`open()` of the temp file. A child that dies **by signal** (the OOM killer's
+usual target is exactly this fork: it is the newest large RSS on the box) or
+**exits non-zero** (a full or read-only disk, which is what its `_exit(1)`
+paths mean) falls out of the function with the pid still set — after `waitpid()`
+has already reaped the process. From then on `waitpid()` returns `-1`/`ECHILD`
+every loop, `r != g_aof_child_pid`, and nothing ever clears it.
+
+`rdb_check_background_save` (`rdb.cpp:966-996`) is the same function for the
+other child and gets it right: it clears the pid on a clean exit, on a failure,
+*and* on a `waitpid` error, logging each. **The two copies of one routine, one
+correct.** That is the third time this project has been bitten by a
+repeated-shape divergence.
+
+Measured, all four against `build-rel/server` with the child frozen on a FIFO
+and then killed:
+
+| symptom | measured |
+|---|---|
+| anything logged when the child dies | **nothing at all** — the last line is still `aof_rewrite: started (pid=N)` |
+| `INFO aof_pending_rewrite` | stuck at **1** forever (control: back to 0) |
+| a later `BGREWRITEAOF` | replies **`Background append only file rewriting started`** and does nothing; `aof_rewrite_background` bails at its "already running" guard |
+| RSS after 32 MB of writes | **+65.8 MB, 2.05x** — `propagate()` (`commands.cpp:3244-3251`) keeps mirroring every write into `g_aof_rewrite_buf` while a child is believed to live, and nothing will ever drain it |
+
+So one OOM kill of a rewrite child leaves a server that never rewrites its AOF
+again, never reports why, and stores every subsequent write twice until it is
+OOM-killed itself — this time the parent.
+
+**Fix:** one exit path. Clear the pid, clear (and `shrink_to_fit`) the shadow
+buffer, and log the outcome, whatever the outcome was.
+
+### 🔴 `close()` on a byte count — one fd leaked per successful rewrite
+
+`aof.cpp:179`, in the success path of the same function:
+
+```cpp
+if (g_data.g_aof_fd >= 0){ close(g_data.g_aof_current_size); }
+g_data.g_aof_fd = open(g_config.aof_path.c_str(), ...);
+```
+
+`g_aof_current_size` is a `size_t` byte count, not an fd. Two consequences, both
+measured:
+
+- **The live AOF fd is never closed.** 12 successful rewrites took the process
+  from 7 open fds to 19 — exactly one leaked per rewrite. With `maxclients` now
+  clamped to `RLIMIT_NOFILE` at boot, that budget is fixed, so a server doing
+  routine auto-rewrites walks itself into refusing clients.
+- **The rewrite frees no disk space.** Each leaked fd pins the superseded AOF
+  inode. Measured: an 8,557,676-byte AOF compacted to **135 bytes**, and
+  `stat` on the leaked fd showed all **8,557,676 bytes still held**. `ls` shows
+  135; the filesystem still owes 8.5 MB. Compaction is the entire point of the
+  command, and it was returning nothing.
+- **`close()` is aimed at an arbitrary fd number.** Demonstrated: with a fresh
+  AOF (`aof_current_size == 0`) the first successful rewrite runs `close(0)`.
+  The server was spawned with fd 0 pointing at a marker file; after the rewrite
+  fd 0 was `appendonly.aof` — stdin closed, and the new AOF handed the freed
+  slot. A tracked size that lands on 4 or 7 instead would aim at the listener or
+  a client socket.
+
+**Fix:** `close(g_data.g_aof_fd)`.
+
+### 🟠 The delta write never advances its pointer
+
+`aof.cpp:159-168`, the loop that appends the rewrite delta:
+
+```cpp
+ssize_t n = write(fd, d.data(), d.size() - off);
+...
+off += (size_t)n;
+```
+
+`off` advances, the pointer does not, so a short write re-sends the prefix and
+the delta lands with duplicated commands. `aof_write_snapshot` (`aof.cpp:108`)
+does `data += n` correctly, fifty lines away.
+
+**Not reproduced live** — forcing a short write on a regular file needs a
+filesystem that fills mid-write, and no attempt was made to build one. It is
+recorded as an inspection finding on its own merits: the loop is wrong however
+rarely it is entered, replayed duplicate `INCR`/`LPUSH`/`SADD` frames change
+data rather than being idempotent, and the fix is one term.
+
+### 🟠 CONFIG REWRITE writes operator strings into a file it then parses by line
+
+The ROADMAP asked whether anything downstream re-scans a length-prefixed value
+as if it were delimiter-bounded. The keyspace answer is **no** (see the clean
+list below). The answer for the config file is **yes**, four ways, every one of
+them confirmed end-to-end (set → `CONFIG REWRITE` → restart → observe):
+
+| payload | outcome after the restart |
+|---|---|
+| `CONFIG SET auditlog 'audit.log"\nmaxclients 20077  # '` | the server boots **running `maxclients 20077`** |
+| `CONFIG SET dbfilename 'dump.rdb\nmaxclients 20077  # '` | same, and `dbfilename` silently truncated to `dump.rdb` |
+| `CONFIG SET requirepass '$argon2id$x\n…'` | the server boots and **nobody can authenticate** — `WRONGPASS` for the operator's own password |
+| `ACL SETUSER "bob on ~* +@read" … ~x:*` | the user is renamed to `bob` and its key scope **widens from `~x:*` to `~*`** — confirmed reading a key it was denied before the restart |
+
+Root cause, one sentence: `config_write_scalar` (`state.cpp:842-865`) quotes a
+value containing whitespace or a quote and escapes `"` and `\` — which is
+correct for spaces and quotes and **cannot work for a newline**, because the
+newline ends the line before the reader ever reaches the closing quote. Three
+emit lambdas skip even that much and `fprintf` the value raw inside quotes:
+`auditlog` (`state.cpp:714`), `requirepass` on its `$argon2id$` passthrough
+(`state.cpp:305`), and `user` via `acl_format_user` (`commands.cpp:4526`), which
+writes the username completely bare. `masterauth`, six lines from `requirepass`,
+*does* escape — the inconsistency is the evidence that the intent was there.
+
+The last row is the one with teeth: `~*` sets `all_keys = true`, and the later
+real `~x:*` pushes a pattern **without clearing it** (`commands.cpp:4479-4482`),
+so the injected grant wins. `acl_check` short-circuits on `all_keys`, and the
+user quietly holds the whole keyspace from the next boot onward.
+
+Reachability is admin-only (`CONFIG SET` and `ACL SETUSER` are `@admin`), and
+that is stated plainly rather than dressed up. The realistic vector is not an
+attacker typing these by hand — it is a provisioning script syncing usernames
+from somewhere else, or an operator picking a password with a quote in it. The
+outcome ranges from "a directive the operator never wrote" to "the server comes
+back up and locks everyone out", and neither is announced.
+
+**Fix:** validate at the setter, not the writer. `rename-command` already
+rejects control characters in its NEW name (`state.cpp:682`) — **the correct
+check exists in this codebase exactly once**. The same rule belongs on
+`auditlog`, `dbfilename`, `masterauth`, the `requirepass` passthrough, and ACL
+usernames and patterns (which additionally must reject whitespace, since
+`acl_format_user` writes them unquoted).
+
+### 🟡 An ACL rule the server accepts is not necessarily a rule it enforces
+
+`acl_apply_rule` validates `+@cat`/`-@cat` against the category table and
+rejects an unknown one (`commands.cpp:4485-4499`), then two branches later takes
+**any string at all** after a bare `+`/`-` and files it under that name
+(`4503-4518`). `acl_check` only ever looks up the canonical command name, so:
+
+- `ACL SETUSER u … -nosuchcommand` → **`OK`**. The rule is stored, echoed back
+  by `ACL LIST`, and never consulted. A typo (`-flushal`) is a deny that does
+  nothing, and all three surfaces agree it worked.
+- With `rename-command get zzget` in place, `-zzget` → **`OK`**, and the user it
+  was written to deny still runs the command. The name the operator actually
+  types is the one that cannot work.
+
+Enforcement itself is fine — that half is in the clean list.
+
+### 🟡 ACL GETUSER does not describe the user that exists
+
+`ACL GETUSER` (`commands.cpp:4693-4721`) renders `commands` as one of three
+fixed strings — `+@all`, `+<cats>`, `-@all` — and never reads `cmd_overrides` or
+the channel patterns at all. Confirmed in both directions:
+
+- `-@all +flushall` reports **`-@all`** while `FLUSHALL` succeeds. An audit of a
+  single user cannot see a dangerous command granted on top of the base rule.
+- `+@all -flushall` reports **`+@all`** while `FLUSHALL` is denied.
+- `&news:*` does not appear anywhere in the reply.
+
+`ACL LIST` renders all of it correctly, so the information exists and only the
+per-user introspection command — the natural one to reach for — is wrong.
+
+### 🟡 The fork children inherit every socket
+
+Confirmed from `/proc/<child>/fd` with a child frozen on a FIFO: the rewrite
+child holds the **listener and every live client socket**. Nothing in
+`server.cpp` uses `SOCK_CLOEXEC` or `accept4` (only the eventfd and the audit
+log set it). Consequences, both measured:
+
+- A client that hangs up mid-rewrite **cannot finish closing**. The parent drops
+  it (`connected_clients` decrements) but the child's duplicate reference keeps
+  the socket in `CLOSE-WAIT`/`FIN-WAIT-2`; killing the child moved it to
+  `TIME-WAIT` immediately, which is the attribution.
+- The listening port stays bound after the parent exits — `bind()` without
+  `SO_REUSEADDR` fails with `EADDRINUSE` while the child lives.
+
+Impact is bounded by how long the child runs, and that is genuinely short here:
+both `rdb_save_background` and `aof_rewrite_background` serialize **fully in the
+parent** before forking, so the child's whole life is one `write()` plus
+`fsync()` of a pre-built buffer. **A restart during that window still works**,
+because the server sets `SO_REUSEADDR` — the hypothesis that it would fail was
+tested and is wrong. Worth noting how nearly this was mis-recorded: a bare
+`connect()` to the port succeeds even with nobody accepting, because the
+child's inherited listener still completes handshakes out of its backlog. The
+first version of that check "passed" on exactly that basis; it took demanding a
+real RESP round trip to make the result mean anything.
+
+**Fix:** `SOCK_CLOEXEC` on the two `socket()` calls (`server.cpp:203`, `654`)
+and `accept4(..., SOCK_CLOEXEC)` at `557`.
+
+### Verified correct — the three cases that did not pay off
+
+Kept in as much detail as the findings. This is the part that stops the next
+pass re-deriving it, and two of these were the ROADMAP's most confident bets.
+
+- **ACL enforcement through a renamed command.** Eight probes, all correct.
+  `do_request` lowercases `cmd[0]`, resolves it through `g_dispatch` to the
+  canonical name, and every gate downstream uses that canonical: category grants
+  (`+@read` allows the aliased GET, `-@write` denies the aliased SET), explicit
+  per-command overrides written canonically (`-get` denies `zzget`), admin
+  commands (a non-admin cannot reach `CONFIG` through its alias), and key
+  patterns (`~allowed:*` permits `allowed:1` and denies `denied:1` through the
+  alias). The bet was placed because this same canonicalization path had already
+  produced two real bugs — the AOF-restart brick and the V9.5.1 admin-category
+  mistagging — and it did not produce a third.
+- **The subscribe-mode gate through an alias.** `cmd_ok_in_subscribe` is checked
+  against the canonical name: an aliased `SET` is refused with the subscribe-mode
+  error while an aliased `PING` is allowed.
+- **Keys holding control bytes, through AOF re-encode and RDB round trip.**
+  Eight key shapes (CR+LF, bare LF, NUL, embedded quote and backslash, a literal
+  `*3\r\n$3\r\nSET\r\n`, `#`, spaces, high bytes) across strings, lists and
+  hashes: 24 keys stored, 24 after a `BGREWRITEAOF` and restart, 24 after a
+  `SAVE` and restart, every value byte-identical. Length-prefixed in, length-
+  prefixed out.
+- **TLS handshake state confusion.** Seven shapes at a `tls-port` with a 1s
+  `tls-handshake-timeout` — a plaintext RESP frame, an HTTP request, a truncated
+  ClientHello then silence, a record header claiming 16 KB that never arrives, an
+  RST mid-handshake, a corrupt record inside a completed session, and a TLS
+  ClientHello at the *plaintext* port. Every one ends at the same clean close:
+  immediate for the ones OpenSSL rejects outright, at 2.01s against a 2s timeout
+  for the ones that go silent, never hung past it. A bystander TLS session was
+  untouched throughout and the server took new connections afterwards. Re-run
+  under **ASan+UBSan+LSan**: no double free of the `SSL*`, no leak, no report —
+  which was the specific question the ROADMAP asked.
+
+### What landed in the suite
+
+**46 checks across five sections**, all in existing phases:
+
+- `phase_aof_rewrite` → "Persistence: rewrite-child failure and fd hygiene" (10):
+  fd count across three successful rewrites, bytes pinned by leaked fds, socket
+  inheritance, the signal path (logged, pid cleared, next rewrite really runs,
+  no shadow copy), and the non-zero-exit path.
+- `phase_config_roundtrip` → "Config: operator strings must not rewrite the
+  config file" (15): five payloads, each on its own instance, asserting the
+  server still boots, the operator's password still works, no directive was
+  injected, and the key scope is unchanged.
+- `phase_security` → "Security: an ACL rule must mean what it says" (7): rule
+  validation, the alias rule, GETUSER fidelity in both directions, channels, and
+  the two positive alias-enforcement checks that lock in the clean result.
+- `phase_persistence` → "Persistence: keys holding control bytes survive a
+  re-encode" (5) and `phase_tls` → the handshake-confusion shapes (9).
+
+Suite: **1401 → 1447 checks, currently 1428/1447 on Release**, and the 19
+failures are exactly the `[REG]` checks for the findings above — nothing else
+moved. **All 19 were watched failing against today's binary before any of this
+was written up**, which is the only thing that makes them regression tests
+rather than assertions of what the code already does. Every one asserts on the
+attack — "no directive appeared that the operator did not set", "the user's key
+scope is what was granted", "RSS did not grow by a second copy of the write
+stream" — never on the shape of a fix.
+
+Two test-design notes worth keeping, both paid for in this pass:
+
+- **The shadow-copy measurement was wrong twice, in opposite directions.**
+  First it seeded 16 MB before breaking the child, and the 16 MB buffer
+  `rdb_build_aof_preamble` had just freed was arena enough to absorb the whole
+  duplicate: RSS grew 256 KB for a 16 MB write in *both* the broken server and
+  the control. That run measured the allocator and called a broken server
+  clean. Seeding almost nothing fixed it — on Release. Then the replacement, an
+  absolute "RSS grew less than 1.5x the payload", turned out to be unportable:
+  the identical workload on a **healthy** server costs **1.04x on Release and
+  5.78x under ASan**, whose size classes and redzones dwarf the thing being
+  measured, so the check would have failed on the sanitizer build no matter what
+  the code did. The version that works compares against a **control instance** —
+  same binary, same seed, same rewrite, but one that completes — and asserts the
+  difference is under half a payload. It separates cleanly on both builds. The
+  general rule: an RSS number is only meaningful next to another RSS number
+  taken the same way.
+- **A check that neither passes nor fails is worse than one that fails.** The
+  first version of the rewrite-child section shared one instance across all
+  three failure cases; the wedged parent from the signal case then made the two
+  cases after it silently unable to fork a child at all. Their checks simply did
+  not run, and the section reported 1/8 with no indication that two of the eight
+  had evaporated. Each case now gets its own instance.
+
+---
+
 ## Consolidated Bug Audit — 2026-07-13 (V9.6.4 worklist)
 
 Scope: every open item from ROADMAP "Known Bugs and Correctness Follow-ups" (now moved
