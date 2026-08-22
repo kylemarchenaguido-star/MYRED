@@ -65,11 +65,6 @@ than using the STL containers.
 - **Generic keyspace commands** — `DBSIZE`, `RANDOMKEY`, `RENAME`/`RENAMENX`, `TOUCH`, `UNLINK`, `FLUSHALL`
 - **Single-threaded event loop** (`poll`, non-blocking I/O) with `TCP_NODELAY`
 - **Thread pool** for offloading large async deletions (`UNLINK`)
-- **Regression suite:** one command spins up its own server and runs 1000+
-  checks across unit, memory, config, auth, security, persistence, TLS, and
-  replication phases in under two minutes — see Testing below. A differential
-  pass against real `redis-server`, fuzzing, and a sanitizer build are active
-  work, not yet landed.
 
 ### Known gaps
 
@@ -122,19 +117,19 @@ sudo apt install build-essential cmake zlib1g-dev
 # optional deps - see the table below
 sudo apt install libssl-dev libargon2-dev
 
-# a debug build for day-to-day dev/test work
+# a debug build for day-to-day dev work
 cmake -B build
 cmake --build build
 
-# a release build for anything you'll benchmark or run for real
+# a release build for anything you'll run for real
 cmake -B build-rel -DCMAKE_BUILD_TYPE=Release
 cmake --build build-rel -j
 ```
 
 This produces two binaries per build directory: `server` and `client`.
-**Only benchmark the Release build.** A Debug build runs a whole-keyspace
-memory self-check after every single command, so its latency/throughput
-numbers do not reflect the server's real performance.
+**Only use the Release build day to day.** A Debug build runs a whole-keyspace
+memory self-check after every single command, so its latency does not reflect
+the server's real performance.
 
 ### Optional dependencies
 
@@ -176,7 +171,7 @@ Common settings can also be overridden at startup via environment variable:
 `MYRED_AOF_FSYNC`, `MYRED_AOF_REWRITE_MIN`, `MYRED_AOF_REWRITE_PERC`,
 `MYRED_MAXMEMORY`, `MYRED_MAXMEMORY_POLICY`.
 
-### With `redis-cli`
+### A simple test with `redis-cli`
 
 Because MYRED speaks RESP, the official Redis CLI works directly:
 
@@ -201,11 +196,10 @@ redis-cli -p 1234 -a kek1234
 ```
 
 > A general-purpose Redis client library (redis-py, ioredis, Jedis, go-redis,
-> ...) has not been validated against MYRED yet — only `redis-cli`,
-> `redis-benchmark`, and this project's own raw-socket test harness have. Plain
-> `GET`/`SET`/hash/list/set/sorted-set traffic over RESP2 should work; anything
-> that leans on `HELLO`/RESP3, multiple databases, or `EVAL` will not, per
-> Known gaps above.
+> ...) has not been validated against MYRED yet — only `redis-cli` and
+> `redis-benchmark` have. Plain `GET`/`SET`/hash/list/set/sorted-set traffic
+> over RESP2 should work; anything that leans on `HELLO`/RESP3, multiple
+> databases, or `EVAL` will not, per Known gaps above.
 
 ### With the bundled client
 
@@ -266,73 +260,6 @@ Command names are case-insensitive. Besides RESP framing, plain-text **inline
 commands** are accepted (newline-terminated), and empty inline lines are ignored
 — so `redis-cli --pipe` bulk loading works end to end.
 
-## Testing
-
-**`scripts/stress_test.py` is the whole regression suite**, and one command
-runs it — no server needs to be started first, it manages its own:
-
-```bash
-# the full suite against a Release build: 1000+ checks in well under two minutes
-python3 scripts/stress_test.py --server build-rel/server --destructive --bench
-
-# the TLS-aware run
-python3 scripts/stress_test.py --server build-rel/server --tls
-
-# see what a run covers before running it
-python3 scripts/stress_test.py --list-phases
-```
-
-`--server` is what turns on process-management: it spawns a private instance in
-a temp directory, drives it through eight phases — `unit`, `memory`, `config`,
-`auth`, `security`, `persistence`, `tls`, `replication` — and tears it down
-after, so nothing it touches belongs to anyone and nothing has to be running
-beforehand. `--phases` selects a subset.
-
-```bash
-# against a server you already started yourself
-python3 scripts/stress_test.py --password kek1234
-
-# TLS, against your own instance
-python3 scripts/stress_test.py --tls --tls-insecure --port 1235 --password kek1234
-
-# TLS metrics (measurement, not pass/fail) — handshake cost, accept-storm
-# behavior, redis-benchmark throughput, cert-rotation latency
-python3 scripts/test_tls.py --server build-rel/server
-```
-
-Results are filed under `docs/logs/<WSL|Native>/` — the environment is detected
-from the kernel rather than passed as a flag, because WSL2 and native Linux
-throughput numbers are not comparable and mixing them into one file was a real
-mistake this project made once. `--compare A.json B.json` diffs two runs.
-
-> Only benchmark a Release build. `build/`'s Debug binary runs a whole-keyspace
-> memory audit after every command, which `test_tls.py` refuses to measure.
-
-Additional helpers in `scripts/`:
-
-```bash
-scripts/test_evict_tick.sh      # incremental eviction regression (EVICT_RUNNING)
-scripts/test_aof_restart.py     # AOF replay across restarts (incl. ACL identity)
-scripts/test_async_auth.py      # async Argon2id AUTH / ACL suite
-scripts/test_memory.py          # focused memory/eviction checks
-scripts/test_replication.py     # replication + failover (ported into stress_test.py's `replication` phase)
-scripts/test_security.py        # ACL, auth, protected-mode, audit-log checks
-scripts/test_aof.sh
-scripts/test_aof_rewrite.sh
-scripts/test_aof_hybrid.sh
-scripts/diag_live.sh
-scripts/diag_ttl.sh
-```
-
-The old per-topic scripts are still on disk and still runnable, but nothing in
-`stress_test.py` depends on them any more — it is one tracked file with no
-local-only dependency.
-
-**Not built yet, tracked as active work in `docs/planning/ROADMAP.md` → V11:** a
-differential harness comparing replies against a real `redis-server`,
-libFuzzer/AFL fuzzing of the RESP parser and RDB loader, an ASan/UBSan build,
-and a static security review. All scoped, none landed.
-
 ## Project structure
 
 ```
@@ -355,13 +282,8 @@ client.cpp         a small RESP client (single-shot + REPL)
 cred.* / sha256.*  Argon2id/SHA-256 credential hashing + verification
 aof.* / rdb.*      append-only-file and RDB snapshot persistence
 myred.conf         example server configuration
-scripts/           all tests: stress_test.py (primary harness), persistence,
-                   auth/ACL, replication, TLS, and diagnostic helpers
 docs/planning/     ROADMAP (progress), BACKLOG (future work + open bugs),
                    DECISIONS (design + architecture), CODE_REVIEW (bug audit)
-docs/TESTING.md    testing runbook: every command, TLS, benchmarks, commit gate
-docs/logs/         current per-environment (WSL|Native) test-run logs/baselines
-docs/*.md          older test-run logs, superseded in part by docs/logs/
 ```
 
 ## Status and what's next
@@ -386,22 +308,17 @@ detail — this is a summary.
 - **V10 — Replication and coordinated failover:** full and partial `PSYNC`
   resync, automatic reconnect, a read-only replica gate, `WAIT`,
   `min-replicas-*`, and coordinated `FAILOVER`. Automatic (unattended,
-  Sentinel-style) failover is deliberately **not** in this milestone — it's
-  parked until there's a regression suite that can prove it, which V11 builds.
+  Sentinel-style) failover is deliberately **not** in this milestone.
 - **V10.6.1 — TLS optimization pass:** measured three deferred ideas; shipped
   live cert reload, reverted a bounded-accept-queue change that didn't clear
   the noise floor, declined kTLS on the arithmetic.
 
-**Active — V11, Testing Hardening:** a unified regression harness
-(`scripts/stress_test.py --server ...`, 1000+ checks, 8 phases) is done. What's
-left: a differential harness against real `redis-server`, fuzzing the RESP
-parser and RDB loader, an ASan/UBSan build, and a static security review —
-all scoped in `docs/planning/ROADMAP.md`, none executed yet.
-
-**Scoped but not started:** automatic/Sentinel-style failover (V10.6e),
-cluster/hash-slot sharding (V12), a Windows port (POSIX→Win32 translation is
-fully scoped in `docs/planning/BACKLOG.md` with concrete difficulty rankings),
-and `EVAL` scripting (custom bytecode VM, designed but not built).
+**Scoped but not started:** automatic/Sentinel-style failover, cluster/hash-slot
+sharding, a Windows port (POSIX→Win32 translation is fully scoped in
+`docs/planning/BACKLOG.md` with concrete difficulty rankings), `EVAL` scripting
+(custom bytecode VM, designed but not built), and closing the app-compatibility
+gap (multi-database support, a `HELLO`/RESP3 handshake, a minimum `CLIENT`
+command subset) needed to point a real, unmodified application at the server.
 
 **No open bugs in the data path.** What's tracked in
 `docs/planning/BACKLOG.md` → Open Bugs is a hardening follow-up, a latent

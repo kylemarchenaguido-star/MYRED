@@ -21,8 +21,8 @@ appendonly.aof.bak
 # stress-test output (stress_test.py --log)
 stress_results.md
 
-# Test suites: only scripts/stress_test.py is tracked. The rest are local-only
-# until they are folded into it — see BACKLOG.md → V11.
+# Test suites: all local-only, none tracked.
+scripts/stress_test.py
 scripts/test_*.py
 scripts/test_*.sh
 scripts/test_*.cpp
