@@ -29,6 +29,15 @@ scripts/test_*.cpp
 scripts/diag_*.sh
 scripts/myred_testlib.py
 
+docs/TESTING.md
+docs/bench_*.md                                                     
+docs/correctness_*.md                                               
+docs/stress_results_*.md                                            
+docs/tls_metrics*                                                   
+docs/logs/                                                          
+.vscode/tasks.json 
+
+
 # Python bytecode cache
 __pycache__/
 *.pyc
