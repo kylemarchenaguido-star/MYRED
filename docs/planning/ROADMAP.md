@@ -68,7 +68,39 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
-### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security [ACTIVE]
+### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security [Done 2026-08-22]
+
+**CLOSED 2026-08-22. Suite 1458/1458 on Release AND under ASan+UBSan+LSan,
+with no sanitizer output of any kind.** Every item delivered: Step 0, the
+differential harness, the libFuzzer harnesses, the ASan/UBSan build, the static
+security review (2026-08-19), the targeted logic-level attacks (2026-08-21) and
+`docs/SECURITY_TESTING.md`. The suite went **1023 → 1458 checks** across the
+milestone; every finding it produced is fixed and has a regression check that
+was watched failing against the pre-fix binary first.
+
+Three things this milestone is worth remembering for:
+
+- **The hypotheses were mostly wrong, and that was fine.** Of the five targeted
+  attack cases, three came back clean — including the two reasoned about most
+  confidently. The two 🔴s came from following the fork machinery next door to
+  where the search was aimed. A hypothesis earns its place by aiming the search,
+  not by being right.
+- **An instrument nobody reads is not instrumentation.** The suite ran under
+  ASan+UBSan+LSan from Step 0 onward and nothing ever read the sanitizer's
+  output, so a `Conn` leaked on *every connection* sat in a stderr file for a
+  week while the suite reported green. Closed by
+  `PhaseCtx.check_sanitizer_output()`, one check per phase.
+- **A fix can grep clean, build clean, and do nothing.** `SOCK_CLOEXEC` was
+  applied exactly as specified against the fd-inheritance finding and could
+  never have worked — CLOEXEC fires on `exec()` and the save children never
+  exec. Only the check written against the attack could tell a real fix from a
+  plausible one.
+
+The milestone's own recurring bug, in three forms: **a routine that exists twice
+where only one copy is right** — `aof_rewrite_reap` against
+`rdb_check_background_save`, the delta write loop against `aof_write_snapshot`,
+and (from V9.8) the config row whose second copy carried the first's identifier.
+When a routine exists twice, diff the two.
 
 **Promoted from `BACKLOG.md` on 2026-08-16**, when V10.6.1 closed and its gate —
 "do not start until V10 ships" — was met. V10.1-V10.6d shipped 2026-08-13 and
@@ -319,72 +351,95 @@ a real fuzzer.
     target, so a manual read-through first is what tells the fuzzer where to
     bias its mutations (length-prefixed fields, type tags, the `k_cmd_table`
     fallback used under `g_loading`).
-- **Targeted logic-level attacks** — the part an agent is actually good at:
-  hypothesize specific abuse cases and write concrete Python repro scripts
-  against a real, disposable server for each one. Six concrete starting cases
-  — the first found by inspection while drafting this list, not hypothesized
-  in the abstract:
-  - **Audit-log injection via an unescaped field.** `audit_write`
-    (`commands.cpp:1223-1246`) builds each line by string concatenation —
-    `ts=... event=... peer=... user=<uname>...` — with no escaping, and writes
-    it verbatim plus one trailing `\n`. On the two-argument `AUTH <user>
-    <pass>` path, `uname` is `cmd[1]` unmodified (`commands.cpp:1356`), a RESP
-    bulk string that — per `resp.cpp`'s length-prefixed parsing — can legally
-    *contain* `\n`; there is no username character validation anywhere in
-    `cred.cpp`/`commands.cpp` (checked by grep). A username of `evil\nts=2099-
-    01-01T00:00:00Z event=admin_command user=root ...` sent on a failed
-    `AUTH` forges a fake audit-log line indistinguishable from a real one to
-    anything that greps the file (the write happens at `commands.cpp:1318`).
-    This is the concrete repro to write first, not a hypothetical.
-    **CONFIRMED 2026-08-19** by the static review above: one failed `AUTH` wrote
-    two lines, the second a well-formed `event=auth_success user=default` record.
-    Fix in `CODE_REVIEW.md`; the five cases below are still open.
-  - **Case-aliasing around ACL deny** — already narrower than it sounds:
-    `do_request` lowercases `cmd[0]` and resolves it through `g_dispatch` to a
-    canonical name before any ACL check runs (`commands.cpp:5227-5240`), so a
-    bare-case bypass looks closed by inspection. The sharper version of this
-    test is enforcement through a **renamed** command (`rename-command`),
-    since that same canonicalization path already produced two real,
-    already-fixed bugs elsewhere (the AOF-restart brick and the V9.5.1
-    admin-category mistagging) — a third bug in the same mechanism, this time
-    in ACL enforcement, is a reasonable bet worth a targeted test even with no
-    specific lead yet.
-  - **Subscribe-mode gate bypass** — `cmd_ok_in_subscribe`
-    (`commands.cpp:5200-5205`) is checked against the canonical name
-    (`5262-5266`), the same resolution path as above; test it specifically
-    through a renamed alias of both an allowed and a blocked command.
-  - **Key names containing RESP control bytes** — legal today, since bulk
-    strings are length-prefixed rather than delimiter-scanned. The productive
-    question isn't "does the parser choke" (it doesn't), it's "does anything
-    downstream re-scan a key as if it were delimiter-bounded" — the audit-log
-    case above is one instance of that general shape; AOF's re-encode path
-    (`aof_feed`) and RDB load/save are the other places a length-prefixed
-    value could get treated as text and truncated or misparsed on the way
-    back out.
-  - **TLS handshake state confusion** — send a plaintext RESP frame
-    (`*1\r\n$4\r\nPING\r\n`) at a `tls-port` instead of a ClientHello, and
-    separately, a truncated ClientHello followed by silence past
-    `tls-handshake-timeout`; confirm both hit the same clean `tr_close` path
-    (`transport.cpp:242-248`) rather than one of them hanging past the
-    timeout or double-freeing the `SSL*`.
-  - **Races around the `fork()`-based BGSAVE** — `rdb_save_background()`
-    (`rdb.cpp:925-956`) serializes fully in the parent before forking, and the
-    child only ever calls `_exit()` (`rdb_write_snapshot`, `rdb.cpp:898-921`),
-    so the child never re-enters the event loop — that part checks out clean
-    by reading it. What's untested: no socket fd anywhere in `server.cpp` is
-    opened with `SOCK_CLOEXEC`/`accept4` (grepped — only the eventfd and the
-    audit-log fd set `CLOEXEC`), so the forked child inherits every live
-    listening, client, and replica socket fd for however long it takes to
-    write the snapshot. On a large dataset, does a client disconnecting
-    mid-`BGSAVE` actually finish tearing down (`TIME_WAIT`, freeing the port
-    for a new `accept()`) while the child still holds a duplicate fd
-    reference, or does teardown stall until the child's `_exit()` runs?
-- **One running document** (e.g. `docs/SECURITY_TESTING.md`) logging every
-  attempt, outcome, and repro steps — same evidence-preservation habit as the
-  rest of the test suite. The audit-log-injection case and the RESP
-  overflow-guard asymmetry above are the first two entries it should open
-  with, since both were found by inspection before either a fuzzer or an
-  adversarial script existed to find them independently.
+- **Targeted logic-level attacks** — **DONE 2026-08-21.** Five hypothesized
+  cases, each with a repro against a disposable instance; full write-ups in
+  `docs/planning/CODE_REVIEW.md` → "V11 Targeted Logic-Level Attacks", and the
+  running log of attempts in `docs/SECURITY_TESTING.md`.
+
+  **Three of the five came back clean. Two found bugs — and following the
+  machinery behind the second one produced the two most serious findings of the
+  whole milestone, neither of which was on the list.** Worth remembering when
+  scoring the next batch of hypotheses: the two bets reasoned about most
+  confidently (ACL enforcement through a rename; control bytes re-scanned
+  downstream) were both wrong *in the place they were predicted*, and one of
+  them was right one layer over.
+
+  - **Audit-log injection via an unescaped field** — CONFIRMED and fixed in the
+    static review above (2026-08-19).
+  - **Case-aliasing around ACL deny through a renamed command** — **CLEAN.**
+    Eight probes: category grants, canonical per-command overrides, admin
+    commands and key patterns all enforce correctly through an alias, because
+    `do_request` resolves to the canonical name before any gate runs. The bet
+    was placed because this path had already produced two bugs; it did not
+    produce a third.
+  - **Subscribe-mode gate bypass through a renamed alias** — **CLEAN.** An
+    aliased `SET` gets the subscribe-mode refusal; an aliased `PING` runs.
+  - **Key names containing RESP control bytes** — **CLEAN in the keyspace**
+    (8 key shapes across strings, lists and hashes: 24 keys and every value
+    byte-identical through an AOF rewrite + restart and again through a `SAVE`
+    + restart), **but the config file is the downstream re-scanner that does
+    get it wrong** — see the 🟠 below.
+  - **TLS handshake state confusion** — **CLEAN.** Seven shapes against a 1s
+    `tls-handshake-timeout` all end at the same clean close, a bystander
+    session is untouched, and a re-run under ASan+UBSan+LSan shows no double
+    free of the `SSL*` and no leak. That was the specific question asked.
+  - **Races around the `fork()`-based BGSAVE** — the fd-inheritance half is
+    **CONFIRMED** (the child holds the listener and every client socket; a
+    client that hangs up mid-rewrite cannot finish closing until the child
+    exits), but the operational consequence predicted — a restart failing on
+    the held port — **does not happen**, because the server sets
+    `SO_REUSEADDR`. The far bigger bug was next door, in the reap path.
+
+  **FIX STATUS 2026-08-22: six of seven applied and verified, suite 1447/1448
+  on Release.** The one still open is 🟡 socket inheritance, and only because
+  the fix specified for it was wrong: `SOCK_CLOEXEC` fires on `exec()`, not on
+  `fork()`, and these children never exec. The child must close the fds itself
+  after `fork()` returns 0. Everything else below is closed.
+
+  **The findings, and what each fix was:**
+  - 🔴 **FIXED** — `aof_rewrite_reap` only cleared `g_aof_child_pid` on total success. A
+    child killed by a signal or exiting non-zero wedges the server silently:
+    nothing logged, `aof_pending_rewrite` stuck at 1, later `BGREWRITEAOF`
+    replies success and does nothing, and every subsequent write is duplicated
+    into `g_aof_rewrite_buf` forever — measured **+65.8 MB RSS for a 32 MB
+    write stream, 2.05x**. `rdb_check_background_save` is the same function for
+    the other child and clears the pid on every outcome.
+  - 🔴 **FIXED** — `close(g_data.g_aof_current_size)` closed a byte count,
+    not `g_aof_fd`: **one fd leaked per successful rewrite** (7 → 19 over 12),
+    the superseded AOF inode pinned (8,557,676 bytes compacted to 135 with all
+    8.5 MB still held), and `close()` aimed at an arbitrary fd number —
+    demonstrated closing stdin when the tracked size was 0.
+  - 🟠 **FIXED** — the rewrite delta's write loop advanced `off` but not the pointer, so a
+    short write re-sends the prefix. Inspection only; not reproduced.
+  - 🟠 **FIXED** — `CONFIG REWRITE` wrote operator strings into a line-oriented file.
+    Confirmed four ways end-to-end: `auditlog` and `dbfilename` payloads left
+    the server **running an injected `maxclients 20077`**, the `requirepass`
+    `$argon2id$` passthrough left it booting with **nobody able to
+    authenticate**, and an ACL username containing spaces **widened a user's
+    key scope from `~x:*` to `~*`**. `rename-command`'s setter already rejects
+    control characters — the check exists in this codebase exactly once.
+  - 🟡 **FIXED** — `+cmd`/`-cmd` accepted any string and stored a rule `acl_check` never looks
+    up (unknown *categories* are rejected one branch away).
+  - 🟡 **FIXED** — `ACL GETUSER` never read per-command overrides or channel patterns:
+    `-@all +flushall` reports `-@all` while FLUSHALL succeeds.
+  - 🟡 **STILL OPEN** — the fork children inherit every socket. `SOCK_CLOEXEC`
+    and `accept4` were applied and do nothing here: the flag fires on `exec()`
+    and these children never exec. The child must close the fds itself.
+
+  **46 regression checks landed** across five sections of `stress_test.py`
+  (`phase_aof_rewrite`, `phase_config_roundtrip`, `phase_security`,
+  `phase_persistence`, `phase_tls`), taking the suite 1401 → 1448. Against the
+  pre-fix binary 19 of them failed, which is what makes them regression tests;
+  after the fixes it runs **1457/1458**, the one failure being the socket
+  inheritance still open above. Each asserts on the attack rather than on the
+  shape of a fix — and that is what caught a *fix* that was wrong: the
+  `SOCK_CLOEXEC` change greps clean, builds clean, and does nothing, which only
+  a check written against the attack could tell.
+- **One running document** — **DONE 2026-08-21**, `docs/SECURITY_TESTING.md`.
+  Logs every attempt with its outcome and the technique used, keeps the
+  "nothing here" entries deliberately, and carries a standing-weak-spots list
+  (admin-only reach, repeated-shape code where one copy is wrong, validation
+  that exists exactly once, and the fork children).
 - Run the adversarial/live-server pieces against a disposable local instance
   only, never anything that matters if it crashes or hangs.
 

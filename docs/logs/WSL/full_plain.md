@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-08-20 00:14:12
+# MYRED stress test — 2026-08-22 01:12:17
 
 **Run:** correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:1234
 
@@ -15,13 +15,13 @@
   Crypto ISA:   aes pclmulqdq sha_ni avx2  (no vaes — one AES block per instruction)
   Memory:       12209364 kB  swap 3145728 kB
   Governor:     n/a
-  Load average: 0.82 0.74 0.50 2/410 15719
+  Load average: 1.03 0.61 0.42 1/375 59648
   somaxconn:    4096   nofile=1048576   tcp_ulp=tls
-  Build:        Debug  [build-asan/]
-  warning this is a Debug build: mem_selfcheck() walks the whole keyspace after every command, so every timing below is O(keyspace) per op. Correctness is still valid — speed is not. Build with -DCMAKE_BUILD_TYPE=Release for numbers.
+  note load average is 1.03 before the run started — something else is using this machine and the numbers below are not a clean baseline.
+  Build:        release  [build-rel/]
   Log:          docs/logs/WSL/full_plain.md
 
-✓ Spawned the primary instance on 127.0.0.1:12590  (/tmp/myred-primary-s97pvq3q)
+✓ Spawned the primary instance on 127.0.0.1:25490  (/tmp/myred-primary-i_qyxgu1)
   Transport:    plaintext
   Auth:         none
 ✓ Server is reachable
@@ -184,10 +184,10 @@
 
 ── TTL Commands: PEXPIRE / PTTL ──────────────────────
   ✓ pexpire ttlkey 5000 → 1
-  ✓ pttl returns int → 4999
+  ✓ pttl returns int → 5000
   ✓ pttl > 0
   ✓ pttl <= 5000
-  ℹ  remaining TTL: 4999ms
+  ℹ  remaining TTL: 5000ms
   ✓ pttl no-ttl → -1
   ✓ pttl missing → -2
   ℹ  waiting 600ms for key to expire...
@@ -522,7 +522,7 @@
   ✓ config set maxmemory 0 -> OK
   ✓ config get maxmemory -> array → ['maxmemory', '0']
   ✓ config get maxmemory value
-  ✓ config get * -> array → ['port', '12590', 'maxclients', '10000', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
+  ✓ config get * -> array → ['port', '25490', 'maxclients', '10000', 'protected-mode', 'yes', 'bind', '0.0.0.0', 'allow-ip', '', 'requirepass', '', 'tls-port', '0', 'tls-cert-file', '', 'tls-key-file', '', 'tls-ca-cert-file', '', 'tls-auth-clients', 'no', 'tls-handshake-timeout', '10', 'dbfilename', 'dump.rdb', 'appendonly', 'no', 'appendfilename', 'appendonly.aof', 'appendfsync', 'everysec', 'maxmemory', '0', 'maxmemory-policy', 'noeviction', 'maxmemory-samples', '10', 'notify-keyspace-events', '', 'save', '', 'auto-aof-rewrite-percentage', '100', 'auto-aof-rewrite-min-size', '67108864', 'repl-backlog-size', '1048576', 'repl-timeout', '60', 'repl-ping-replica-period', '10', 'min-replicas-to-write', '0', 'min-replicas-max-lag', '10', 'masterauth', '', 'auditlog', '']
   ✓ config get * includes maxmemory
   ✓ config get * includes maxmemory-policy
   ✓ config get unknown -> []
@@ -552,7 +552,7 @@
   ✓ acl users contains default
   ✓ acl list -> array → ['user default on nopass ~* &* +@all']
   ✓ acl list includes default
-  ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*']
+  ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*', 'channels', '&*']
   ✓ acl getuser exposes flags
   ✓ acl getuser exposes commands
   ✓ acl getuser exposes keys
@@ -580,7 +580,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:151126016\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2792\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:3663\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:d3ba56fcb207b05df2735a0e8962ee9be5b8d67c\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122292\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122292\r\n\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:2\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:5\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:66842624\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2792\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:24137\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:089090ebcd10444f05095c4e6364b0b1b5b4c561\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122292\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122292\r\n\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -613,7 +613,7 @@
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:151126016
+    used_memory_rss:66842624
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
@@ -628,7 +628,7 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:3663
+    rdb_last_save_time:24137
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -641,7 +641,7 @@
     # Replication
     role:master
     failover_state:no-failover
-    master_replid:d3ba56fcb207b05df2735a0e8962ee9be5b8d67c
+    master_replid:089090ebcd10444f05095c4e6364b0b1b5b4c561
     master_replid2:0000000000000000000000000000000000000000
     second_repl_offset:-1
     connected_slaves:0
@@ -677,9 +677,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 4.6ms: 'Background saving started'
+  ℹ  bgsave returned in 1.8ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 16.4ms
+  ℹ  100 ops during save took 12.1ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -731,7 +731,7 @@
 
 ── Memory: incremental eviction (EVICT_RUNNING semantics) 
   ✓ write admitted during overshoot
-  ✓ idle drain under cap (2268000 -> 524090 <= 524288)
+  ✓ idle drain under cap (2268000 -> 523908 <= 524288)
 
 ── ECHO + inline protocol ────────────────────────────
   ✓ echo roundtrip
@@ -851,14 +851,14 @@
 ── Pub/Sub: fan-out under concurrent publishers ──────
   ✓ no publisher/reader errors
   ✓ every subscriber received every message
-    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.63s (6,379 deliveries/s)
+    4 publishers × 250 msgs → 4 subscribers = 4000 deliveries in 0.57s (7,025 deliveries/s)
 
 ═══════════════════════════════════════════════════════
   Managed-instance phases
 ═══════════════════════════════════════════════════════
-  Binary:   /home/kyled/projects/testfiles/build-asan/server
-  Workdir:  /tmp/myred-suite-mozli8r2
-  Ports:    from 12500
+  Binary:   /home/kyled/projects/testfiles/build-rel/server
+  Workdir:  /tmp/myred-suite-dyj3a251
+  Ports:    from 25400
   Phases:   unit, memory, config, auth, security, persistence, tls, replication, differential, fuzz
   note --destructive adds the SIGKILL crash-recovery and protocol-abuse checks
 
@@ -873,6 +873,7 @@
       ok   all keys found after rehash cycles
     4 passed, 0 failed
   ✓ [REG] the incremental rehash always finishes draining
+  ✓ no sanitizer report from any 'unit' instance
 
 ── Memory: per-type accounting invariants ────────────
   ✓ an empty database accounts for 0 bytes
@@ -913,7 +914,8 @@
 
 ── Memory: incremental eviction under a large overshoot 
   ✓ [REG] the write right after a 6x overshoot is admitted
-  ✓ the keyspace drains while completely idle (6000 keys -> 899)
+  ✓ the keyspace drains while completely idle (6000 keys -> 898)
+  ✓ no sanitizer report from any 'memory' instance
 
 ── Config: CONFIG REWRITE survives a restart ─────────
   ✓ repl-backlog-size read its boot value from the config file
@@ -954,6 +956,30 @@
   ✓ [REG] no fused '~*&*' token in ACL LIST
   ✓ the allchannels user survived the restart
 
+── Config: operator strings must not rewrite the config file 
+  ✓ [REG] auditlog: the server still boots after CONFIG REWRITE
+  ✓ [REG] auditlog: the operator's password still works
+  ✓ [REG] auditlog: no directive was injected into the config file
+      (auditlog was refused at set time: ERR auditlog: value contains a control character)
+  ✓ [REG] dbfilename: the server still boots after CONFIG REWRITE
+  ✓ [REG] dbfilename: the operator's password still works
+  ✓ [REG] dbfilename: no directive was injected into the config file
+      (dbfilename was refused at set time: ERR dbfilename: value contains a control character)
+  ✓ [REG] requirepass: the server still boots after CONFIG REWRITE
+  ✓ [REG] requirepass: the operator's password still works
+  ✓ [REG] requirepass: no directive was injected into the config file
+      (requirepass was refused at set time: ERR requirepass: value contains a control character)
+  ✓ [REG] acl-username-newline: the server still boots after CONFIG REWRITE
+  ✓ [REG] acl-username-newline: the operator's password still works
+  ✓ [REG] acl-username-newline: no directive was injected into the config file
+      (acl-username-newline was refused at set time: ERR ACL username contains a space or control byte)
+  ✓ [REG] acl-username-space: the server still boots after CONFIG REWRITE
+  ✓ [REG] acl-username-space: the operator's password still works
+  ✓ [REG] acl-username-space: no directive was injected into the config file
+  ✓ [REG] acl-username-space: the user's key scope is still what was granted
+      (acl-username-space was refused at set time: ERR ACL username contains a space or control byte)
+  ✓ no sanitizer report from any 'config' instance
+
 ── Auth: async verify, pipelining, lockout, loop latency 
   ✓ [REG] three replies arrive in order (OK, PONG, OK)
   ✓ the pipelined SET actually executed with the authed identity
@@ -961,12 +987,13 @@
   ✓ the connection is closed after repeated auth failures
   ✓ all 8 concurrent AUTHs completed
   ✓ all 200 PINGs were answered during the AUTH storm
-  info PING during an AUTH storm: p50=0.12ms p99=0.31ms
+  info PING during an AUTH storm: p50=0.12ms p99=0.30ms
          a synchronous Argon2 verify would put p99 at 20-60ms+; that gap is the whole point of the async path.
   ✓ AUTH #1 accepted (the credential survives any rehash)
   ✓ AUTH #2 accepted (the credential survives any rehash)
   ✓ [REG] the audit log carries no plaintext, digest, or PHC hash
   info cred_rehash events this lifetime: 0 (0 is correct for a credential already stored as Argon2id)
+  ✓ no sanitizer report from any 'auth' instance
 
 ── Security: ACL enforcement, renames, audit log ─────
   ✓ setuser limited (+@read +@write)
@@ -1015,6 +1042,16 @@
   ✓ the server keeps serving its existing clients at the cap
   ✓ raising maxclients lets new connections in again
 
+── Security: an ACL rule must mean what it says ──────
+  ✓ [REG] an unknown command name in an ACL rule is rejected
+  ✓ [REG] an ACL rule naming a renamed alias is rejected or enforced
+  ✓ [REG] ACL GETUSER shows a command granted on top of -@all
+  ✓ [REG] ACL GETUSER shows a command denied on top of +@all
+  ✓ [REG] ACL GETUSER reports the user's channel patterns
+  ✓ a category deny still applies when the command is renamed
+  ✓ a key pattern still applies when the command is renamed
+  ✓ no sanitizer report from any 'security' instance
+
 ── Persistence: AOF write gating ─────────────────────
   ✓ AOF exists and is non-empty
   ✓ the write was logged
@@ -1046,6 +1083,18 @@
   ✓ compacted file reconstructs the list
   ✓ compacted file reconstructs the hash
   ✓ compacted file reconstructs the set
+
+── Persistence: rewrite-child failure and fd hygiene ─
+  ✓ [REG] a successful rewrite closes the AOF fd it replaced
+  ✓ [REG] a rewrite frees the file it compacted
+  ✓ [REG] the rewrite child does not inherit the server's sockets
+  ✓ [REG] a rewrite child killed by a signal is reported
+  ✓ [REG] a failed rewrite does not shadow-copy every later write
+  ✓ [REG] a killed rewrite child clears aof_pending_rewrite
+  ✓ [REG] a later BGREWRITEAOF really runs after a failed one
+  ✓ the server still serves writes after a failed rewrite
+  ✓ [REG] a rewrite child that exits non-zero clears the pid too
+  ✓ [REG] a rewrite child that exits non-zero is reported
 
 ── Persistence: hybrid AOF (RDB preamble + RESP delta) 
   ✓ rewrite produced the MYAOFRDB preamble
@@ -1099,6 +1148,14 @@
   ✓ [REG] the set SREM emptied stayed empty
   ✓ the alias still resolves after restart
 
+── Persistence: keys holding control bytes survive a re-encode 
+  ✓ every control-byte key was stored
+  ✓ [REG] the AOF rewrite re-encoded every control-byte key
+  ✓ [REG] every value came back intact through the AOF
+  ✓ [REG] the RDB round-trip kept every control-byte key
+  ✓ [REG] every value came back intact through the RDB
+  ✓ no sanitizer report from any 'persistence' instance
+
 ── TLS: handshake and live certificate rotation ──────
   ✓ the server boots with TLS configured
   ✓ a TLS handshake completes on the tls-port
@@ -1111,7 +1168,7 @@
   ✓ the presented certificate can be fingerprinted
   ✓ CONFIG SET tls-cert-file is accepted
   ✓ [REG] new connections are served the NEW certificate
-  info hot reload took 3.75ms (a restart costs tens of ms and drops every connection)
+  info hot reload took 1.36ms (a restart costs tens of ms and drops every connection)
   ✓ CONFIG SET tls-key-file is accepted
   ✓ [REG] tls-key-file reads back the key path, not the cert path
   ✓ [REG] the connection established before the rotation still works
@@ -1121,7 +1178,17 @@
   ✓ the server is still serving plaintext too
   ✓ a peer dribbling bytes is still reaped at the handshake timeout
   ✓ a completed handshake is unaffected by the same timeout
-  master :12513   proxy :12515   replica :12514
+  ✓ a healthy TLS session is up before the abuse
+  ✓ [REG] a plaintext RESP frame at the tls-port ends at the same clean close
+  ✓ [REG] an HTTP request at the tls-port ends at the same clean close
+  ✓ [REG] a truncated ClientHello then silence at the tls-port ends at the same clean close
+  ✓ [REG] a record header claiming 16 KB that never arrives at the tls-port ends at the same clean close
+  ✓ [REG] a TLS handshake at the plaintext port fails cleanly
+  ✓ the bystander TLS session survived all of it
+  ✓ a fresh TLS handshake still completes afterwards
+  ✓ the plaintext listener still serves afterwards
+  ✓ no sanitizer report from any 'tls' instance
+  master :25424   proxy :25426   replica :25425
 
 ── Replication: full resync ──────────────────────────
   ✓ the replica booted into the role from its config file
@@ -1307,9 +1374,10 @@
   ✓ the sibling's link bounced at least once
   ✓ the sibling re-dialled on its own
   ✓ [REG] every reconnect after the promotion is still partial
+  ✓ no sanitizer report from any 'replication' instance
 
 ── Differential: MYRED against a real redis-server ───
-  oracle: redis-server 7.0.15 on :12521   MYRED on :12520
+  oracle: redis-server 7.0.15 on :25432   MYRED on :25431
 
 ── Differential: strings ─────────────────────────────
   ✓ = SET s hello
@@ -1696,40 +1764,42 @@
   ✓ [scan] SSCAN over a 61-member set: same elements over a full iteration
   ✓ [scan] a full iteration yields every key KEYS reports
 
-── Differential: randomized streams (seed 799271525) ─
+── Differential: randomized streams (seed 995633861) ─
   8 rounds x 150 ops, pool of 6 keys
-  ✓ round 0 (150 ops, seed 799271525) agrees
-  ✓ round 1 (150 ops, seed 799271526) agrees
-  ✓ round 2 (150 ops, seed 799271527) agrees
-  ✓ round 3 (150 ops, seed 799271528) agrees
-  ✓ round 4 (150 ops, seed 799271529) agrees
-  ✓ round 5 (150 ops, seed 799271530) agrees
-  ✓ round 6 (150 ops, seed 799271531) agrees
-  ✓ round 7 (150 ops, seed 799271532) agrees
+  ✓ round 0 (150 ops, seed 995633861) agrees
+  ✓ round 1 (150 ops, seed 995633862) agrees
+  ✓ round 2 (150 ops, seed 995633863) agrees
+  ✓ round 3 (150 ops, seed 995633864) agrees
+  ✓ round 4 (150 ops, seed 995633865) agrees
+  ✓ round 5 (150 ops, seed 995633866) agrees
+  ✓ round 6 (150 ops, seed 995633867) agrees
+  ✓ round 7 (150 ops, seed 995633868) agrees
   info no divergence in 1200 generated operations
+  ✓ no sanitizer report from any 'differential' instance
 
 ── Fuzz: RESP and RDB parsers under ASan + UBSan ─────
   ✓ [fuzz] resp harness builds
   ✓ [fuzz] resp: 200,000 runs find no crash
-    info #200000	DONE   cov: 150 ft: 541 corp: 96/5649b lim: 1188 exec/s: 200000 rss: 206Mb
+    info #200000	DONE   cov: 150 ft: 550 corp: 103/7334b lim: 1058 exec/s: 200000 rss: 213Mb
   ✓ [fuzz] rdb harness builds
   ✓ [fuzz] seeded the RDB corpus from a real image
   ✓ [fuzz] rdb: 200,000 runs find no crash
-    info #200000	DONE   cov: 646 ft: 817 corp: 29/4109b lim: 2066 exec/s: 13333 rss: 135Mb
+    info #200000	DONE   cov: 646 ft: 835 corp: 33/4790b lim: 2046 exec/s: 9523 rss: 147Mb
+  ✓ no sanitizer report from any 'fuzz' instance
 
 ═══════════════════════════════════════════════════════
-Results: 1401/1401 passed
-Runtime: 104.12s (13.5 assertions/sec)
+Results: 1458/1458 passed
+Runtime: 102.31s (14.3 assertions/sec)
 All tests passed!
 Slowest sections:
-  34.91s  5/5  Fuzz: RESP and RDB parsers under ASan + UBSan
-  7.95s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  38.12s  6/6  Fuzz: RESP and RDB parsers under ASan + UBSan
+  7.94s  11/11  Pub/Sub: keyspace notifications (V8.3)
   7.00s  3/3  Replication: an idle link must survive
-  5.70s  47/47  Replication: coordinated FAILOVER
-  4.81s  15/15  Persistence: BGREWRITEAOF (manual + auto-trigger)
+  5.33s  47/47  Replication: coordinated FAILOVER
+  4.29s  10/10  Persistence: rewrite-child failure and fd hygiene
+  4.17s  15/15  Persistence: BGREWRITEAOF (manual + auto-trigger)
   3.99s  9/9  Replication: REPLCONF ACK + WAIT
-  3.73s  9/9  Auth: async verify, pipelining, lockout, loop latency
-  3.56s  15/15  Replication: min-replicas-to-write durability floor
+  3.96s  29/29  TLS: handshake and live certificate rotation
 ═══════════════════════════════════════════════════════
 
 ── Stress Test ────────────────────────────────────────
@@ -1737,83 +1807,83 @@ Slowest sections:
   Ops/thread: 500
   Total ops:  4000
 
-  Elapsed:    1.19s
-  Throughput: 3351 ops/sec
+  Elapsed:    1.06s
+  Throughput: 3766 ops/sec
   note client-bound (GIL-contended); never use this to compare transports — see --bench for server throughput
   Total ops:   4000
   Errors:      0
-  Latency avg: 2.26ms
-  Latency min: 0.13ms
-  Latency max: 15.41ms
-  Latency p50: 1.78ms
-  Latency p95: 5.89ms
-  Latency p99: 8.93ms
+  Latency avg: 2.03ms
+  Latency min: 0.12ms
+  Latency max: 12.54ms
+  Latency p50: 1.61ms
+  Latency p95: 5.20ms
+  Latency p99: 7.84ms
   No errors!
   Operation mix:
-    list_pop_trim         132 ok     0 errors
-    config_get            124 ok     0 errors
-    ttl_triplet           117 ok     0 errors
-    zscore                115 ok     0 errors
-    object_encoding       115 ok     0 errors
-    sismember             115 ok     0 errors
-    lrange                114 ok     0 errors
-    smembers              111 ok     0 errors
-    incr                  111 ok     0 errors
-    mget                  110 ok     0 errors
-    srem                  110 ok     0 errors
-    keyspace_scan         109 ok     0 errors
+    strlen                123 ok     0 errors
+    ttl_triplet           122 ok     0 errors
+    keyspace_scan         122 ok     0 errors
+    zscore                121 ok     0 errors
+    srem                  116 ok     0 errors
+    zadd                  114 ok     0 errors
+    hset                  114 ok     0 errors
+    srandmember           113 ok     0 errors
+    append                112 ok     0 errors
+    getex_px              111 ok     0 errors
+    hscan                 111 ok     0 errors
+    sscan                 110 ok     0 errors
   Slowest operations by average latency:
-    keyspace_scan          8.00ms avg over 109 ops
-    ttl_triplet            5.60ms avg over 117 ops
-    list_pop_trim          5.34ms avg over 132 ops
-    object_encoding        3.70ms avg over 115 ops
-    getex_px               3.62ms avg over 84 ops
-    keys                   2.28ms avg over 99 ops
-    srandmember            1.96ms avg over 87 ops
-    rpush                  1.89ms avg over 90 ops
-    memory_usage           1.87ms avg over 93 ops
-    mget                   1.86ms avg over 110 ops
-    hgetall                1.85ms avg over 92 ops
-    set                    1.84ms avg over 91 ops
-  ℹ  cleaned 166 leftover keys
+    keyspace_scan          6.67ms avg over 122 ops
+    list_pop_trim          5.07ms avg over 98 ops
+    ttl_triplet            4.90ms avg over 122 ops
+    object_encoding        3.45ms avg over 88 ops
+    getex_px               3.15ms avg over 111 ops
+    keys                   1.92ms avg over 85 ops
+    lrange                 1.78ms avg over 98 ops
+    sadd                   1.74ms avg over 103 ops
+    config_get             1.74ms avg over 99 ops
+    zpopmin                1.73ms avg over 99 ops
+    zadd                   1.70ms avg over 114 ops
+    info                   1.69ms avg over 98 ops
+  ℹ  cleaned 165 leftover keys
 
 -- Command Metrics -------------------------------------
-  Commands observed: 45543
-  RESP errors:       1468 (expected negative tests included)
+  Commands observed: 46081
+  RESP errors:       1489 (expected negative tests included)
   Transport errors:  0
-  Latency avg:       0.63ms
-  Latency p50/p95/p99: 0.22/2.23/3.82ms
-  Latency max:       1003.66ms
+  Latency avg:       0.52ms
+  Latency p50/p95/p99: 0.12/2.06/3.71ms
+  Latency max:       1002.30ms
   Most used commands:
-    set             26669 calls
-    zadd             2081 calls
-    get              1610 calls
-    rpush            1463 calls
-    type             1036 calls
+    set             26955 calls
+    zadd             2085 calls
+    get              1666 calls
+    rpush            1457 calls
     publish          1009 calls
-    pttl              753 calls
-    del               746 calls
-    lpop              662 calls
-    sadd              511 calls
-    hset              474 calls
-    srem              460 calls
+    type             1005 calls
+    del               768 calls
+    pttl              752 calls
+    lpop              644 calls
+    sadd              503 calls
+    hset              496 calls
+    srem              458 calls
   Slowest commands by average latency:
-    wait             621.01ms avg over 4 calls
-    auth              36.00ms avg over 2 calls
-    save               9.61ms avg over 4 calls
-    acl                7.76ms avg over 36 calls
-    bgsave             4.51ms avg over 2 calls
-    bgrewriteaof       3.09ms avg over 4 calls
-    publish            1.99ms avg over 1009 calls
-    scan               1.97ms avg over 132 calls
-    getex              1.76ms avg over 93 calls
-    memory             1.73ms avg over 100 calls
-    object             1.72ms avg over 127 calls
-    hscan              1.70ms avg over 97 calls
+    wait             622.17ms avg over 4 calls
+    auth              34.47ms avg over 2 calls
+    bgrewriteaof      17.28ms avg over 12 calls
+    acl                6.79ms avg over 50 calls
+    save               5.80ms avg over 5 calls
+    publish            1.82ms avg over 1009 calls
+    bgsave             1.80ms avg over 2 calls
+    scan               1.62ms avg over 145 calls
+    object             1.57ms avg over 100 calls
+    hscan              1.53ms avg over 118 calls
+    getex              1.53ms avg over 120 calls
+    zrevquery          1.48ms avg over 92 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
-  correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:12590
+  correctness + concurrency + managed-instance phases + stress over plaintext (passwordless) → 127.0.0.1:25490
   WSL — 6.6.87.2-microsoft-standard-WSL2
   Log:     docs/logs/WSL/full_plain.md
   Summary: docs/logs/WSL/full_plain.json

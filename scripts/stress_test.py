@@ -4190,6 +4190,32 @@ class PhaseCtx:
     def section(self, title: str):
         self.r.section(title)
 
+    # -- sanitizer output --------------------------------------------------
+    #
+    # A sanitizer build only helps if something reads what it printed. The suite
+    # has run under ASan+UBSan+LSan since V11 Step 0 and nothing ever looked:
+    # every phase asserts on protocol behaviour and leaves the server's stderr
+    # sitting in a file. A Conn leaked on every single connection lived in that
+    # output undetected the whole time — 432 bytes per connect, linear, found
+    # only when someone grepped by hand.
+    SANITIZER_NEEDLES = ("ERROR: AddressSanitizer", "ERROR: LeakSanitizer",
+                         "runtime error:", "SUMMARY: UndefinedBehaviorSanitizer")
+
+    def check_sanitizer_output(self, phase: str):
+        """Scan this phase's instances. Call AFTER stop_all(): LSan reports at
+        exit, so a running server has not written its verdict yet."""
+        hits = []
+        for tag, inst in self.instances:
+            txt = inst.stderr_text()
+            if not any(n in txt for n in self.SANITIZER_NEEDLES):
+                continue
+            summary = next((l.strip() for l in txt.splitlines()
+                            if "SUMMARY:" in l), "see stderr")
+            hits.append(f"{tag}: {summary}")
+        self.ok(f"no sanitizer report from any '{phase}' instance", not hits,
+                "\n    ".join(hits) + "\n    (only a sanitizer build can fail "
+                "this; on Release it passes trivially)")
+
     # -- evidence ----------------------------------------------------------
     def dump_evidence(self, limit: int = 12):
         for tag, inst in self.instances:
@@ -5398,8 +5424,13 @@ def _security_acl_rules_mean_what_they_say(ctx: "PhaseCtx"):
                "one option that misleads the operator who wrote it")
 
         # 3/4. does GETUSER describe the user that actually exists?
-        cmd(a, "ACL", "SETUSER", "sneak", "on", ">sn", "~*", "-@all",
-            "+ping", "+auth")
+        #
+        # No "+auth" here, deliberately. AUTH is not in k_cmd_table — do_request
+        # intercepts it before dispatch and before acl_check — so it is not a
+        # name an ACL rule can govern, and the validation above now says so.
+        # The user still authenticates: that is the whole reason AUTH is
+        # intercepted first.
+        cmd(a, "ACL", "SETUSER", "sneak", "on", ">sn", "~*", "-@all", "+ping")
         g = _getuser_dict(a, "sneak")
         ctx.ok("[REG] ACL GETUSER shows a command granted on top of -@all",
                "ping" in str(g.get("commands", "")).lower(),
@@ -9325,6 +9356,7 @@ def run_spawned_phases(r: "TestRunner", args, phases) -> dict:
             # A phase that dies partway leaves instances running; they own ports
             # the next phase wants.
             ctx.stop_all()
+            ctx.check_sanitizer_output(name)
             ctx.instances = [] if not (r.failed - f0) else ctx.instances
         results[name] = {
             "passed": r.passed - p0,

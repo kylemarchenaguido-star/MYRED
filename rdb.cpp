@@ -953,6 +953,7 @@ void rdb_save_background(){
   }
 
   if (pid == 0){
+    child_close_inherited_fds();
     // child, only syscalls from here
     rdb_write_snapshot(&buf, g_config.dump_path.c_str());
   }

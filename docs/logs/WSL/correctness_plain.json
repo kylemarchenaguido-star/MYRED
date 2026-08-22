@@ -7,14 +7,14 @@
     "debug_info": null,
     "optimized": null
   },
-  "duration_s": 15.0,
+  "duration_s": 15.6,
   "failed_parts": [],
-  "generated": "2026-08-19T18:21:31",
+  "generated": "2026-08-21T23:28:44",
   "phases": {},
   "platform": {
     "container": null,
     "cpu_affinity": 12,
-    "cpu_mhz": "3792.896",
+    "cpu_mhz": "3792.891",
     "cpu_model": "AMD Ryzen 5 3600X 6-Core Processor",
     "cpu_threads": 12,
     "crypto_isa": [
@@ -28,8 +28,8 @@
     "init": "systemd",
     "kernel": "6.6.87.2-microsoft-standard-WSL2",
     "kernel_build": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37)",
-    "loadavg": "0.39 0.21 0.13 1/412 41124",
-    "mem_total": "12209356 kB",
+    "loadavg": "0.35 0.28 0.29 1/438 37977",
+    "mem_total": "12209364 kB",
     "no_turbo": null,
     "nofile_soft": 10240,
     "overcommit": "0",

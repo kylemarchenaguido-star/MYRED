@@ -237,6 +237,145 @@ Note the hard ordering against V11: cluster multiplies the state space that the
 differential and fuzz work has to cover, so building it *before* there is one
 runnable regression suite means testing it by hand forever.
 
+## V13 - Production-Pointable: closing the app-compatibility gap [Unscoped, after V11]
+
+Different question than V11. V11 proves the server that exists today doesn't
+lie, crash, or leak under adversarial input. V13 asks whether an
+**unmodified real application** — the kind already written against real
+Redis, using a real client library — can be pointed at MYRED and just work
+for its actual command mix. Gathered here from what actually surfaced when
+this was checked: the README's Known Gaps section, the client-compatibility
+discussion that produced it, and the backlog items it touches.
+
+Scope boundary, stated up front: this is not "reach full Redis parity." It's
+the practical minimum for *one* real application to run against MYRED
+without modification. What that minimum is depends entirely on which
+commands that application actually calls — which is exactly what Step 0 is
+for.
+
+### Step 0 - Find the real blocker list empirically, before building any of the rest
+
+Every item below is a **hypothesis**, not a confirmed blocker, and two of
+them are genuinely uncertain in a way that changes priority a lot:
+
+- Whether an unknown-command reply (`-ERR unknown command`, returned
+  without closing the connection — confirmed by reading `do_request`'s
+  `!found` branch, `commands.cpp`) is enough for a real client library's
+  on-connect handshake to proceed past a `CLIENT SETINFO`/`CLIENT SETNAME`
+  call it makes optimistically. Several client libraries wrap this specific
+  call defensively for compatibility with older Redis versions; if that
+  holds here too, the missing `CLIENT` family may be a non-issue rather
+  than a blocker.
+- Whether the same is true of an app whose connection URL names a non-zero
+  database (`redis://host/1`) and sends `SELECT 1` on connect — this one is
+  a plausible **hard** failure, since db selection is not usually optional
+  the way `CLIENT SETINFO` is.
+
+Resolve both by writing the smoke test directly: `pip install redis`, point
+`redis.Redis(host=..., port=..., password=...)` at a running
+`build-rel/server`, and run it through whatever the target application's
+actual command mix is (or, with no specific app in mind yet, a generic CRUD
++ pipeline + pub/sub session — see README → "with `redis-cli`" for the kind
+of traffic that's already known to work at the protocol level). Log exactly
+what errors and where. This is cheaper and more reliable than continuing to
+reason about client-library internals from memory, and it re-orders
+everything below by what's actually load-bearing instead of what looks
+scary on paper.
+
+### 1. Protocol/session surface
+
+- **Multiple logical databases** (`SELECT`/`SWAPDB`) — already designed in
+  this file under **Multiple Logical Databases**; promote it here if Step 0
+  shows a real client failing on `SELECT`. Everything needed
+  (`std::vector<HMap> dbs`, `Conn::db_index`, the RDB/AOF format bump) is
+  already scoped there, not re-derived here.
+- **`HELLO` / RESP3** — do not build full RESP3 speculatively. First confirm
+  whether a plain RESP2 client that never calls `HELLO` even needs it (most
+  don't, by default) versus one that probes it defensively; if it's the
+  latter, the minimum viable fix might just be answering `HELLO 2` correctly
+  and erroring cleanly (not fatally) on `HELLO 3`, which is a much smaller
+  job than a real RESP3 writer.
+- **Minimum `CLIENT` subset** — `CLIENT SETINFO`, `CLIENT SETNAME`,
+  `CLIENT GETNAME`, `CLIENT ID` at least reply instead of erroring, even as
+  stubs, if Step 0 shows a client library treating the current
+  `-ERR unknown command` as fatal. Full `CLIENT LIST`/`CLIENT KILL` are an
+  operability nicety (see item 5), not a connection-time blocker, and can
+  lag behind.
+
+### 2. Command-surface gaps, prioritized by real-world hit rate rather than doc order
+
+Cross-reference **Command Coverage Gaps** and **ACL and Command-Surface
+Feature Gaps** for the full lists — not repeated here, on purpose: this
+project has already been bitten several times by one command list getting
+edited and a parallel one forgotten (the `k_cmd_table` duplicate-key
+outage, the `CONFIG` get/set/rewrite drift), so a second copy of "which
+commands exist" in this file would just be a new way to reproduce that bug.
+What V13 adds is priority, not a new list:
+
+- **Sorted-set family** (`ZCARD`, `ZINCRBY`, `ZRANGEBYSCORE`, …) — highest
+  real-world hit rate of anything on the gap list (leaderboards, rate-limit
+  windows); promote first if the target app uses zsets at all.
+- **Blocking list ops** (`BLPOP`/`BRPOP`/`BLMOVE`) — the thing that breaks
+  job-queue-style usage (Sidekiq/BullMQ-shaped workloads) outright rather
+  than degrading; promote if the target app is a queue consumer.
+- `SCAN ... TYPE`, `SORT`, `COPY`, `DUMP`/`RESTORE` — smaller,
+  self-contained, low-risk to add regardless of which app is being pointed
+  at.
+
+### 3. Scripting
+
+`EVAL`/`EVALSHA` — already fully designed in **Scripting (EVAL)** (custom
+bytecode VM, not embedded Lua). Only pull it into V13's critical path if
+Step 0's target application actually depends on Lua-based atomicity
+(Redlock-style distributed locks, Sidekiq/BullMQ internals, or a hand-rolled
+`EVAL` script) — otherwise this is the single largest item on this list for
+the least likely payoff, and should stay exactly where it already is:
+designed, scoped, not urgent.
+
+### 4. Deployment ergonomics — "point an app at it" implies not babysitting a terminal
+
+- **Daemonization + leveled logging** — already scoped under **Structured
+  Logging and Daemonization** (`daemonize yes`, `pidfile`,
+  `loglevel`/`logfile`). Currently every log line is a bare
+  `fprintf(stderr, ...)` and the process only runs in the foreground;
+  that's fine for `stress_test.py` and unworkable for anything meant to
+  stay up unattended.
+- **A systemd unit file** (new — not currently tracked anywhere) —
+  `Type=notify` or `Type=simple` with `Restart=on-failure`, once
+  daemonization lands. Small and mechanical, and it's the difference
+  between "runs in my terminal" and "runs."
+- **A Dockerfile** — currently listed only as an Upgrade-Catalog curiosity
+  ("zero C++ required, entirely different skill"); worth promoting into
+  V13 specifically because "point an application at it" very often means
+  "point a container at it," not because the C++ side needs anything new.
+
+### 5. Minimum operability once it's actually running
+
+`CLIENT LIST`/`CLIENT KILL`, `SLOWLOG` — already listed under **Server
+Observability and Tooling**. Not a connection-time blocker (see item 1),
+but the first thing anyone reaches for when a real app's traffic does
+something unexpected against a server with no `redis-cli --bigkeys`-style
+tooling of its own yet.
+
+### 6. Safety gate — dependency, not new work
+
+V13 assumes V11's differential/fuzz/static-review pass has at least a first
+pass done before anything real — even a disposable local app, per V11's own
+safety note — is pointed at this server. Not duplicated here; just stated
+as an ordering dependency, the same way V10.6e states its own dependency
+against V11 Step 0 above.
+
+### Done when
+
+Not "full Redis parity." Concretely: the target application's client
+library completes its normal on-connect handshake without a fatal error,
+every command that application actually issues in its real workflow gets a
+correct reply, and the server can be started, stopped, and left running as
+a background service without a human watching a terminal for it. Steps
+1-5 above only need as much investment as Step 0 shows is actually
+necessary for the app in question — this milestone is scoped to "make one
+real thing work," not "close every gap in the README's Known Gaps list."
+
 ## Memory and Encoding Optimizations
 
 - `embstr` for small strings.

@@ -1,4 +1,4 @@
-# MYRED stress test — 2026-08-19 18:21:16
+# MYRED stress test — 2026-08-21 23:28:29
 
 **Run:** correctness only over plaintext (passwordless) → 127.0.0.1:1234
 
@@ -13,9 +13,9 @@
   CPU:          AMD Ryzen 5 3600X 6-Core Processor
   Threads:      12 (usable by this process: 12)
   Crypto ISA:   aes pclmulqdq sha_ni avx2  (no vaes — one AES block per instruction)
-  Memory:       12209356 kB  swap 3145728 kB
+  Memory:       12209364 kB  swap 3145728 kB
   Governor:     n/a
-  Load average: 0.39 0.21 0.13 1/412 41124
+  Load average: 0.35 0.28 0.29 1/438 37977
   somaxconn:    4096   nofile=10240   tcp_ulp=tls
   Log:          docs/logs/WSL/correctness_plain.md
 
@@ -550,7 +550,7 @@
   ✓ acl users contains default
   ✓ acl list -> array → ['user default on nopass ~* &* +@all']
   ✓ acl list includes default
-  ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*']
+  ✓ acl getuser default -> array → ['flags', 'on', 'commands', '+@all', 'keys', '~*', 'channels', '&*']
   ✓ acl getuser exposes flags
   ✓ acl getuser exposes commands
   ✓ acl getuser exposes keys
@@ -578,7 +578,7 @@
   ✓ channel grant rendered
 
 ── INFO Command ──────────────────────────────────────
-  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:19\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:4\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:66449408\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2792\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:32637\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:645850bbce03fd18c599ec153177f498969f29f0\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122292\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122292\r\n\r\n'
+  ✓ info returns string → '# Server\r\nversion:1.0.0\r\nuptime_seconds:16\r\nuptime_minutes:0\r\nuptime_hours:0\r\n\r\n# Clients\r\nconnected_clients:1\r\ntotal_connections:4\r\n\r\n# Memory\r\nused_memory:0\r\nused_memory_human:0.00M\r\nused_memory_rss:66711552\r\nmem_fragmentation_ratio:0.00\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\nevicted_keys:0\r\n\r\n# Stats\r\ntotal_commands:2792\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\n\r\n# Keyspace\r\nkeys_total:0\r\nkeys_with_ttl:0\r\nkeys_no_ttl:0\r\n\r\n# Persistence\r\nrdb_last_save_time:18011\r\nrdb_changes_since_save:1993\r\nrdb_last_save_ok:1\r\nrdb_last_save_size_bytes:0\r\naof_enabled:0\r\naof_current_size:0\r\naof_base_size:0\r\naof_pending_rewrite:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n\r\n# Replication\r\nrole:master\r\nfailover_state:no-failover\r\nmaster_replid:66a3624d1ef9229ce8e4c950806b4d027fcc036c\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\nmaster_repl_offset:122292\r\nrepl_backlog_active:1\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:1\r\nmin_slaves_good_slaves:0\r\nrepl_backlog_histlen:122292\r\n\r\n'
   ✓ has # Server section
   ✓ has # Clients section
   ✓ has # Memory section
@@ -602,7 +602,7 @@
   INFO output:
     # Server
     version:1.0.0
-    uptime_seconds:19
+    uptime_seconds:16
     uptime_minutes:0
     uptime_hours:0
     # Clients
@@ -611,7 +611,7 @@
     # Memory
     used_memory:0
     used_memory_human:0.00M
-    used_memory_rss:66449408
+    used_memory_rss:66711552
     mem_fragmentation_ratio:0.00
     maxmemory:0
     maxmemory_policy:noeviction
@@ -626,7 +626,7 @@
     keys_with_ttl:0
     keys_no_ttl:0
     # Persistence
-    rdb_last_save_time:32637
+    rdb_last_save_time:18011
     rdb_changes_since_save:1993
     rdb_last_save_ok:1
     rdb_last_save_size_bytes:0
@@ -639,7 +639,7 @@
     # Replication
     role:master
     failover_state:no-failover
-    master_replid:645850bbce03fd18c599ec153177f498969f29f0
+    master_replid:66a3624d1ef9229ce8e4c950806b4d027fcc036c
     master_replid2:0000000000000000000000000000000000000000
     second_repl_offset:-1
     connected_slaves:0
@@ -675,9 +675,9 @@
 ── BGSAVE (fork-based background save) ───────────────
   ✓ bgsave returns string → 'Background saving started'
   ✓ bgsave returns fast (<50ms)
-  ℹ  bgsave returned in 1.8ms: 'Background saving started'
+  ℹ  bgsave returned in 1.6ms: 'Background saving started'
   ✓ server responsive during save
-  ℹ  100 ops during save took 12.3ms
+  ℹ  100 ops during save took 12.0ms
   ✓ save did not block event loop (burst <500ms)
   ✓ dump.rdb exists after bgsave
   ✓ bgsave file has magic
@@ -847,17 +847,17 @@ note the phases that manage their own instances (restart, crash recovery, replic
 
 ═══════════════════════════════════════════════════════
 Results: 652/652 passed
-Runtime: 15.03s (43.4 assertions/sec)
+Runtime: 15.05s (43.3 assertions/sec)
 All tests passed!
 Slowest sections:
-  7.93s  11/11  Pub/Sub: keyspace notifications (V8.3)
+  7.91s  11/11  Pub/Sub: keyspace notifications (V8.3)
   1.11s  16/16  Transactions: WATCH / UNWATCH (V8.6-V8.7)
-  0.69s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
-  0.69s  9/9  UNLINK Command (async delete)
+  0.68s  9/9  UNLINK Command (async delete)
+  0.67s  2/2  Memory: incremental eviction (EVICT_RUNNING semantics)
   0.60s  10/10  TTL Commands: PEXPIRE / PTTL
+  0.58s  9/9  Memory: maxmemory eviction + OOM
   0.53s  7/7  BGSAVE (fork-based background save)
-  0.51s  6/6  Persistence Round-trip (in-memory)
-  0.50s  16/16  Pub/Sub: SUBSCRIBE / UNSUBSCRIBE / PUBLISH (V8.1)
+  0.51s  4/4  SAVE / RDB Persistence
 ═══════════════════════════════════════════════════════
 
 -- Command Metrics -------------------------------------
@@ -865,8 +865,8 @@ Slowest sections:
   RESP errors:       119 (expected negative tests included)
   Transport errors:  0
   Latency avg:       0.13ms
-  Latency p50/p95/p99: 0.11/0.15/0.19ms
-  Latency max:       43.81ms
+  Latency p50/p95/p99: 0.12/0.16/0.24ms
+  Latency max:       41.96ms
   Most used commands:
     set              8334 calls
     zadd             1634 calls
@@ -881,18 +881,18 @@ Slowest sections:
     acl                16 calls
     multi              16 calls
   Slowest commands by average latency:
-    save               6.96ms avg over 2 calls
-    acl                4.31ms avg over 16 calls
-    bgsave             1.82ms avg over 2 calls
-    info               0.19ms avg over 34 calls
-    flushall           0.19ms avg over 13 calls
-    incrbyfloat        0.16ms avg over 7 calls
-    flushdb            0.15ms avg over 1 calls
-    scan               0.15ms avg over 3 calls
-    ping               0.15ms avg over 11 calls
-    zquery             0.15ms avg over 6 calls
-    subscribe          0.15ms avg over 2 calls
-    psubscribe         0.15ms avg over 1 calls
+    save               8.33ms avg over 2 calls
+    acl                4.07ms avg over 16 calls
+    bgsave             2.25ms avg over 2 calls
+    flushall           0.22ms avg over 13 calls
+    info               0.20ms avg over 34 calls
+    lpush              0.20ms avg over 3 calls
+    incrbyfloat        0.17ms avg over 7 calls
+    smismember         0.16ms avg over 2 calls
+    hmget              0.16ms avg over 2 calls
+    unwatch            0.15ms avg over 1 calls
+    decrby             0.15ms avg over 3 calls
+    object             0.15ms avg over 11 calls
 
 ═══════════════════════════════════════════════════════
   ALL TESTS PASSED
