@@ -1,0 +1,203 @@
+{
+  "authed": false,
+  "bench": {
+    "params": {
+      "clients": 50,
+      "pipeline": 16,
+      "requests": 100000,
+      "transport": "tls"
+    },
+    "tests": {
+      "get": {
+        "p50": 0.415,
+        "rps": 1428571.38
+      },
+      "hset": {
+        "p50": 0.487,
+        "rps": 1250000.0
+      },
+      "incr": {
+        "p50": 0.471,
+        "rps": 1282051.25
+      },
+      "lpop": {
+        "p50": 0.463,
+        "rps": 1111111.12
+      },
+      "lpush": {
+        "p50": 0.463,
+        "rps": 1250000.0
+      },
+      "lrange_100": {
+        "p50": 3.975,
+        "rps": 187969.92
+      },
+      "lrange_300": {
+        "p50": 4.327,
+        "rps": 55617.35
+      },
+      "lrange_500": {
+        "p50": 7.831,
+        "rps": 27662.52
+      },
+      "lrange_600": {
+        "p50": 9.631,
+        "rps": 22306.49
+      },
+      "mset": {
+        "p50": 1.111,
+        "rps": 588235.31
+      },
+      "ping_inline": {
+        "p50": 0.247,
+        "rps": 1612903.25
+      },
+      "ping_mbulk": {
+        "p50": 0.287,
+        "rps": 1562499.88
+      },
+      "rpop": {
+        "p50": 0.463,
+        "rps": 1041666.69
+      },
+      "rpush": {
+        "p50": 0.463,
+        "rps": 1250000.0
+      },
+      "sadd": {
+        "p50": 0.503,
+        "rps": 1010101.0
+      },
+      "set": {
+        "p50": 0.415,
+        "rps": 1388889.0
+      },
+      "spop": {
+        "p50": 0.375,
+        "rps": 1449275.38
+      },
+      "zadd": {
+        "p50": 0.511,
+        "rps": 1204819.38
+      },
+      "zpopmin": {
+        "p50": 0.431,
+        "rps": 1333333.25
+      }
+    }
+  },
+  "build": {
+    "binary": "/home/kylemg/testfiles/testfiles/build-rel/server",
+    "cmake_build_type": "RELEASE",
+    "debug_info": false,
+    "optimized": true
+  },
+  "duration_s": 62.5,
+  "failed_parts": [],
+  "generated": "2026-08-15T23:47:09",
+  "phases": {
+    "_skipped_total": 0,
+    "auth": {
+      "duration": 0.55,
+      "error": null,
+      "failed": 0,
+      "passed": 9,
+      "skipped": 0
+    },
+    "config": {
+      "duration": 0.19,
+      "error": null,
+      "failed": 0,
+      "passed": 37,
+      "skipped": 0
+    },
+    "memory": {
+      "duration": 0.54,
+      "error": null,
+      "failed": 0,
+      "passed": 35,
+      "skipped": 0
+    },
+    "persistence": {
+      "duration": 2.58,
+      "error": null,
+      "failed": 0,
+      "passed": 75,
+      "skipped": 0
+    },
+    "replication": {
+      "duration": 25.69,
+      "error": null,
+      "failed": 0,
+      "passed": 153,
+      "skipped": 0
+    },
+    "security": {
+      "duration": 5.8,
+      "error": null,
+      "failed": 0,
+      "passed": 43,
+      "skipped": 0
+    },
+    "tls": {
+      "duration": 0.11,
+      "error": null,
+      "failed": 0,
+      "passed": 17,
+      "skipped": 0
+    },
+    "unit": {
+      "duration": 0.35,
+      "error": null,
+      "failed": 0,
+      "passed": 2,
+      "skipped": 0
+    }
+  },
+  "platform": {
+    "container": null,
+    "cpu_affinity": 8,
+    "cpu_mhz": "454.924",
+    "cpu_model": "11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz",
+    "cpu_threads": 8,
+    "crypto_isa": [
+      "aes",
+      "vaes",
+      "pclmulqdq",
+      "vpclmulqdq",
+      "sha_ni",
+      "avx2",
+      "avx512f",
+      "avx512vl"
+    ],
+    "env": "Native",
+    "governor": "performance",
+    "init": "systemd",
+    "kernel": "6.18.35-1-lts",
+    "kernel_build": "Linux version 6.18.35-1-lts (linux-lts@archlinux) (gcc (GCC) 16.1.1 20260430, GNU ld (GNU Binutils) 2.46.0)",
+    "loadavg": "0.61 0.23 0.11 1/781 24831",
+    "mem_total": "16045708 kB",
+    "no_turbo": "0",
+    "nofile_soft": 524288,
+    "overcommit": "0",
+    "product": "HP ProBook 450 G8 Notebook PC",
+    "python": "3.14.5",
+    "somaxconn": "4096",
+    "swap_total": "0 kB",
+    "tcp_ulp": "espintcp mptcp",
+    "uname": "Linux kyle-hpprobook450g8notebookpc 6.18.35-1-lts #1 SMP PREEMPT_DYNAMIC Tue, 09 Jun 2026 11:41:56 +0000 x86_64",
+    "virtualized": false,
+    "wsl_version": null
+  },
+  "run_kind": "full",
+  "server": {
+    "host": "127.0.0.1",
+    "mode": "spawned",
+    "port": 12591
+  },
+  "totals": {
+    "failed": 0,
+    "passed": 1023
+  },
+  "transport": "tls"
+}
