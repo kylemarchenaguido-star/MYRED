@@ -13,7 +13,11 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-08-16.
+Date: 2026-08-26. **V4 through V11 are done.** V11 (testing hardening) closed
+2026-08-22 with the suite at **1458/1458 on Release and under
+ASan+UBSan+LSan**. The active milestone is **V13 — Production-Pointable**,
+promoted ahead of V12 (cluster): the question is now whether an unmodified real
+application can be pointed at this server and just work.
 
 Primary commands:
 ```bash
@@ -23,6 +27,8 @@ cmake -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j
 
 # the whole suite, no server needed first — it starts its own (V11 Step 0)
 python3 scripts/stress_test.py --server build-rel/server --destructive --bench
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
+python3 scripts/stress_test.py --server build-asan/server   # same suite, sanitizer output asserted
 python3 scripts/stress_test.py --server build-rel/server --tls
 python3 scripts/stress_test.py --list-phases
 
@@ -35,6 +41,24 @@ python3 scripts/test_tls.py --server build-rel/server          # TLS metrics (me
 Results land in `docs/logs/<WSL|Native>/` — the environment is read from the
 kernel, and the split exists so a VM number is never mistaken for a bare-metal
 one. `--compare A.json B.json` diffs two machines.
+
+**⚠ `scripts/stress_test.py` is tracked on the `test` branch only.** On `main`
+it is gitignored, so it exists as an untracked local file and a `main` checkout
+does not create it — checking out `main` from a branch that has it will *delete
+it from the working tree*, which is exactly what happened on 2026-08-26. It is
+not lost; restore the working copy with:
+
+```bash
+git show test:scripts/stress_test.py > scripts/stress_test.py
+```
+
+A fresh clone of `main` has no suite at all until that is run.
+
+**Branch policy (2026-08-26): `main` is code only; `test` carries everything
+local.** The direction matters — `.gitignore` does not apply to already-tracked
+files, so **merging `test` into `main` would pull every test artifact onto main
+and start tracking it**. Only `main` → `test` merges; move code the other way
+with `git checkout test -- <paths>`.
 
 **`build/` is Debug and `build-rel/` is Release** (corrected 2026-08-14 — this
 file previously claimed the opposite). Never benchmark `build/`: `commands.cpp`
@@ -68,382 +92,310 @@ Do not rely on old test-count claims; run the harness for the current count.
 
 ## Current Focus
 
+### V13 - Production-Pointable: closing the app-compatibility gap [ACTIVE 2026-08-22]
+
+**Promoted from `BACKLOG.md` on 2026-08-22**, when V11 closed. It runs **ahead
+of V12 (cluster)**, a deliberate reordering: cluster multiplies the state space,
+and pointing one real application at a single node is both cheaper and a better
+test of whether any of this is usable.
+
+A different question than V11. V11 proved the server that exists today does not
+lie, crash, or leak under adversarial input. **V13 asks whether an unmodified
+real application — one already written against real Redis, using a real client
+library — can be pointed at MYRED and just work for its actual command mix.**
+
+Scope boundary: this is **not** "reach full Redis parity." It is the practical
+minimum for a real application to run against MYRED without modification.
+
+**Target shape, chosen 2026-08-26: a heavy web application** — cache + sessions
++ pub/sub, with a ranked structure (leaderboard or sliding-window rate limiter)
+and ideally a replica behind the primary. That mix was picked because it reaches
+the parts of MYRED that only its own test suite has ever exercised, rather than
+the six commands a pure cache would touch.
+
+---
+
+### Measured command surface (2026-08-26) — supersedes the guesses below
+
+Read out of `k_cmd_table` in `commands.cpp`, not taken from a list. **113
+commands implemented.** The backlog's gap list was wrong in one way that
+matters, and right about the rest.
+
+**🔴 The zset is implemented but unreachable from a real client.** MYRED has
+`zadd`, `zrem`, `zscore`, `zrank`, `zpopmin` — and then **`zquery` /
+`zrevquery`, which are not Redis commands at all**. Every range query over the
+AVL zset exists, works, and is invisible to `redis-py`, `redis-cli`, or any
+other client. This is not "some zset commands are missing"; it is a working data
+structure behind a private door.
+
+**The primitives underneath are already there**, which makes the fix wiring
+rather than design:
+
+| Needed command | Primitive it sits on |
+|---|---|
+| `ZCARD` | `avl_cnt(root)` — `avl.h` carries `cnt`, the subtree size |
+| `ZRANGE` / `ZREVRANGE` (by index) | `avl_offset(node, i)` — O(log n) rank navigation, already used by `ZRANK` |
+| `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` | `zset_seekge` / `zset_seekle` + the walk `zquery` already does |
+| `ZCOUNT` | two seeks, rank difference |
+| `ZINCRBY` | `zscore` + `zadd` |
+| `ZREMRANGEBYSCORE` / `BYRANK` | seek + repeated delete |
+
+**Decision: replace `zquery`/`zrevquery` with the real Redis names, do not alias
+them.** Standing rule — no back-compat spellings carried forward. Cost is 25
+references in `stress_test.py`, which is a local file and cheap to update.
+
+**Missing and relevant to a client connecting at all:** `SELECT`, `CLIENT`,
+`HELLO`, `COMMAND`. Note `AUTH` is *not* in `k_cmd_table` either but is
+intercepted in `do_request` before dispatch, so it works — and `+auth` is
+correctly rejected by ACL rule validation as a result. `QUIT` and `RESET` are in
+the same position minus the interception, so they currently answer
+`-ERR unknown command`; `redis-py` closes the socket rather than sending `QUIT`,
+so this is probably harmless. Verify, do not assume.
+
+**Missing and gating nothing in the target shape:** `EVAL`/`EVALSHA`/`SCRIPT`,
+blocking list ops (`BLPOP`/`BRPOP`/`BLMOVE`), streams (`XADD` family),
+geospatial (`GEO*`), HyperLogLog (`PF*`), bit operations, `SORT`, `COPY`,
+`DUMP`/`RESTORE`, `LPOS`, `SLOWLOG`, `DEBUG`, `SHUTDOWN`, `LASTSAVE`, `SWAPDB`.
+
+---
+
+### Order of work
+
+Judged against "a server that works in various cases" first, "deployed" second —
+those two want different orders, and this follows the former.
+
+1. **Step 1, the session/protocol stubs.** Smallest change with the broadest
+   effect: without `HELLO`/`CLIENT`/`SELECT` answering *something*, a real
+   client may not finish connecting at all, which gates every use case equally.
+2. **Step 2, the zset surface only.** Highest value-to-effort item on the whole
+   list, and the part of MYRED that is most distinctive. Gates leaderboards,
+   sliding-window rate limiting, feeds and schedulers — roughly half the
+   candidate applications.
+3. **Step 4, deployment ergonomics.** Turns "runs in a terminal" into "runs."
+   Use-case independent, so it can land any time after the above without
+   changing what works.
+
+**Deferred, with reasons: Step 3 (`EVAL`)** gates nothing in the target shape
+and is the largest item on the page; **Step 5 (operability)** is a nicety once
+something is actually running. Both stay scoped in `BACKLOG.md`.
+
+Step 0 below is not a phase so much as the **instrument** steps 1-3 are verified
+with.
+
+---
+
+### Step 0 - The empirical check, partly answered
+
+Two of its three questions are now settled structurally, by reading the code
+rather than a library's internals:
+
+- **`CLIENT SETINFO` on connect** — MYRED returns `-ERR unknown command`
+  *without closing the connection* (`do_request`'s `!found` branch). Whether a
+  current `redis-py` treats that as fatal is still open and needs the real
+  client.
+- **`SELECT n` on a `redis://host/1` URL** — `SELECT` does not exist at all, so
+  this fails today. Confirmed, not hypothesised.
+
+**Blocked on one command**: this box has no `pip` and no `ensurepip`, so
+`redis-py` cannot be installed.
+
+```bash
+sudo apt install python3-pip      # then an isolated venv, not the system python
+```
+
+The apt package `python3-redis` is 4.3.4, which **predates `CLIENT SETINFO`** —
+installing it would sidestep the exact question being asked rather than answer
+it. Use pip and a current 5.x/6.x.
+
+---
+
+### 1. Protocol/session surface — **NEEDED, and cheap**
+
+All four are missing; all four are stubbable without touching the data path.
+
+- **`SELECT`** — the one real decision here. Full multiple databases
+  (`std::vector<HMap> dbs`, `Conn::db_index`, an RDB/AOF format bump) is scoped
+  in `BACKLOG.md` under **Multiple Logical Databases** and is days of work.
+  **Accepting `SELECT 0` and erroring on anything non-zero is ~10 lines** and
+  unblocks every app that leaves the database at its default, which is most of
+  them. Do the cheap version first and let a real failure justify the expensive
+  one.
+- **`HELLO`** — do not build RESP3 speculatively. Answer `HELLO` / `HELLO 2`
+  with the standard reply map and error *cleanly* (not fatally) on `HELLO 3`.
+- **`CLIENT`** — `SETINFO`, `SETNAME`, `GETNAME`, `ID` as stubs that reply
+  instead of erroring. `CLIENT LIST`/`KILL` belong to step 5, not here.
+- **`COMMAND`** — `redis-cli` calls it on connect; an empty array is usually
+  enough to get past it.
+
+### 2. Command-surface gaps — **zsets NEEDED, the rest DEFERRED**
+
+Full lists stay in `BACKLOG.md` → **Command Coverage Gaps** and **ACL and
+Command-Surface Feature Gaps**. Deliberately not duplicated here: this project
+has been bitten more than once by one command list being edited while a parallel
+copy was forgotten (the `k_cmd_table` duplicate-key outage, the `CONFIG`
+get/set/rewrite drift). What V13 adds is priority.
+
+- **The zset family** — see the measured-surface block above. This is the item.
+- `SCAN ... TYPE`, `SORT`, `COPY`, `DUMP`/`RESTORE` — small and self-contained,
+  but they gate nothing in the target shape. Do them when something asks.
+- **Blocking list ops** — gate job queues only, which are explicitly out of the
+  target shape (they also need `EVAL`). Not V13 work.
+
+### 3. Scripting — **DEFERRED**
+
+`EVAL`/`EVALSHA` is fully designed in `BACKLOG.md` → **Scripting (EVAL)**
+(custom bytecode VM, not embedded Lua). It gates nothing in the target shape and
+is the largest item on this page. Pull it in only if a chosen application turns
+out to depend on Lua-based atomicity — Redlock-style locks, Sidekiq/BullMQ
+internals, a hand-rolled `EVAL`.
+
+### 4. Deployment ergonomics — **NEEDED; this is literally "deployment"**
+
+Nothing here is deployable without it, and it is use-case independent — the same
+fixed cost whichever application wins.
+
+- **Daemonization + leveled logging** — scoped in `BACKLOG.md` under
+  **Structured Logging and Daemonization** (`daemonize yes`, `pidfile`,
+  `loglevel`/`logfile`). Today every log line is a bare `fprintf(stderr, ...)`
+  and the process only runs in the foreground: fine for `stress_test.py`,
+  unworkable for anything meant to stay up unattended.
+- **A systemd unit file** — tracked nowhere else. `Type=notify` or
+  `Type=simple` with `Restart=on-failure`, once daemonization lands. Small and
+  mechanical, and it is the difference between "runs in my terminal" and "runs."
+- **A Dockerfile** — currently only an Upgrade-Catalog curiosity. "Point an
+  application at it" very often means "point a container at it."
+- `SHUTDOWN` is worth folding in here despite living in step 5's family: it is
+  trivial and operators expect it.
+
+### 5. Minimum operability — **DEFERRED**
+
+`CLIENT LIST` / `CLIENT KILL`, `SLOWLOG` — already in `BACKLOG.md` under
+**Server Observability and Tooling**. Not a connection-time blocker, but the
+first thing anyone reaches for when a real app's traffic does something
+unexpected.
+
+### Safety gate — satisfied
+
+V13 assumed V11's differential/fuzz/static-review pass had at least a first pass
+done before anything real was pointed at this server. **V11 closed 2026-08-22**,
+so this is met rather than pending. The standing rule still applies: point apps
+at a disposable local instance, never at anything that matters if it crashes or
+hangs.
+
+### Done when
+
+Not full Redis parity. Concretely: **a real client library completes its normal
+on-connect handshake without a fatal error, every command the application
+actually issues in its real workflow gets a correct reply, and the server can be
+started, stopped and left running as a background service without a human
+watching a terminal.** Steps 1-5 only need as much investment as the target
+application demands — this milestone is scoped to "make one real thing work,"
+not "close every gap in the README's Known Gaps list."
+
+## Completed Milestones
+
 ### V11 - Testing Hardening: Differential, Fuzz, and Adversarial Security [Done 2026-08-22]
 
-**CLOSED 2026-08-22. Suite 1458/1458 on Release AND under ASan+UBSan+LSan,
-with no sanitizer output of any kind.** Every item delivered: Step 0, the
-differential harness, the libFuzzer harnesses, the ASan/UBSan build, the static
-security review (2026-08-19), the targeted logic-level attacks (2026-08-21) and
-`docs/SECURITY_TESTING.md`. The suite went **1023 → 1458 checks** across the
-milestone; every finding it produced is fixed and has a regression check that
-was watched failing against the pre-fix binary first.
+Opened 2026-08-16, closed 2026-08-22. **Suite 1023 → 1458 checks, green on
+Release and under ASan+UBSan+LSan with no sanitizer output of any kind.** Every
+finding it produced is fixed and carries a regression check that was watched
+failing against the pre-fix binary first.
 
-Three things this milestone is worth remembering for:
+**Step 0 made `scripts/stress_test.py` the whole suite.** One command, no setup:
+`--server <binary>` turns on the phases that need process control *and* starts
+the instance the rest talks to. The machinery that made it possible is
+`Instance` (spawn in a temp dir, SIGTERM/SIGKILL, stderr kept in a file) and
+`PhaseCtx` (bind-tested private ports, per-phase workdirs, evidence dump on
+failure, a `skip` counted separately from a pass) — which is what lets a
+restart, a crash and a two-node link live in the same file as the command tests.
+Ten phases now: `unit`, `memory`, `config`, `auth`, `security`, `persistence`,
+`tls`, `replication`, `differential` (against a real `redis-server`), `fuzz`
+(libFuzzer on `parse_resp_request` and `rdb_load_buffer`). **New coverage goes
+in a phase, never a new file.** The replication suite ported whole — 153 checks
+— including the three shapes that existed nowhere else: a freezable proxy (a
+link that goes silent *without* closing, which `poll()` cannot see), assertions
+read from a server's stderr file rather than over the wire, and a phase that
+spawns its own pair because a handover swaps both roles. The shell scripts
+became assertions; `test_tls.py` deliberately stayed out, being a measurement
+harness with nothing to assert.
 
-- **The hypotheses were mostly wrong, and that was fine.** Of the five targeted
-  attack cases, three came back clean — including the two reasoned about most
-  confidently. The two 🔴s came from following the fork machinery next door to
+Results file by environment, decided by **reading the kernel** rather than a
+flag (`/proc/sys/kernel/osrelease`, `/proc/version`, with `WSL_DISTRO_NAME`,
+`binfmt_misc/WSLInterop` and `/run/WSL` as fallbacks — a custom WSL2 kernel
+drops "microsoft"): `docs/logs/<WSL|Native>/<kind>_<plain|tls>.{md,json}`. The
+split exists because the WSL numbers sit ~2.4x below native and one filename for
+both erases that. `--compare` refuses mismatched `-n/-c/-P` but *not* a
+differing transport, and prints no verdict column, because one run per side has
+no noise floor.
+
+**Step 0c characterised the harness itself, and that paid twice over.** Its own
+client read *one byte per `recv()`*: a 100k-element `KEYS` cost over a million
+syscalls — **1422 ms client-side against 19 ms of real server CPU**, with the
+distortion scaling by the host's syscall cost (26x between two machines the C
+client puts 2.3x apart). Buffered, that became 253 ms, and the stress phase went
+145 → 3450 ops/sec on WSL against 3742 → 22957 on native. **The asymmetry is the
+proof**: 1.41x off total WSL runtime and 1.01x off native, exactly proportional
+to syscall cost. What *survived* the fix matters more — TLS still measures ~13%
+faster than plaintext there, and it is the client (`ssl` releases the GIL across
+longer C sections), so "never compare transports with the Python stress number"
+is right for a completely different reason than syscalls. That caveat now prints
+next to the number, because keeping it only in a doc failed twice.
+
+**The findings.** The sanitizer build found a 🔴 128 KB-per-connection leak
+(`Buffer` is a POD; `delete conn` orphaned both 64 KB arrays). The **static
+security review** (2026-08-19) found four reproducing issues: a 🔴 accept-loop
+spin — no `maxclients` existed anywhere in the tree, and at `RLIMIT_NOFILE` the
+loop burned **96% of a core and 2 MB/s of log** (416,509 identical lines in five
+seconds) — plus 🟠 audit-log forgery through an unescaped `AUTH` username (a
+*failed* auth wrote a well-formed fake success record), 🟠 a missing inline-command
+cap worth **16x measured RSS amplification**, and 🟠 a `tls-handshake-timeout`
+that any byte reset, so a peer dribbling 1 B/s survived 4x past it. The
+**targeted logic-level attacks** (2026-08-21) added two 🔴s in the fork
+machinery: `aof_rewrite_reap` cleared `g_aof_child_pid` only on total success,
+so an OOM-killed or `_exit(1)` child wedged the server silently — nothing
+logged, `BGREWRITEAOF` replying success while doing nothing, every write
+duplicated into a buffer nothing drains (66 MB against a control's 33 MB); and
+`close(g_aof_current_size)` closed a **byte count** rather than `g_aof_fd`,
+leaking one fd per rewrite, pinning the superseded inode (8.5 MB compacted to
+135 bytes freed nothing) and aiming `close()` at an arbitrary fd number —
+demonstrated closing stdin. Then 🟠 `CONFIG REWRITE` writing operator strings
+into a line-oriented file four ways (an ACL username containing spaces widened a
+user from `~x:*` to `~*` across a restart), 🟡 ACL rules accepting any string and
+never being consulted, 🟡 `ACL GETUSER` ignoring overrides and channels, 🟡 fork
+children inheriting every socket, and 🟡 conns open at shutdown never freed.
+Full write-ups and measurements in `CODE_REVIEW.md`; the log of every attempt,
+including the ones that found nothing, is `docs/SECURITY_TESTING.md`.
+
+**Four lessons, each paid for:**
+
+- **The hypotheses were mostly wrong, and that was fine.** Three of the five
+  targeted attack cases came back clean — including the two reasoned about most
+  confidently (ACL enforcement through a rename; control bytes re-scanned
+  downstream). Both 🔴s came from following the fork machinery next door to
   where the search was aimed. A hypothesis earns its place by aiming the search,
   not by being right.
 - **An instrument nobody reads is not instrumentation.** The suite ran under
-  ASan+UBSan+LSan from Step 0 onward and nothing ever read the sanitizer's
-  output, so a `Conn` leaked on *every connection* sat in a stderr file for a
-  week while the suite reported green. Closed by
-  `PhaseCtx.check_sanitizer_output()`, one check per phase.
+  ASan+UBSan+LSan from Step 0 onward and *nothing ever read the output*, so a
+  `Conn` leaked on every single connection sat in a stderr file for a week while
+  the suite reported green. `PhaseCtx.check_sanitizer_output()` now scans every
+  instance after its phase stops it, one check per phase.
 - **A fix can grep clean, build clean, and do nothing.** `SOCK_CLOEXEC` was
   applied exactly as specified against the fd-inheritance finding and could
   never have worked — CLOEXEC fires on `exec()` and the save children never
-  exec. Only the check written against the attack could tell a real fix from a
-  plausible one.
+  exec. Only the check written against the *attack* could tell a real fix from a
+  plausible one. Verifying that a snippet landed is not verifying that it works.
+- **A measurement needs a control taken the same way.** The shadow-buffer check
+  was wrong twice: first a 16 MB seed let a freed allocator arena absorb the
+  entire duplicate (+256 KB on the broken server *and* the control), then an
+  absolute "under 1.5x the payload" threshold proved unportable — the same
+  workload on a healthy server costs 1.04x on Release and **5.78x under ASan**.
+  What works is a control instance built the same way.
 
-The milestone's own recurring bug, in three forms: **a routine that exists twice
+**The milestone's recurring bug, in three forms: a routine that exists twice
 where only one copy is right** — `aof_rewrite_reap` against
 `rdb_check_background_save`, the delta write loop against `aof_write_snapshot`,
 and (from V9.8) the config row whose second copy carried the first's identifier.
 When a routine exists twice, diff the two.
-
-**Promoted from `BACKLOG.md` on 2026-08-16**, when V10.6.1 closed and its gate —
-"do not start until V10 ships" — was met. V10.1-V10.6d shipped 2026-08-13 and
-the TLS detour closed 2026-08-16, so this is the active milestone. It was always
-a scheduling choice rather than a hard dependency: nothing below needs
-replication to exist, and auth, ACL, TLS and transactions are the real attack
-surface this is aimed at. Bundled into one milestone number the same way Pub/Sub
-and Transactions shared V8 — for convenience, not because the pieces depend on
-each other.
-
-### Step 0 - One runnable regression surface [Done 2026-08-15]
-
-**`scripts/stress_test.py` is now the whole suite**, and one command runs it:
-
-```bash
-python3 scripts/stress_test.py --server build-rel/server --destructive --bench
-```
-
-`--server` is the hinge. Naming the binary turns on the phases that need process
-control and, unless `--host`/`--port` say otherwise, starts the instance the rest
-of the suite talks to — so nothing has to be running first and nothing it touches
-belongs to anyone. **1023 checks, ~60 s, zero setup.**
-
-What made it possible was the piece this step existed to build: a managed-instance
-mode. `Instance` (spawn in a temp dir, SIGTERM, SIGKILL, keep stderr in a file)
-and `PhaseCtx` (bind-tested private ports from `--base-port`, per-phase workdirs,
-evidence dump, a `skip` that counts separately from a pass) are what let a
-restart, a crash and a two-node link live in the same file as the command tests.
-
-Eight phases, listable with `--list-phases`, selectable with `--phases`:
-`unit`, `memory`, `config`, `auth`, `security`, `persistence`, `tls`,
-`replication`.
-
-Notes worth keeping:
-
-- **Every `[REG]` came across with its story.** An assertion whose comment
-  explains which bug it pins survives a refactor; a bare assertion gets deleted
-  by the next person who finds it inconvenient.
-- **The replication phase ported whole — 153 checks — including all three shapes
-  that existed nowhere else**: the freezable proxy (a link that goes silent
-  *without* closing, which `poll()` cannot see), assertions read from a server's
-  **stderr file** rather than over the wire, and a phase that spawns its own pair
-  because a handover swaps both roles. That last one now allocates its ports from
-  the same `PhaseCtx`, so the fixed 12401–12410 block is gone.
-- **The `SPOP`-then-restart gap is closed**, and so is `SPOP <count>`-to-empty and
-  `SREM`-to-empty. The replication phase got the matching case: `SPOP` must
-  propagate *the member it removed*, not the command — a divergence where both
-  sides stay individually plausible.
-- **The shell scripts became assertions.** `test_aof.sh` only ever printed
-  `cat -A` output for a human to read; what it was really checking is now four
-  `[REG]`s (a read is never logged, a failed `SETNX` is not logged, a `DEL` of a
-  missing key is not logged, `SETEX` decomposes into `SET` + absolute
-  `PEXPIREAT`). Same for the hybrid and rewrite scripts — including the torn-tail
-  case, which is the only one of the three whose failure is loud.
-- **A boot-only directive needs a different probe.** `repl-backlog-size` and
-  `tls-handshake-timeout` refuse `CONFIG SET` by design, so the `config` phase
-  writes them into the file the server boots from and makes the value cross a
-  rewrite instead. Both own a hand-written emit, which is exactly the class
-  `config_selfcheck`'s round-trip skips.
-- **`test_tls.py` stays out**, as planned: it is a measurement harness, not a
-  regression suite. What crossed over is its assertable half — the handshake, the
-  hot reload, the `tls-key-file`-writes-the-key-field `[REG]`, and the rollback
-  on a refused swap. Its `docs/tls_metrics_<tag>.json` baselines are the durable
-  artifact and are tracked.
-- The old local suites are still on disk and still runnable; nothing in
-  `stress_test.py` reads them any more. `myred_testlib` is not imported at all —
-  the suite is one tracked file with no local-only dependency, which was the
-  point.
-
-**Two things the port itself found, both in the test rather than the server:**
-`evicted_keys` lives in INFO's *Memory* section, and asking for it under *Stats*
-returns a counter that reads as "never moved" — indistinguishable from a real
-result, which is how a section-scoped `INFO` read fails silently. And arming the
-AOF auto-trigger while measuring a *manual* rewrite lets a background rewrite land
-mid-measurement, so "the file did not shrink" turns out to mean "it had already
-been compacted".
-
-### Step 0b - Where the numbers go [Done 2026-08-15]
-
-Results are filed by **environment, decided by reading the kernel** rather than by
-a flag:
-
-```
-docs/logs/<WSL|Native>/<kind>_<plain|tls>.md     transcript
-docs/logs/<WSL|Native>/<kind>_<plain|tls>.json   platform + per-phase counts + throughput
-```
-
-WSL is detected from `/proc/sys/kernel/osrelease` and `/proc/version`, with
-`WSL_DISTRO_NAME`, `/proc/sys/fs/binfmt_misc/WSLInterop` and `/run/WSL` as
-independent fallbacks — a custom-built WSL2 kernel drops `microsoft` from its
-release string, so no single signal is enough. Everything else files under
-`Native`.
-
-The split is the whole point: **the WSL numbers in the Testing Matrix sit ~2.4x
-below the native ones**, and one filename for both makes that difference vanish
-the moment the second run finishes. The run banner also prints the CPU governor,
-the load average before the run started, and the build type — the three things
-that quietly invalidate a throughput comparison.
-
-`--compare A.json B.json` diffs two summaries. It refuses when `-n`/`-c`/`-P`
-differ — but **not** on a differing transport, which is the one difference
-somebody legitimately wants to measure. It prints **no verdict column**: one run
-per side has no noise floor, which is the same lesson V10.6.1 Step 0 paid for.
-
-### Step 0c - Characterising the instrument [Done 2026-08-16]
-
-The first four-run matrix was measured, and two of the findings drawn from it did
-not survive a second run. Both failures were the same failure, and it is the one
-this project keeps paying for: **a difference taken from one run per side.**
-
-- **The harness's own client was distorting every large reply.** `_recv_line`
-  read *one byte per `recv()`*, so a 100k-element `KEYS` cost over a million
-  syscalls: **1422 ms client-side against 19 ms of real server CPU**, and the
-  distortion scaled with the host's syscall cost — 26x between two machines the C
-  client puts 2.3x apart. Fixed with a per-socket buffer
-  (`weakref.WeakKeyDictionary`, so the sockets opened and closed all over that
-  file clean themselves up). KEYS 1422->253 ms; the stress phase 145->3450
-  ops/sec on WSL and 3742->22957 on native. **The asymmetry is the proof**: 1.41x
-  off the total WSL runtime and 1.01x off native, exactly proportional to syscall
-  cost. It also fixed a latent bug — the old reader accumulated into a *local*
-  buffer, so a timeout mid-line discarded bytes already taken from the kernel and
-  desynchronised the stream, which the pub/sub push readers were quietly relying
-  on not happening.
-- **What survived the fix matters more.** The stress phase still reports TLS ~13%
-  *faster* than plaintext on WSL, and five runs per side (spreads 2.5% and 5.4%)
-  put that outside the noise. It is real, and it is the client: `ssl` releases the
-  GIL across longer C sections than a bare socket, which helps a GIL-bound client
-  running 8 threads. So the standing rule "never compare transports with the
-  Python stress number" is correct for a completely different reason than
-  syscalls, and did not go away. **The caveat is now printed next to the number**,
-  because having it only in a doc failed to stop two readings of it as a server
-  measurement.
-- **The platform block now records `crypto_isa`.** A WSL/native comparison came
-  back with the TLS gap 20% *wider* than the plaintext gap; the explanation
-  offered was Tiger Lake's `vaes` against Zen 2's plain `aes` — a fact that was
-  nowhere in the summary and had to be dug out of `/proc/cpuinfo` by hand. It is
-  in the block and in the `--compare` label now. **And the finding it was invented
-  to explain did not reproduce**: the second matrix put plaintext at 2.38x and TLS
-  at 2.37x. The gap was noise; the mechanism was a story told about noise. VAES is
-  real and present on exactly one of the two machines, and it makes no measurable
-  difference to MYRED's TLS cost — which is the useful result, and the same
-  conclusion V10.6.1 reached about kTLS.
-- **A stress-mix race, not a server bug.** `random_key()` draws from 201 names
-  shared by all 8 workers, so `OBJECT ENCODING` on a key another worker had just
-  deleted failed about one run in three. Answering "ERR no such key" there is
-  correct Redis behaviour; the expectation was wrong. That op now uses a
-  worker-private key.
-
-### The rest of V11
-
-With Step 0 done, the reason V10.6e stayed parked is answered — an automatic
-failover now has a regression surface to land on.
-
-Structured, not "point an agent at the live server and see what happens" — that
-finds less than the combination below, because an LLM-driven agent is strong at
-reasoning about logic bugs and weak at raw byte-level crash-finding compared to
-a real fuzzer.
-
-- **Differential harness**: drive the same randomized operation stream through
-  `redis-py` against both a real `redis-server` and MYRED, diff replies, with a
-  normalization table for deliberate divergences (e.g. the V9.5.1 ACL tagging
-  rule). Catches semantics drift of the "SET should discard TTL" class that
-  hand-written assertions miss. **Neither dependency is on this box yet** —
-  `python3 -c "import redis"` and `which redis-server` both come back empty —
-  so provisioning (`pip install redis`, plus a real Redis build or
-  `apt install redis-server` for the reference oracle) is step 0 here, the same
-  shape as `stress_test.py`'s own `--server` bootstrap was for Step 0 above.
-  Generate the op stream from the command table already in `k_cmd_table`
-  (`commands.cpp`) rather than hand-listing commands, so newly implemented
-  commands enter the differential net automatically instead of by remembering
-  to add them each time.
-- **libFuzzer/AFL harnesses** for `parse_resp_request` (`resp.cpp:9`) and
-  `rdb_load_buffer` (`rdb.cpp:766`) — both pure functions over byte buffers, so
-  harnesses are ~20 lines each (`LLVMFuzzerTestOneInput(data, size)` calling
-  straight into the function with a scratch `Buffer`/output vector, no server
-  or event loop needed). Corpus seeds: the real AOF/RDB files already produced
-  by `scripts/test_aof*.sh` and sitting under `docs/logs/`. **libFuzzer itself
-  needs Clang, and this box only has GCC** (`which clang++` comes back empty;
-  `g++` is 13.3.0) — either provision Clang for `-fsanitize=fuzzer`, or fuzz
-  with AFL++ in GCC mode (`afl-gcc-fast`/`afl-g++-fast`), which needs no Clang
-  at all and gets the same persistent-mode, coverage-guided loop. Extend the
-  same harness toward adversarial protocol fuzzing specifically (malformed
-  bulk lengths, negative sizes, truncated frames) rather than building a
-  second one. **One concrete finding to seed the corpus with, found by reading
-  the two loops side by side**: `parse_resp_request`'s length checks aren't
-  symmetric — the `n_args` loop guards overflow *before* the multiply
-  (`if (n_args > k_max_args / 10) return -1;`, resp.cpp:53), but the `str_len`
-  loop only checks `str_len > k_max_msg` *after* it (resp.cpp:75-76). It
-  doesn't actually overflow today only because `k_max_msg` (32 MiB) is small
-  enough relative to `INT32_MAX` that the post-check always fires before a
-  second multiply could wrap past it — an incidental property of the two
-  constants' current values, not a structural guarantee. A fuzzer won't know
-  that distinction; a reviewer reading both loops does. Worth hardening to the
-  same pre-check shape as `n_args` regardless, since "safe only because of an
-  unstated relationship between two constants" is exactly the kind of
-  invariant that breaks quietly when one of them changes.
-- **ASan/UBSan CMake build type** (`-fsanitize=address,undefined`) and a CI
-  lane that runs `stress_test.py --correctness-only` under it. **`CMakeLists.txt`
-  has no sanitizer build type today** — just the `Debug`/`Release` split
-  covered by the Current Snapshot's `build/` vs `build-rel/` warning above —
-  so this is new CMake plumbing (a third `CMAKE_BUILD_TYPE`, or a
-  `-DMYRED_SANITIZE=ON` option threaded into compile+link flags), not a flag
-  flip on an existing target. It needs no Clang: GCC 13 (the toolchain already
-  on this box) has shipped `-fsanitize=address,undefined` since GCC 4.9/6.0
-  respectively. The `container_of` pattern and manual `Buffer` management are
-  exactly where sanitizers pay off — and it's the build anything found during
-  the adversarial pass below should be reproduced under, for a real stack
-  trace instead of "the server died." **There is no CI at all yet** (no
-  `.github/` in the repo) — "a CI lane" here means standing one up, most
-  naturally on top of this build type, not adding a job to an existing
-  pipeline.
-- **Static/code-level security review** — **DONE 2026-08-19**, findings in
-  `CODE_REVIEW.md` → "V11 Static Security Review". All five areas below were
-  read; four issues reproduced against a disposable server (one 🔴: the accept
-  loop spins a core and writes 2 MB/s of log once fds run out, and there is no
-  `maxclients` anywhere in the tree to stop it getting there; three 🟠: audit-log
-  forgery through an unescaped `AUTH` username — exactly the case predicted
-  below — a missing argument cap on the inline-command path worth 16x measured
-  memory amplification, and a `tls-handshake-timeout` that any byte resets, so it
-  never reaps a slow peer). Five 🟡 hardening items and six *verified-correct*
-  results recorded alongside them. No live server was needed to find any of them;
-  the repros exist because "by inspection" has been wrong here before.
-  **All nine issues fixed and re-verified 2026-08-19**, with nine regression
-  checks landed in `stress_test.py` — suite is **1401/1401 on Release and
-  identical under ASan+UBSan+LSan**. Nothing from this review is left open.
-  Original starting points, kept for the record:
-  - **Auth/ACL**: `cred.cpp` (password hashing, `fill_random`), and the
-    `ACL SETUSER` staged-apply pattern in `commands.cpp` (stage onto a `User`
-    copy, commit only on full success — the thing worth checking is whether
-    *every* mutating ACL path actually goes through that pattern, not just the
-    one that already had a bug there in V8.8).
-  - **RESP parsing bounds**: `resp.cpp`'s two length loops — see the fuzz
-    bullet above for the concrete asymmetry already found by inspection alone.
-    Static review and fuzzing are cross-checking the same ~90 lines here,
-    which is the point of running both.
-  - **TLS handshake state machine**: `tr_handshake()` (`transport.cpp:213-223`)
-    driven from `server.cpp:965-974`, gated by `Conn::tls_handshaking` (set at
-    `server.cpp:624`, cleared at `974`, branched on in the poll loop at
-    `1308`) and bounded by `tls-handshake-timeout` (`server.cpp:680,821-826`,
-    default 10s). The timeout path exists and looks correct by inspection; the
-    open review question is whether every exit from the handshake state
-    (success, `SSL_ERROR_SSL`, timeout, and a plaintext RESP frame arriving on
-    a TLS port instead of a ClientHello) leaves exactly one owner of the fd
-    and the `SSL*` — a double-free or fd leak here is adversary-triggerable,
-    since the attacker picks which of those exits fires.
-  - **AOF/RDB loading from untrusted files**: `rdb_load_buffer` (`rdb.cpp:766`)
-    and the AOF replay path — the same functions the fuzz harnesses above
-    target, so a manual read-through first is what tells the fuzzer where to
-    bias its mutations (length-prefixed fields, type tags, the `k_cmd_table`
-    fallback used under `g_loading`).
-- **Targeted logic-level attacks** — **DONE 2026-08-21.** Five hypothesized
-  cases, each with a repro against a disposable instance; full write-ups in
-  `docs/planning/CODE_REVIEW.md` → "V11 Targeted Logic-Level Attacks", and the
-  running log of attempts in `docs/SECURITY_TESTING.md`.
-
-  **Three of the five came back clean. Two found bugs — and following the
-  machinery behind the second one produced the two most serious findings of the
-  whole milestone, neither of which was on the list.** Worth remembering when
-  scoring the next batch of hypotheses: the two bets reasoned about most
-  confidently (ACL enforcement through a rename; control bytes re-scanned
-  downstream) were both wrong *in the place they were predicted*, and one of
-  them was right one layer over.
-
-  - **Audit-log injection via an unescaped field** — CONFIRMED and fixed in the
-    static review above (2026-08-19).
-  - **Case-aliasing around ACL deny through a renamed command** — **CLEAN.**
-    Eight probes: category grants, canonical per-command overrides, admin
-    commands and key patterns all enforce correctly through an alias, because
-    `do_request` resolves to the canonical name before any gate runs. The bet
-    was placed because this path had already produced two bugs; it did not
-    produce a third.
-  - **Subscribe-mode gate bypass through a renamed alias** — **CLEAN.** An
-    aliased `SET` gets the subscribe-mode refusal; an aliased `PING` runs.
-  - **Key names containing RESP control bytes** — **CLEAN in the keyspace**
-    (8 key shapes across strings, lists and hashes: 24 keys and every value
-    byte-identical through an AOF rewrite + restart and again through a `SAVE`
-    + restart), **but the config file is the downstream re-scanner that does
-    get it wrong** — see the 🟠 below.
-  - **TLS handshake state confusion** — **CLEAN.** Seven shapes against a 1s
-    `tls-handshake-timeout` all end at the same clean close, a bystander
-    session is untouched, and a re-run under ASan+UBSan+LSan shows no double
-    free of the `SSL*` and no leak. That was the specific question asked.
-  - **Races around the `fork()`-based BGSAVE** — the fd-inheritance half is
-    **CONFIRMED** (the child holds the listener and every client socket; a
-    client that hangs up mid-rewrite cannot finish closing until the child
-    exits), but the operational consequence predicted — a restart failing on
-    the held port — **does not happen**, because the server sets
-    `SO_REUSEADDR`. The far bigger bug was next door, in the reap path.
-
-  **FIX STATUS 2026-08-22: six of seven applied and verified, suite 1447/1448
-  on Release.** The one still open is 🟡 socket inheritance, and only because
-  the fix specified for it was wrong: `SOCK_CLOEXEC` fires on `exec()`, not on
-  `fork()`, and these children never exec. The child must close the fds itself
-  after `fork()` returns 0. Everything else below is closed.
-
-  **The findings, and what each fix was:**
-  - 🔴 **FIXED** — `aof_rewrite_reap` only cleared `g_aof_child_pid` on total success. A
-    child killed by a signal or exiting non-zero wedges the server silently:
-    nothing logged, `aof_pending_rewrite` stuck at 1, later `BGREWRITEAOF`
-    replies success and does nothing, and every subsequent write is duplicated
-    into `g_aof_rewrite_buf` forever — measured **+65.8 MB RSS for a 32 MB
-    write stream, 2.05x**. `rdb_check_background_save` is the same function for
-    the other child and clears the pid on every outcome.
-  - 🔴 **FIXED** — `close(g_data.g_aof_current_size)` closed a byte count,
-    not `g_aof_fd`: **one fd leaked per successful rewrite** (7 → 19 over 12),
-    the superseded AOF inode pinned (8,557,676 bytes compacted to 135 with all
-    8.5 MB still held), and `close()` aimed at an arbitrary fd number —
-    demonstrated closing stdin when the tracked size was 0.
-  - 🟠 **FIXED** — the rewrite delta's write loop advanced `off` but not the pointer, so a
-    short write re-sends the prefix. Inspection only; not reproduced.
-  - 🟠 **FIXED** — `CONFIG REWRITE` wrote operator strings into a line-oriented file.
-    Confirmed four ways end-to-end: `auditlog` and `dbfilename` payloads left
-    the server **running an injected `maxclients 20077`**, the `requirepass`
-    `$argon2id$` passthrough left it booting with **nobody able to
-    authenticate**, and an ACL username containing spaces **widened a user's
-    key scope from `~x:*` to `~*`**. `rename-command`'s setter already rejects
-    control characters — the check exists in this codebase exactly once.
-  - 🟡 **FIXED** — `+cmd`/`-cmd` accepted any string and stored a rule `acl_check` never looks
-    up (unknown *categories* are rejected one branch away).
-  - 🟡 **FIXED** — `ACL GETUSER` never read per-command overrides or channel patterns:
-    `-@all +flushall` reports `-@all` while FLUSHALL succeeds.
-  - 🟡 **STILL OPEN** — the fork children inherit every socket. `SOCK_CLOEXEC`
-    and `accept4` were applied and do nothing here: the flag fires on `exec()`
-    and these children never exec. The child must close the fds itself.
-
-  **46 regression checks landed** across five sections of `stress_test.py`
-  (`phase_aof_rewrite`, `phase_config_roundtrip`, `phase_security`,
-  `phase_persistence`, `phase_tls`), taking the suite 1401 → 1448. Against the
-  pre-fix binary 19 of them failed, which is what makes them regression tests;
-  after the fixes it runs **1457/1458**, the one failure being the socket
-  inheritance still open above. Each asserts on the attack rather than on the
-  shape of a fix — and that is what caught a *fix* that was wrong: the
-  `SOCK_CLOEXEC` change greps clean, builds clean, and does nothing, which only
-  a check written against the attack could tell.
-- **One running document** — **DONE 2026-08-21**, `docs/SECURITY_TESTING.md`.
-  Logs every attempt with its outcome and the technique used, keeps the
-  "nothing here" entries deliberately, and carries a standing-weak-spots list
-  (admin-only reach, repeated-shape code where one copy is wrong, validation
-  that exists exactly once, and the fork children).
-- Run the adversarial/live-server pieces against a disposable local instance
-  only, never anything that matters if it crashes or hangs.
-
-## Completed Milestones
 
 ### V10.6.1 - Deferred TLS Optimizations (V9.7.5 tail) [Done 2026-08-16]
 

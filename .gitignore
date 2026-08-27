@@ -51,3 +51,6 @@ __pycache__/
 tls/
 # local-only: extracted Claude session transcripts
 .chatlog/
+
+# Local working notes (not tracked)
+docs/APP_CANDIDATES.md
