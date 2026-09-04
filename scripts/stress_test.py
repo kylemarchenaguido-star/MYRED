@@ -86,6 +86,13 @@ G_TLS_CERT: Optional[str] = None
 G_TLS_KEY: Optional[str] = None
 _G_TLS_CTX: Optional["ssl.SSLContext"] = None
 
+# Set by spawn_primary() to the managed primary instance's working directory.
+# A spawned --server instance runs in a temp dir, so it writes dump.rdb there,
+# not in the repo root where this script runs. Stays None when the live half is
+# pointed at a user-supplied server, where the historical "dump.rdb lives in the
+# cwd" assumption is the best we can do (MYRED has no `dir` directive).
+G_SERVER_DIR: Optional[str] = None
+
 # ─── colors ───────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -1874,6 +1881,23 @@ def test_info_command(r: TestRunner, sock: socket.socket):
             print(f"    {line}")
 
 
+def _server_rdb_path(sock: socket.socket) -> str:
+    """Absolute-ish path to the RDB file the server under test writes.
+
+    A spawned --server primary runs in a temp workdir (G_SERVER_DIR); a
+    user-supplied server is assumed to run from this script's cwd. The filename
+    comes from CONFIG GET dbfilename so a non-default conf still resolves.
+    """
+    name = "dump.rdb"
+    try:
+        got = cmd(sock, "config", "get", "dbfilename")
+        if isinstance(got, (list, tuple)) and len(got) >= 2 and got[1]:
+            name = got[1]
+    except Exception:
+        pass
+    return os.path.join(G_SERVER_DIR or ".", name)
+
+
 def test_save_command(r: TestRunner, sock: socket.socket):
     r.section("SAVE / RDB Persistence")
 
@@ -1881,18 +1905,20 @@ def test_save_command(r: TestRunner, sock: socket.socket):
     cmd(sock, "set", "rdb_key2", "value2")
     cmd(sock, "pexpire", "rdb_key2", "60000")
 
+    rdb = _server_rdb_path(sock)
+
     r.check("save → OK", cmd(sock, "save"), "OK")
 
     # give the thread pool time to flush the file
     time.sleep(0.5)
 
-    r.check("dump.rdb exists", os.path.exists("dump.rdb"), True)
-    if os.path.exists("dump.rdb"):
-        size = os.path.getsize("dump.rdb")
+    r.check("dump.rdb exists", os.path.exists(rdb), True)
+    if os.path.exists(rdb):
+        size = os.path.getsize(rdb)
         r.check_true("dump.rdb not empty", size > 18)
         print(f"  {YELLOW}ℹ{RESET}  dump.rdb size: {size} bytes")
 
-        with open("dump.rdb", "rb") as f:
+        with open(rdb, "rb") as f:
             header = f.read(5)
         r.check("magic number correct", header, b"MYRED")
 
@@ -1943,10 +1969,11 @@ def test_bgsave_command(r: TestRunner, sock: socket.socket):
     time.sleep(0.5)
 
     # verify file exists and is valid
+    rdb = _server_rdb_path(sock)
     r.check("dump.rdb exists after bgsave",
-            os.path.exists("dump.rdb"), True)
-    if os.path.exists("dump.rdb"):
-        with open("dump.rdb", "rb") as f:
+            os.path.exists(rdb), True)
+    if os.path.exists(rdb):
+        with open(rdb, "rb") as f:
             magic = f.read(5)
         r.check("bgsave file has magic", magic, b"MYRED")
 
@@ -7192,11 +7219,17 @@ def _repl_failover(ctx, m_port, r_port, p_port):
                f"ever exists on a master, so a field emitted inside the "
                f"`if (replica)` block can never be seen in the one state an "
                f"operator needs it for")
-        err = err_of(m, "SET", "during_pause", "1")
-        ctx.ok("[REG] writes are paused while the handover waits",
-               err is not None and err.startswith("FAILOVER"),
-               f"{err!r} — every write accepted here moves the offset the target "
-               f"is trying to reach, and the handover never converges")
+        # A write during the pause is PARKED, not refused: no reply comes back
+        # until the handover resolves (Redis holds the client the same way).
+        # A dedicated socket, so the withheld reply can't stall the rest of the
+        # phase, and every write accepted here would move the offset the target
+        # is chasing and the handover would never converge.
+        paused = raw_conn(m_port)
+        send_request(paused, "SET", "during_pause", "1")
+        ctx.ok("[REG] a write during the pause gets no reply yet (parked)",
+               _push(paused, 1.0) is None,
+               "a parked write must stay silent until failover_reset runs; a "
+               "reply here means the offset moved under the handover")
         ctx.ok("reads are served throughout the pause", cmd(m, "GET", "fo0") == "v0")
         err = err_of(m, "FAILOVER", "TO", "127.0.0.1", str(r_port))
         ctx.ok("a second FAILOVER is refused",
@@ -7204,6 +7237,13 @@ def _repl_failover(ctx, m_port, r_port, p_port):
 
         rep, err = reply_or_err(m, "FAILOVER", "ABORT")
         ctx.ok("FAILOVER ABORT unwinds a waiting handover", rep == "OK", str(err))
+        ctx.ok("[REG] the parked write completes once ABORT clears the pause",
+               _push(paused, SYNC_WAIT) == "OK",
+               "fo_resume_paused_writes must re-dispatch the parked write, as "
+               "master since the handover was aborted")
+        ctx.ok("...and the parked write's effect landed",
+               cmd(m, "GET", "during_pause") == "1")
+        paused.close()
         ctx.ok("writes flow again after the abort",
                err_of(m, "SET", "after_abort", "1") is None)
         ctx.ok("the role never changed",
@@ -9406,6 +9446,8 @@ def spawn_primary(args, workdir: str):
     conf = write_conf(os.path.join(workdir, "primary.conf"), lines)
     inst = Instance(os.path.abspath(args.server), workdir, conf, "primary",
                     plain_port)
+    global G_SERVER_DIR
+    G_SERVER_DIR = workdir   # so the live-half RDB tests can find dump.rdb
     return inst, "127.0.0.1", port
 
 

@@ -12,3 +12,5 @@ void watch_clear_conn(Conn *conn); // drop conn from every watched key (teardown
 void repl_remove_conn(Conn *conn); // drop conn from the replica registry (teardown)
 void wait_remove_conn(Conn *conn); // drop conn from the WAIT registry (teardown)
 void wait_try_resume();            // settle deferred WAITs (ack arrival, timer tick)
+void fo_paused_remove_conn(Conn *conn); // drop conn from the FAILOVER pause registry (teardown)
+void fo_resume_paused_writes();          // re-dispatch writes parked during a FAILOVER pause

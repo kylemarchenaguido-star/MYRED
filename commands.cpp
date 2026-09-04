@@ -1696,8 +1696,9 @@ static void info_replication(std::string &o) {
       const std::string ip = r->peer.substr(0, r->peer.find(':'));
       const uint64_t lag = r->ack_time_ms ? (now - r->ack_time_ms) / 1000 : 0;
       info_add(o,
-               "slave%zu:ip=%s,port=%d,state=online,offset=%llu,lag=%llu\r\n",
+               "slave%zu:ip=%s,port=%d,state=%s,offset=%llu,lag=%llu\r\n",
                i++, ip.c_str(), r->replica_port,
+               r->ack_time_ms ? "online" : "sync",
                (unsigned long long)r->ack_offset, (unsigned long long)lag);
     }
   }
@@ -3283,6 +3284,40 @@ void wait_remove_conn(Conn *conn) {
   g_data.waiters.erase(conn);
 }
 
+// teardown: fo_paused holds raw Conn* that fo_resume_paused_writes dereferences
+void fo_paused_remove_conn(Conn *conn) {
+  if (!conn->fo_write_pending) {
+    return;
+  }
+  conn->fo_write_pending = false;
+  conn->fo_cmd.clear();
+  g_data.fo_paused.erase(conn);
+}
+
+// A coordinated FAILOVER has ended (failover_reset). Re-dispatch every write that
+// was parked while it ran. failover_state is NONE again here, so do_request won't
+// re-park them: a node still master runs the write, a node that just demoted
+// answers READONLY. raw==nullptr -> the AOF entry is re-encoded from the vector,
+// the same contract EXEC relies on.
+void fo_resume_paused_writes() {
+  if (g_data.fo_paused.empty()) {
+    return;
+  }
+  std::vector<Conn *> parked(g_data.fo_paused.begin(), g_data.fo_paused.end());
+  g_data.fo_paused.clear();
+  for (Conn *c : parked) {
+    c->fo_write_pending = false;
+    std::vector<std::string> cmd;
+    cmd.swap(c->fo_cmd);
+    if (c->want_close) {
+      continue; // conn_destroy will run on the poll sweep
+    }
+    // already counted in g_total_commands when it was first parsed & parked
+    do_request(cmd, &c->outgoing, c, nullptr, 0);
+    conn_resume(c); // flush the reply + drain any pipelined frames behind it
+  }
+}
+
 // REPLCONF <option> <value> ... - the wire-compatibility handshake. Every
 // option is accept-and-ack
 static void do_replconf(std::vector<std::string> &cmd, Buffer *out,
@@ -3449,7 +3484,9 @@ static void do_failover(std::vector<std::string> &cmd, Buffer *out){
     g_data.failover_deadline_ms = 0;
     g_data.failover_force = false;
     fprintf(stderr, "failover: aborted by client\n");
-    return resp_ok(out);
+    resp_ok(out);
+    fo_resume_paused_writes(); // writes resume as master; reply is already queued
+    return;
   }
 
   if (g_data.replica_mode) {
@@ -5423,9 +5460,20 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
     return resp_err_txn(out, conn, "ERR wrong number of arguments");
   }
 
-  // writes are paused for the duration of a handover
+  // Writes are paused for the duration of a handover. Redis holds the client and
+  // lands the write after the handover rather than erroring, so park the whole
+  // command and re-dispatch it from fo_resume_paused_writes() once failover_reset
+  // runs: an aborted/timed-out handover then executes it as master, a completed
+  // one re-runs it into the READONLY gate below (this node is a replica now).
+  // A queued or mid-EXEC write can't be parked - poison the transaction instead.
   if (g_data.failover_state != FailoverState::NONE && spec.is_write && !g_data.g_loading) {
-    return resp_err_txn(out, conn, "FAILOVER Failover in progress, writes are paused");
+    if (conn->in_multi || conn->in_exec) {
+      return resp_err_txn(out, conn, "FAILOVER Failover in progress, writes are paused");
+    }
+    conn->fo_write_pending = true;
+    conn->fo_cmd = cmd; // copy: `cmd` is a local of the caller
+    g_data.fo_paused.insert(conn);
+    return; // no reply; try_one_request stops reading this conn until resumed
   }
 
   // Read-only replica
@@ -5637,7 +5685,6 @@ void acl_init_categories() {
       {"save", KeySpec::NONE},
       {"bgsave", KeySpec::NONE},
       {"bgrewriteaof", KeySpec::NONE},
-      {"auth", KeySpec::NONE},
       {"keys", KeySpec::NONE},
       {"scan", KeySpec::NONE},
       {"acl", KeySpec::NONE},
@@ -5695,7 +5742,6 @@ void acl_init_categories() {
       {"rename", CAT_KEYSPACE},
       {"renamenx", CAT_KEYSPACE},
       {"ping", CAT_CONNECTION},
-      {"auth", CAT_CONNECTION},
       {"info", CAT_ADMIN},
       {"memory", CAT_ADMIN},
       {"object", CAT_ADMIN},
@@ -5765,4 +5811,18 @@ void acl_init_categories() {
     auto nit = notify_cls.find(kv.first);
     s.notify_class = (nit != notify_cls.end()) ? nit->second : 0;
   }
+
+  auto orphan_check = [](const char *label, const auto &m){
+    for (const auto &kv : m){
+      if (k_cmd_table.find(kv.first) == k_cmd_table.end()){
+        fprintf(stderr, "selfcheck: %s references unknown command '%.*s'\n",
+                label, (int)kv.first.size(), kv.first.data());
+        die("k_cmd_table side_map references a missing command");
+      }
+    }
+  };
+  orphan_check("resolvers", resolvers);
+  orphan_check("ks", ks);
+  orphan_check("extra", extra);
+  orphan_check("notify_cls", notify_cls);
 }

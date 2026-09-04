@@ -107,6 +107,7 @@ static void conn_destroy(Conn *conn){
   watch_clear_conn(conn);
   repl_remove_conn(conn);
   wait_remove_conn(conn);   // waiters holds raw Conn* too
+  fo_paused_remove_conn(conn); // fo_paused holds raw Conn* too
   repl_link_lost(conn);
   g_data.fd2conn[conn->fd] = NULL;
   dlist_detach(&conn->idle_node);
@@ -193,6 +194,9 @@ static void failover_reset(const std::string &why) {
   g_data.failover_port = 0;
   g_data.failover_deadline_ms = 0;
   g_data.failover_force = false;
+  // the pause is over: run every write parked during it. state is NONE now, so
+  // a still-master node executes them and a just-demoted node answers READONLY.
+  fo_resume_paused_writes();
 }
 
 bool repl_start(const std::string &host, int port, std::string &err){
@@ -734,10 +738,13 @@ static int32_t next_timer_ms() {
       if (g_data.repl_state == ReplState::STREAMING){
         next_ms = std::min<uint64_t>(next_ms, g_data.repl_ack_at_ms);
       }
-      if (!g_data.replicas.empty() && g_config.repl_ping_period_ms > 0){
-        next_ms = std::min<uint64_t>(next_ms, g_data.repl_ping_at_ms);
-      }
-    } 
+    }
+  }
+
+  // a master must wake to fire its own keepalive PING, even with every replica idle.
+  // repl_cron() sends the PING once now_ms >= repl_ping_at_ms; this is just the wake-up.
+  if (!g_data.replicas.empty() && g_config.repl_ping_period_ms > 0){
+    next_ms = std::min<uint64_t>(next_ms, g_data.repl_ping_at_ms);
   }
 
   // a master stays awake only because its replicas ACL once a second.
@@ -945,7 +952,7 @@ static void conn_set_timer(Conn *conn, ConnTimer type){
 // we will try to proccess if theres enough data
 static bool try_one_request(Conn *conn){
   // nothing runs with the pre-auth identity
-  if (conn->auth_pending || conn->wait_pending){ return false; }
+  if (conn->auth_pending || conn->wait_pending || conn->fo_write_pending){ return false; }
 
   std::vector<std::string> cmd;
   int32_t consumed = parse_resp_request(&conn->incoming, cmd);
@@ -973,10 +980,10 @@ static bool try_one_request(Conn *conn){
 
   // moved after do_request, raw must stay valid
   buf_consume(&conn->incoming, raw_len);
-  if (conn->auth_pending || conn->wait_pending){
+  if (conn->auth_pending || conn->wait_pending || conn->fo_write_pending){
     conn->want_read = false;
-    conn->want_write = false;  
-    return false; 
+    conn->want_write = false;
+    return false;
   }
   conn->want_read = false;
   conn->want_write = true;

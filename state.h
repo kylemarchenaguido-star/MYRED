@@ -190,6 +190,10 @@ struct Conn {
   uint64_t wait_target = 0; // master_repl_offset sample when wait was issued
   int wait_numreplicas = 0;
   uint64_t wait_deadline_ms = 0; // 0 = wait forever
+  // a write parked while a coordinated FAILOVER pauses writes; re-dispatched
+  // verbatim when failover_reset() runs (see fo_resume_paused_writes)
+  bool fo_write_pending = false;
+  std::vector<std::string> fo_cmd;
 };
 
 // global hashtable
@@ -206,6 +210,8 @@ struct GlobalData{
   std::unordered_set<Conn *> replicas;
   // Conns with a deferred wait reply
   std::unordered_set<Conn *> waiters; // Conns with a deferred wait reply.
+  // Conns whose write is parked while a coordinated FAILOVER pauses writes.
+  std::unordered_set<Conn *> fo_paused;
   uint64_t repl_ack_at_ms = 0; // replica side, when to send the next REPLCONF ACK
   uint64_t master_last_io_ms = 0; // replica side, monotonic, last time any buyte arrived from the master
   uint64_t repl_ping_at_ms = 0; // master side, when to send the next keepalive
