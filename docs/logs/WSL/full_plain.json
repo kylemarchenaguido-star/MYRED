@@ -1,0 +1,128 @@
+{
+  "authed": false,
+  "bench": null,
+  "build": {
+    "binary": "/home/kyled/projects/testfiles/build-rel/server",
+    "cmake_build_type": "release",
+    "debug_info": false,
+    "optimized": true
+  },
+  "duration_s": 106.4,
+  "failed_parts": [],
+  "generated": "2026-08-22T01:14:04",
+  "phases": {
+    "_skipped_total": 0,
+    "auth": {
+      "duration": 0.7,
+      "error": null,
+      "failed": 0,
+      "passed": 10,
+      "skipped": 0
+    },
+    "config": {
+      "duration": 1.39,
+      "error": null,
+      "failed": 0,
+      "passed": 54,
+      "skipped": 0
+    },
+    "differential": {
+      "duration": 0.91,
+      "error": null,
+      "failed": 0,
+      "passed": 371,
+      "skipped": 0
+    },
+    "fuzz": {
+      "duration": 38.09,
+      "error": null,
+      "failed": 0,
+      "passed": 6,
+      "skipped": 0
+    },
+    "memory": {
+      "duration": 2.45,
+      "error": null,
+      "failed": 0,
+      "passed": 36,
+      "skipped": 0
+    },
+    "persistence": {
+      "duration": 10.62,
+      "error": null,
+      "failed": 0,
+      "passed": 90,
+      "skipped": 0
+    },
+    "replication": {
+      "duration": 25.92,
+      "error": null,
+      "failed": 0,
+      "passed": 154,
+      "skipped": 0
+    },
+    "security": {
+      "duration": 1.87,
+      "error": null,
+      "failed": 0,
+      "passed": 51,
+      "skipped": 0
+    },
+    "tls": {
+      "duration": 3.86,
+      "error": null,
+      "failed": 0,
+      "passed": 29,
+      "skipped": 0
+    },
+    "unit": {
+      "duration": 0.68,
+      "error": null,
+      "failed": 0,
+      "passed": 3,
+      "skipped": 0
+    }
+  },
+  "platform": {
+    "container": null,
+    "cpu_affinity": 12,
+    "cpu_mhz": "3792.891",
+    "cpu_model": "AMD Ryzen 5 3600X 6-Core Processor",
+    "cpu_threads": 12,
+    "crypto_isa": [
+      "aes",
+      "pclmulqdq",
+      "sha_ni",
+      "avx2"
+    ],
+    "env": "WSL",
+    "governor": null,
+    "init": "systemd",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "kernel_build": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37)",
+    "loadavg": "1.03 0.61 0.42 1/375 59648",
+    "mem_total": "12209364 kB",
+    "no_turbo": null,
+    "nofile_soft": 1048576,
+    "overcommit": "0",
+    "product": null,
+    "python": "3.12.3",
+    "somaxconn": "4096",
+    "swap_total": "3145728 kB",
+    "tcp_ulp": "tls",
+    "uname": "Linux DESKTOP-4KRDJ2U 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64",
+    "virtualized": true,
+    "wsl_version": "WSL2"
+  },
+  "run_kind": "full",
+  "server": {
+    "host": "127.0.0.1",
+    "mode": "spawned",
+    "port": 25490
+  },
+  "totals": {
+    "failed": 0,
+    "passed": 1458
+  },
+  "transport": "plain"
+}
