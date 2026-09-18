@@ -270,34 +270,23 @@ without modification. What that minimum is depends entirely on which
 commands that application actually calls — which is exactly what Step 0 is
 for.
 
-### Step 0 - Find the real blocker list empirically, before building any of the rest
+### Step 0 - Find the real blocker list empirically — **DONE 2026-09-18**
 
-Every item below is a **hypothesis**, not a confirmed blocker, and two of
-them are genuinely uncertain in a way that changes priority a lot:
+Answered. Full findings live in `docs/planning/ROADMAP.md` → **V13 → Step 0**;
+not duplicated here. Headlines, because they re-order everything below:
 
-- Whether an unknown-command reply (`-ERR unknown command`, returned
-  without closing the connection — confirmed by reading `do_request`'s
-  `!found` branch, `commands.cpp`) is enough for a real client library's
-  on-connect handshake to proceed past a `CLIENT SETINFO`/`CLIENT SETNAME`
-  call it makes optimistically. Several client libraries wrap this specific
-  call defensively for compatibility with older Redis versions; if that
-  holds here too, the missing `CLIENT` family may be a non-issue rather
-  than a blocker.
-- Whether the same is true of an app whose connection URL names a non-zero
-  database (`redis://host/1`) and sends `SELECT 1` on connect — this one is
-  a plausible **hard** failure, since db selection is not usually optional
-  the way `CLIENT SETINFO` is.
+- **`HELLO 3` is a hard blocker.** `redis-py` 8.x defaults to RESP3 and opens
+  every connection with it, so a stock client cannot connect at all today. This
+  was not on anyone's hypothesis list.
+- **`CLIENT SETINFO` is a non-issue**, exactly as the optimistic reading below
+  guessed — the client swallows the error.
+- **`SELECT` is a near-non-issue**: `db=0` sends no `SELECT` at all, so only a
+  non-zero db in the URL fails.
+- **`SET` rejects `EX`/`NX`/`PX`/`XX`** — an arity gap no command-list audit
+  could have seen.
 
-Resolve both by writing the smoke test directly: `pip install redis`, point
-`redis.Redis(host=..., port=..., password=...)` at a running
-`build-rel/server`, and run it through whatever the target application's
-actual command mix is (or, with no specific app in mind yet, a generic CRUD
-+ pipeline + pub/sub session — see README → "with `redis-cli`" for the kind
-of traffic that's already known to work at the protocol level). Log exactly
-what errors and where. This is cheaper and more reliable than continuing to
-reason about client-library internals from memory, and it re-orders
-everything below by what's actually load-bearing instead of what looks
-scary on paper.
+The hypotheses this section used to hold are preserved in git history; what
+replaced them is measurement.
 
 ### 1. Protocol/session surface
 
@@ -306,12 +295,15 @@ scary on paper.
   shows a real client failing on `SELECT`. Everything needed
   (`std::vector<HMap> dbs`, `Conn::db_index`, the RDB/AOF format bump) is
   already scoped there, not re-derived here.
-- **`HELLO` / RESP3** — do not build full RESP3 speculatively. First confirm
-  whether a plain RESP2 client that never calls `HELLO` even needs it (most
-  don't, by default) versus one that probes it defensively; if it's the
-  latter, the minimum viable fix might just be answering `HELLO 2` correctly
-  and erroring cleanly (not fatally) on `HELLO 3`, which is a much smaller
-  job than a real RESP3 writer.
+- **`HELLO` / RESP3** — **superseded 2026-09-18; this bullet was wrong.** It
+  assumed a modern client defaults to RESP2 and only probes `HELLO`
+  defensively. It doesn't: `redis-py` 8.x defaults to RESP3 and leads with
+  `HELLO 3` on every connection. The "minimum viable fix" proposed here —
+  error cleanly on `HELLO 3` — is not available, because the client raises on
+  the error before any caller sees it. Answering `proto=3` while still writing
+  RESP2 shapes was tested and **silently corrupts replies** (`HGETALL` returns
+  a list, no error). The real choice is a genuine RESP3 writer or requiring
+  `protocol=2` from the app. See `ROADMAP.md` → **V13 → Step 0**.
 - **Minimum `CLIENT` subset** — `CLIENT SETINFO`, `CLIENT SETNAME`,
   `CLIENT GETNAME`, `CLIENT ID` at least reply instead of erroring, even as
   stubs, if Step 0 shows a client library treating the current

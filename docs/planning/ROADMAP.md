@@ -13,11 +13,24 @@ Companion: `CODE_REVIEW.md` — audit worklist + Resolved Bugs Archive.
 
 ## Current Snapshot
 
-Date: 2026-08-26. **V4 through V11 are done.** V11 (testing hardening) closed
+Date: 2026-09-18. **V4 through V11 are done.** V11 (testing hardening) closed
 2026-08-22 with the suite at **1458/1458 on Release and under
 ASan+UBSan+LSan**. The active milestone is **V13 — Production-Pointable**,
 promoted ahead of V12 (cluster): the question is now whether an unmodified real
 application can be pointed at this server and just work.
+
+**V13 Step 0 answered it on 2026-09-18: not yet, and for one reason.** A stock
+`redis-py` 8.x opens every connection with `HELLO 3` and dies on
+`-ERR unknown command` — **0/20** on the first probe run. Forced to
+`protocol=2` the same probe scores **13/20**, so the server underneath is in
+better shape than the handshake suggests. Three gaps explain every remaining
+failure: `HELLO`/RESP3, the unreachable zset range commands, and `SET`
+rejecting `EX`/`NX`. Full detail in **V13 → Step 0** below. The real client
+lives at `~/.local/share/myred-testenv` (redis-py 8.1.0, outside the repo):
+
+```bash
+~/.local/share/myred-testenv/bin/python -c "import redis; print(redis.__version__)"
+```
 
 Primary commands:
 ```bash
@@ -117,6 +130,11 @@ the six commands a pure cache would touch.
 
 ### Measured command surface (2026-08-26) — supersedes the guesses below
 
+> **Amended 2026-09-18 by Step 0.** Reading `k_cmd_table` found every *missing*
+> command but could not see a command that exists with the wrong *arity*. A real
+> client found one immediately: `SET` rejects `EX`/`NX`/`PX`/`XX`. When auditing
+> the surface again, check arity and options, not just presence.
+
 Read out of `k_cmd_table` in `commands.cpp`, not taken from a list. **113
 commands implemented.** The backlog's gap list was wrong in one way that
 matters, and right about the rest.
@@ -164,9 +182,11 @@ geospatial (`GEO*`), HyperLogLog (`PF*`), bit operations, `SORT`, `COPY`,
 Judged against "a server that works in various cases" first, "deployed" second —
 those two want different orders, and this follows the former.
 
-1. **Step 1, the session/protocol stubs.** Smallest change with the broadest
-   effect: without `HELLO`/`CLIENT`/`SELECT` answering *something*, a real
-   client may not finish connecting at all, which gates every use case equally.
+1. **Step 1, the session/protocol surface.** Confirmed empirically as the
+   gate: a stock `redis-py` cannot open a single connection today, because it
+   leads with `HELLO 3`. Step 0 also showed this step is *not* four cheap stubs
+   — `HELLO` is a real fork (RESP3 or `protocol=2`) and must be decided first.
+   `CLIENT SETINFO` and `SELECT` turned out to block nothing.
 2. **Step 2, the zset surface only.** Highest value-to-effort item on the whole
    list, and the part of MYRED that is most distinctive. Gates leaderboards,
    sliding-window rate limiting, feeds and schedulers — roughly half the
@@ -184,48 +204,206 @@ with.
 
 ---
 
-### Step 0 - The empirical check, partly answered
+### Step 0 - The empirical check — **ANSWERED 2026-09-18**
 
-Two of its three questions are now settled structurally, by reading the code
-rather than a library's internals:
+No longer blocked, and no longer hypothetical. `redis-py` **8.1.0** was pointed
+at a disposable MYRED instance and every question below is now settled by
+observation, most of them against a byte-level trace of the wire.
 
-- **`CLIENT SETINFO` on connect** — MYRED returns `-ERR unknown command`
-  *without closing the connection* (`do_request`'s `!found` branch). Whether a
-  current `redis-py` treats that as fatal is still open and needs the real
-  client.
-- **`SELECT n` on a `redis://host/1` URL** — `SELECT` does not exist at all, so
-  this fails today. Confirmed, not hypothesised.
-
-**Blocked on one command**: this box has no `pip` and no `ensurepip`, so
-`redis-py` cannot be installed.
+**The pip block was a false blocker.** `redis-py` is a pure-Python wheel with
+*zero* required dependencies on Python 3.12 (`async-timeout` applies only below
+3.11.3). A wheel is a zip, so pip was never actually needed:
 
 ```bash
-sudo apt install python3-pip      # then an isolated venv, not the system python
+python3 -m venv --without-pip ~/.local/share/myred-testenv
+curl -sSLO https://files.pythonhosted.org/.../redis-8.1.0-py3-none-any.whl
+python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+        redis-8.1.0-py3-none-any.whl ~/.local/share/myred-testenv/lib/python3.12/site-packages
+~/.local/share/myred-testenv/bin/python -c "import redis; print(redis.__version__)"
 ```
 
-The apt package `python3-redis` is 4.3.4, which **predates `CLIENT SETINFO`** —
-installing it would sidestep the exact question being asked rather than answer
-it. Use pip and a current 5.x/6.x.
+The env lives at **`~/.local/share/myred-testenv`**, deliberately *outside* the
+repo so neither git tree needs a `.gitignore` edit. It is current (8.1.0), not
+apt's 4.3.4, so it does not sidestep the `CLIENT SETINFO` question.
 
 ---
 
-### 1. Protocol/session surface — **NEEDED, and cheap**
+#### 🔴 The headline: `HELLO 3` is the first command on the wire, and it is fatal
 
-All four are missing; all four are stubbable without touching the data path.
+`redis-py` 8.x sets **`DEFAULT_RESP_VERSION = 3`** (`redis/utils.py`). A default
+`redis.Redis(host, port)` — no arguments, no options — opens with `HELLO 3`
+before anything else. Traced:
 
-- **`SELECT`** — the one real decision here. Full multiple databases
-  (`std::vector<HMap> dbs`, `Conn::db_index`, an RDB/AOF format bump) is scoped
-  in `BACKLOG.md` under **Multiple Logical Databases** and is days of work.
-  **Accepting `SELECT 0` and erroring on anything non-zero is ~10 lines** and
-  unblocks every app that leaves the database at its default, which is most of
-  them. Do the cheap version first and let a real failure justify the expensive
-  one.
-- **`HELLO`** — do not build RESP3 speculatively. Answer `HELLO` / `HELLO 2`
-  with the standard reply map and error *cleanly* (not fatally) on `HELLO 3`.
-- **`CLIENT`** — `SETINFO`, `SETNAME`, `GETNAME`, `ID` as stubs that reply
-  instead of erroring. `CLIENT LIST`/`KILL` belong to step 5, not here.
-- **`COMMAND`** — `redis-cli` calls it on connect; an empty array is usually
-  enough to get past it.
+```
+> HELLO 3
+< -ERR unknown command          ← read_response() raises ResponseError, connection dead
+```
+
+**A stock `redis-py` cannot complete a single connection to MYRED today.** The
+probe scored **0/20** on its first run — not 19/20 with a handshake wart, zero.
+Every use case is gated behind this one command.
+
+Forcing `protocol=2` gets past it and the server does well underneath: **13/20**,
+with the remaining 7 failures all attributable to the three gaps below.
+
+#### 🔴 Answering `HELLO 3` *cheaply* is worse than not answering it
+
+The previous plan on this page — "do not build RESP3 speculatively, error
+cleanly on `HELLO 3`" — **does not work**, and the obvious shortcut is actively
+harmful. Both were tested, not reasoned about:
+
+- **Erroring cleanly on `HELLO 3` is still fatal.** `read_response()` raises
+  before any caller can see the error. There is no "clean" error here.
+- **Claiming `proto=3` while still emitting RESP2 shapes silently corrupts
+  data.** Verified against a stub server that agreed to `proto=3` and then
+  replied in RESP2. `redis-py` switches its parser to RESP3 *before* sending
+  `HELLO`, and once `proto=3` is agreed it drops its RESP2→dict conversion
+  callbacks, expecting real map replies:
+
+  | server emits | `r.hgetall("sess")` returns |
+  |---|---|
+  | RESP2 array | `['uid', '42', 'csrf', 'tok']` ← **a list. no error.** |
+  | RESP3 map   | `{'uid': '42', 'csrf': 'tok'}` ← correct |
+
+  That turns a loud connect-time failure into a wrong value deep inside
+  application code. **Ruled out.**
+
+So `HELLO` is a genuine fork in the road, and it belongs to Step 1:
+
+- **(a) Implement RESP3 properly** — `HELLO 3` plus the map/set/double/boolean/
+  null/push types and RESP3 reply shapes for the map-returning commands
+  (`HGETALL`, `CONFIG GET`, `XPENDING`, `CLIENT INFO`). Real work. It is what
+  "point an unmodified app at it" actually costs.
+- **(b) Answer `HELLO 2`, reject `HELLO 3`, require `protocol=2` from the app.**
+  Cheap. It *is* a modification to the application, which dents V13's premise —
+  but it is one documented connection parameter, not a code change, and it is
+  how every app talked to Redis before 7.0. A defensible interim.
+- **(c) Claim `proto=3`, keep RESP2 shapes.** Proven harmful above. Never.
+
+**Not decided here — this is Step 1's call to make.**
+
+#### Confirmed: `CLIENT SETINFO` is harmless
+
+The open question from the last pass. `redis-py` wraps both `SETINFO` calls in
+`try: ... except ResponseError: pass`. Traced under `protocol=2`:
+
+```
+> CLIENT SETINFO LIB-NAME redis-py
+< -ERR unknown command                ← swallowed
+> CLIENT SETINFO LIB-VER 8.1.0
+< -ERR unknown command                ← swallowed
+> PING
+< +PONG
+```
+
+**`CLIENT SETINFO` needs no stub to unblock connection.** It is cosmetic.
+`CLIENT SETNAME` is different — it is only sent when the app passes
+`client_name=`, but when sent it raises `ConnectionError("Error setting client
+name")` on non-OK. `CLIENT GETNAME`/`ID` are app-initiated, never handshake.
+
+#### Confirmed: `SELECT` is only sent for a non-zero db
+
+`redis-py` guards it with `if self.db:` — **`db=0` sends no `SELECT` at all**.
+So the cheap plan is cheaper than scoped: `redis://host/0` already works today,
+and only `redis://host/1` fails. Accepting `SELECT 0` and erroring non-zero
+remains right, but it unblocks *nothing that is currently blocked* — it only
+turns a confusing `unknown command` into an honest `ERR DB index out of range`.
+Priority drops accordingly.
+
+#### 🔴 New, and not on this page before: `SET` takes no options
+
+Not a missing command — a missing **arity**. Traced:
+
+```
+> SET k v          < +OK
+> SET k v EX 60    < -ERR wrong number of arguments
+> SET k v NX       < -ERR wrong number of arguments
+```
+
+`commands.cpp:5169` has `{"set", {do_set, 3, 3, true}}` — exactly three
+arguments. Meanwhile `commands.cpp:5180` has `{"getex", {do_getex, 2, -1, ...}}`,
+which **already parses `EX`/`PX`/`EXAT`/`PXAT`**. Same shape as the zset
+finding: the option-parsing machinery exists and is proven, `SET` simply is not
+wired to it.
+
+This matters more than its size suggests. `SET key val EX n` is *the* cache
+idiom — it is what Django's cache backend, Flask-Caching, and essentially every
+"cache with a TTL" call site emit. `SETEX` works, but no modern library reaches
+for it (`redis-py` marks `setex` deprecated since 2.6.12 and routes callers to
+`set(ex=)`). **`SET` with options belongs in Step 2 as a first-class item.**
+
+#### Confirmed: the zset really is unreachable
+
+Exactly as the measured-surface block predicted, now demonstrated from a real
+client. Working: `ZADD`, `ZSCORE`, `ZRANK`, `ZREM`, `ZPOPMIN`. Every one of
+`ZCARD`, `ZCOUNT`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREVRANGE`, `ZINCRBY` answers
+`-ERR unknown command`.
+
+#### What already works, unmodified
+
+Under `protocol=2`, with no server changes at all — this is the good news and it
+is most of the target shape:
+
+| area | verified |
+|---|---|
+| sessions | `HSET mapping=` / `HGETALL` / `HLEN` / `HDEL` / `EXPIRE` / `TTL` |
+| lists | `LPUSH` / `LRANGE` / `LLEN` |
+| cache | `GET` / `SETEX` / `SETNX` / `GETEX EX` / `EXPIRE` / `TTL` / `INCR` / `DEL` |
+| pub/sub | `SUBSCRIBE` + `PUBLISH`, messages delivered and parsed by the client |
+| transactions | `pipeline(transaction=True)` → real `MULTI`/`EXEC`, and plain batching |
+| scanning | `scan_iter(match=...)` — the client's cursor loop drives MYRED's `SCAN` correctly |
+| introspection | `r.info()` parses into 42 fields; `DBSIZE` |
+
+#### Method note: `redis-cli` would have missed all of this
+
+`redis-cli` 7.0.15 sends `HELLO 3` **only** with `-3`, and on failure prints
+`HELLO 3 failed: ERR unknown command` and **carries on to a working session**.
+`redis-py` raises and dies. The suite's `differential` phase drives
+`redis-cli`/`redis-server`, so it would have reported a clean pass over the
+single most important defect on this page. **A tolerant client is not a test of
+protocol compatibility.** Keep the real library in the loop for V13.
+
+#### Still open
+
+- `QUIT`/`RESET` remain `-ERR unknown command`. `redis-py` closes the socket
+  rather than sending `QUIT`, so nothing is blocked — as suspected, now
+  confirmed by the trace (no `QUIT` appears on disconnect).
+- `COMMAND` and `COMMAND DOCS` both error. Nothing observed depends on them yet;
+  `redis-cli` did not send either on connect.
+- No real *application* has been pointed at the server yet — this was the client
+  library, one layer below. That is the next empirical step, after Step 1.
+
+---
+
+### 1. Protocol/session surface — **NEEDED; `HELLO` is no longer cheap**
+
+Rewritten 2026-09-18 after Step 0 measured this against a real client. The
+"all four are cheap stubs" framing was wrong about exactly one of them, and it
+happens to be the one that gates everything.
+
+- **`HELLO` — the milestone's central decision, not a stub.** Step 0 proved a
+  stock `redis-py` 8.x opens every connection with `HELLO 3` and dies on the
+  error, that erroring "cleanly" is not a thing the client offers, and that
+  claiming `proto=3` without RESP3 reply shapes silently turns `HGETALL` into a
+  list. Options (a) real RESP3, (b) `HELLO 2` only + app passes `protocol=2`,
+  (c) fake `proto=3` — **(c) is ruled out on evidence**. Pick (a) or (b) before
+  writing any of the rest of this step; the choice sets V13's ceiling.
+  Recommendation: **(b) first** to get a real application running end-to-end and
+  learn what else breaks, then (a) as its own scoped piece of work — RESP3 is a
+  wire-format milestone, not a session stub, and pretending otherwise is what
+  made this bullet wrong the first time.
+- **`CLIENT`** — `SETNAME` is the only one that can be fatal, and only when the
+  app passes `client_name=`. **`SETINFO` is confirmed harmless** (the client
+  swallows the error), so it needs a stub for tidiness, not for function.
+  `GETNAME`/`ID` are app-initiated. `CLIENT LIST`/`KILL` stay in step 5.
+- **`SELECT`** — **priority dropped.** `redis-py` guards it with `if self.db:`,
+  so `db=0` sends nothing and `redis://host/0` already works untouched. The
+  cheap version (accept `0`, error non-zero) is still right and still ~10 lines,
+  but it unblocks nothing currently blocked — it only replaces a misleading
+  `unknown command` with an honest `ERR DB index out of range`. Full multiple
+  databases stays scoped in `BACKLOG.md` → **Multiple Logical Databases**.
+- **`COMMAND`** — no longer urgent. Step 0 observed neither `redis-py` nor
+  `redis-cli` sending it on connect. An empty array when something asks.
 
 ### 2. Command-surface gaps — **zsets NEEDED, the rest DEFERRED**
 
@@ -236,6 +414,13 @@ copy was forgotten (the `k_cmd_table` duplicate-key outage, the `CONFIG`
 get/set/rewrite drift). What V13 adds is priority.
 
 - **The zset family** — see the measured-surface block above. This is the item.
+- **`SET` with options — added 2026-09-18, NEEDED.** `{"set", {do_set, 3, 3}}`
+  accepts exactly three arguments, so `SET k v EX 60` / `NX` / `XX` / `PX` /
+  `KEEPTTL` / `GET` all answer `-ERR wrong number of arguments`. This is the
+  single most common cache idiom in every web framework, and `do_getex` already
+  contains a working `EX`/`PX`/`EXAT`/`PXAT` parser to copy. Wiring, not design.
+  `SETEX` works but no modern client emits it (`redis-py` deprecated `setex` in
+  favour of `set(ex=)`).
 - `SCAN ... TYPE`, `SORT`, `COPY`, `DUMP`/`RESTORE` — small and self-contained,
   but they gate nothing in the target shape. Do them when something asks.
 - **Blocking list ops** — gate job queues only, which are explicitly out of the
