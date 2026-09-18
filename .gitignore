@@ -54,3 +54,6 @@ tls/
 
 # Local working notes (not tracked)
 docs/APP_CANDIDATES.md
+
+# test-run artifacts under scripts/ (main is code only)
+scripts/docs/

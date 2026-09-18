@@ -1,0 +1,15 @@
+# GitHub Linguist — keep the repo's language bar about the server itself.
+#
+# This project is a C++ database server. The regression suite is ~626 KB of
+# Python and the planning docs are ~800 KB of Markdown; on the `test` branch,
+# which carries everything, that reports the repo as majority-Python. Markdown
+# and JSON are already excluded by Linguist (prose / data), but the suite is
+# not, so it is marked here.
+#
+# `linguist-vendored` excludes a path from the language statistics. Side effect
+# worth knowing: GitHub also collapses those files by default in diffs.
+
+scripts/**          linguist-vendored
+docs/**             linguist-documentation
+*.aof               linguist-generated
+benchappend.aof     linguist-generated
