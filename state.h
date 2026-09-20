@@ -154,6 +154,9 @@ struct User {
 struct Conn {
   // Hot metadata: checked every event-loop iteration (fits in first cache line)
   int fd = -1;
+  // RESP protocol version, set by HELLO
+  int resp_proto = 2;
+  std::string client_name; // CLIENT SETNAME / GETNAME; empty = unnamed
   bool want_read = false;
   bool want_write = false;
   bool want_close = false;

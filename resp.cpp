@@ -1,9 +1,12 @@
+#include <cstddef>
 #include <cstdint>
 #include <stdio.h>
 #include <stddef.h>
 #include <cstring>
 #include <vector>
+#include <cmath>
 #include "resp.h"
+#include "buffer.h"
 #include "state.h"
 
 //Parse the RESP protocol
@@ -91,11 +94,13 @@ for (size_t i = n_start; i < pos; ++i){
 //RESP response helpers
 // NIL response
 void resp_nil(Buffer *out){
+  if (g_reply_proto >= 3){ return buf_append(out, "_\r\n", 3); }
   buf_append(out, "$-1\r\n", sizeof("$-1\r\n") - 1);
 }
 
 // null response distinc from the null bulk string (use by exec) and is resp2 null array 
 void resp_nil_arr(Buffer *out){
+  if (g_reply_proto >= 3){ return buf_append(out, "_\r\n", 3); }
   buf_append(out, "*-1\r\n", sizeof("*-1\r\n") - 1);
 }
 
@@ -138,6 +143,17 @@ void resp_str(Buffer *out, const char *s, size_t len){
 // DBL response
 void resp_dbl(Buffer *out, double val){
   char tmp[64];
+  if (g_reply_proto >= 3){
+    int len;
+    if (std::isnan(val)){
+      len = snprintf(tmp, sizeof(tmp), ",nan\r\n");
+    } else if (std::isinf(val)){
+      len = snprintf(tmp, sizeof(tmp), val < 0 ? ",-inf\r\n" : ",inf\r\n");
+    } else {
+      len = snprintf(tmp, sizeof(tmp), ",%.17g\r\n", val);
+    }
+    return buf_append(out, tmp, (size_t)len);
+  }
   int len = snprintf(tmp, sizeof(tmp), "%.17g", val);
   resp_str(out, tmp, (size_t)len);
 }
@@ -147,4 +163,43 @@ void resp_arr(Buffer *out, uint32_t n){
   char tmp[32];
   int len = snprintf(tmp, sizeof(tmp), "*%u\r\n", n);
   buf_append(out, tmp, (size_t)len);
+}
+
+// dispatch-scoped
+int g_reply_proto = 2;
+
+// MAP header. n is the number of PAIRS, not the number of elements - RESP2
+// doubles it, RESP3 does not. Passing an element count here is the easy bug
+void resp_map(Buffer *out, uint32_t n){
+  char tmp[32];
+  int len = (g_reply_proto >= 3) ? snprintf(tmp, sizeof(tmp), "%%%u\r\n", n)
+                                 : snprintf(tmp, sizeof(tmp), "*%u\r\n", n *2);
+  buf_append(out, tmp, (size_t)len);
+}
+
+// SET header. Same element count in both only the type byte differs
+void resp_set(Buffer *out, uint32_t n){
+  char tmp[32];
+  int len = (g_reply_proto >= 3) ? snprintf(tmp, sizeof(tmp), "~%u\r\n", n)
+                                 : snprintf(tmp, sizeof(tmp), "*%u\r\n", n);
+  buf_append(out, tmp, (size_t)len);
+}
+
+// PUSH header. Takes proto explicitly: two subscribers on one PUBLISH can be on different protocols
+void resp_push_n(Buffer *out, uint32_t n, int proto){
+  char tmp[32];
+  int len = (proto >= 3) ? snprintf(tmp, sizeof(tmp), ">%u\r\n", n)
+                         : snprintf(tmp, sizeof(tmp), "*%u\r\n", n);
+  buf_append(out, tmp, (size_t)len);
+}
+
+// VERBATIM string
+void resp_verbatim(Buffer *out, const char *s, size_t len){
+  if (g_reply_proto < 3){ return resp_str(out, s, len); }
+  char tmp[32];
+  int hlen = snprintf(tmp, sizeof(tmp), "=%zu\r\n", len + 4);
+  buf_append(out, tmp, (size_t)hlen);
+  buf_append(out, "txt:", 4);
+  buf_append(out, s, len);
+  buf_append(out, "\r\n", sizeof("\r\n") - 1);
 }

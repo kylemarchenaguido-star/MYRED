@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <stdint.h>
 #include <stddef.h>
 #include <string>
@@ -15,3 +17,13 @@ void resp_int(Buffer *out, int64_t val);
 void resp_str(Buffer *out, const char *s, size_t len);
 void resp_dbl(Buffer *out, double val);
 void resp_arr(Buffer *out, uint32_t n);
+
+// RESP3
+extern int g_reply_proto;
+
+void resp_map(Buffer *out, uint32_t n); // n PAIRS -> %n (RESP3) / *2n (RESP2)
+void resp_set(Buffer *out, uint32_t n); // ~n (RESP3) / *n (RESP2)
+void resp_push_n(Buffer *out, uint32_t n, int proto); // >n / *n, explicit proto
+void resp_verbatim(Buffer *out, const char *s, size_t len); // =txt: / $
+
+
