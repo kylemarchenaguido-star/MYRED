@@ -154,6 +154,8 @@ struct User {
 struct Conn {
   // Hot metadata: checked every event-loop iteration (fits in first cache line)
   int fd = -1;
+  // > 0 while an async AUTH issued by HELLO is in flight
+  int hello_pending_proto = 0;
   // RESP protocol version, set by HELLO
   int resp_proto = 2;
   std::string client_name; // CLIENT SETNAME / GETNAME; empty = unnamed

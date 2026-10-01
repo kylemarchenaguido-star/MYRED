@@ -1389,6 +1389,21 @@ struct AuthJob {
 static int g_auth_inflight = 0; // main-thread only (queue++ / completetion--)
 static const int k_max_auth_inflight = 4; // bounds argon2 memory to 4 x 19MIB
 
+// The hanshake map. Shated by the inline path and the deffered auth path, so the two
+// can never drift
+static void hello_emit_map(Buffer *out, Conn *conn, int proto){
+  resp_map(out, 7);
+  resp_str(out, "server", 6);     resp_str(out, "myred", 5);
+  resp_str(out, "version", 7);    resp_str(out, "1.0.0", 5);
+  resp_str(out, "proto", 5);         resp_int(out, proto);
+  resp_str(out, "id", 2);         resp_int(out, (int64_t)conn->id);
+  resp_str(out, "mode", 4);       resp_str(out, "standalone", 10);
+  resp_str(out, "role", 4);
+  if (g_data.replica_mode){ resp_str(out, "replica", 7); }
+  else                    { resp_str(out, "master", 6); }
+  resp_str(out, "modules", 7); resp_arr(out, 0);
+}
+
 // main thread (via loop_post)
 static void auth_complete(AuthJob *job) {
   g_auth_inflight--;
@@ -1425,13 +1440,23 @@ static void auth_complete(AuthJob *job) {
       }
     }
     audit_event("auth_success", c, "");
-    resp_ok(&c->outgoing);
+    if (c->hello_pending_proto){
+      // this auth came from HELLO: negotiate and answer with the handshake map
+      c->resp_proto = c->hello_pending_proto;
+      c->hello_pending_proto = 0;
+      g_reply_proto = c->resp_proto;
+      hello_emit_map(&c->outgoing, c, c->resp_proto);
+      g_reply_proto = 2;
+    } else {
+      resp_ok(&c->outgoing);
+    }
   } else {
     c->failed_attemps++;
     if (c->failed_attemps >= k_max_failed_auth) {
       c->want_close = true;
     }
     audit_event("auth_fail", c, " target=" + audit_escape(job->uname) + " result=wrongpass");
+    c->hello_pending_proto = 0;
     resp_err(&c->outgoing,
              "WRONGPASS invalid username-password pair or user is disable");
   }
@@ -1472,7 +1497,7 @@ static void do_auth(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     uname = cmd[1]; // AUTH <pass>
     pass = cmd[2];  // AUTH <user ><pass>
   } else {
-    return resp_err(out, "ERR wwrong number of arguments for 'auth' command");
+    return resp_err(out, "ERR wrong number of arguments for 'auth' command");
   }
 
   // Dos bound
@@ -1763,7 +1788,7 @@ static void do_info(std::vector<std::string> &cmd, Buffer *out) {
       k_info_sections[s].emit(body);
     }
   }
-  resp_str(out, body.data(), body.size());
+  resp_verbatim(out, body.data(), body.size());
 }
 
 // LPUSH key
@@ -2530,11 +2555,13 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out,
   case Lookup::WRONGTYPE:
     return resp_err(out, "WRONGTYPE wrong type");
   case Lookup::MISSING:
-    return resp_arr(out, 0);
+    return (mode == 0) ? resp_map(out, 0) : resp_arr(out, 0);
   case Lookup::OK:
     break;
   }
   size_t n = hm_size(&entry_hash(ent));
+  if (mode == 0){ resp_map(out, (uint32_t)n); } // pairs, kek
+  else          { resp_arr(out, (uint32_t)n); }
   resp_arr(out, (uint32_t)(mode == 0 ? n * 2 : n));
   HEmit c{out, mode};
   hm_foreach(&entry_hash(ent), cb_hemit, &c);
@@ -3177,11 +3204,11 @@ static void do_smembers(std::vector<std::string> &cmd, Buffer *out) {
   case Lookup::WRONGTYPE:
     return resp_err(out, "WRONGTYPE wrong type");
   case Lookup::MISSING:
-    return resp_arr(out, 0);
+    return resp_set(out, 0);
   case Lookup::OK:
     break;
   }
-  resp_arr(out, (uint32_t)hm_size(&entry_set(ent)));
+  resp_set(out, (uint32_t)hm_size(&entry_set(ent)));
   hm_foreach(&entry_set(ent), cb_members_emit, out);
 }
 
@@ -3577,13 +3604,13 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out) {
   case Lookup::WRONGTYPE:
     return resp_err(out, "WRONGTYPE wrong type");
   case Lookup::MISSING:
-    return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
+    return (cmd.size() >= 3) ? resp_set(out, 0) : resp_nil(out);
   case Lookup::OK:
     break;
   }
   HMap *set = &entry_set(ent);
   if (hm_size(set) == 0) { // defensive; empty sets are dropped by mutators
-    return (cmd.size() >= 3) ? resp_arr(out, 0) : resp_nil(out);
+    return (cmd.size() >= 3) ? resp_set(out, 0) : resp_nil(out);
   }
 
   bool feed = propagate_enabled();
@@ -3612,11 +3639,11 @@ static void do_spop(std::vector<std::string> &cmd, Buffer *out) {
       return resp_err(out, "ERR value is out of range, must be positive");
     }
     if (count == 0) {
-      return resp_arr(out, 0);
+      return resp_set(out, 0);
     }
 
     size_t n = ((size_t)count < hm_size(set)) ? (size_t)count : hm_size(set);
-    resp_arr(out, (uint32_t)n);
+    resp_set(out, (uint32_t)n);
     for (size_t i = 0; i < n; ++i) {
       SetNode *sn = container_of(hm_random(set), &SetNode::node);
       resp_str(out, sn->member.data(), sn->member.size());
@@ -3770,7 +3797,7 @@ static void do_sinter(std::vector<std::string> &cmd, Buffer *out) {
   if (!sinter_impl(cmd, 1, result)) {
     return resp_err(out, "WRONGTYPE wrong type");
   }
-  resp_arr(out, (uint32_t)result.size());
+  resp_set(out, (uint32_t)result.size());
   for (auto &m : result) {
     resp_str(out, m.data(), m.size());
   }
@@ -3782,7 +3809,7 @@ static void do_sunion(std::vector<std::string> &cmd, Buffer *out) {
   if (!sunion_impl(cmd, 1, result)) {
     return resp_err(out, "WRONGTYPE wrong type");
   }
-  resp_arr(out, (uint32_t)result.size());
+  resp_set(out, (uint32_t)result.size());
   for (auto &m : result) {
     resp_str(out, m.data(), m.size());
   }
@@ -3794,7 +3821,7 @@ static void do_sdiff(std::vector<std::string> &cmd, Buffer *out) {
   if (!sdiff_impl(cmd, 1, result)) {
     return resp_err(out, "WRONGTYPE wrong type");
   }
-  resp_arr(out, (uint32_t)result.size());
+  resp_set(out, (uint32_t)result.size());
   for (auto &m : result) {
     resp_str(out, m.data(), m.size());
   }
@@ -3955,7 +3982,7 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out) {
     }
 
     // empty array for unknown params
-    resp_arr(out, (uint32_t)(kv.size() * 2));
+    resp_map(out, (uint32_t)(kv.size() * 2));
     for (auto &p : kv) {
       resp_str(out, p.first.data(), p.first.size());
       resp_str(out, p.second.data(), p.second.size());
@@ -4820,7 +4847,7 @@ static size_t pubsub_count(const Conn *conn) {
 // subscribe/unsubscribe)
 static void pubsub_confirm(Buffer *out, const char *kind,
                            const std::string *chan, int64_t count) {
-  resp_arr(out, 3);
+  resp_push_n(out, 3, g_reply_proto);
   resp_str(out, kind, strlen(kind));
   if (chan) {
     resp_str(out, chan->data(), chan->size());
@@ -4982,7 +5009,7 @@ static int64_t pubsub_publish(const std::string &chan, const char *msg,
     // we only read the set here - no invalidation
     for (Conn *sub : it->second) {
       // push straigh into the subscriber's outgoing: *3 message <chan> <msg>
-      resp_arr(&sub->outgoing, 3);
+      resp_push_n(&sub->outgoing, 3, sub->resp_proto);
       resp_str(&sub->outgoing, "message", 7);
       resp_str(&sub->outgoing, chan.data(), chan.size());
       resp_str(&sub->outgoing, msg, msglen);
@@ -4998,7 +5025,7 @@ static int64_t pubsub_publish(const std::string &chan, const char *msg,
       continue;
     }
     for (Conn *sub : pe.second) {
-      resp_arr(&sub->outgoing, 4);
+      resp_push_n(&sub->outgoing, 4, sub->resp_proto);
       resp_str(&sub->outgoing, "pmessage", 8);
       resp_str(&sub->outgoing, pat.data(), pat.size());
       resp_str(&sub->outgoing, chan.data(), chan.size());
@@ -5269,6 +5296,7 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
     {"memory", {do_memory, 2, -1}},
     {"object", {do_object, 2, -1}},
     {"acl", {do_acl_placeholder, 2, -1}},
+    {"client", {do_pubsub_stub, 2, -1}},
     // pubsub
     {"subscribe", {do_pubsub_stub, 2, -1}},
     {"unsubscribe", {do_pubsub_stub, 1, -1}},
@@ -5395,8 +5423,98 @@ static void resp_err_txn(Buffer *out, Conn *conn, const char *msg) {
   resp_err(out, msg);
 }
 
+// Publishes a connections's RESP verison for the reply writers and restores the previous one on every exit path
+struct ReplyProtoScope {
+  int prev;
+  explicit ReplyProtoScope(int proto) : prev(g_reply_proto) {
+    g_reply_proto = proto;
+  }
+  ~ReplyProtoScope() { g_reply_proto = prev; }
+};
+
+// HELLO [protover [AUTH user pass] [SETNAME name]]
+// Redis allows re-HELLO at any time, inclusind downgrading 3 -> 2, so this is not one-shot 
+static void do_hello(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  int want = conn->resp_proto; // no argument: report, don't change 
+
+  if (cmd.size() >= 2){
+    int64_t v = 0;
+    if (!str2int(cmd[1], v)){
+      return resp_err(out, "ERR Protocol version is not an integer or out of range");
+    }
+    if (v != 2 && v != 3){
+      return resp_err(out, "NOPROTO unsupported protocol version");
+    }
+    want = (int)v;
+  }
+
+  // Scan the options first : nothing may take effect until the while command is known good
+  size_t auth_at = 0, name_at = 0;
+  for (size_t i = 2; i < cmd.size();){
+    std::string opt = cmd[i];
+    for (char &ch : opt){ ch = (char)tolower((unsigned char)ch); }
+    if (opt == "auth" && i + 2 < cmd.size()){ auth_at = i; i += 3; }
+    else if (opt == "setname" && i + 1 < cmd.size()){ name_at = i; i += 2; }
+    else {
+      return resp_err(out, "ERR Syntax error in HELLO option");
+    }
+  }
+  if (name_at){ conn->client_name = cmd[name_at + 1]; }
+
+  if (auth_at){
+    // Hand off to the async verifier and answer from auth_complete()
+    conn->hello_pending_proto = want;
+    std::vector<std::string> a = {"auth", cmd[auth_at + 1], cmd[auth_at + 2]};
+    do_auth(a, out, conn); // queues the job, writes nothing 
+    return; // no reply now - auth_complete() emits the map
+  }
+
+  // No credentials offered: HELLO still requires an already-authenticated connection
+  if (!conn->user){
+    return resp_err(out, "NOAUTH HELLO must be called with the client already "
+                         "authenticated, otherwise the HELLO <proto> AUTH "
+                         "<user> <pass> option can be used to authenticated the "
+                         "client and select the RESP protocol version."); 
+  }
+
+  // switch first: the reply itself is encoded in the negotiated protocol
+  conn->resp_proto = want;
+  g_reply_proto = want;
+  hello_emit_map(out, conn, want);
+}
+
+// CLIENT SETNAME|GETNAME|ID|SETINFO - the connection-time subset
+static void do_client(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  std::string sub = cmd[1];
+  for (char &ch : sub){ ch = (char)tolower((unsigned char)ch); }
+
+  if (sub == "id" && cmd.size() == 2){
+    return resp_int(out, (int64_t)conn->id);
+  }
+  if (sub == "getname" && cmd.size() == 2){
+    if (conn->client_name.empty()){ return resp_nil(out); }
+    return resp_str(out, conn->client_name.data(), conn->client_name.size());
+  }
+  if (sub == "setname" && cmd.size() == 3){
+    // a name with a space or newline would corrupt CLIENT LIST output later
+    for (unsigned char ch : cmd[2]){
+      if (ch < '!' || ch > '~'){
+        return resp_err(out, "ERR Client names cannot contain spaces, newlines or special characters.");
+      }
+    }
+    conn->client_name = cmd[2];
+    return resp_ok(out);
+  }
+  if (sub == "setinfo" && cmd.size() == 4){
+    return resp_ok(out); // accepted and dropped, deliberately
+  }
+  return resp_err(out, "ERR Unknown CLIENT subcommand or wrong number of arguments");
+}
+
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
                 const char *raw, size_t raw_len) {
+  ReplyProtoScope proto_scope(conn->resp_proto);
+
   if (cmd.empty()) {
     return resp_err(out, "ERR empty command");
   }
@@ -5430,13 +5548,17 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
     return do_auth(cmd, out, conn);
   }
 
+  if (canonical == "client"){
+    return do_client(cmd, out, conn);
+  }
+
   // check authentication
   if (!conn->user) {
     return resp_err(out, "NOAUTH authentication required");
   }
 
   // Subscribe-mode gate : once subscribed, only pub/sub + PING/QUIT/RESET run.
-  if (!(conn->sub_channels.empty() && conn->sub_patterns.empty()) &&
+  if (conn->resp_proto < 3 && !(conn->sub_channels.empty() && conn->sub_patterns.empty()) &&
       !cmd_ok_in_subscribe(canonical)) {
     return resp_err(out, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT "
                          "/ RESET are allowed in subscribe mode");
@@ -5721,6 +5843,7 @@ void acl_init_categories() {
       {"replicaof", KeySpec::NONE},
       {"slaveof", KeySpec::NONE},
       {"wait", KeySpec::NONE},
+      {"client", KeySpec::NONE},
   };
 
   // category bits OR'd on TOP of the READ/WRITE base (this is where acl's line
@@ -5762,6 +5885,7 @@ void acl_init_categories() {
       {"replicaof", CAT_ADMIN | CAT_DANGEROUS},
       {"slaveof", CAT_ADMIN | CAT_DANGEROUS},
       {"wait", CAT_SLOW},
+      {"client", CAT_SLOW},
   };
 
   static const std::unordered_map<std::string_view, int> notify_cls = {

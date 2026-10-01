@@ -478,8 +478,30 @@ single member and stays a bulk string:
     return (cmd.size() >= 3) ? resp_set(out, 0) : resp_nil(out);
 ```
 
-...and the same swap in the `hm_size(set) == 0` guard, plus the `resp_arr`
-that heads the counted result further down.
+`do_spop` has **four** reply-shape sites, not two. All four of the counted-form
+ones become `resp_set`; measured against a real redis-server 2026-10-01:
+
+| call | RESP2 | RESP3 | site |
+|---|---|---|---|
+| `SPOP missing N` | `*0` | `~0` | `Lookup::MISSING` |
+| `SPOP empty N` | `*0` | `~0` | `hm_size(set) == 0` guard |
+| `SPOP key 0` | `*0` | `~0` | the `count == 0` early return |
+| `SPOP key N` | `*n` | `~n` | the counted header |
+| `SPOP key` (bare) | `$len` / `$-1` | `$len` / `_` | single-pop + the two nil arms |
+
+The `count == 0` arm is the one that gets missed, because `resp_arr(out, 0)` and
+`resp_set(out, 0)` are **byte-identical under RESP2** (`*0\r\n`) — it cannot be
+caught until a client negotiates RESP3:
+
+```cpp
+    if (count == 0) {
+      return resp_set(out, 0);   // was resp_arr; SPOP key 0 is still the counted form
+    }
+```
+
+**`do_srandmember` stays `resp_arr` everywhere** — verified, real redis answers
+`SRANDMEMBER key 2` with `*1` even under RESP3, because a negative count may
+repeat members, so it is not a set. Do not "fix" it to match `do_spop`.
 
 **`do_config` (3919), the `get` branch** — `kv.size()` is already a pair count,
 so the `* 2` goes away:
