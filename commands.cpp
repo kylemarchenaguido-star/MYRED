@@ -2562,7 +2562,6 @@ static void h_collect_reply(std::vector<std::string> &cmd, Buffer *out,
   size_t n = hm_size(&entry_hash(ent));
   if (mode == 0){ resp_map(out, (uint32_t)n); } // pairs, kek
   else          { resp_arr(out, (uint32_t)n); }
-  resp_arr(out, (uint32_t)(mode == 0 ? n * 2 : n));
   HEmit c{out, mode};
   hm_foreach(&entry_hash(ent), cb_hemit, &c);
 }
@@ -3982,7 +3981,7 @@ static void do_config(std::vector<std::string> &cmd, Buffer *out) {
     }
 
     // empty array for unknown params
-    resp_map(out, (uint32_t)(kv.size() * 2));
+    resp_map(out, (uint32_t)kv.size());
     for (auto &p : kv) {
       resp_str(out, p.first.data(), p.first.size());
       resp_str(out, p.second.data(), p.second.size());
@@ -5432,6 +5431,14 @@ struct ReplyProtoScope {
   ~ReplyProtoScope() { g_reply_proto = prev; }
 };
 
+// A client name is one printable, space-free token. Shared by CLIENT SETNAME and HELLO ... SERNAME so the two cannot drift
+static bool client_name_valid(const std::string &name){
+  for (unsigned char ch : name){
+    if (ch < '!' || ch > '~'){ return false; }
+  }
+  return true;
+}
+
 // HELLO [protover [AUTH user pass] [SETNAME name]]
 // Redis allows re-HELLO at any time, inclusind downgrading 3 -> 2, so this is not one-shot 
 static void do_hello(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
@@ -5459,13 +5466,19 @@ static void do_hello(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
       return resp_err(out, "ERR Syntax error in HELLO option");
     }
   }
+
+  if (name_at && !client_name_valid(cmd[name_at + 1])){
+    return resp_err(out, "ERR client names cannot contain spaces, newlines or special characters");
+  }
+
   if (name_at){ conn->client_name = cmd[name_at + 1]; }
 
   if (auth_at){
     // Hand off to the async verifier and answer from auth_complete()
-    conn->hello_pending_proto = want;
     std::vector<std::string> a = {"auth", cmd[auth_at + 1], cmd[auth_at + 2]};
-    do_auth(a, out, conn); // queues the job, writes nothing 
+    do_auth(a, out, conn); // queues the job, writes nothing
+    if (conn->auth_pending){ conn->hello_pending_proto = want; }
+    secure_zero(&cmd[auth_at + 2], cmd[auth_at + 2].size());
     return; // no reply now - auth_complete() emits the map
   }
 
@@ -5485,6 +5498,9 @@ static void do_hello(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
 
 // CLIENT SETNAME|GETNAME|ID|SETINFO - the connection-time subset
 static void do_client(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
+  if (cmd.size() < 2){
+    return resp_err(out, "ERR wrong number of arguments for 'client command");
+  }
   std::string sub = cmd[1];
   for (char &ch : sub){ ch = (char)tolower((unsigned char)ch); }
 
@@ -5497,10 +5513,8 @@ static void do_client(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
   }
   if (sub == "setname" && cmd.size() == 3){
     // a name with a space or newline would corrupt CLIENT LIST output later
-    for (unsigned char ch : cmd[2]){
-      if (ch < '!' || ch > '~'){
-        return resp_err(out, "ERR Client names cannot contain spaces, newlines or special characters.");
-      }
+    if (!client_name_valid(cmd[2])){
+      return resp_err(out, "ERR Client names cannot contain spaces, newlines or special characteres.");
     }
     conn->client_name = cmd[2];
     return resp_ok(out);
@@ -5526,6 +5540,9 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
 
   if (cmd[0] == "auth") {
     return do_auth(cmd, out, conn);
+  }  
+  if (cmd[0] == "hello") {
+    return do_hello(cmd, out, conn);
   }
 
   // resolve the typed name against the live map
@@ -5546,10 +5563,6 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
   // AUTH always allowed, even under an alias is always allowed
   if (found && canonical == "auth") {
     return do_auth(cmd, out, conn);
-  }
-
-  if (canonical == "client"){
-    return do_client(cmd, out, conn);
   }
 
   // check authentication
@@ -5645,6 +5658,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
   if (canonical == "acl") {
     return do_acl(cmd, out, conn);
   } // permission checked above; needs conn
+
+  if (canonical == "client"){
+    return do_client(cmd, out, conn);
+  }
 
   // pub/sub control
   if (canonical == "subscribe") {

@@ -32,6 +32,11 @@ lives at `~/.local/share/myred-testenv` (redis-py 8.1.0, outside the repo):
 ~/.local/share/myred-testenv/bin/python -c "import redis; print(redis.__version__)"
 ```
 
+**V13 Step 1 (RESP3) landed 2026-10-01 and was tested 2026-10-02:** a stock
+`redis-py` now connects and gets real `dict`/`set`/`float`/`None`, but six
+defects came with it — fixes in `docs/V13_STEP1_FIXES.md`, coverage in the new
+`resp3` phase (`--phases resp3`).
+
 Primary commands:
 ```bash
 cmake -B build && cmake --build build          # build/ is a DEBUG build
@@ -376,6 +381,23 @@ protocol compatibility.** Keep the real library in the loop for V13.
 ---
 
 ### 1. Protocol/session surface — **NEEDED; `HELLO` is no longer cheap**
+
+> **Status 2026-10-02 — RESP3 implemented, tested, six defects found, fixes
+> written and proven but not yet applied.** `HELLO`/RESP3 landed in `14fb0f3`
+> (decision taken 2026-10-01: real RESP3, not `protocol=2`). Testing it needed a
+> new **`resp3` phase** in `scripts/stress_test.py` — 232 checks, because the
+> harness reader could not see RESP3 types at all. Against the tree as written it
+> failed 40 checks and, under ASan, a `heap-buffer-overflow`. The defects, worst
+> first: a bare `CLIENT` killed the server **before authentication**; every hash
+> read (`HGETALL`/`HKEYS`/`HVALS`) hung every client, **RESP2 included**; `CONFIG
+> GET` hung both protocols; `CLIENT` ran unauthenticated and outside ACL/MULTI
+> (same cause as the crash); a `-BUSY`'d `HELLO ... AUTH` left a flag armed that
+> corrupted the next plain `AUTH`; and two smaller ones. All six fixes were
+> applied to a scratch copy and verified: **1692/1692 on Release and under
+> ASan+UBSan+LSan, all eleven sanitizer assertions green.** The edits, as before/after snippets, are in
+> **`docs/V13_STEP1_FIXES.md`**. Open there as well: `CONFIG GET` with several
+> parameters (Redis 7.0+) is unimplemented, and the `Conn` hot block grew from
+> 48 to 88 bytes (unmeasured cost).
 
 Rewritten 2026-09-18 after Step 0 measured this against a real client. The
 "all four are cheap stubs" framing was wrong about exactly one of them, and it

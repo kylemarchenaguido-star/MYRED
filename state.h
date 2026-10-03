@@ -237,7 +237,7 @@ struct GlobalData{
   size_t g_last_save_size_bytes = 0; // size of last dump
   size_t used_memory = 0;
   bool g_last_save_ok = true; // did the last save succeded
-  uint64_t next_conn_id = -1; // 0 = "never a real conn"  
+  uint64_t next_conn_id = 1; // 0 = "never a real conn"  
   // statdistics// written per command
   uint64_t g_server_start_ms = 0;
   uint64_t g_total_commands = 0;
