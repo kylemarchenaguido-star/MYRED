@@ -22,7 +22,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <string>
 #include <unistd.h>
 #include <cstring>
 #include <cctype>
@@ -46,8 +45,7 @@ static constexpr const char *MSG_SYNTAX = "ERR syntax error";
 static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
 
 static size_t good_replicas(uint64_t now_ms);
-
-static bool arg_ieq(const std::string &s, const char *lit);
+static bool arg_ieq(const std::string &s, const char *lit); // defined below
 
 static void die(const char *msg) {
   int err = errno;
@@ -320,15 +318,17 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out) {
 }
 
 // SET key value [NX | XX] [GET] [EX s | PX ms | EXAT s | PXAT ms | KEEPTTL]
-struct SetOps {
+struct SetOpts {
   bool nx = false, xx = false, get = false, keepttl = false;
   bool has_exp = false;
-  int64_t abs_ms = 0; // wall-clock deadline in msl only meaningful if has_exp
+  int64_t abs_ms = 0; // wall-clock deadline in ms; only meaningful if has_exp
 };
 
-// Parses cmd[3..]. Returns nullptr on succes, else the error text, Shared by set functions
-static const char *parse_set_opts(const std::vector<std::string> &cmd, SetOps &o){
-
+// Parses cmd[3..]. Returns nullptr on success, else the error text. Shared by
+// do_set and propagate_cmd so the AOF writer reads the options the same way the
+// command did.
+static const char *parse_set_opts(const std::vector<std::string> &cmd,
+                                  SetOpts &o) {
   enum : unsigned {
     NX = 1, XX = 2, GET = 4, KEEPTTL = 8,
     EX = 16, PX = 32, EXAT = 64, PXAT = 128,
@@ -337,36 +337,36 @@ static const char *parse_set_opts(const std::vector<std::string> &cmd, SetOps &o
   unsigned f = 0;
   const int64_t now = (int64_t)get_wall_msec();
 
-  for (size_t i = 3; i < cmd.size(); ++i){
+  for (size_t i = 3; i < cmd.size(); ++i) {
     const std::string &a = cmd[i];
     // each option is accepted only if nothing it conflicts with was seen;
-    // reapting value is allowed, last option wins
-    auto unit = [&](const char *name, unsigned bit){
+    // repeating the SAME option is allowed (the last value wins), as in redis
+    auto unit = [&](const char *name, unsigned bit) {
       return arg_ieq(a, name) && !(f & KEEPTTL) && !(f & EXPIRY & ~bit);
     };
     unsigned bit = 0;
     bool secs = false, absolute = false;
 
-    if (arg_ieq(a, "nx") && !(f & XX)){ f |= NX; continue; }
-    if (arg_ieq(a, "xx") && !(f & NX)){ f |= XX; continue; }
-    if (arg_ieq(a, "get")){ f |= GET; continue; }
-    if (arg_ieq(a, "keepttl") && !(f & EXPIRY)){ f |= KEEPTTL; continue; }
+    if (arg_ieq(a, "nx") && !(f & XX)) { f |= NX; continue; }
+    if (arg_ieq(a, "xx") && !(f & NX)) { f |= XX; continue; }
+    if (arg_ieq(a, "get")) { f |= GET; continue; }
+    if (arg_ieq(a, "keepttl") && !(f & EXPIRY)) { f |= KEEPTTL; continue; }
 
-    if (unit("ex", EX)){ bit = EX; secs = true; }
-    else if (unit("px", PX)){ bit = PX; }
-    else if (unit("exat", EXAT)){ bit = EXAT; secs = true; absolute = true; }
-    else if (unit("pxat", PXAT)){ bit = PXAT; absolute = true; }
+    if (unit("ex", EX)) { bit = EX; secs = true; }
+    else if (unit("px", PX)) { bit = PX; }
+    else if (unit("exat", EXAT)) { bit = EXAT; secs = true; absolute = true; }
+    else if (unit("pxat", PXAT)) { bit = PXAT; absolute = true; }
     else { return MSG_SYNTAX; }
 
-    if (i + 1 >= cmd.size()){ return MSG_SYNTAX; }
+    if (i + 1 >= cmd.size()) { return MSG_SYNTAX; } // option without its value
     int64_t v = 0;
-    if (!str2int(cmd[++i], v)){ return MSG_NOT_INT; }
-    static const char *bad = "ERR invalid expire time in 'set command";
-    if (v <= 0 || (secs && v > INT64_MAX / 1000)){ return bad; }
+    if (!str2int(cmd[++i], v)) { return MSG_NOT_INT; }
+    static const char *bad = "ERR invalid expire time in 'set' command";
+    if (v <= 0 || (secs && v > INT64_MAX / 1000)) { return bad; }
     int64_t ms = secs ? v * 1000 : v;
-    if (!absolute){
-      if (nms > INT64_MAX - now){ return bad; } // now + ms must not overflow
-      ms += now; 
+    if (!absolute) {
+      if (ms > INT64_MAX - now) { return bad; } // now + ms must not overflow
+      ms += now;
     }
     f |= bit;
     o.abs_ms = ms;
@@ -382,7 +382,7 @@ static const char *parse_set_opts(const std::vector<std::string> &cmd, SetOps &o
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out) {
   Entry *ent;
-  if (cmd.size() == 3){
+  if (cmd.size() == 3) { // plain SET: the hot path, nothing below touches it
     if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
       return resp_err(out, "WRONGTYPE wrong type");
     }
@@ -393,51 +393,55 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
     return resp_ok(out);
   }
 
-  SetOps o;
-  if (const char *err = parse_set_opts(cmd, o)){
+  SetOpts o;
+  if (const char *err = parse_set_opts(cmd, o)) {
     return resp_err(out, err);
   }
 
-  // Look at the key WITHOUT consuming cmd[1]
+  // Look at the key WITHOUT consuming cmd[1] (lookup_entry swaps it away) and
+  // without a type check: NX/XX/GET need to know what is there first.
   Entry *old = nullptr;
   {
     LookupKey lk;
     lk.key = cmd[1];
     lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
-    if (HNode *n = hm_lookup(&g_data.db, &lk.node, &entry_eq)){
+    if (HNode *n = hm_lookup(&g_data.db, &lk.node, &entry_eq)) {
       Entry *e = container_of(n, &Entry::node);
-      if (!expire_if_needed(e)){ old = e; } // an expired key counts as missing
+      if (!expire_if_needed(e)) { old = e; } // an expired key counts as missing
     }
   }
 
   // GET on a non-string is an error and must change nothing
-  if (o.get && old && old->type != T_STR){
+  if (o.get && old && old->type != T_STR) {
     return resp_err(out, MSG_WRONGTYPE);
   }
-  std::string prev; // the old value, copied
-  if (o.get && old){ prev = entry_str(old); }
+  std::string prev; // the old value, copied: we overwrite it below
+  if (o.get && old) { prev = entry_str(old); }
   auto reply = [&] {
-    if (o.get){ return old ? resp_str(out, prev.data(), prev.size()) : resp_nil(out); }
+    if (o.get) {
+      return old ? resp_str(out, prev.data(), prev.size()) : resp_nil(out);
+    }
     return resp_ok(out);
   };
-  
-  // condition not met: write nothing 
-  if ((o.nx && old) || (o.xx && !old)) {
+
+  if ((o.nx && old) || (o.xx && !old)) { // condition not met: write nothing
     return o.get ? reply() : resp_nil(out);
   }
 
-  // KEEPTTL must survive even an overwrite that replaces the entry
+  // KEEPTTL must survive even an overwrite that replaces the entry (a key of
+  // another type is destroyed and recreated), so read the TTL before writing
   int64_t keep_ms = -1;
-  if (o.keepttl && old && entry_has_ttl(old)){
+  if (o.keepttl && old && entry_has_ttl(old)) {
     uint64_t at = g_data.heap[old->heap_idx].val, now = get_monotonic_msec();
     keep_ms = at > now ? (int64_t)(at - now) : 0;
   }
 
   int64_t ttl_ms = -1;
-  if (o.has_exp){
+  if (o.has_exp) {
     ttl_ms = o.abs_ms - (int64_t)get_wall_msec();
-    if (ttl_ms <= 0){
-      // EXAT/PXAT already in the past
+    if (ttl_ms <= 0) {
+      // EXAT/PXAT already in the past: the value is set and expires at once,
+      // which is the same as the key simply not being there afterwards
       if (old) {
         hm_delete(&g_data.db, &old->node, &hnode_same);
         entry_del(old);
@@ -445,15 +449,15 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
       }
       return reply();
     }
-  } else if (o.keepttl){
+  } else if (o.keepttl) {
     ttl_ms = keep_ms;
   }
 
   if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
-    return resp_err(out, MSG_WRONGTYPE);
+    return resp_err(out, MSG_WRONGTYPE); // replace=true: cannot happen
   }
   entry_str(ent).swap(cmd[2]);
-  entry_set_ttl(ent, ttl_ms);
+  entry_set_ttl(ent, ttl_ms); // -1 clears it, as a plain SET does
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
   return reply();
@@ -1189,7 +1193,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out) {
   bool changed = false;
   ZSet *zs = &entry_zset(ent);
   for (size_t i = 2; i + 1 < cmd.size(); i += 2) {
-    double score;
+    double score = 0;
     str2dbl(cmd[i], score);
     if (ZNode *zn = zset_lookup(zs, cmd[i + 1].data(), cmd[i + 1].size())) {
       if (zn->score != score) {
@@ -1279,12 +1283,22 @@ struct ZQueryResult {
   double score;
 };
 
+// ── sorted-set range surface ────────────────────────────────────────────────
+//
+// ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCOUNT and the two
+// ZREMRANGE* commands are one question asked six ways: "which members sit in
+// this stretch of the ordering?". They all reduce to an ASCENDING RANK
+// INTERVAL [lo, hi) and differ only in how the interval is spelled
+// (ranks / scores), which end is walked first (REV) and what is done with the
+// members (emit / count / delete). Everything below is built on two O(log n)
+// primitives from zset.cpp, both of which read the subtree sizes the AVL
+// already keeps:
+//
+//   zset_count_below(zs, s, inclusive)  how many members have score < s (<= s)
+//   zset_at_rank(zs, r)                 the r-th member in ascending order
+
 enum : unsigned {
-  ZO_BYSCORE = 1,
-  ZO_BYLEX = 2,
-  ZO_REV = 4,
-  ZO_LIMIT = 8,
-  ZO_WITHSCORES = 16,
+  ZO_BYSCORE = 1, ZO_BYLEX = 2, ZO_REV = 4, ZO_LIMIT = 8, ZO_WITHSCORES = 16,
 };
 
 struct ZRangeSpec {
@@ -1293,12 +1307,18 @@ struct ZRangeSpec {
   bool withscores = false;
   bool has_limit = false;
   int64_t offset = 0, count = -1; // LIMIT; a negative count means "all"
-  int64_t start = 0, stop = 0;
-  double lo = 0, hi = 0;
+  int64_t start = 0, stop = 0;    // by rank
+  double lo = 0, hi = 0;          // by score, in ascending order
   bool lo_excl = false, hi_excl = false;
 };
 
-static bool parse_score_bound(const std::string &s, double &v, bool &excl){
+// "5", "(5", "-inf", "+inf", "(-inf" ... A leading '(' makes the bound exclusive.
+// Deliberately NOT str2dbl: redis parses range bounds with a laxer routine than
+// it uses for ZADD/ZINCRBY scores (zslParseRange), and the differential phase
+// caught the difference. Here "" is 0, a bare "(" is "exclusive 0", leading
+// blanks are skipped and "1e999" is +inf; only trailing junk and NaN are
+// refused. Matching it is two lines, and an app can never tell otherwise.
+static bool parse_score_bound(const std::string &s, double &v, bool &excl) {
   excl = !s.empty() && s[0] == '(';
   const char *p = s.c_str() + (excl ? 1 : 0);
   char *end = nullptr;
@@ -1306,20 +1326,22 @@ static bool parse_score_bound(const std::string &s, double &v, bool &excl){
   return *end == '\0' && !std::isnan(v);
 }
 
-// Options from cmd[i ...], limited to the ones 'allow' names. nullptr = resp_ok
-static const char *parse_zrange_opts(const std::vector<std::string> &cmd, size_t i, unsigned allow, ZRangeSpec &sp){
-  for (; i < cmd.size(); ++i){
-    if ((allow & ZO_WITHSCORES) && arg_ieq(cmd[i], "withscores")){
+// Options from cmd[i...], limited to the ones `allow` names. nullptr = ok.
+static const char *parse_zrange_opts(const std::vector<std::string> &cmd,
+                                     size_t i, unsigned allow,
+                                     ZRangeSpec &sp) {
+  for (; i < cmd.size(); ++i) {
+    if ((allow & ZO_WITHSCORES) && arg_ieq(cmd[i], "withscores")) {
       sp.withscores = true;
-    } else if ((allow & ZO_REV) && arg_ieq(cmd[i], "rev")){
+    } else if ((allow & ZO_REV) && arg_ieq(cmd[i], "rev")) {
       sp.rev = true;
-    } else if ((allow & ZO_BYSCORE) && arg_ieq(cmd[i], "byscore")){
+    } else if ((allow & ZO_BYSCORE) && arg_ieq(cmd[i], "byscore")) {
       sp.by_score = true;
-    } else if ((allow & ZO_BYLEX) && arg_ieq(cmd[i], "bylex")){
+    } else if ((allow & ZO_BYLEX) && arg_ieq(cmd[i], "bylex")) {
       return "ERR syntax error, BYLEX is not supported";
-    } else if ((allow & ZO_LIMIT) && arg_ieq(cmd[i], "limit")){
-      if (i + 2 >= cmd.size()){ return MSG_SYNTAX; }
-      if (!str2int(cmd[i + 1], sp.offset) || !str2int(cmd[i + 2], sp.count)){
+    } else if ((allow & ZO_LIMIT) && arg_ieq(cmd[i], "limit")) {
+      if (i + 2 >= cmd.size()) { return MSG_SYNTAX; }
+      if (!str2int(cmd[i + 1], sp.offset) || !str2int(cmd[i + 2], sp.count)) {
         return MSG_NOT_INT;
       }
       sp.has_limit = true;
@@ -1331,162 +1353,323 @@ static const char *parse_zrange_opts(const std::vector<std::string> &cmd, size_t
   return nullptr;
 }
 
-// Turn the two positional bounds into numbers.
-static const char *zrange_bounds(ZRangeSpec &sp, const std::string &a, const std::string &b){
-
+// Turn the two positional bounds into numbers. Must run BEFORE the key is
+// looked up: a malformed bound is an error even when the key does not exist.
+static const char *zrange_bounds(ZRangeSpec &sp, const std::string &a,
+                                 const std::string &b) {
+  if (!sp.by_score) {
+    return (str2int(a, sp.start) && str2int(b, sp.stop)) ? nullptr : MSG_NOT_INT;
+  }
+  // ZRANGE .. BYSCORE and ZRANGEBYSCORE read (min, max); with REV and for
+  // ZREVRANGEBYSCORE the operands arrive as (max, min)
+  const std::string &smin = sp.rev ? b : a;
+  const std::string &smax = sp.rev ? a : b;
+  if (!parse_score_bound(smin, sp.lo, sp.lo_excl) ||
+      !parse_score_bound(smax, sp.hi, sp.hi_excl)) {
+    return "ERR min or max is not a float";
+  }
+  return nullptr;
 }
 
+// The ascending rank interval [lo, hi) the request covers. Empty if hi <= lo.
+static void zrange_interval(ZSet *zs, const ZRangeSpec &sp, int64_t &lo,
+                            int64_t &hi) {
+  if (sp.by_score) {
+    // first member NOT below the min bound .. first member ABOVE the max bound
+    lo = zset_count_below(zs, sp.lo, /*inclusive=*/sp.lo_excl);
+    hi = zset_count_below(zs, sp.hi, /*inclusive=*/!sp.hi_excl);
+    return;
+  }
+  const int64_t card = (int64_t)avl_cnt(zs->root);
+  int64_t s = sp.start, e = sp.stop;
+  if (s < 0) { s += card; }
+  if (e < 0) { e += card; }
+  if (s < 0) { s = 0; }
+  if (s > e || s >= card) { lo = hi = 0; return; }
+  if (e >= card) { e = card - 1; }
+  if (sp.rev) { // indexes count from the top: mirror them onto ascending ranks
+    lo = card - 1 - e;
+    hi = card - s;
+  } else {
+    lo = s;
+    hi = e + 1;
+  }
+}
 
+static void emit_member(Buffer *out, const ZNode *zn, bool withscores) {
+  if (withscores && g_reply_proto >= 3) { resp_arr(out, 2); } // [member, score]
+  resp_str(out, zn->name, zn->len);
+  if (withscores) { resp_dbl(out, zn->score); }
+}
 
+// Apply LIMIT, then write the members: walk n nodes from the right end.
+static void zrange_emit(Buffer *out, ZSet *zs, const ZRangeSpec &sp) {
+  int64_t lo, hi;
+  zrange_interval(zs, sp, lo, hi);
+  int64_t n = hi > lo ? hi - lo : 0, skip = 0;
+  if (sp.has_limit) {
+    if (sp.offset < 0 || sp.offset >= n) {
+      n = 0;
+    } else {
+      skip = sp.offset;
+      n -= skip;
+      if (sp.count >= 0 && sp.count < n) { n = sp.count; }
+    }
+  }
+  // RESP2 flattens [member, score] pairs; RESP3 nests them
+  const bool flat = sp.withscores && g_reply_proto < 3;
+  resp_arr(out, (uint32_t)(flat ? n * 2 : n));
+  ZNode *zn = n > 0 ? zset_at_rank(zs, sp.rev ? hi - 1 - skip : lo + skip) : NULL;
+  for (int64_t i = 0; i < n && zn; ++i) {
+    emit_member(out, zn, sp.withscores);
+    zn = znode_offset(zn, sp.rev ? -1 : +1);
+  }
+}
 
+// ZRANGE / ZREVRANGE / ZRANGEBYSCORE / ZREVRANGEBYSCORE. The caller presets
+// what the command name already implies (by_score / rev) and which options the
+// command accepts at all.
+static void zrange_generic(std::vector<std::string> &cmd, Buffer *out,
+                           ZRangeSpec sp, unsigned allow) {
+  if (const char *err = parse_zrange_opts(cmd, 4, allow, sp)) {
+    return resp_err(out, err);
+  }
+  if (sp.has_limit && !sp.by_score) {
+    return resp_err(out, "ERR syntax error, LIMIT is only supported in "
+                         "combination with either BYSCORE or BYLEX");
+  }
+  if (const char *err = zrange_bounds(sp, cmd[2], cmd[3])) {
+    return resp_err(out, err);
+  }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_arr(out, 0);
+  case Lookup::OK:
+    break;
+  }
+  zrange_emit(out, &entry_zset(ent), sp);
+}
 
+static void do_zrange(std::vector<std::string> &cmd, Buffer *out) {
+  zrange_generic(cmd, out, ZRangeSpec{},
+                 ZO_BYSCORE | ZO_BYLEX | ZO_REV | ZO_LIMIT | ZO_WITHSCORES);
+}
+static void do_zrevrange(std::vector<std::string> &cmd, Buffer *out) {
+  ZRangeSpec sp;
+  sp.rev = true;
+  zrange_generic(cmd, out, sp, ZO_WITHSCORES);
+}
+static void do_zrangebyscore(std::vector<std::string> &cmd, Buffer *out) {
+  ZRangeSpec sp;
+  sp.by_score = true;
+  zrange_generic(cmd, out, sp, ZO_LIMIT | ZO_WITHSCORES);
+}
+static void do_zrevrangebyscore(std::vector<std::string> &cmd, Buffer *out) {
+  ZRangeSpec sp;
+  sp.by_score = true;
+  sp.rev = true;
+  zrange_generic(cmd, out, sp, ZO_LIMIT | ZO_WITHSCORES);
+}
 
+// ZCARD key
+static void do_zcard(std::vector<std::string> &cmd, Buffer *out) {
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_int(out, 0);
+  case Lookup::OK:
+    break;
+  }
+  resp_int(out, (int64_t)avl_cnt(entry_zset(ent).root));
+}
 
+// ZCOUNT key min max: two descents, no walk
+static void do_zcount(std::vector<std::string> &cmd, Buffer *out) {
+  ZRangeSpec sp;
+  sp.by_score = true;
+  if (const char *err = zrange_bounds(sp, cmd[2], cmd[3])) {
+    return resp_err(out, err);
+  }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_int(out, 0);
+  case Lookup::OK:
+    break;
+  }
+  int64_t lo, hi;
+  zrange_interval(&entry_zset(ent), sp, lo, hi);
+  resp_int(out, hi > lo ? hi - lo : 0);
+}
 
+// ZREVRANK key member: the rank counted from the top (leaderboard position)
+static void do_zrevrank(std::vector<std::string> &cmd, Buffer *out) {
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_nil(out);
+  case Lookup::OK:
+    break;
+  }
+  ZSet *zs = &entry_zset(ent);
+  ZNode *zn = zset_lookup(zs, cmd[2].data(), cmd[2].size());
+  if (!zn) {
+    return resp_nil(out);
+  }
+  resp_int(out, (int64_t)avl_cnt(zs->root) - 1 - avl_rank(&zn->tree));
+}
 
+// ZINCRBY key increment member -> the new score
+static void do_zincrby(std::vector<std::string> &cmd, Buffer *out) {
+  double incr;
+  if (!str2dbl(cmd[2], incr)) {
+    return resp_err(out, "ERR value is not a valid float");
+  }
+  Entry *ent;
+  if (lookup_entry(cmd[1], T_ZSET, true, &ent) == Lookup::WRONGTYPE) {
+    return resp_err(out, MSG_WRONGTYPE);
+  }
+  ZSet *zs = &entry_zset(ent);
+  ZNode *zn = zset_lookup(zs, cmd[3].data(), cmd[3].size());
+  // The ONLY way to get NaN here is inf + -inf, which needs an existing member,
+  // so bailing out below can never strand the empty zset create=true just made.
+  double score = zn ? zn->score + incr : incr;
+  if (std::isnan(score)) {
+    return resp_err(out, "ERR resulting score is not a number (NaN)");
+  }
+  if (zn) {
+    zset_update(zs, zn, score);
+  } else {
+    zset_insert(zs, cmd[3].data(), cmd[3].size(), score);
+  }
+  mem_reaccount(ent);
+  g_data.g_writes_since_save++;
+  resp_dbl(out, score);
+}
 
+// ZREMRANGEBYSCORE key min max / ZREMRANGEBYRANK key start stop -> removed
+static void zremrange_generic(std::vector<std::string> &cmd, Buffer *out,
+                              bool by_score) {
+  ZRangeSpec sp;
+  sp.by_score = by_score;
+  if (const char *err = zrange_bounds(sp, cmd[2], cmd[3])) {
+    return resp_err(out, err);
+  }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_int(out, 0);
+  case Lookup::OK:
+    break;
+  }
+  ZSet *zs = &entry_zset(ent);
+  int64_t lo, hi;
+  zrange_interval(zs, sp, lo, hi);
+  if (hi <= lo) {
+    return resp_int(out, 0);
+  }
+  // Collect first, delete second: every delete rebalances the tree, which
+  // would pull the ground out from under a walk that is still going.
+  std::vector<ZNode *> doomed;
+  doomed.reserve((size_t)(hi - lo));
+  ZNode *zn = zset_at_rank(zs, lo);
+  for (int64_t i = lo; i < hi && zn; ++i) {
+    doomed.push_back(zn);
+    zn = znode_offset(zn, +1);
+  }
+  for (ZNode *d : doomed) {
+    zset_delete(zs, d);
+  }
+  g_data.g_writes_since_save++;
+  if (hm_size(&zs->hmap) == 0) { // an empty zset must not outlive its last member
+    hm_delete(&g_data.db, &ent->node, &hnode_same);
+    entry_del(ent);
+  } else {
+    mem_reaccount(ent);
+  }
+  resp_int(out, (int64_t)doomed.size());
+}
+static void do_zremrangebyscore(std::vector<std::string> &cmd, Buffer *out) {
+  zremrange_generic(cmd, out, true);
+}
+static void do_zremrangebyrank(std::vector<std::string> &cmd, Buffer *out) {
+  zremrange_generic(cmd, out, false);
+}
 
+static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out) {
+  int64_t count = 1;
+  if (cmd.size() >= 3) {
+    if (!str2int(cmd[2], count)) {
+      return resp_err(out, MSG_NOT_INT);
+    }
+    if (count < 0) {
+      count = 0;
+    }
+  }
+  Entry *ent;
+  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+  case Lookup::WRONGTYPE:
+    return resp_err(out, MSG_WRONGTYPE);
+  case Lookup::MISSING:
+    return resp_arr(out, 0);
+  case Lookup::OK:
+    break;
+  }
+  ZSet *zset = &entry_zset(ent);
 
+  // collect the lowest-score members first - RESP needs the array lenght up
+  // front
+  std::vector<ZQueryResult> popped;
+  for (int64_t i = 0; i < count && zset->root; ++i) {
+    AVLNode *node = zset->root;
+    // leftmost = min
+    while (node->left) {
+      node = node->left;
+    }
+    ZNode *zn = container_of(node, &ZNode::tree);
+    popped.push_back({std::string(zn->name, zn->len), zn->score});
+    zset_delete(zset, zn);
+  }
+  // RESP2: flat [member, score, ...]. RESP3 asks for pairs, but only when a
+  // COUNT was given: a bare ZPOPMIN stays the flat [member, score], and a
+  // client such as redis-py tells the two apart by shape, so sending a flat
+  // list for a counted pop silently keeps only its first pair.
+  if (g_reply_proto >= 3 && cmd.size() >= 3) {
+    resp_arr(out, (uint32_t)popped.size());
+    for (const auto &p : popped) {
+      resp_arr(out, 2);
+      resp_str(out, p.name.data(), p.name.size());
+      resp_dbl(out, p.score);
+    }
+  } else {
+    resp_arr(out, (uint32_t)(popped.size() * 2));
+    for (const auto &p : popped) {
+      resp_str(out, p.name.data(), p.name.size());
+      resp_dbl(out, p.score);
+    }
+  }
 
-
-
-// // zquery zset score name offset limit (search by ascending order)
-// static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
-//   // we parse the args
-//   double score = 0;
-//   if (!str2dbl(cmd[2], score)) {
-//     return resp_err(out, "ERR invalid score");
-//   }
-//
-//   int64_t offset = 0, limit = 0;
-//   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
-//     return resp_err(out, "ERR invalid offset/limit");
-//   }
-//
-//   Entry *ent;
-//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-//   case Lookup::WRONGTYPE:
-//     return resp_err(out, "WRONGTYPE wrong type");
-//   case Lookup::MISSING:
-//     return resp_arr(out, 0);
-//   case Lookup::OK:
-//     break;
-//   }
-//   // we collect into a vector first so we know the count up front
-//   // (RESP wants the array length before the elements)
-//   std::vector<ZQueryResult> results;
-//
-//   ZNode *znode =
-//       zset_seekge(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
-//   znode = znode_offset(znode, offset);
-//
-//   // walk forward collecting until we hit the end (NULL) or fill the page
-//   // (limit)
-//   while (znode && (int64_t)results.size() < limit) {
-//     // znode->name is the flexible char[0] array, znode->len its length
-//     results.push_back({std::string(znode->name, znode->len), znode->score});
-//     znode = znode_offset(znode, +1); // next node in ascending order
-//   }
-//
-//   // flat output: each result = name + score, so element count is size * 2
-//   // -> [name1, score1, name2, score2, ...]
-//   resp_arr(out, (uint32_t)(results.size() * 2));
-//   for (auto &r : results) {
-//     resp_str(out, r.name.data(), r.name.size());
-//     resp_dbl(out, r.score);
-//   }
-// }
-//
-// // reverse order from do_zquery (descending order)
-// static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out) {
-//   // we parse the args
-//   double score = 0;
-//   if (!str2dbl(cmd[2], score)) {
-//     return resp_err(out, "ERR invalid score");
-//   }
-//   int64_t offset = 0, limit = 0;
-//   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
-//     return resp_err(out, "ERR invalid offset/limit");
-//   }
-//
-//   // we get the zset
-//   Entry *ent;
-//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-//   case Lookup::WRONGTYPE:
-//     return resp_err(out, "WRONGTYPE wrong type");
-//   case Lookup::MISSING:
-//     return resp_arr(out, 0);
-//   case Lookup::OK:
-//     break;
-//   }
-//   std::vector<ZQueryResult> results;
-//   ZNode *znode =
-//       zset_seekle(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
-//   znode = znode_offset(znode, -offset);
-//
-//   while (znode && (int64_t)results.size() < limit) {
-//     results.push_back({std::string(znode->name, znode->len), znode->score});
-//     znode = znode_offset(znode, -1);
-//   }
-//
-//   resp_arr(out, (uint32_t)(results.size() * 2));
-//   for (auto &r : results) {
-//     resp_str(out, r.name.data(), r.name.size());
-//     resp_dbl(out, r.score);
-//   }
-// }
-//
-// static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out) {
-//   int64_t count = 1;
-//   if (cmd.size() >= 3) {
-//     if (!str2int(cmd[2], count)) {
-//       return resp_err(out, MSG_NOT_INT);
-//     }
-//     if (count < 0) {
-//       count = 0;
-//     }
-//   }
-//   Entry *ent;
-//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-//   case Lookup::WRONGTYPE:
-//     return resp_err(out, MSG_WRONGTYPE);
-//   case Lookup::MISSING:
-//     return resp_arr(out, 0);
-//   case Lookup::OK:
-//     break;
-//   }
-//   ZSet *zset = &entry_zset(ent);
-//
-//   // collect the lowest-score members first - RESP needs the array lenght up
-//   // front
-//   std::vector<ZQueryResult> popped;
-//   for (int64_t i = 0; i < count && zset->root; ++i) {
-//     AVLNode *node = zset->root;
-//     // leftmost = min
-//     while (node->left) {
-//       node = node->left;
-//     }
-//     ZNode *zn = container_of(node, &ZNode::tree);
-//     popped.push_back({std::string(zn->name, zn->len), zn->score});
-//     zset_delete(zset, zn);
-//   }
-//   // pairs of (member, score)
-//   resp_arr(out, (uint32_t)(popped.size() * 2));
-//   for (const auto &p : popped) {
-//     resp_str(out, p.name.data(), p.name.size());
-//     resp_dbl(out, p.score);
-//   }
-//
-//   if (!popped.empty()) {
-//     g_data.g_writes_since_save++;
-//     if (hm_size(&zset->hmap) == 0) {
-//       hm_delete(&g_data.db, &ent->node, &hnode_same);
-//       entry_del(ent);
-//     } else {
-//       mem_reaccount(ent);
-//     }
-//   }
-// }
+  if (!popped.empty()) {
+    g_data.g_writes_since_save++;
+    if (hm_size(&zset->hmap) == 0) {
+      hm_delete(&g_data.db, &ent->node, &hnode_same);
+      entry_del(ent);
+    } else {
+      mem_reaccount(ent);
+    }
+  }
+}
 
 static int g_audit_fd = -1;
 std::string g_audit_last_error;
@@ -1790,6 +1973,7 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out) {
   return resp_int(out, 1);
 }
 
+static bool arg_ieq(const std::string &s, const char *lit);
 
 // INFO section
 
@@ -4395,6 +4579,26 @@ static void propagate_cmd(const std::vector<std::string> &cmd) {
     } else {
       aof_encode(frame, cmd);
     }
+  } else if (name == "set" && cmd.size() > 3) {
+    // Log the EFFECT, not the request. NX/XX/GET were settled when the write
+    // ran, and a relative EX would restart its clock on every replay. One
+    // frame, not SET + PEXPIREAT: a crash between two frames would leave a key
+    // that should expire but never does.
+    SetOpts o;
+    if (parse_set_opts(cmd, o) != nullptr) {
+      aof_encode(frame, cmd);
+    } else if (o.has_exp && o.abs_ms <= now) {
+      aof_encode(frame, {"DEL", cmd[1]}); // already past: the key is gone
+    } else if (o.has_exp) {
+      char ts[32];
+      int n = snprintf(ts, sizeof(ts), "%lld", (long long)o.abs_ms);
+      aof_encode(frame,
+                 {"SET", cmd[1], cmd[2], "PXAT", std::string_view(ts, (size_t)n)});
+    } else if (o.keepttl) {
+      aof_encode(frame, {"SET", cmd[1], cmd[2], "KEEPTTL"});
+    } else {
+      aof_encode(frame, {"SET", cmd[1], cmd[2]});
+    }
   } else if (name == "setex" || name == "psetex") {
     int64_t v = 0;
     if (str2int(cmd[2], v)) {
@@ -5392,7 +5596,7 @@ static void do_acl_placeholder(std::vector<std::string> &, Buffer *) {
 static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
     // strings
     {"get", {do_get, 2, 2}},
-    {"set", {do_set, 3, 3, true}},
+    {"set", {do_set, 3, -1, true}},
     {"incr", {do_incr, 2, 2, true}},
     {"decr", {do_decr, 2, 2, true}},
     {"incrby", {do_incrby, 3, 3, true}},
@@ -5438,8 +5642,16 @@ static std::unordered_map<std::string_view, CmdSpec> k_cmd_table = {
     {"zrem", {do_zrem, 3, 3, true}},
     {"zscore", {do_zscore, 3, 3}},
     {"zrank", {do_zrank, 3, 3}},
-    {"zquery", {do_zquery, 6, 6}},
-    {"zrevquery", {do_zquery_reversed, 6, 6}},
+    {"zrevrank", {do_zrevrank, 3, 3}},
+    {"zcard", {do_zcard, 2, 2}},
+    {"zcount", {do_zcount, 4, 4}},
+    {"zrange", {do_zrange, 4, -1}},
+    {"zrevrange", {do_zrevrange, 4, 5}},
+    {"zrangebyscore", {do_zrangebyscore, 4, -1}},
+    {"zrevrangebyscore", {do_zrevrangebyscore, 4, -1}},
+    {"zincrby", {do_zincrby, 4, 4, true}},
+    {"zremrangebyscore", {do_zremrangebyscore, 4, 4, true}},
+    {"zremrangebyrank", {do_zremrangebyrank, 4, 4, true}},
     {"zpopmin", {do_zpopmin, 2, 3, true}},
     // list
     {"lpush", {do_lpush, 3, -1, true}},
@@ -5596,6 +5808,7 @@ static bool cmd_can_grow_memory(const std::string &name) {
       "expireat", "pexpireat", "persist",  "getdel",   "getex",  "lpop",
       "rpop",     "lrem",      "ltrim",    "spop",     "srem",   "hdel",
       "zrem",     "zpopmin",   "rename",   "renamenx",
+      "zremrangebyscore", "zremrangebyrank",
   };
   return no_grow.count(name) == 0;
 }
@@ -5678,7 +5891,7 @@ static void do_hello(std::vector<std::string> &cmd, Buffer *out, Conn *conn){
     std::vector<std::string> a = {"auth", cmd[auth_at + 1], cmd[auth_at + 2]};
     do_auth(a, out, conn); // queues the job, writes nothing
     if (conn->auth_pending){ conn->hello_pending_proto = want; }
-    secure_zero(&cmd[auth_at + 2], cmd[auth_at + 2].size());
+    secure_zero(&cmd[auth_at + 2][0], cmd[auth_at + 2].size());
     return; // no reply now - auth_complete() emits the map
   }
 
@@ -5935,7 +6148,10 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn,
   bool may_log = propagate_enabled() && spec.is_write && !spec.aof_self;
   bool renamed = (cmd[0] != canonical);
   // raw == nullptr means the caller has no verbatim client bytes
-  bool reencode = spec.aof_rewrite || renamed || !raw;
+  // SET with options (EX/PX/NX/GET...) is the same shape of problem as SETEX
+  // (see propagate_cmd); plain 3-word SET stays on the verbatim fast path
+  bool reencode = spec.aof_rewrite || renamed || !raw ||
+                  (cmd.size() > 3 && canonical == "set");
   std::vector<std::string> snapshot;
   if (may_log && reencode) {
     snapshot = cmd;
@@ -6130,6 +6346,8 @@ void acl_init_categories() {
       {"hsetnx", NOTIFY_HASH},      {"hincrby", NOTIFY_HASH},
       {"zadd", NOTIFY_ZSET},        {"zrem", NOTIFY_ZSET},
       {"zpopmin", NOTIFY_ZSET},
+      {"zincrby", NOTIFY_ZSET},     {"zremrangebyscore", NOTIFY_ZSET},
+      {"zremrangebyrank", NOTIFY_ZSET},
   };
 
   for (auto &kv : k_cmd_table) {

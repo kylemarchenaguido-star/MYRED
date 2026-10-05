@@ -2,7 +2,6 @@
 
 #include "ds/hashtable.h"
 #include "ds/avl.h"
-#include <cstdint>
 
 //Is the sorted set
 struct ZSet {

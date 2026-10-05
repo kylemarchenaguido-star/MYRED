@@ -1,11 +1,8 @@
 #include <assert.h>
-#include <cstddef>
-#include <cstdint>
 #include <string.h>
 #include <stdlib.h>
 
 #include "types/zset.h"
-#include "ds/avl.h"
 #include "core/common.h"
 
 static ZNode *znode_new(const char *name, size_t len, double score){
@@ -183,37 +180,41 @@ ZNode *znode_offset(ZNode *node, int64_t offset) {
     return tnode ? container_of(tnode, &ZNode::tree) : NULL;
 }
 
-
-// How many members have score < 'score' (score <= 'score' if inclusive)
+// How many members have score < `score` (score <= `score` if inclusive). The
+// tree is ordered by (score, name), so "score below s" is true for a prefix of
+// the in-order sequence: at every node either it and its whole left subtree
+// qualify (take avl_cnt(left) + 1, go right) or none of its right side does
+// (go left). O(log n), no allocation, and no name to fake for the tie-break.
 int64_t zset_count_below(ZSet *zset, double score, bool inclusive){
-  int64_t n = 0;
-  for (AVLNode *node = zset->root; node;){
-    ZNode *zn = container_of(node, &ZNode::tree);
-    if (zn->score < score || (inclusive && zn->score == score)){
-      n += (int64_t)avl_cnt(node->left) + 1;
-      node = node->right;
-    } else {
-      node = node->left;
+    int64_t n = 0;
+    for (AVLNode *node = zset->root; node; ){
+        ZNode *zn = container_of(node, &ZNode::tree);
+        if (zn->score < score || (inclusive && zn->score == score)){
+            n += (int64_t)avl_cnt(node->left) + 1;
+            node = node->right;
+        } else {
+            node = node->left;
+        }
     }
-  }
-  return n;
+    return n;
 }
 
-// The member with rank members before it (0 = lowest), or NULL if out of range. Same descent as avl_ranl in reverse
+// The member with `rank` members before it (0 = lowest), or NULL if out of
+// range. Same descent as avl_rank in reverse; O(log n).
 ZNode *zset_at_rank(ZSet *zset, int64_t rank){
-  AVLNode *node = zset->root;
-  while (node){
-    int64_t left = (int64_t)avl_cnt(node->left);
-    if (rank < left){
-      node = node->left;
-    } else if (rank == left){
-        return container_of(node, &ZNode::tree);
-    } else {
-      rank -= left + 1;
-      node = node->right;
+    AVLNode *node = zset->root;
+    while (node){
+        int64_t left = (int64_t)avl_cnt(node->left);
+        if (rank < left){
+            node = node->left;
+        } else if (rank == left){
+            return container_of(node, &ZNode::tree);
+        } else {
+            rank -= left + 1;
+            node = node->right;
+        }
     }
-  }
-  return NULL;
+    return NULL;
 }
 
 static void tree_dispose(AVLNode *node){
