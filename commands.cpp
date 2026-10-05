@@ -1332,7 +1332,9 @@ static const char *parse_zrange_opts(const std::vector<std::string> &cmd, size_t
 }
 
 // Turn the two positional bounds into numbers.
+static const char *zrange_bounds(ZRangeSpec &sp, const std::string &a, const std::string &b){
 
+}
 
 
 
