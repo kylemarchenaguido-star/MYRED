@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <unistd.h>
 #include <cstring>
 #include <cctype>
@@ -45,6 +46,8 @@ static constexpr const char *MSG_SYNTAX = "ERR syntax error";
 static constexpr const char *MSG_OUT_OF_RANGE = "ERR index out of range";
 
 static size_t good_replicas(uint64_t now_ms);
+
+static bool arg_ieq(const std::string &s, const char *lit);
 
 static void die(const char *msg) {
   int err = errno;
@@ -316,17 +319,144 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out) {
   resp_str(out, entry_str(ent).data(), entry_str(ent).size());
 }
 
+// SET key value [NX | XX] [GET] [EX s | PX ms | EXAT s | PXAT ms | KEEPTTL]
+struct SetOps {
+  bool nx = false, xx = false, get = false, keepttl = false;
+  bool has_exp = false;
+  int64_t abs_ms = 0; // wall-clock deadline in msl only meaningful if has_exp
+};
+
+// Parses cmd[3..]. Returns nullptr on succes, else the error text, Shared by set functions
+static const char *parse_set_opts(const std::vector<std::string> &cmd, SetOps &o){
+
+  enum : unsigned {
+    NX = 1, XX = 2, GET = 4, KEEPTTL = 8,
+    EX = 16, PX = 32, EXAT = 64, PXAT = 128,
+    EXPIRY = EX | PX | EXAT | PXAT,
+  };
+  unsigned f = 0;
+  const int64_t now = (int64_t)get_wall_msec();
+
+  for (size_t i = 3; i < cmd.size(); ++i){
+    const std::string &a = cmd[i];
+    // each option is accepted only if nothing it conflicts with was seen;
+    // reapting value is allowed, last option wins
+    auto unit = [&](const char *name, unsigned bit){
+      return arg_ieq(a, name) && !(f & KEEPTTL) && !(f & EXPIRY & ~bit);
+    };
+    unsigned bit = 0;
+    bool secs = false, absolute = false;
+
+    if (arg_ieq(a, "nx") && !(f & XX)){ f |= NX; continue; }
+    if (arg_ieq(a, "xx") && !(f & NX)){ f |= XX; continue; }
+    if (arg_ieq(a, "get")){ f |= GET; continue; }
+    if (arg_ieq(a, "keepttl") && !(f & EXPIRY)){ f |= KEEPTTL; continue; }
+
+    if (unit("ex", EX)){ bit = EX; secs = true; }
+    else if (unit("px", PX)){ bit = PX; }
+    else if (unit("exat", EXAT)){ bit = EXAT; secs = true; absolute = true; }
+    else if (unit("pxat", PXAT)){ bit = PXAT; absolute = true; }
+    else { return MSG_SYNTAX; }
+
+    if (i + 1 >= cmd.size()){ return MSG_SYNTAX; }
+    int64_t v = 0;
+    if (!str2int(cmd[++i], v)){ return MSG_NOT_INT; }
+    static const char *bad = "ERR invalid expire time in 'set command";
+    if (v <= 0 || (secs && v > INT64_MAX / 1000)){ return bad; }
+    int64_t ms = secs ? v * 1000 : v;
+    if (!absolute){
+      if (nms > INT64_MAX - now){ return bad; } // now + ms must not overflow
+      ms += now; 
+    }
+    f |= bit;
+    o.abs_ms = ms;
+  }
+  o.nx = f & NX;
+  o.xx = f & XX;
+  o.get = f & GET;
+  o.keepttl = f & KEEPTTL;
+  o.has_exp = f & EXPIRY;
+  return nullptr;
+}
+
 // sets a key with value in the hashtab
 static void do_set(std::vector<std::string> &cmd, Buffer *out) {
   Entry *ent;
+  if (cmd.size() == 3){
+    if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
+      return resp_err(out, "WRONGTYPE wrong type");
+    }
+    entry_str(ent).swap(cmd[2]);
+    entry_set_ttl(ent, -1);
+    mem_reaccount(ent);
+    g_data.g_writes_since_save++;
+    return resp_ok(out);
+  }
+
+  SetOps o;
+  if (const char *err = parse_set_opts(cmd, o)){
+    return resp_err(out, err);
+  }
+
+  // Look at the key WITHOUT consuming cmd[1]
+  Entry *old = nullptr;
+  {
+    LookupKey lk;
+    lk.key = cmd[1];
+    lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
+    if (HNode *n = hm_lookup(&g_data.db, &lk.node, &entry_eq)){
+      Entry *e = container_of(n, &Entry::node);
+      if (!expire_if_needed(e)){ old = e; } // an expired key counts as missing
+    }
+  }
+
+  // GET on a non-string is an error and must change nothing
+  if (o.get && old && old->type != T_STR){
+    return resp_err(out, MSG_WRONGTYPE);
+  }
+  std::string prev; // the old value, copied
+  if (o.get && old){ prev = entry_str(old); }
+  auto reply = [&] {
+    if (o.get){ return old ? resp_str(out, prev.data(), prev.size()) : resp_nil(out); }
+    return resp_ok(out);
+  };
+  
+  // condition not met: write nothing 
+  if ((o.nx && old) || (o.xx && !old)) {
+    return o.get ? reply() : resp_nil(out);
+  }
+
+  // KEEPTTL must survive even an overwrite that replaces the entry
+  int64_t keep_ms = -1;
+  if (o.keepttl && old && entry_has_ttl(old)){
+    uint64_t at = g_data.heap[old->heap_idx].val, now = get_monotonic_msec();
+    keep_ms = at > now ? (int64_t)(at - now) : 0;
+  }
+
+  int64_t ttl_ms = -1;
+  if (o.has_exp){
+    ttl_ms = o.abs_ms - (int64_t)get_wall_msec();
+    if (ttl_ms <= 0){
+      // EXAT/PXAT already in the past
+      if (old) {
+        hm_delete(&g_data.db, &old->node, &hnode_same);
+        entry_del(old);
+        g_data.g_writes_since_save++;
+      }
+      return reply();
+    }
+  } else if (o.keepttl){
+    ttl_ms = keep_ms;
+  }
+
   if (lookup_entry(cmd[1], T_STR, true, &ent, true) == Lookup::WRONGTYPE) {
-    return resp_err(out, "WRONGTYPE wrong type");
+    return resp_err(out, MSG_WRONGTYPE);
   }
   entry_str(ent).swap(cmd[2]);
-  entry_set_ttl(ent, -1);
+  entry_set_ttl(ent, ttl_ms);
   mem_reaccount(ent);
   g_data.g_writes_since_save++;
-  return resp_ok(out);
+  return reply();
 }
 
 // mult = 1000 for SETEX (s), mult = 1 for PSETEX (ms)
@@ -1149,143 +1279,212 @@ struct ZQueryResult {
   double score;
 };
 
-// zquery zset score name offset limit (search by ascending order)
-static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
-  // we parse the args
-  double score = 0;
-  if (!str2dbl(cmd[2], score)) {
-    return resp_err(out, "ERR invalid score");
-  }
+enum : unsigned {
+  ZO_BYSCORE = 1,
+  ZO_BYLEX = 2,
+  ZO_REV = 4,
+  ZO_LIMIT = 8,
+  ZO_WITHSCORES = 16,
+};
 
-  int64_t offset = 0, limit = 0;
-  if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
-    return resp_err(out, "ERR invalid offset/limit");
-  }
+struct ZRangeSpec {
+  bool by_score = false;
+  bool rev = false;
+  bool withscores = false;
+  bool has_limit = false;
+  int64_t offset = 0, count = -1; // LIMIT; a negative count means "all"
+  int64_t start = 0, stop = 0;
+  double lo = 0, hi = 0;
+  bool lo_excl = false, hi_excl = false;
+};
 
-  Entry *ent;
-  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-  case Lookup::WRONGTYPE:
-    return resp_err(out, "WRONGTYPE wrong type");
-  case Lookup::MISSING:
-    return resp_arr(out, 0);
-  case Lookup::OK:
-    break;
-  }
-  // we collect into a vector first so we know the count up front
-  // (RESP wants the array length before the elements)
-  std::vector<ZQueryResult> results;
-
-  ZNode *znode =
-      zset_seekge(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
-  znode = znode_offset(znode, offset);
-
-  // walk forward collecting until we hit the end (NULL) or fill the page
-  // (limit)
-  while (znode && (int64_t)results.size() < limit) {
-    // znode->name is the flexible char[0] array, znode->len its length
-    results.push_back({std::string(znode->name, znode->len), znode->score});
-    znode = znode_offset(znode, +1); // next node in ascending order
-  }
-
-  // flat output: each result = name + score, so element count is size * 2
-  // -> [name1, score1, name2, score2, ...]
-  resp_arr(out, (uint32_t)(results.size() * 2));
-  for (auto &r : results) {
-    resp_str(out, r.name.data(), r.name.size());
-    resp_dbl(out, r.score);
-  }
+static bool parse_score_bound(const std::string &s, double &v, bool &excl){
+  excl = !s.empty() && s[0] == '(';
+  const char *p = s.c_str() + (excl ? 1 : 0);
+  char *end = nullptr;
+  v = strtod(p, &end);
+  return *end == '\0' && !std::isnan(v);
 }
 
-// reverse order from do_zquery (descending order)
-static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out) {
-  // we parse the args
-  double score = 0;
-  if (!str2dbl(cmd[2], score)) {
-    return resp_err(out, "ERR invalid score");
-  }
-  int64_t offset = 0, limit = 0;
-  if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
-    return resp_err(out, "ERR invalid offset/limit");
-  }
-
-  // we get the zset
-  Entry *ent;
-  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-  case Lookup::WRONGTYPE:
-    return resp_err(out, "WRONGTYPE wrong type");
-  case Lookup::MISSING:
-    return resp_arr(out, 0);
-  case Lookup::OK:
-    break;
-  }
-  std::vector<ZQueryResult> results;
-  ZNode *znode =
-      zset_seekle(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
-  znode = znode_offset(znode, -offset);
-
-  while (znode && (int64_t)results.size() < limit) {
-    results.push_back({std::string(znode->name, znode->len), znode->score});
-    znode = znode_offset(znode, -1);
-  }
-
-  resp_arr(out, (uint32_t)(results.size() * 2));
-  for (auto &r : results) {
-    resp_str(out, r.name.data(), r.name.size());
-    resp_dbl(out, r.score);
-  }
-}
-
-static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out) {
-  int64_t count = 1;
-  if (cmd.size() >= 3) {
-    if (!str2int(cmd[2], count)) {
-      return resp_err(out, MSG_NOT_INT);
-    }
-    if (count < 0) {
-      count = 0;
-    }
-  }
-  Entry *ent;
-  switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
-  case Lookup::WRONGTYPE:
-    return resp_err(out, MSG_WRONGTYPE);
-  case Lookup::MISSING:
-    return resp_arr(out, 0);
-  case Lookup::OK:
-    break;
-  }
-  ZSet *zset = &entry_zset(ent);
-
-  // collect the lowest-score members first - RESP needs the array lenght up
-  // front
-  std::vector<ZQueryResult> popped;
-  for (int64_t i = 0; i < count && zset->root; ++i) {
-    AVLNode *node = zset->root;
-    // leftmost = min
-    while (node->left) {
-      node = node->left;
-    }
-    ZNode *zn = container_of(node, &ZNode::tree);
-    popped.push_back({std::string(zn->name, zn->len), zn->score});
-    zset_delete(zset, zn);
-  }
-  // pairs of (member, score)
-  resp_arr(out, (uint32_t)(popped.size() * 2));
-  for (const auto &p : popped) {
-    resp_str(out, p.name.data(), p.name.size());
-    resp_dbl(out, p.score);
-  }
-
-  if (!popped.empty()) {
-    g_data.g_writes_since_save++;
-    if (hm_size(&zset->hmap) == 0) {
-      hm_delete(&g_data.db, &ent->node, &hnode_same);
-      entry_del(ent);
+// Options from cmd[i ...], limited to the ones 'allow' names. nullptr = resp_ok
+static const char *parse_zrange_opts(const std::vector<std::string> &cmd, size_t i, unsigned allow, ZRangeSpec &sp){
+  for (; i < cmd.size(); ++i){
+    if ((allow & ZO_WITHSCORES) && arg_ieq(cmd[i], "withscores")){
+      sp.withscores = true;
+    } else if ((allow & ZO_REV) && arg_ieq(cmd[i], "rev")){
+      sp.rev = true;
+    } else if ((allow & ZO_BYSCORE) && arg_ieq(cmd[i], "byscore")){
+      sp.by_score = true;
+    } else if ((allow & ZO_BYLEX) && arg_ieq(cmd[i], "bylex")){
+      return "ERR syntax error, BYLEX is not supported";
+    } else if ((allow & ZO_LIMIT) && arg_ieq(cmd[i], "limit")){
+      if (i + 2 >= cmd.size()){ return MSG_SYNTAX; }
+      if (!str2int(cmd[i + 1], sp.offset) || !str2int(cmd[i + 2], sp.count)){
+        return MSG_NOT_INT;
+      }
+      sp.has_limit = true;
+      i += 2;
     } else {
-      mem_reaccount(ent);
+      return MSG_SYNTAX;
     }
   }
+  return nullptr;
 }
+
+// Turn the two positional bounds into numbers.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// // zquery zset score name offset limit (search by ascending order)
+// static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
+//   // we parse the args
+//   double score = 0;
+//   if (!str2dbl(cmd[2], score)) {
+//     return resp_err(out, "ERR invalid score");
+//   }
+//
+//   int64_t offset = 0, limit = 0;
+//   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
+//     return resp_err(out, "ERR invalid offset/limit");
+//   }
+//
+//   Entry *ent;
+//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+//   case Lookup::WRONGTYPE:
+//     return resp_err(out, "WRONGTYPE wrong type");
+//   case Lookup::MISSING:
+//     return resp_arr(out, 0);
+//   case Lookup::OK:
+//     break;
+//   }
+//   // we collect into a vector first so we know the count up front
+//   // (RESP wants the array length before the elements)
+//   std::vector<ZQueryResult> results;
+//
+//   ZNode *znode =
+//       zset_seekge(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
+//   znode = znode_offset(znode, offset);
+//
+//   // walk forward collecting until we hit the end (NULL) or fill the page
+//   // (limit)
+//   while (znode && (int64_t)results.size() < limit) {
+//     // znode->name is the flexible char[0] array, znode->len its length
+//     results.push_back({std::string(znode->name, znode->len), znode->score});
+//     znode = znode_offset(znode, +1); // next node in ascending order
+//   }
+//
+//   // flat output: each result = name + score, so element count is size * 2
+//   // -> [name1, score1, name2, score2, ...]
+//   resp_arr(out, (uint32_t)(results.size() * 2));
+//   for (auto &r : results) {
+//     resp_str(out, r.name.data(), r.name.size());
+//     resp_dbl(out, r.score);
+//   }
+// }
+//
+// // reverse order from do_zquery (descending order)
+// static void do_zquery_reversed(std::vector<std::string> &cmd, Buffer *out) {
+//   // we parse the args
+//   double score = 0;
+//   if (!str2dbl(cmd[2], score)) {
+//     return resp_err(out, "ERR invalid score");
+//   }
+//   int64_t offset = 0, limit = 0;
+//   if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
+//     return resp_err(out, "ERR invalid offset/limit");
+//   }
+//
+//   // we get the zset
+//   Entry *ent;
+//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+//   case Lookup::WRONGTYPE:
+//     return resp_err(out, "WRONGTYPE wrong type");
+//   case Lookup::MISSING:
+//     return resp_arr(out, 0);
+//   case Lookup::OK:
+//     break;
+//   }
+//   std::vector<ZQueryResult> results;
+//   ZNode *znode =
+//       zset_seekle(&entry_zset(ent), score, cmd[3].data(), cmd[3].size());
+//   znode = znode_offset(znode, -offset);
+//
+//   while (znode && (int64_t)results.size() < limit) {
+//     results.push_back({std::string(znode->name, znode->len), znode->score});
+//     znode = znode_offset(znode, -1);
+//   }
+//
+//   resp_arr(out, (uint32_t)(results.size() * 2));
+//   for (auto &r : results) {
+//     resp_str(out, r.name.data(), r.name.size());
+//     resp_dbl(out, r.score);
+//   }
+// }
+//
+// static void do_zpopmin(std::vector<std::string> &cmd, Buffer *out) {
+//   int64_t count = 1;
+//   if (cmd.size() >= 3) {
+//     if (!str2int(cmd[2], count)) {
+//       return resp_err(out, MSG_NOT_INT);
+//     }
+//     if (count < 0) {
+//       count = 0;
+//     }
+//   }
+//   Entry *ent;
+//   switch (lookup_entry(cmd[1], T_ZSET, false, &ent)) {
+//   case Lookup::WRONGTYPE:
+//     return resp_err(out, MSG_WRONGTYPE);
+//   case Lookup::MISSING:
+//     return resp_arr(out, 0);
+//   case Lookup::OK:
+//     break;
+//   }
+//   ZSet *zset = &entry_zset(ent);
+//
+//   // collect the lowest-score members first - RESP needs the array lenght up
+//   // front
+//   std::vector<ZQueryResult> popped;
+//   for (int64_t i = 0; i < count && zset->root; ++i) {
+//     AVLNode *node = zset->root;
+//     // leftmost = min
+//     while (node->left) {
+//       node = node->left;
+//     }
+//     ZNode *zn = container_of(node, &ZNode::tree);
+//     popped.push_back({std::string(zn->name, zn->len), zn->score});
+//     zset_delete(zset, zn);
+//   }
+//   // pairs of (member, score)
+//   resp_arr(out, (uint32_t)(popped.size() * 2));
+//   for (const auto &p : popped) {
+//     resp_str(out, p.name.data(), p.name.size());
+//     resp_dbl(out, p.score);
+//   }
+//
+//   if (!popped.empty()) {
+//     g_data.g_writes_since_save++;
+//     if (hm_size(&zset->hmap) == 0) {
+//       hm_delete(&g_data.db, &ent->node, &hnode_same);
+//       entry_del(ent);
+//     } else {
+//       mem_reaccount(ent);
+//     }
+//   }
+// }
 
 static int g_audit_fd = -1;
 std::string g_audit_last_error;
@@ -1589,7 +1788,6 @@ static void do_asyncdel(std::vector<std::string> &cmd, Buffer *out) {
   return resp_int(out, 1);
 }
 
-static bool arg_ieq(const std::string &s, const char *lit);
 
 // INFO section
 

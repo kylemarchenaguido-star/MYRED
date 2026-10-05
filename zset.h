@@ -2,6 +2,7 @@
 
 #include "hashtable.h"
 #include "avl.h"
+#include <cstdint>
 
 //Is the sorted set
 struct ZSet {
@@ -31,5 +32,7 @@ ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len);
 ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len);
 void zset_clear(ZSet *zset);
 ZNode *znode_offset(ZNode *node, int64_t offset);
+int64_t zset_count_below(ZSet *zset, double score, bool inclusive);
+ZNode *zset_at_rank(ZSet *zset, int64_t rank);
 int64_t avl_rank(AVLNode *node);
 void zset_update(ZSet *zset, ZNode *node, double score);

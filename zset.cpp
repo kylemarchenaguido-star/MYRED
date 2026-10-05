@@ -1,8 +1,11 @@
 #include <assert.h>
+#include <cstddef>
+#include <cstdint>
 #include <string.h>
 #include <stdlib.h>
 
 #include "zset.h"
+#include "avl.h"
 #include "common.h"
 
 static ZNode *znode_new(const char *name, size_t len, double score){
@@ -178,6 +181,39 @@ ZNode *zset_seekle(ZSet *zset, double score, const char *name, size_t len){
 ZNode *znode_offset(ZNode *node, int64_t offset) {
     AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
     return tnode ? container_of(tnode, &ZNode::tree) : NULL;
+}
+
+
+// How many members have score < 'score' (score <= 'score' if inclusive)
+int64_t zset_count_below(ZSet *zset, double score, bool inclusive){
+  int64_t n = 0;
+  for (AVLNode *node = zset->root; node;){
+    ZNode *zn = container_of(node, &ZNode::tree);
+    if (zn->score < score || (inclusive && zn->score == score)){
+      n += (int64_t)avl_cnt(node->left) + 1;
+      node = node->right;
+    } else {
+      node = node->left;
+    }
+  }
+  return n;
+}
+
+// The member with rank members before it (0 = lowest), or NULL if out of range. Same descent as avl_ranl in reverse
+ZNode *zset_at_rank(ZSet *zset, int64_t rank){
+  AVLNode *node = zset->root;
+  while (node){
+    int64_t left = (int64_t)avl_cnt(node->left);
+    if (rank < left){
+      node = node->left;
+    } else if (rank == left){
+        return container_of(node, &ZNode::tree);
+    } else {
+      rank -= left + 1;
+      node = node->right;
+    }
+  }
+  return NULL;
 }
 
 static void tree_dispose(AVLNode *node){
