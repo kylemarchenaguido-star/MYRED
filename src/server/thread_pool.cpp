@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdlib.h>
-#include "thread_pool.h"
+#include "server/thread_pool.h"
 #include <unistd.h>
 
 

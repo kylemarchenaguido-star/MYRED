@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string>
-#include "hashtable.h"
+#include "ds/hashtable.h"
 
 // intrusive node + field/value strings
 struct HashNode {

@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string>
-#include "hashtable.h"
+#include "ds/hashtable.h"
 
 struct SetNode{
     HNode node;

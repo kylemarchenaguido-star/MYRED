@@ -12,4 +12,3 @@
 scripts/**          linguist-vendored
 docs/**             linguist-documentation
 *.aof               linguist-generated
-benchappend.aof     linguist-generated

@@ -1,9 +1,9 @@
-#include "rdb.h"
-#include "state.h"      
-#include "buffer.h"
-#include "common.h"
-#include "hash.h"
-#include "set.h"
+#include "persistence/rdb.h"
+#include "core/state.h"      
+#include "protocol/buffer.h"
+#include "core/common.h"
+#include "types/hash.h"
+#include "types/set.h"
 #include <cstddef>
 #include <zlib.h>  
 #include <stdio.h> 

@@ -1,6 +1,6 @@
-#include "set.h"
-#include "str_node.h"
-#include "common.h"
+#include "types/set.h"
+#include "ds/str_node.h"
+#include "core/common.h"
 #include <vector>
 #include <utility>
 

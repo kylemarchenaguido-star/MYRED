@@ -36,7 +36,7 @@ than using the STL containers.
   can't forge a fake log line), `rename-command`/disable, and control-plane
   category gating
 - **TLS** — optional `tls-port` alongside the plaintext port, with OpenSSL kept a
-  private dependency of a single transport translation unit (`transport.cpp`)
+  private dependency of a single transport translation unit (`src/server/transport.cpp`)
   and the handshake driven as connection state (bounded by
   `tls-handshake-timeout`) rather than a blocking `SSL_accept`; certificates can
   be rotated live via `CONFIG SET` with no restart and no dropped connections
@@ -90,21 +90,21 @@ are scoped and tracked in `docs/planning/BACKLOG.md`.
   serving requests. When AOF is enabled, writes are appended as RESP frames; rewrite
   compacts the log into an RDB preamble plus a RESP tail.
 - **Networking:** plaintext and TLS connections share one non-blocking transport
-  interface (`transport.cpp`); a TLS handshake is driven forward on the same
+  interface (`src/server/transport.cpp`); a TLS handshake is driven forward on the same
   `poll()` ticks as ordinary reads instead of blocking the event loop.
 
 ### Data structures (all hand-written)
 
 | Structure | File | Used for |
 |---|---|---|
-| Hash table (progressive rehashing) | `hashtable.*` | the keyspace, hash fields, set members, zset member index |
-| AVL tree | `avl.*` | sorted-set ordering / ranking |
-| Sorted set (AVL + hashtable) | `zset.*` | the `ZSET` type |
-| Ring-buffer deque | `deque.*` | the `LIST` type |
-| Hash node map | `hash.*` | the `HASH` type (field → value) |
-| Set node map | `set.*` | the `SET` type (members only, value-less HMap) |
-| Min-heap | `heap.*` | TTL expiry |
-| Intrusive doubly-linked list | `list.h` | connection idle/IO timeout queues |
+| Hash table (progressive rehashing) | `src/ds/hashtable.*` | the keyspace, hash fields, set members, zset member index |
+| AVL tree | `src/ds/avl.*` | sorted-set ordering / ranking |
+| Sorted set (AVL + hashtable) | `src/types/zset.*` | the `ZSET` type |
+| Ring-buffer deque | `src/ds/deque.*` | the `LIST` type |
+| Hash node map | `src/types/hash.*` | the `HASH` type (field → value) |
+| Set node map | `src/types/set.*` | the `SET` type (members only, value-less HMap) |
+| Min-heap | `src/ds/heap.*` | TTL expiry |
+| Intrusive doubly-linked list | `src/ds/list.h` | connection idle/IO timeout queues |
 
 ## Building
 
@@ -148,7 +148,7 @@ Force a feature off even when the library is installed with
 zlib is **not** optional: compression is part of the on-disk RDB format, so a
 build without it could not read snapshots written by a build with it.
 
-> Building without OpenSSL means `myred.conf` and `bench.conf` will not boot as
+> Building without OpenSSL means `conf/myred.conf` and `conf/bench.conf` will not boot as
 > shipped — both set `tls-port`. Comment out their `tls-port` / `tls-cert-file` /
 > `tls-key-file` lines, or run `./build/server` with no config file.
 
@@ -159,7 +159,7 @@ build without it could not read snapshots written by a build with it.
 ./build-rel/server
 
 # or load a config file explicitly
-./build-rel/server myred.conf
+./build-rel/server conf/myred.conf
 ```
 
 Without a config file the server runs open on loopback (protected mode rejects
@@ -262,28 +262,38 @@ commands** are accepted (newline-terminated), and empty inline lines are ignored
 
 ## Project structure
 
+All code lives under `src/`, one directory per module. Local includes are rooted
+at `src/` (`#include "ds/avl.h"`, `#include "core/state.h"`); CMake adds `src` as
+the include directory.
+
 ```
-server.cpp         event loop + main()
-state.*            Entry, the global DB, constants, entry lifecycle, clocks
-resp.*             RESP request parser + response writers
-commands.*         command handlers + dispatch
-transport.*        plaintext/TLS socket I/O behind one non-blocking interface
-buffer.*           per-connection growable byte buffer
-hashtable.*        the core hash table (dual-table progressive rehashing)
-zset.* / avl.*     sorted set + AVL tree
-deque.*            ring-buffer deque (lists)
-hash.*             hash fields (HashNode: field + value)
-set.*              set members (SetNode: member only, no value)
-heap.*             TTL min-heap
-thread_pool.*      background worker pool
-list.h             intrusive list (connection timers)
-common.h           container_of, FNV hash
-client.cpp         a small RESP client (single-shot + REPL)
-cred.* / sha256.*  Argon2id/SHA-256 credential hashing + verification
-aof.* / rdb.*      append-only-file and RDB snapshot persistence
-myred.conf         example server configuration
-docs/planning/     ROADMAP (progress), BACKLOG (future work + open bugs),
-                   DECISIONS (design + architecture), CODE_REVIEW (bug audit)
+src/
+  server/        server.cpp        event loop + main()
+                 transport.*       plaintext/TLS socket I/O behind one non-blocking interface
+                 thread_pool.*     background worker pool
+  protocol/      resp.*            RESP request parser + response writers
+                 buffer.*          per-connection growable byte buffer
+  commands/      commands.*        command handlers + dispatch
+  core/          state.*           Entry, the global DB, constants, entry lifecycle, clocks
+                 common.h          container_of, FNV hash
+  ds/            hashtable.*       the core hash table (dual-table progressive rehashing)
+                 avl.*             AVL tree
+                 deque.*           ring-buffer deque (lists)
+                 heap.*            TTL min-heap
+                 list.h            intrusive list (connection timers)
+                 str_node.h        string node
+  types/         zset.*            sorted set (AVL + hashtable)
+                 hash.*            hash fields (HashNode: field + value)
+                 set.*             set members (SetNode: member only, no value)
+  persistence/   aof.* / rdb.*     append-only-file and RDB snapshot persistence
+  auth/          cred.*            Argon2id/SHA-256 credential hashing + verification
+                 sha256.h
+  client/        client.cpp        a small RESP client (single-shot + REPL)
+conf/            myred.conf, bench.conf, replica.conf    example configurations
+                 (paths inside them, like tls/cert.pem, are relative to where you
+                 start the server: run from the project root)
+docs/planning/   ROADMAP (progress), BACKLOG (future work + open bugs),
+                 DECISIONS (design + architecture), CODE_REVIEW (bug audit)
 ```
 
 ## Status and what's next

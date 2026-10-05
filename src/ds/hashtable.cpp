@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdlib.h>     // calloc(), free()
-#include "hashtable.h"
-#include "common.h"
+#include "ds/hashtable.h"
+#include "core/common.h"
 
 // Initialiazer for the hashtable 
 static void h_init(HTab *htab, size_t n){

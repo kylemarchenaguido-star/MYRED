@@ -51,26 +51,36 @@ if(MYRED_ARGON2)
   endif()
 endif()
 
-# server: main + the data-structure translation units
+# server: main + the data-structure translation units, grouped by module under
+# src/. Local includes are rooted at src/ ("ds/avl.h", "core/state.h", ...).
 add_executable(server
-  server.cpp
-  hashtable.cpp
-  zset.cpp
-  avl.cpp
-  heap.cpp
-  thread_pool.cpp
-  buffer.cpp
-  state.cpp
-  resp.cpp
-  rdb.cpp
-  commands.cpp
-  deque.cpp
-  hash.cpp
-  set.cpp
-  aof.cpp
-  cred.cpp
-  transport.cpp
+  # event loop, main(), sockets
+  src/server/server.cpp
+  src/server/transport.cpp
+  src/server/thread_pool.cpp
+  # wire format and per-connection buffers
+  src/protocol/resp.cpp
+  src/protocol/buffer.cpp
+  # commands and dispatch
+  src/commands/commands.cpp
+  # global state, the keyspace, entry lifecycle
+  src/core/state.cpp
+  # data structures
+  src/ds/hashtable.cpp
+  src/ds/avl.cpp
+  src/ds/heap.cpp
+  src/ds/deque.cpp
+  # value types built on them
+  src/types/zset.cpp
+  src/types/hash.cpp
+  src/types/set.cpp
+  # durability
+  src/persistence/aof.cpp
+  src/persistence/rdb.cpp
+  # credentials
+  src/auth/cred.cpp
 )
+target_include_directories(server PRIVATE src)
 target_link_libraries(server PRIVATE ZLIB::ZLIB Threads::Threads)
 
 if(MYRED_HAVE_TLS)
@@ -85,7 +95,7 @@ if(MYRED_HAVE_ARGON2)
 endif()
 
 # client is standalone (sockets only)
-add_executable(client client.cpp)
+add_executable(client src/client/client.cpp)
 
 # what the resulting build can actually do, so an absent optional dep is
 # visible at configure time rather than as a surprise at runtime

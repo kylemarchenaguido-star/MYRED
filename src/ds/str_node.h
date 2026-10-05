@@ -1,8 +1,8 @@
 #pragma once
 #include <vector>
 #include <string>
-#include "hashtable.h"
-#include "common.h"
+#include "ds/hashtable.h"
+#include "core/common.h"
 
 // Single lookup key for any hmap keyed by a string
 struct StringKey {

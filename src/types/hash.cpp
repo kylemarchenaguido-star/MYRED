@@ -1,6 +1,6 @@
-#include "hash.h"
-#include "common.h"
-#include "str_node.h"
+#include "types/hash.h"
+#include "core/common.h"
+#include "ds/str_node.h"
 #include <vector>
 #include <utility>
 

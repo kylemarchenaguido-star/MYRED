@@ -1,5 +1,5 @@
 #include <assert.h>
-#include "avl.h"
+#include "ds/avl.h"
 
 static uint32_t max(uint32_t lhs, uint32_t rhs){
     return lhs < rhs ? rhs : lhs;
