@@ -5,9 +5,9 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
-#include "resp.h"
-#include "buffer.h"
-#include "state.h"
+#include "protocol/resp.h"
+#include "protocol/buffer.h"
+#include "core/state.h"
 
 //Parse the RESP protocol
 int32_t parse_resp_request( Buffer *buf, std::vector<std::string> &cmd){

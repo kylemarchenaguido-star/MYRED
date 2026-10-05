@@ -29,20 +29,20 @@
 #include <utility>
 #include <algorithm>
 // project
-#include "hashtable.h"
-#include "common.h"
-#include "list.h"
-#include "heap.h"
-#include "thread_pool.h"
-#include "buffer.h"
-#include "state.h"
-#include "resp.h"
-#include "rdb.h"
-#include "commands.h"
-#include "aof.h"
+#include "ds/hashtable.h"
+#include "core/common.h"
+#include "ds/list.h"
+#include "ds/heap.h"
+#include "server/thread_pool.h"
+#include "protocol/buffer.h"
+#include "core/state.h"
+#include "protocol/resp.h"
+#include "persistence/rdb.h"
+#include "commands/commands.h"
+#include "persistence/aof.h"
 // #include "sha256.h"
-#include "cred.h"
-#include "transport.h"
+#include "auth/cred.h"
+#include "server/transport.h"
 
 struct Listener {
   int fd;

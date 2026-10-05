@@ -1,7 +1,7 @@
 #pragma once
 
-#include "hashtable.h"
-#include "avl.h"
+#include "ds/hashtable.h"
+#include "ds/avl.h"
 #include <cstdint>
 
 //Is the sorted set

@@ -1,4 +1,4 @@
-#include "heap.h"
+#include "ds/heap.h"
 #include <assert.h>
 
 static size_t heap_parent(size_t i){

@@ -1,4 +1,4 @@
-#include "deque.h"
+#include "ds/deque.h"
 #include <utility>
 
 // INVARIANT: cap is always a power of two (so deque_phys can use & instead of %)

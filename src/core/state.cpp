@@ -1,9 +1,9 @@
-#include "state.h"
-#include "common.h"
-#include "hash.h"
+#include "core/state.h"
+#include "core/common.h"
+#include "types/hash.h"
 // #include "sha256.h"
-#include "cred.h"
-#include "transport.h"
+#include "auth/cred.h"
+#include "server/transport.h"
 #include "unistd.h"
 #include <arpa/inet.h>  
 #include <climits>

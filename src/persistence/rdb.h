@@ -2,7 +2,7 @@
 #include <sys/types.h>
 #include <cstdint> 
 #include <cstddef>    
-#include "buffer.h"    
+#include "protocol/buffer.h"    
 
 // Tracks the current running background save child
 extern pid_t g_rdb_child_pid;

@@ -1,10 +1,10 @@
-#include "buffer.h"
-#include "list.h"
-#include "hashtable.h"
-#include "heap.h"
-#include "thread_pool.h"
-#include "state.h"
-#include "transport.h"
+#include "protocol/buffer.h"
+#include "ds/list.h"
+#include "ds/hashtable.h"
+#include "ds/heap.h"
+#include "server/thread_pool.h"
+#include "core/state.h"
+#include "server/transport.h"
 
 #include <cstddef>
 #include <cstdint>

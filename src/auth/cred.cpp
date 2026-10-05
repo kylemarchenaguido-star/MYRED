@@ -1,5 +1,5 @@
-#include "cred.h"
-#include "sha256.h"
+#include "auth/cred.h"
+#include "auth/sha256.h"
 // #include <cinttypes>
 #include <cerrno>
 #include <cstdint>

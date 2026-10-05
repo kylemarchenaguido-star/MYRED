@@ -4,9 +4,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "zset.h"
-#include "avl.h"
-#include "common.h"
+#include "types/zset.h"
+#include "ds/avl.h"
+#include "core/common.h"
 
 static ZNode *znode_new(const char *name, size_t len, double score){
     ZNode *node = (ZNode *)malloc(sizeof(ZNode) + len); // struct + array
