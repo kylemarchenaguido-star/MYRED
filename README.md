@@ -1,12 +1,18 @@
 # MYRED — a Redis-like in-memory database in C++
 
+> **Project status: paused (2026-10-05).** This is the last version that is being
+> worked on for now. The server is on hold and is not expected to be developed
+> again for a long time. What is described below is exactly what `main` does today;
+> nothing here is a promise of future work. See [Status](#status-and-whats-next)
+> for what is finished, what is known to be missing, and why.
+
 MYRED is a from-scratch, single-threaded, RESP-speaking in-memory key–value
 database written in C++. It implements all five core Redis data types — strings,
 lists, hashes, sorted sets, and sets — plus key expiry, RDB/AOF persistence,
 ACL-backed authentication, TLS, master-replica replication with coordinated
-failover, transactions, pub/sub, and runtime config. Because it speaks the real
-**RESP protocol**, you can talk to it with the official `redis-cli` and other
-Redis clients.
+failover, transactions, pub/sub, RESP3, and runtime config. Because it speaks the
+real **RESP protocol**, you can talk to it with the official `redis-cli` and with
+Redis client libraries (stock `redis-py` is verified, see below).
 
 > **Foundation:** this project is built on the excellent guide at
 > **https://build-your-own.org/redis/** — the book provides the core event-loop,
@@ -18,11 +24,38 @@ than using the STL containers.
 
 ---
 
+## What `main` contains
+
+`main` is **code only**: the server and client sources under `src/`, the CMake
+build, example configurations under `conf/`, and the documentation under `docs/`.
+The regression suite, the stress and benchmark tooling and their logs live on the
+separate **`test`** branch and are not part of `main` (see
+[Branches](#branches)). Everything in this README is something you can do with
+`main` alone: build it, run it, and talk to it with `redis-cli` or a client library.
+
 ## Features
 
-- **RESP protocol** — works with `redis-cli` and standard Redis client libraries
+- **RESP2 and RESP3** — `HELLO 2|3` negotiates the protocol per connection
+  (including `HELLO 3 AUTH <user> <pass> SETNAME <name>`). Under RESP3 replies use
+  the real types: maps for `HGETALL`/`CONFIG GET`/`HELLO`, doubles for sorted-set
+  scores, a proper null, `>` push messages for pub/sub, and a verbatim string for
+  `INFO`. A minimal `CLIENT` subset (`ID`, `GETNAME`, `SETNAME`, `SETINFO`) is
+  there because client libraries send it on connect.
+- **Works with stock client libraries** — `redis-py` 8.1.0 was run against it over
+  both RESP2 and RESP3 and gave the same results as a real Redis 7.0 for `SET`
+  with options, the sorted-set range commands, pipelines and pub/sub (see
+  [Using it from a client library](#using-it-from-a-client-library))
 - **All 5 data types:** strings, lists, hashes, sorted sets, sets
 - **Key expiry (TTL):** `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`, active + lazy expiration
+- **`SET` with its options:** `NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`
+  — the cache and session idiom (`SET key value EX 3600`). Logged to the AOF and to
+  replicas as a single frame carrying an absolute deadline, so a restart does not
+  restart the TTL
+- **A real sorted-set read surface:** `ZRANGE` (with `REV`, `BYSCORE`, `LIMIT`,
+  `WITHSCORES`), `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZCOUNT`,
+  `ZCARD`, `ZINCRBY`, `ZRANK`/`ZREVRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`.
+  Range queries are O(log n): they reduce to rank arithmetic on the size-augmented
+  AVL tree, so leaderboards, sliding-window rate limiters and schedulers work
 - **Persistence:** custom RDB snapshots plus append-only-file (AOF) replay, hybrid AOF rewrite, and CRC32-protected RDB payloads
 - **`fork()`-based background work:** `BGSAVE` and `BGREWRITEAOF` keep the parent serving clients
 - **Authentication and ACLs:** `AUTH`, named users, command/category rules, and
@@ -51,8 +84,8 @@ than using the STL containers.
   automatic reconnect after a silent/dropped link, a read-only gate on the
   replica, `WAIT` as a durability barrier, a `min-replicas-*` write floor, and
   coordinated `FAILOVER` (pauses writes, hands over cleanly, loses nothing).
-  What's *not* here yet: failover is operator-triggered, not automatic — there
-  is no unattended, Sentinel-style election if a master silently dies
+  Failover is operator-triggered, not automatic — there is no unattended,
+  Sentinel-style election if a master silently dies
 - **Runtime configuration:** config file, selected environment overrides,
   `CONFIG GET`/`CONFIG SET`, and `CONFIG REWRITE` — every directive is one row in
   a single table owning its arity, parser, getter and on-disk form, checked for
@@ -66,15 +99,37 @@ than using the STL containers.
 - **Single-threaded event loop** (`poll`, non-blocking I/O) with `TCP_NODELAY`
 - **Thread pool** for offloading large async deletions (`UNLINK`)
 
+In total the server answers **124 command names** (listed under
+[Supported commands](#supported-commands)).
+
 ### Known gaps
 
-Worth knowing before you point a real application at this: there is **no
-multiple-database support** (`SELECT`/`SWAPDB` — everything lives in db0), **no
-`HELLO`/RESP3 handshake** or `CLIENT` command family, **no scripting**
-(`EVAL`/Lua — a custom bytecode VM is designed but not built), and **no
-cluster/sharding**. It also only builds and runs on Linux today (WSL2 and
-native both tested) — there is no Windows port. None of these are secret; they
-are scoped and tracked in `docs/planning/BACKLOG.md`.
+Worth knowing before you point a real application at this. Each is a decision,
+not an oversight; the larger ones are scoped in `docs/planning/BACKLOG.md`.
+
+- **One database only.** `SELECT` and `SWAPDB` do not exist: everything lives in
+  db0. (Clients that never select a non-zero database are unaffected.)
+- **No scripting.** No `EVAL`/`EVALSHA`/`SCRIPT`.
+- **No cluster or sharding**, and **no automatic failover**.
+- **Not implemented as commands:** `QUIT`, `RESET`, `COMMAND`, `DEBUG`,
+  `SLOWLOG`, `SHUTDOWN`, `LASTSAVE`, blocking list operations (`BLPOP`/`BRPOP`/
+  `BLMOVE`), streams (`XADD` family), geospatial (`GEO*`), HyperLogLog (`PF*`),
+  bit operations, `SORT`, `COPY`, `DUMP`/`RESTORE`, `LPOS`. Unknown commands
+  answer `-ERR unknown command`. Clients close the socket instead of sending `QUIT`.
+- **A subset of the sorted-set commands.** Missing: `ZADD` options
+  (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZPOPMAX`, `ZMSCORE`, `ZRANDMEMBER`,
+  `ZRANGESTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFF*`, `ZSCAN`, `ZLEXCOUNT`, and
+  `ZRANGE ... BYLEX` (refused with an error rather than misread).
+- **`CLIENT` is a subset:** `ID`, `GETNAME`, `SETNAME`, `SETINFO` only (no
+  `CLIENT LIST`/`KILL`).
+- **Small, known divergences from Redis 7.0:** the arity error is
+  `ERR wrong number of arguments` without the `for '<cmd>' command` suffix;
+  `SET ... EX` emits the `set` keyspace event but not Redis's extra `expire`
+  event; `SET key v EXAT <past>` removes the key immediately, where Redis 7.0
+  leaves a logically-dead key that `DBSIZE` still counts until it is touched.
+- **Linux only.** It builds and runs on Linux (WSL2 and native both tested);
+  there is no Windows port (the POSIX→Win32 translation is scoped in
+  `docs/planning/BACKLOG.md`).
 
 ## Architecture
 
@@ -88,7 +143,12 @@ are scoped and tracked in `docs/planning/BACKLOG.md`.
 - **Persistence:** `SAVE` writes synchronously; `BGSAVE` and the periodic auto-save
   `fork()` a child that serializes a copy-on-write snapshot while the parent keeps
   serving requests. When AOF is enabled, writes are appended as RESP frames; rewrite
-  compacts the log into an RDB preamble plus a RESP tail.
+  compacts the log into an RDB preamble plus a RESP tail. Commands whose request
+  cannot be replayed verbatim (`SETEX`, `EXPIRE`, `SET` with options, ...) are
+  logged as their effect, with absolute deadlines.
+- **Sorted sets:** an AVL tree ordered by `(score, member)` whose nodes carry
+  subtree sizes, plus a hashtable from member to node. Rank,
+  `ZCOUNT` and every range command are O(log n) descents; nothing is re-sorted.
 - **Networking:** plaintext and TLS connections share one non-blocking transport
   interface (`src/server/transport.cpp`); a TLS handshake is driven forward on the same
   `poll()` ticks as ordinary reads instead of blocking the event loop.
@@ -131,6 +191,9 @@ This produces two binaries per build directory: `server` and `client`.
 memory self-check after every single command, so its latency does not reflect
 the server's real performance.
 
+If you use clangd, ask CMake for a compile database so it knows the include
+root (`src/`): `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+
 ### Optional dependencies
 
 Both are detected at configure time and **compile out cleanly when absent** — the
@@ -171,17 +234,35 @@ Common settings can also be overridden at startup via environment variable:
 `MYRED_AOF_FSYNC`, `MYRED_AOF_REWRITE_MIN`, `MYRED_AOF_REWRITE_PERC`,
 `MYRED_MAXMEMORY`, `MYRED_MAXMEMORY_POLICY`.
 
+### Configuration directives
+
+All of these can be set in a config file; most can also be changed at runtime
+with `CONFIG SET` and persisted with `CONFIG REWRITE`. Examples are in `conf/`.
+
+| Area | Directives |
+|---|---|
+| Network | `port`, `bind`, `protected-mode`, `allow-ip`, `maxclients` |
+| TLS | `tls-port`, `tls-cert-file`, `tls-key-file`, `tls-ca-cert-file`, `tls-auth-clients`, `tls-handshake-timeout` |
+| Auth and ACL | `requirepass`, `user`, `rename-command`, `auditlog` |
+| Persistence | `dbfilename`, `save`, `appendonly`, `appendfilename`, `appendfsync`, `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` |
+| Memory | `maxmemory`, `maxmemory-policy`, `maxmemory-samples` |
+| Events | `notify-keyspace-events` |
+| Replication | `replicaof`, `masterauth`, `repl-backlog-size`, `repl-timeout`, `repl-ping-replica-period`, `min-replicas-to-write`, `min-replicas-max-lag` |
+
 ### A simple test with `redis-cli`
 
 Because MYRED speaks RESP, the official Redis CLI works directly:
 
 ```bash
 redis-cli -p 1234 -a kek1234 set foo bar
+redis-cli -p 1234 -a kek1234 set session:42 data ex 3600
 redis-cli -p 1234 -a kek1234 get foo
 redis-cli -p 1234 -a kek1234 sadd myset a b c
 redis-cli -p 1234 -a kek1234 smembers myset
 redis-cli -p 1234 -a kek1234 hset user:1 name alice age 30
 redis-cli -p 1234 -a kek1234 hgetall user:1
+redis-cli -p 1234 -a kek1234 zadd board 10 alice 20 bob 15 carol
+redis-cli -p 1234 -a kek1234 zrange board 0 -1 withscores
 redis-cli -p 1234 -a kek1234 scan 0 match 'user:*'
 ```
 
@@ -193,13 +274,36 @@ redis-cli -p 1234 -a kek1234
 127.0.0.1:1234> lrange mylist 0 -1
 127.0.0.1:1234> sadd tags redis cpp database
 127.0.0.1:1234> sinter tags othertags
+127.0.0.1:1234> zrangebyscore board (10 +inf limit 0 2 withscores
 ```
 
-> A general-purpose Redis client library (redis-py, ioredis, Jedis, go-redis,
-> ...) has not been validated against MYRED yet — only `redis-cli` and
-> `redis-benchmark` have. Plain `GET`/`SET`/hash/list/set/sorted-set traffic
-> over RESP2 should work; anything that leans on `HELLO`/RESP3, multiple
-> databases, or `EVAL` will not, per Known gaps above.
+### Using it from a client library
+
+A stock `redis-py` 8.1.0 connects with its default handshake (`HELLO 3`) and was
+checked against a real Redis 7.0 on the same calls, over both RESP2 and RESP3,
+with identical results for: `SET` with `ex`/`px`/`exat`/`pxat`/`nx`/`xx`/`get`/
+`keepttl`, `ZADD`, `ZRANGE` (including `desc`, `byscore`, `offset`/`num`,
+`withscores`), `ZREVRANGE`, `ZRANGEBYSCORE`, `ZINCRBY`, `ZPOPMIN`, both
+`ZREMRANGE*`, transaction pipelines, pub/sub and `WRONGTYPE` errors.
+
+```python
+import redis
+
+r = redis.Redis(port=1234, password="kek1234", decode_responses=True)  # RESP3 by default
+
+r.set("session:42", "data", ex=3600)          # cache / session idiom
+r.zadd("board", {"alice": 10, "bob": 20, "carol": 15})
+r.zincrby("board", 5, "alice")
+r.zrange("board", 0, 2, desc=True, withscores=True)   # top three
+r.zrevrank("board", "alice")                           # position from the top
+
+p = r.pubsub(); p.subscribe("news")
+r.publish("news", "hello")
+```
+
+What still will not work with a real application is listed under Known gaps:
+multiple databases, scripting, blocking list commands, `ZADD` options. Other
+libraries (ioredis, Jedis, go-redis, ...) have not been tried.
 
 ### With the bundled client
 
@@ -211,7 +315,8 @@ REDIS_PASSWORD=kek1234 ./build-rel/client                  # interactive REPL
 ## Supported commands
 
 ### Strings
-`GET`, `SET`, `DEL key [key...]`, `EXISTS key [key...]`
+`GET`, `SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT ms-ts|KEEPTTL]`,
+`DEL key [key...]`, `EXISTS key [key...]`
 `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`
 `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETEX`, `GETDEL`
 `MSET`, `MGET`, `MSETNX`
@@ -237,11 +342,14 @@ REDIS_PASSWORD=kek1234 ./build-rel/client                  # interactive REPL
 `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SMOVE`
 
 ### Sorted sets
-`ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZQUERY`, `ZREVQUERY`, `ZPOPMIN`
+`ZADD`, `ZREM`, `ZSCORE`, `ZINCRBY`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK`,
+`ZRANGE key start stop [BYSCORE] [REV] [LIMIT offset count] [WITHSCORES]`,
+`ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`,
+`ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZPOPMIN`
 
-This is a functional subset, not the full Redis zset surface — `ZCARD`,
-`ZINCRBY`, `ZRANGEBYSCORE`, `ZUNIONSTORE`, `ZSCAN` and friends are tracked as a
-gap in `docs/planning/BACKLOG.md`, not silently missing.
+Score bounds accept `(` for exclusive and `-inf`/`+inf`. This is a functional
+subset of the Redis sorted-set surface; the missing commands are listed under
+Known gaps.
 
 ### Pub/Sub
 `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
@@ -253,8 +361,8 @@ gap in `docs/planning/BACKLOG.md`, not silently missing.
 `REPLICAOF` (`SLAVEOF`), `REPLCONF`, `PSYNC`, `WAIT`, `FAILOVER`
 
 ### Admin / connection
-`AUTH`, `ACL`, `PING`, `ECHO`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`,
-`SAVE`, `BGSAVE`, `BGREWRITEAOF`
+`AUTH`, `HELLO`, `CLIENT` (`ID`/`GETNAME`/`SETNAME`/`SETINFO`), `ACL`, `PING`,
+`ECHO`, `INFO`, `CONFIG`, `MEMORY`, `OBJECT`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`
 
 Command names are case-insensitive. Besides RESP framing, plain-text **inline
 commands** are accepted (newline-terminated), and empty inline lines are ignored
@@ -271,7 +379,7 @@ src/
   server/        server.cpp        event loop + main()
                  transport.*       plaintext/TLS socket I/O behind one non-blocking interface
                  thread_pool.*     background worker pool
-  protocol/      resp.*            RESP request parser + response writers
+  protocol/      resp.*            RESP request parser + response writers (RESP2 and RESP3)
                  buffer.*          per-connection growable byte buffer
   commands/      commands.*        command handlers + dispatch
   core/          state.*           Entry, the global DB, constants, entry lifecycle, clocks
@@ -296,22 +404,42 @@ docs/planning/   ROADMAP (progress), BACKLOG (future work + open bugs),
                  DECISIONS (design + architecture), CODE_REVIEW (bug audit)
 ```
 
+## Branches
+
+| Branch | Contains | Use it for |
+|---|---|---|
+| `main` | the code only: `src/`, `conf/`, `CMakeLists.txt`, the README and the planning docs | building and running the server — **this is the finished, paused version** |
+| `test` | everything in `main`, plus the local-only regression suite and its logs | verifying a change |
+
+The suite on `test` is a single script, `scripts/stress_test.py`: correctness for
+every command, a concurrent stress run, and managed phases that start their own
+servers for memory accounting, config rewrite, auth, security/ACL, RESP3,
+persistence (AOF/RDB restart matrix), TLS, replication and failover, a
+**differential** phase that replays the same operations against a real
+`redis-server` and compares the replies, and libFuzzer harnesses over the RESP and
+RDB parsers. It is 2083 checks, passing on a Release build and under
+AddressSanitizer + UBSan + LSan. A couple of timing checks (a `WAIT` timeout, a TTL
+across a restart) measure with the wall clock and can fail on a machine whose clock
+is being stepped, which was observed under WSL2; they are not server bugs. Changes
+flow `main` → `test` only; the suite is never merged into `main`.
+
 ## Status and what's next
 
-See `docs/planning/ROADMAP.md` for the authoritative, actively-maintained
-detail — this is a summary.
+**The project is paused.** `main` is the last version being worked on, and the
+server is not expected to be developed again for a long time. See
+`docs/planning/ROADMAP.md` for the detailed history — this is a summary.
 
 **Done:**
 
+- **V8 — Pub/Sub and Transactions:** channel/pattern pub/sub with keyspace
+  notifications; `MULTI`/`EXEC`/`WATCH` with atomicity free from the
+  single-threaded event loop.
 - **V9 — Security and auth:** config file, Argon2id credentials with async
   verification, protected mode + CIDR allowlist, ACLs with key patterns,
   command hardening, and an escaped audit log.
 - **V9.7 — TLS:** a transport seam keeps OpenSSL a private dependency of one
   translation unit, with the handshake driven as connection state; live
   certificate rotation shipped later in V10.6.1c.
-- **V8 — Pub/Sub and Transactions:** channel/pattern pub/sub with keyspace
-  notifications; `MULTI`/`EXEC`/`WATCH` with atomicity free from the
-  single-threaded event loop.
 - **V9.8 — Config directive table:** `CONFIG GET`/`SET`/`REWRITE` unified onto
   one self-checking table, closing a class of bug that had already shipped a
   passwordless-server regression once.
@@ -322,22 +450,29 @@ detail — this is a summary.
 - **V10.6.1 — TLS optimization pass:** measured three deferred ideas; shipped
   live cert reload, reverted a bounded-accept-queue change that didn't clear
   the noise floor, declined kTLS on the arithmetic.
+- **V11 — Testing hardening:** the single regression suite described under
+  Branches, with a differential oracle and fuzzing, run clean under sanitizers.
+- **V13 — Production-pointable (the part that was finished):** an unmodified
+  `redis-py` can now connect and work. Step 1: `HELLO`/RESP3 and the `CLIENT`
+  subset. Step 2: `SET` with options and the sorted-set read surface (the
+  private `ZQUERY`/`ZREVQUERY` commands were replaced by the real Redis names,
+  not aliased).
 
-**Scoped but not started:** automatic/Sentinel-style failover, cluster/hash-slot
-sharding, a Windows port (POSIX→Win32 translation is fully scoped in
-`docs/planning/BACKLOG.md` with concrete difficulty rankings), `EVAL` scripting
-(custom bytecode VM, designed but not built), and closing the app-compatibility
-gap (multi-database support, a `HELLO`/RESP3 handshake, a minimum `CLIENT`
-command subset) needed to point a real, unmodified application at the server.
+**Not done, and not planned while the project is paused:** the `ZADD` options and
+the rest of the sorted-set family, multiple databases (`SELECT`), `EVAL`
+scripting (a custom bytecode VM is designed but not built), automatic
+Sentinel-style failover, cluster/hash-slot sharding, deployment ergonomics
+(packaging/service files), and a Windows port. All are scoped in
+`docs/planning/BACKLOG.md`.
 
-**No open bugs in the data path.** What's tracked in
-`docs/planning/BACKLOG.md` → Open Bugs is a hardening follow-up, a latent
-scheduling gap, an observability wart, and a deliberate protocol divergence —
-none of them can corrupt or lose data.
+The planning docs record the last audit of known bugs under
+`docs/planning/BACKLOG.md` → Open Bugs; at that point none could corrupt or lose
+data in the data path.
 
 ## Acknowledgements
 
 Built following **[build-your-own.org/redis](https://build-your-own.org/redis/)**,
 then extended with all five data types, a full generic keyspace command suite,
 `fork()`-based persistence, cursor-based `SCAN`/`HSCAN`/`SSCAN`, TLS, ACLs,
-pub/sub, transactions, replication with coordinated failover, and a CMake build.
+pub/sub, transactions, replication with coordinated failover, RESP3, `SET`
+options, the sorted-set range commands, and a CMake build.
